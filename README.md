@@ -81,7 +81,7 @@ Please ensure your code adheres to our style guide and passes all tests.
 
 Daniel Biocchi - daniel@biocchi.ca
 
-Project Link: [https://github.com/ydanbiocchi/airborne-oxide](https://github.com/danbiocchi/airborne-oxide)
+Project Link: [https://github.com/danbiocchi/airborne-oxide](https://github.com/danbiocchi/airborne-oxide)
 
 
 Getting Involved
