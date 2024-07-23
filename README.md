@@ -84,14 +84,15 @@ Daniel Biocchi - daniel@biocchi.ca
 Project Link: [https://github.com/danbiocchi/airborne-oxide](https://github.com/danbiocchi/airborne-oxide)
 
 
-Getting Involved
+## Getting Involved
+
 While we're not ready for flight tests, we welcome contributions in:
 
-Rust implementation of ArduPilot HAL
-Mavlink protocol integration
-Flight dynamics modeling
-Safety-critical RTOS design in Rust
----
+1. Rust implementation of ArduPilot HAL
+2. Mavlink protocol integration
+3. Flight dynamics modeling
+4. Safety-critical RTOS design in Rust
+
 
 Let's redefine flight control systems with the power of Rust! 🦀✈️
 
