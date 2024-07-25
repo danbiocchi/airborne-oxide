@@ -150,7 +150,7 @@ cargo build --release
    ```
 
 ### b. Connect the Matek F405-VTOL to your computer
-![TTL Converter](docs/images/ttl.jpg)
+![TTL Converter](images/ttl.jpg)
 Use the DSD TECH SH-U09C5 USB to TTL UART Converter (https://www.amazon.ca/gp/product/B07WX2DSVB):
 - Connect as follows:
     - Black wire (GND) to GND on the flight controller
