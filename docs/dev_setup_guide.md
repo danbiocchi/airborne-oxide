@@ -25,7 +25,7 @@ This guide will walk you through the process of setting up your development envi
 
 ### b. Install the GNU Arm Embedded Toolchain
 
-1. Go to https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain/gnu-rm/downloads
+1. Go to https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads
 2. Download the installer for your operating system (e.g., arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-arm-none-eabi.exe for Windows)
 3. Run the installer, ensuring "Add path to environment variable" is checked
 4. Open a new command prompt and verify the installation by running:
