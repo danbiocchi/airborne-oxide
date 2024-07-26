@@ -3,7 +3,7 @@
 This guide will walk you through the process of setting up your development environment for contributing to the airborne-oxide project. Follow these steps carefully to ensure a smooth setup.
 
 ## My hardware
-![](C:\Users\danie\RustroverProjects\airborne-oxide\docs\images\hardware.jpg)
+![hardware.jpg](images%2Fhardware.jpg)
 
 
 
