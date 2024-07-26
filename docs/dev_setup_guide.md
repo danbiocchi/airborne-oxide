@@ -2,6 +2,11 @@
 
 This guide will walk you through the process of setting up your development environment for contributing to the airborne-oxide project. Follow these steps carefully to ensure a smooth setup.
 
+## My hardware
+![](C:\Users\danie\RustroverProjects\airborne-oxide\docs\images\hardware.jpg)
+
+
+
 ## Table of Contents
 
 1. [Set up the Development Environment](#1-set-up-the-development-environment)

@@ -6,7 +6,7 @@ Supercharging ArduPilot: A Rust-powered Flight Controller with Mavlink Integrati
 
 airborne-oxide is an ambitious Rust program aimed at creating a high-performance, safety-critical flight controller. By leveraging Rust's performance and memory safety features, we're building a robust alternative to traditional C/C++ implementations. This project integrates with ArduPilot's ecosystem and implements Mavlink protocol support, bridging proven open-source autopilot software with Rust's modern programming paradigms.
 
-## Current Features
+## Currently developing Features
 
 - Rust-based implementation for improved performance and memory safety
 - ArduPilot compatibility layer
