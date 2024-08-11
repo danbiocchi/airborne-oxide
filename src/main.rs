@@ -12,13 +12,13 @@ fn main() -> ! {
     let rcc = dp.RCC.constrain();
     let clocks = rcc.cfgr.sysclk(168.MHz()).freeze();
 
-    let gpioa = dp.GPIOA.split();
+    let gpioc = dp.GPIOC.split(); // GPIOC for USART6 pins
 
-    // Setup UART on pins A9 (TX) and A10 (RX)
-    let tx = gpioa.pa9.into_alternate();
-    let rx = gpioa.pa10.into_alternate();
+    // Setup UART6 on pins PC6 (TX) and PC7 (RX)
+    let tx = gpioc.pc6.into_alternate(); // TX6 (USART6)
+    let rx = gpioc.pc7.into_alternate(); // RX6 (USART6)
 
-    let mut serial = dp.USART1.serial(
+    let mut serial = dp.USART6.serial(
         (tx, rx),
         Config::default().baudrate(115200.bps()),
         &clocks
