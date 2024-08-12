@@ -1,4 +1,3 @@
-Certainly! I'll provide comprehensive instructions for the Matek Wing F405 WTE board. This guide will cover everything from setup to flashing and testing.
 
 # Comprehensive Development Setup Guide for Matek Wing F405 WTE
 
