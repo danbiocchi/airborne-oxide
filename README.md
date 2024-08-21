@@ -19,8 +19,8 @@ airborne-oxide is an ambitious Rust program aimed at creating a high-performance
 
 ### Phase 1: Foundation (Current)
 - [x] Basic project structure
-- [ ] ArduPilot HAL (Hardware Abstraction Layer) in Rust
-- [ ] Mavlink message parsing and generation
+- [x] ArduPilot HAL (Hardware Abstraction Layer) in Rust
+- [x] Mavlink message parsing and generation
 - [ ] Core flight control loops
 
 ### Phase 2: Advanced Flight Features
