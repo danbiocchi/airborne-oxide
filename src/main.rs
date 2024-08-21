@@ -1,139 +1,125 @@
-#![no_std]
-#![no_main]
-extern crate alloc;
+#![no_std] // This program will not use the Rust standard library
+#![no_main] // This program doesn't use the standard main function entry point
+extern crate alloc; // Import the alloc crate for heap allocation support
 
 use alloc::format;
 use core::fmt::Write;
 use cortex_m_rt::entry;
-use panic_halt as _;
-use stm32f4xx_hal::{
-    pac,
-    prelude::*,
-    serial::{config::Config, Event, Serial},
-};
-use cortex_m::delay::Delay;
+use panic_halt as _; // Use panic-halt for panic handling
+use stm32f4xx_hal::{pac, prelude::*, serial::{config::Config, Serial, Tx}};
 use heapless::String;
-use rand_core::{RngCore, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-use stm32f4xx_hal::timer::Timer;
 
-// Constants for Wi-Fi configuration
+// Import the LockedHeap allocator
+use linked_list_allocator::LockedHeap;
+
+// Define a static memory region for the heap
+// This allocates 1024 bytes in the .heap section of memory
+#[link_section = ".heap"]
+static mut HEAP: [u8; 1024] = [0; 1024];
+
+// Define a global allocator using LockedHeap
+// This will be used for dynamic memory allocation
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+// Wi-Fi configuration constants
 const WIFI_SSID: &str = "F405WTE";
 const WIFI_PASSWORD: &str = "f405wte";
-const UDP_PORT: u16 = 14550; // Common port for MAVLink
+const UDP_PORT: u16 = 14550;
+
+// Global static variable for the USART1 transmitter
+// It's wrapped in Option because it will be initialized later
+static mut SERIAL: Option<Tx<pac::USART1>> = None;
 
 #[entry]
 fn main() -> ! {
-    // Initialize the device peripherals
+    // Get access to the core peripherals from the cortex-m crate
     let dp = pac::Peripherals::take().unwrap();
-    let cp = cortex_m::Peripherals::take().unwrap();
-
-    // Configure the clock system
     let rcc = dp.RCC.constrain();
+    
+    // Configure the system clock
     let clocks = rcc.cfgr.sysclk(168.MHz()).freeze();
 
-    // Split the GPIOA peripheral into individual pins
+    // Configure GPIO pins for USART1
     let gpioa = dp.GPIOA.split();
-
-    // Configure UART1 pins for ESP8266 communication (TX1/RX1)
     let tx_pin = gpioa.pa9.into_alternate();
     let rx_pin = gpioa.pa10.into_alternate();
 
-    // Initialize UART1 for communication with ESP8266
-    let mut serial = Serial::new(
+    // Configure and split the USART1 peripheral
+    let serial = Serial::new(
         dp.USART1,
         (tx_pin, rx_pin),
         Config::default().baudrate(115_200.bps()),
         &clocks
     ).unwrap();
 
-    // Enable RX interrupts
-    serial.listen(Event::Rxne);
+    let (tx, _rx) = serial.split();
+    
+    // Store the transmitter in the global SERIAL variable
+    unsafe {
+        SERIAL = Some(tx);
+    }
 
-    // Initialize delay
-    let mut delay = Timer::new(dp.TIM5, &clocks).delay();
+    // Initialize the heap allocator with the static HEAP
+    unsafe { ALLOCATOR.lock().init(HEAP.as_ptr() as *mut u8, HEAP.len()) }
 
-    // Initialize RNG
-    let seed = 0x13371337; // You might want to use a more random seed in production
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    // Connect to Wi-Fi network
+    connect_wifi();
+    
+    // Set up UDP connection
+    setup_udp();
 
-    // Connect to Wi-Fi
-    connect_wifi(&mut serial, &mut delay);
-
-    // Setup UDP connection
-    setup_udp(&mut serial, &mut delay);
-
-    // Initialize heartbeat counter
     let mut heartbeat_counter = 0;
 
-    // Main loop to send heartbeat messages
+    // Main program loop
     loop {
         heartbeat_counter += 1;
-        let random_data = rng.next_u32();
-
-        // Construct the heartbeat message
-        let message = construct_heartbeat_message(heartbeat_counter, random_data);
-
-        // Send the heartbeat message
-        send_udp_message(&mut serial, &message, &mut delay);
-
-        // Wait for 1 second before sending the next heartbeat
-        delay.delay_ms(1000u32);
+        let message = construct_heartbeat_message(heartbeat_counter);
+        send_udp_message(&message);
+        // Delay for approximately 1 second at 168MHz
+        cortex_m::asm::delay(168_000_000);
     }
 }
 
-fn connect_wifi(serial: &mut Serial<pac::USART1, (pac::USART1, pac::USART1)>, delay: &mut Delay) {
-    // Reset ESP8266
-    send_at_command(serial, "AT+RST", delay);
-    delay.delay_ms(2000u32);
-
-    // Set ESP8266 to station mode
-    send_at_command(serial, "AT+CWMODE=1", delay);
-
-    // Connect to Wi-Fi
+// Function to connect to Wi-Fi network
+fn connect_wifi() {
+    send_at_command("AT+RST"); // Reset the ESP8266 module
+    cortex_m::asm::delay(336_000_000); // 2 second delay
+    send_at_command("AT+CWMODE=1"); // Set ESP8266 to station mode
     let connect_command = format!("AT+CWJAP=\"{}\",\"{}\"", WIFI_SSID, WIFI_PASSWORD);
-    send_at_command(serial, &connect_command, delay);
-    delay.delay_ms(5000u32); // Wait for connection
-
-    // Check connection status
-    send_at_command(serial, "AT+CIFSR", delay);
+    send_at_command(&connect_command); // Connect to Wi-Fi network
+    cortex_m::asm::delay(840_000_000); // 5 second delay
+    send_at_command("AT+CIFSR"); // Get IP address
 }
 
-fn setup_udp(serial: &mut Serial<pac::USART1, (pac::USART1, pac::USART1)>, delay: &mut Delay) {
-    // Enable multiple connections
-    send_at_command(serial, "AT+CIPMUX=1", delay);
-
-    // Setup UDP connection
-    let udp_command = format!("AT+CIPSTART=0,\"UDP\",\"255.255.255.255\",{},{}",
-                              UDP_PORT, UDP_PORT);
-    send_at_command(serial, &udp_command, delay);
+// Function to set up UDP connection
+fn setup_udp() {
+    send_at_command("AT+CIPMUX=1"); // Enable multiple connections
+    let udp_command = format!("AT+CIPSTART=0,\"UDP\",\"255.255.255.255\",{},{}", UDP_PORT, UDP_PORT);
+    send_at_command(&udp_command); // Start UDP connection
 }
 
-fn construct_heartbeat_message(counter: u32, random_data: u32) -> String<128> {
+// Function to construct the heartbeat message
+fn construct_heartbeat_message(counter: u32) -> String<128> {
     let mut message: String<128> = String::new();
-    write!(
-        message,
-        "F405 Heartbeat #{}: Matek F405 Wing is alive! Random: 0x{:08X}",
-        counter,
-        random_data
-    )
-        .unwrap();
+    write!(message, "F405 Heartbeat #{}: Matek F405 Wing is alive!", counter).unwrap();
     message
 }
 
-fn send_udp_message(serial: &mut Serial<pac::USART1, (pac::USART1, pac::USART1)>, 
-                    message: &str, delay: &mut Delay) {
-    // Prepare to send UDP data
+// Function to send UDP message
+fn send_udp_message(message: &str) {
     let send_command = format!("AT+CIPSEND=0,{}", message.len());
-    send_at_command(serial, &send_command, delay);
-
-    // Send the actual message
-    send_at_command(serial, message, delay);
+    send_at_command(&send_command); // Prepare to send data
+    send_at_command(message); // Send the actual message
 }
 
-fn send_at_command(serial: &mut Serial<pac::USART1, (pac::USART1, pac::USART1)>, 
-                   command: &str, delay: &mut Delay) {
-    let _ = serial.write_str(command);
-    let _ = serial.write_str("\r\n");
-    delay.delay_ms(500u32);
+// Function to send AT commands to the ESP8266 module
+fn send_at_command(command: &str) {
+    unsafe {
+        if let Some(tx) = SERIAL.as_mut() {
+            let _ = tx.write_str(command);
+            let _ = tx.write_str("\r\n"); // Add carriage return and newline
+        }
+    }
+    cortex_m::asm::delay(84_000_000); // 0.5 second delay
 }

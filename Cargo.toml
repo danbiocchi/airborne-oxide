@@ -9,8 +9,7 @@ cortex-m-rt = "0.7.3"
 panic-halt = "0.2.0"
 stm32f4xx-hal = { version = "0.15.0", features = ["stm32f405", "rt"] }
 heapless = "0.8.0"
-rand_core = "0.6.4"
-rand_chacha = "0.3.1"
+linked_list_allocator = "0.10.5"
 
 [[bin]]
 name = "matek_wing_f405_project"
