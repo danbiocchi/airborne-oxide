@@ -228,6 +228,9 @@ In a terminal, run:
 dfu-util -l
 ```
 
+
+
+
 You should see a device listed with "STM32 BOOTLOADER" or similar.
 
 ### c. Flash the binary

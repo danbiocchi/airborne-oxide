@@ -1,125 +1,115 @@
-#![no_std] // This program will not use the Rust standard library
-#![no_main] // This program doesn't use the standard main function entry point
-extern crate alloc; // Import the alloc crate for heap allocation support
+#![no_std]
+#![no_main]
 
-use alloc::format;
-use core::fmt::Write;
 use cortex_m_rt::entry;
-use panic_halt as _; // Use panic-halt for panic handling
-use stm32f4xx_hal::{pac, prelude::*, serial::{config::Config, Serial, Tx}};
+use panic_halt as _; // Panic handler
+use stm32f4xx_hal::{pac, prelude::*, serial::{config::Config, Serial, Tx, Rx}};
+use core::fmt::Write;
 use heapless::String;
 
-// Import the LockedHeap allocator
-use linked_list_allocator::LockedHeap;
+// Constants
+const SYSTEM_ID: u8 = 1; // ID of this system
+const COMPONENT_ID: u8 = 1; // ID of this component
+const MESSAGE_INTERVAL: u32 = 168_000_000; // Roughly 1 second at 168MHz
 
-// Define a static memory region for the heap
-// This allocates 1024 bytes in the .heap section of memory
-#[link_section = ".heap"]
-static mut HEAP: [u8; 1024] = [0; 1024];
+// MAVLink-like message IDs (these are example IDs, not official MAVLink IDs)
+const HEARTBEAT_MSG_ID: u8 = 0;
+const ATTITUDE_MSG_ID: u8 = 30;
 
-// Define a global allocator using LockedHeap
-// This will be used for dynamic memory allocation
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
-
-// Wi-Fi configuration constants
-const WIFI_SSID: &str = "F405WTE";
-const WIFI_PASSWORD: &str = "f405wte";
-const UDP_PORT: u16 = 14550;
-
-// Global static variable for the USART1 transmitter
-// It's wrapped in Option because it will be initialized later
-static mut SERIAL: Option<Tx<pac::USART1>> = None;
+// Global static variables for UART
+static mut TX: Option<Tx<pac::USART1>> = None;
+static mut RX: Option<Rx<pac::USART1>> = None;
 
 #[entry]
 fn main() -> ! {
-    // Get access to the core peripherals from the cortex-m crate
+    // Initialize the device peripherals
     let dp = pac::Peripherals::take().unwrap();
-    let rcc = dp.RCC.constrain();
-    
+
     // Configure the system clock
+    let rcc = dp.RCC.constrain();
     let clocks = rcc.cfgr.sysclk(168.MHz()).freeze();
 
-    // Configure GPIO pins for USART1
+    // Configure GPIOA
     let gpioa = dp.GPIOA.split();
+
+    // Configure USART1 pins
     let tx_pin = gpioa.pa9.into_alternate();
     let rx_pin = gpioa.pa10.into_alternate();
 
-    // Configure and split the USART1 peripheral
+    // Configure and split the USART peripheral
     let serial = Serial::new(
         dp.USART1,
         (tx_pin, rx_pin),
-        Config::default().baudrate(115_200.bps()),
+        Config::default().baudrate(921_600.bps()),
         &clocks
     ).unwrap();
+    let (tx, rx) = serial.split();
 
-    let (tx, _rx) = serial.split();
-    
-    // Store the transmitter in the global SERIAL variable
+    // Store UART Tx and Rx in global variables
     unsafe {
-        SERIAL = Some(tx);
+        TX = Some(tx);
+        RX = Some(rx);
     }
 
-    // Initialize the heap allocator with the static HEAP
-    unsafe { ALLOCATOR.lock().init(HEAP.as_ptr() as *mut u8, HEAP.len()) }
+    let mut counter = 0;
+    let mut attitude = Attitude { pitch: 0.0, roll: 0.0, yaw: 0.0 };
 
-    // Connect to Wi-Fi network
-    connect_wifi();
-    
-    // Set up UDP connection
-    setup_udp();
-
-    let mut heartbeat_counter = 0;
-
-    // Main program loop
     loop {
-        heartbeat_counter += 1;
-        let message = construct_heartbeat_message(heartbeat_counter);
-        send_udp_message(&message);
-        // Delay for approximately 1 second at 168MHz
-        cortex_m::asm::delay(168_000_000);
+        // Send heartbeat message
+        send_heartbeat(counter);
+
+        // Update and send attitude
+        attitude.pitch += 0.1;
+        attitude.roll += 0.05;
+        attitude.yaw += 0.025;
+        send_attitude(&attitude);
+
+        counter += 1;
+
+        // Delay before next iteration
+        cortex_m::asm::delay(MESSAGE_INTERVAL);
     }
 }
 
-// Function to connect to Wi-Fi network
-fn connect_wifi() {
-    send_at_command("AT+RST"); // Reset the ESP8266 module
-    cortex_m::asm::delay(336_000_000); // 2 second delay
-    send_at_command("AT+CWMODE=1"); // Set ESP8266 to station mode
-    let connect_command = format!("AT+CWJAP=\"{}\",\"{}\"", WIFI_SSID, WIFI_PASSWORD);
-    send_at_command(&connect_command); // Connect to Wi-Fi network
-    cortex_m::asm::delay(840_000_000); // 5 second delay
-    send_at_command("AT+CIFSR"); // Get IP address
+// Struct to hold attitude data
+struct Attitude {
+    pitch: f32,
+    roll: f32,
+    yaw: f32,
 }
 
-// Function to set up UDP connection
-fn setup_udp() {
-    send_at_command("AT+CIPMUX=1"); // Enable multiple connections
-    let udp_command = format!("AT+CIPSTART=0,\"UDP\",\"255.255.255.255\",{},{}", UDP_PORT, UDP_PORT);
-    send_at_command(&udp_command); // Start UDP connection
+// Function to send a heartbeat message
+fn send_heartbeat(counter: u32) {
+    let mut message: String<64> = String::new();
+    write!(message, "HB,{},{},{}", SYSTEM_ID, COMPONENT_ID, counter).unwrap();
+    send_mavlink_message(HEARTBEAT_MSG_ID, message.as_bytes());
 }
 
-// Function to construct the heartbeat message
-fn construct_heartbeat_message(counter: u32) -> String<128> {
-    let mut message: String<128> = String::new();
-    write!(message, "F405 Heartbeat #{}: Matek F405 Wing is alive!", counter).unwrap();
-    message
+// Function to send an attitude message
+fn send_attitude(attitude: &Attitude) {
+    let mut message: String<64> = String::new();
+    write!(message, "ATT,{:.2},{:.2},{:.2}", attitude.pitch, attitude.roll, attitude.yaw).unwrap();
+    send_mavlink_message(ATTITUDE_MSG_ID, message.as_bytes());
 }
 
-// Function to send UDP message
-fn send_udp_message(message: &str) {
-    let send_command = format!("AT+CIPSEND=0,{}", message.len());
-    send_at_command(&send_command); // Prepare to send data
-    send_at_command(message); // Send the actual message
-}
+// Function to send a MAVLink-like message
+fn send_mavlink_message(msg_id: u8, payload: &[u8]) {
+    // Simple MAVLink-like header (just for demonstration)
+    // In a real MAVLink implementation, this would include more fields and a checksum
+    let header: [u8; 6] = [0xFE, payload.len() as u8, 0, msg_id, SYSTEM_ID, COMPONENT_ID];
 
-// Function to send AT commands to the ESP8266 module
-fn send_at_command(command: &str) {
     unsafe {
-        if let Some(tx) = SERIAL.as_mut() {
-            let _ = tx.write_str(command);
-            let _ = tx.write_str("\r\n"); // Add carriage return and newline
+        if let Some(tx) = TX.as_mut() {
+            // Send header
+            for &byte in &header {
+                let _ = tx.write(byte);
+            }
+            // Send payload
+            for &byte in payload {
+                let _ = tx.write(byte);
+            }
+            // Send a newline for readability (not part of actual MAVLink protocol)
+            let _ = tx.write(b'\n');
         }
     }
-    cortex_m::asm::delay(84_000_000); // 0.5 second delay
 }
