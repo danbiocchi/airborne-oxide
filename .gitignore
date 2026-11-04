@@ -1,0 +1,13 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local data that should not be committed (flight logs, third-party models)
+/local/
