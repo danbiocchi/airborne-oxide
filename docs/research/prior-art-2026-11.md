@@ -36,7 +36,7 @@
 | pulseengine/relay | WebAssembly flight-software components: a PX4-style control cascade with allocation, formal proofs (Verus, Kani, Rocq, Lean) | Apache-2.0 | 2★ | Useful for ideas; not running on hardware |
 | protoflight, pro-flight, peterkrull/quad, Peng | Hobby flight controllers and a quad simulator | GPL / MIT/Apache | small | Not flown, archived, or low fidelity |
 | dora-rs | Rust dataflow middleware for robots, with Python support | Apache-2.0 | 4.1k★, 1.0 (2026-09) | Soft real-time. A brain middleware candidate for S3. |
-| wls-alloc | Constrained least-squares control allocation, ported from TU Delft's C code. No heap, runs on Cortex-M. | MIT | v0.4.0 | Adopted (vendored, with proofs) for Q33 |
+| wls-alloc | Constrained least-squares control allocation. No heap, runs on Cortex-M. | MIT as published, but its README calls it a port of tudelft/ActiveSetCtlAlloc, which is **GPL-3.0**. Provenance unresolved. | v0.4.0 | **Not adopted.** We write our own allocator, or port PX4's BSD-3 one (DESIGN §4.5, §10). |
 | rust-mavlink / MAVSpec | MAVLink 1/2 with signing and async; embedded mode; code generation | MIT OR Apache-2.0 | 0.21.0 (2026-10) | Adopted |
 
 ## 2. Established autopilots
@@ -61,7 +61,7 @@
 | OmniDrones | MIT | Isaac Sim 4.1; maintenance is difficult | None |
 | gym-pybullet-drones | MIT | Gymnasium, multi-agent RL | Betaflight |
 | RotorPy | MIT | Aerodynamics, wind, IMU, motor dynamics; batched | PX4 (optional) |
-| Crazyflow | MIT | JAX/MuJoCo, up to ~914M steps/s on an RTX 4090; fitted to real Crazyflie data; differentiable | None |
+| Crazyflow | MIT | JAX/MuJoCo, up to ~914M steps/s on an RTX 4090 (total throughput across many parallel environments, not one vehicle); fitted to real Crazyflie data (~30 g airframe); differentiable | None |
 | RLtools / learning-to-fly | MIT | C++, trains a hover policy in ~18 s | Deploys to PX4, Crazyflie, ESP32 |
 | Genesis | Apache-2.0 | General-purpose physics | None |
 | JSBSim | LGPL-2.1 | Fixed-wing flight dynamics, batch mode, Python | ArduPilot, PX4 |
@@ -77,7 +77,7 @@
 | XFOIL / XFLR5 | GPL | XFOIL scriptable; XFLR5 mostly a GUI | — |
 | SU2 / OpenFOAM | LGPL-2.1 / GPL-3.0 | CLI | Full CFD, for A3 only |
 | pyBEMT, SizingLab | MIT / ? | Python | Propeller blade-element theory and multirotor sizing |
-| sysid (arplaboratory) | MIT | Jupyter | Quadrotor system identification from PX4 ULog. Nothing equivalent found for ArduPilot logs. |
+| sysid (arplaboratory) | MIT | Jupyter | Quadrotor system identification from PX4 ULog (expects PX4 topic names, DESIGN §4.15). Nothing equivalent found for ArduPilot logs. |
 
 ## 5. On-drone AI autonomy
 
@@ -88,7 +88,7 @@
 | TypeFly | Apache-2.0 | Turns language into skill-based plans (cloud LLM + YOLO). Pattern adopted (Q37). |
 | AerialClaw (arXiv 2026-06) | MIT *(uncertain)* | LLM agent framework; PX4/Gazebo, AirSim; LLM backend can be swapped |
 | "Taking Flight with Dialogue" | ? | PX4 + ROS 2 with local models through Ollama |
-| VLN-on-the-Fly / OnFly | Code not confirmed | Vision-language model on a Jetson Orin NX, ~0.79 s median per decision |
+| VLN-on-the-Fly / OnFly | Code not confirmed | Vision-language model on a Jetson Orin NX, ~0.79 s median per decision. *(Unverified: citation, model size and quantisation still to be added. Orin Nano-class latency will be measured.)* |
 
 ## 6. Rust building blocks
 
