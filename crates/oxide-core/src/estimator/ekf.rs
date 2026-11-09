@@ -31,7 +31,7 @@ pub const IBA: usize = 12;
 /// Standard gravity, m/s².
 const G: f64 = 9.806_65;
 /// Largest gyro bias the filter will estimate, rad/s per axis.
-const GYRO_BIAS_LIMIT: f64 = 0.15;
+pub const GYRO_BIAS_LIMIT: f64 = 0.15;
 /// Largest accelerometer bias the filter will estimate, m/s² per axis.
 const ACCEL_BIAS_LIMIT: f64 = 0.4;
 /// Variance limits `(min, max)` per error-state group: p, v, θ, bg, ba.
