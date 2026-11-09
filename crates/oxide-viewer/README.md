@@ -1,6 +1,6 @@
 # oxide-viewer
 
-Flies the simulator in real time and shows it in [Rerun](https://rerun.io): the quad, rotor thrust arrows, its trail and the setpoint in 3D, plus plots of altitude, attitude, battery voltage and motor commands.
+Flies the simulator in real time and shows it in [Rerun](https://rerun.io): the quad, rotor thrust arrows, its trail, the setpoint and the wind in 3D, plus plots of altitude, attitude, battery voltage, motor commands, wind speed and (when the flight controller publishes an estimate) the estimation error. The blue box is where the state estimator thinks the quad is; the orange one is the true pose.
 
 It is kept out of the main workspace because Rerun is large. The flight crates and CI stay small, and the simulator never depends on it.
 
@@ -39,6 +39,8 @@ This flies the scripted hover-and-step scenario in real time and opens the viewe
 | Option | Effect |
 |---|---|
 | `--joystick` | You fly it with a USB joystick instead of the script |
+| `--scenario gust-hold` | Fly the hold-in-gusts scenario (realistic sensors, wind, EKF) instead of the default `hover-step` |
+| `--seed 3` | Run index for `gust-hold` (default 0) |
 | `--profile h743` | Use the H743 task schedule instead of the F405 one |
 | `--speed 4` | Run at 4× real time (`0` = as fast as possible) |
 | `--save flight.rrd` | Write a recording file instead of opening the viewer (open it later with `rerun flight.rrd`) |
