@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Not a member of the main workspace (see the root Cargo.toml): Rerun and
+# the joystick library are large, and the flight crates must stay small.
+[package]
+name = "oxide-viewer"
+description = "3D viewer and joystick pilot for the Airborne Oxide simulator"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["Daniel Biocchi"]
+rust-version = "1.97"
+publish = false
+
+[features]
+default = ["joystick"]
+joystick = ["dep:gilrs"]
+
+[dependencies]
+oxide-core = { path = "../oxide-core" }
+oxide-sim = { path = "../oxide-sim" }
+# Pinned exactly: Rerun changes its API between minor versions, and the
+# viewer app you install must match this version.
+rerun = { version = "=0.40.0", default-features = false, features = ["sdk"] }
+gilrs = { version = "0.11", optional = true }
+
+[profile.release]
+debug = 1

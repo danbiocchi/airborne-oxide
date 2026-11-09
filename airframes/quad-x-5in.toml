@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Reference 5-inch 6S Quad-X (DESIGN §11: the planned test quad).
+# These are engineering estimates. They get replaced by measured values
+# (weighing, pendulum, thrust stand, log fits) as calibration progresses (§5.9).
+
+name = "quad-x-5in"
+
+[body]
+mass_kg = 0.65
+# Principal moments of inertia about body x, y, z.
+inertia_kg_m2 = [1.6e-3, 1.6e-3, 2.8e-3]
+# Drag coefficient × reference area per body axis (forward, right, down), m².
+drag_area_m2 = [0.010, 0.010, 0.020]
+
+[propulsion]
+# Per rotor, at the battery's nominal voltage.
+max_thrust_n = 8.0
+max_rpm = 30000.0
+# Reaction torque per newton of thrust, m.
+torque_coeff_m = 0.016
+motor_time_constant_s = 0.025
+# Thrust fraction = (1 − e)·u + e·u² for motor command u.
+thrust_expo = 1.0
+# Mechanical-to-electrical efficiency of motor + ESC.
+efficiency = 0.75
+# Electronics and idle draw, W.
+idle_power_w = 2.0
+
+# Rotor positions from the centre of mass, m (x forward, y right).
+# Order and spin follow the common Quad-X convention.
+[[rotor]]
+position_m = [0.0795, 0.0795]   # front right
+spin = "ccw"
+
+[[rotor]]
+position_m = [-0.0795, -0.0795] # rear left
+spin = "ccw"
+
+[[rotor]]
+position_m = [0.0795, -0.0795]  # front left
+spin = "cw"
+
+[[rotor]]
+position_m = [-0.0795, 0.0795]  # rear right
+spin = "cw"
+
+[battery]
+cells = 6
+capacity_mah = 1500.0
+internal_resistance_ohm = 0.025
+# Voltage at which max_thrust_n applies.
+nominal_voltage_v = 22.2
+initial_state_of_charge = 1.0
