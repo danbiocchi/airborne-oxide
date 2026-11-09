@@ -6,11 +6,14 @@
 //!                [--scenario hover-step|gust-hold] [--seed N]
 //!                [--estimator truth|ekf] [--sensors ideal|realistic]
 //! oxide-sim hash [same options]
+//! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
 //! ```
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
-//! the libm paths.
+//! the libm paths. `montecarlo` flies gust-hold indices 0..N (default 200) on
+//! all cores (or `--threads T`) against the M1b acceptance criteria and exits
+//! with 1 if any run fails.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -20,6 +23,8 @@ use oxide_core::config::EstimatorSource;
 use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
+use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold};
+use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimError, SimOptions, Simulation, StepRecord};
@@ -45,11 +50,15 @@ struct Args {
     seed: u64,
     estimator: Option<EstimatorSource>,
     sensors: Option<SensorChoice>,
+    seeds: usize,
+    threads: usize,
 }
 
 fn parse() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let command = it.next().ok_or("missing command: run | hash")?;
+    let command = it
+        .next()
+        .ok_or("missing command: run | hash | montecarlo")?;
     let mut args = Args {
         command,
         profile: F405_LEAN,
@@ -59,6 +68,8 @@ fn parse() -> Result<Args, String> {
         seed: 0,
         estimator: None,
         sensors: None,
+        seeds: 200,
+        threads: 0,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -101,11 +112,26 @@ fn parse() -> Result<Args, String> {
                     other => return Err(format!("unknown sensors {other} (ideal | realistic)")),
                 });
             }
+            "--seeds" => {
+                let v = value()?;
+                args.seeds = v
+                    .parse()
+                    .map_err(|_| format!("--seeds needs a non-negative integer, got {v}"))?;
+            }
+            "--threads" => {
+                let v = value()?;
+                args.threads = v
+                    .parse()
+                    .map_err(|_| format!("--threads needs a non-negative integer, got {v}"))?;
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if args.command != "run" && args.command != "hash" {
-        return Err(format!("unknown command {} (run | hash)", args.command));
+    if !matches!(args.command.as_str(), "run" | "hash" | "montecarlo") {
+        return Err(format!(
+            "unknown command {} (run | hash | montecarlo)",
+            args.command
+        ));
     }
     Ok(args)
 }
@@ -382,17 +408,74 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Flies gust-hold indices `0..seeds`; true when every run passed.
+fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
+    let c = HoldCriteria::default();
+    let profile = args.profile;
+    let start = Instant::now();
+    let results = run_indexed(args.seeds, args.threads, |i| {
+        fly_gust_hold(profile, i as u64, &c)
+    });
+    let wall_s = start.elapsed().as_secs_f64();
+    let mut runs: Vec<HoldMetrics> = Vec::with_capacity(results.len());
+    for r in results {
+        runs.push(r?);
+    }
+    let mut passed = 0usize;
+    for (i, m) in runs.iter().enumerate() {
+        let f = m.failures(&c);
+        if f.is_empty() {
+            passed += 1;
+        } else {
+            println!("FAIL index {i}: {}", f.join("; "));
+        }
+    }
+    println!("profile {}, {} runs", profile.name, runs.len());
+    let worst = |name: &str, f: fn(&HoldMetrics) -> f64| {
+        let (i, v) = runs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, f(m)))
+            .fold((0, f64::MIN), |a, b| if b.1 > a.1 { b } else { a });
+        println!("  worst {name:<32} {v:9.4} at index {i}");
+    };
+    if !runs.is_empty() {
+        worst("max horizontal error (m)", |m| m.max_h_error_m);
+        worst("rms horizontal error (m)", |m| m.rms_h_error_m);
+        worst("max vertical error (m)", |m| m.max_v_error_m);
+        worst("max tilt (deg)", |m| m.max_tilt_deg);
+        worst("estimate max horizontal (m)", |m| m.est_max_h_error_m);
+        worst("estimate max vertical (m)", |m| m.est_max_v_error_m);
+        worst("estimate max velocity (m/s)", |m| m.est_max_vel_error_mps);
+        worst("estimate max attitude (deg)", |m| m.est_max_att_error_deg);
+        worst("rejected measurements", |m| f64::from(m.rejected));
+    }
+    println!("passed {passed}/{}", runs.len());
+    println!("wall time {wall_s:.1} s");
+    Ok(passed == runs.len())
+}
+
 fn main() -> ExitCode {
     let args = match parse() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!(
-                "usage: oxide-sim run|hash [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]"
+                "usage: oxide-sim run|hash|montecarlo [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic] [--seeds N] [--threads T]"
             );
             return ExitCode::from(2);
         }
     };
+    if args.command == "montecarlo" {
+        return match montecarlo(&args) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

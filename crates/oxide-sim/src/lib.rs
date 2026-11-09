@@ -8,6 +8,7 @@
 pub mod airframe;
 pub mod battery;
 pub mod hash;
+pub mod metrics;
 pub mod montecarlo;
 pub mod rng;
 pub mod scenario;
