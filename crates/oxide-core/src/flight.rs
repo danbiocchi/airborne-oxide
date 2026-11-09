@@ -2,10 +2,12 @@
 //! The flight core: one `tick` per base period (DESIGN §4.2, ADR-0001).
 
 use crate::allocation::{Mixer, command_for_fraction};
-use crate::config::{ConfigError, VehicleConfig};
+use crate::config::{ConfigError, EstimatorSource, VehicleConfig};
 use crate::control::{
     AttitudeTarget, PositionController, RateController, RateTarget, attitude_rate_setpoint,
 };
+use crate::estimator::Estimator;
+use crate::filters::LowPass2;
 use crate::io::{
     BatterySample, EstimatorStatus, FlightMode, ImuSample, Inputs, Outputs, RcSample, Stamped,
     StateSample, Status, TrajectorySetpoint,
@@ -88,6 +90,11 @@ pub struct Core<const N: usize> {
     battery: Option<Stamped<BatterySample>>,
     setpoint: Option<Stamped<TrajectorySetpoint>>,
 
+    estimator: Estimator,
+    /// Rate-loop gyro low-pass, and its latest output (body, rad/s).
+    gyro_lpf: LowPass2,
+    gyro_filtered: Vec3<f32>,
+
     estimate: Let<Option<StateSample>>,
     supervision: Let<Supervision>,
     guidance: Let<AttitudeTarget>,
@@ -117,6 +124,8 @@ impl<const N: usize> Core<N> {
             guidance: p(TaskId::Guidance)?,
             attitude: p(TaskId::Attitude)?,
         };
+        let estimator = Estimator::new(&cfg.estimator.ekf, &profile)?;
+        let gyro_lpf = LowPass2::new(1.0 / profile.base_dt(), cfg.gains.gyro_cutoff_hz);
         Ok(Self {
             cfg,
             mixer,
@@ -130,6 +139,9 @@ impl<const N: usize> Core<N> {
             rc: None,
             battery: None,
             setpoint: None,
+            estimator,
+            gyro_lpf,
+            gyro_filtered: Vec3::zero(),
             estimate: Let::default(),
             supervision: Let::default(),
             guidance: Let::default(),
@@ -211,8 +223,27 @@ impl<const N: usize> Core<N> {
 
     /// Keeps the newest sample of each kind.
     fn absorb(&mut self, inputs: &Inputs) {
-        if inputs.imu.is_some() {
-            self.imu = inputs.imu;
+        let ekf = self.cfg.estimator.source == EstimatorSource::Ekf;
+        if let Some(imu) = inputs.imu
+            && imu.value.gyro.is_finite()
+            && imu.value.accel.is_finite()
+        {
+            self.gyro_filtered = self.gyro_lpf.apply(imu.value.gyro);
+            self.imu = Some(imu);
+            if ekf {
+                self.estimator.push_imu(&imu);
+            }
+        }
+        if ekf {
+            if let Some(s) = &inputs.gps {
+                self.estimator.push_gps(s);
+            }
+            if let Some(s) = &inputs.baro {
+                self.estimator.push_baro(s);
+            }
+            if let Some(s) = &inputs.mag {
+                self.estimator.push_mag(s);
+            }
         }
         if inputs.state.is_some() {
             self.state = inputs.state;
@@ -243,14 +274,29 @@ impl<const N: usize> Core<N> {
     }
 
     fn run_estimator(&mut self, now: Micros) {
-        // M1a: the estimate is the external state (simulator ground truth).
-        // The EKF (DESIGN §4.7) replaces this in M1b.
+        if self.cfg.estimator.source == EstimatorSource::Ekf {
+            self.estimator.update(now);
+            self.estimate.pending = self.estimator.estimate();
+            return;
+        }
+        // External: the estimate is the `state` input (simulator ground
+        // truth, motion capture).
         self.estimate.pending = Self::fresh(self.state, now, STATE_TIMEOUT_US).filter(|s| {
             s.position.is_finite()
                 && s.velocity.is_finite()
                 && s.attitude.is_finite()
                 && s.rate.is_finite()
         });
+    }
+
+    fn estimator_status(&self) -> EstimatorStatus {
+        match self.cfg.estimator.source {
+            EstimatorSource::Ekf => self.estimator.status(),
+            EstimatorSource::External => EstimatorStatus {
+                aligned: self.estimate.visible.is_some(),
+                ..EstimatorStatus::default()
+            },
+        }
     }
 
     fn run_supervisor(&mut self, now: Micros) {
@@ -419,7 +465,7 @@ impl<const N: usize> Core<N> {
             saturated: false,
             timing_faults: self.timing_faults,
             no_estimate: self.estimate.visible.is_none(),
-            estimator: EstimatorStatus::default(),
+            estimator: self.estimator_status(),
         };
         let t_valid = now.add_us(base_us);
         if !sup.armed {
@@ -431,8 +477,13 @@ impl<const N: usize> Core<N> {
             };
         }
         let target = self.attitude.visible;
+        let bias = if self.cfg.estimator.source == EstimatorSource::Ekf {
+            self.estimator.gyro_bias()
+        } else {
+            Vec3::zero()
+        };
         let gyro = Self::fresh(self.imu, now, STATE_TIMEOUT_US)
-            .map(|i| i.gyro)
+            .map(|_| self.gyro_filtered - bias)
             .or_else(|| self.estimate.visible.map(|e| e.rate))
             .unwrap_or_else(Vec3::zero);
         // Don't wind up the integrator while sitting on the ground.
@@ -497,6 +548,7 @@ fn leash(sp: Vec3<f32>, pos: Vec3<f32>, radius: f32) -> Vec3<f32> {
 mod tests {
     use super::*;
     use crate::config::{EstimatorConfig, Gains, Limits, Rotor, Spin};
+    use crate::io::{BaroSample, GpsSample, MagSample};
     use crate::schedule::F405_LEAN;
 
     fn cfg() -> VehicleConfig<4> {
@@ -602,5 +654,129 @@ mod tests {
         core.tick(Micros(0), &Inputs::default());
         let out = core.tick(Micros(2500), &Inputs::default());
         assert_eq!(out.status.timing_faults, 1);
+    }
+
+    fn ekf_cfg() -> VehicleConfig<4> {
+        let mut c = cfg();
+        c.estimator.source = EstimatorSource::Ekf;
+        c
+    }
+
+    /// Stationary level vehicle on the ground: IMU at 1 kHz, GPS at 5 Hz with
+    /// 150 ms latency, baro and mag at 50 Hz.
+    fn ekf_inputs(k: u64, rc_sample: RcSample) -> Inputs {
+        let t = Micros(k * 1000);
+        let mut i = Inputs {
+            imu: Some(Stamped::ideal(
+                t,
+                ImuSample {
+                    gyro: Vec3::zero(),
+                    accel: Vec3::new(0.0, 0.0, -crate::GRAVITY),
+                },
+            )),
+            rc: Some(Stamped::ideal(t, rc_sample)),
+            ..Inputs::default()
+        };
+        if k.is_multiple_of(20) {
+            i.baro = Some(Stamped::ideal(t, BaroSample { altitude_m: 40.0 }));
+            i.mag = Some(Stamped::ideal(
+                t,
+                MagSample {
+                    field_ut: Vec3::new(25.0, 0.0, 43.3),
+                },
+            ));
+        }
+        // The fix measured 150 ms ago arrives now.
+        if k >= 150 && (k - 150).is_multiple_of(200) {
+            let ts = Micros((k - 150) * 1000);
+            i.gps = Some(Stamped {
+                t_sample: ts,
+                t_arrival: t,
+                value: GpsSample {
+                    h_acc_m: 0.6,
+                    v_acc_m: 1.0,
+                    s_acc_mps: 0.2,
+                    fix_3d: true,
+                    ..GpsSample::default()
+                },
+            });
+        }
+        i
+    }
+
+    #[test]
+    fn ekf_mode_aligns_estimates_and_arms_only_with_an_estimate() {
+        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
+        let mut first_estimate = None;
+        let mut armed_before = false;
+        // Arm switch is high from the start (no rising edge to use later).
+        for k in 0..3000u64 {
+            let out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(true, false)));
+            if core.estimate().is_none() {
+                armed_before |= out.status.armed;
+                assert!(out.status.no_estimate);
+                assert!(!out.status.estimator.aligned || k > 500);
+            } else if first_estimate.is_none() {
+                first_estimate = Some(k);
+            }
+        }
+        assert!(!armed_before, "must not arm without an estimate");
+        let first = first_estimate.expect("estimate by 3 s");
+        assert!(first > 900, "no estimate before alignment (k = {first})");
+        let e = core.estimate().expect("estimate at 3 s");
+        assert!(e.position.norm() < 0.1, "p = {:?}", e.position);
+        assert!(
+            e.attitude.to_rotation_vector().norm() < 1.0_f32.to_radians(),
+            "attitude = {:?}",
+            e.attitude
+        );
+        // The switch was already high when the estimate appeared: no arm.
+        let out = core.tick(Micros(3_000_000), &ekf_inputs(3000, rc(true, false)));
+        assert!(!out.status.armed);
+        assert!(out.status.estimator.aligned && out.status.estimator.gps_aiding);
+        // A fresh rising edge arms.
+        let mut armed = false;
+        for k in 3001..3200u64 {
+            let out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(false, false)));
+            armed |= out.status.armed;
+        }
+        assert!(!armed);
+        for k in 3200..3400u64 {
+            let out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(true, false)));
+            armed |= out.status.armed;
+        }
+        assert!(armed, "arming works once the estimate exists");
+    }
+
+    #[test]
+    fn ekf_mode_ignores_the_external_state_input() {
+        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
+        for k in 0..500u64 {
+            let t = Micros(k * 1000);
+            let mut i = ekf_inputs(k, rc(false, false));
+            i.state = Some(Stamped::ideal(t, StateSample::default()));
+            core.tick(t, &i);
+        }
+        assert!(core.estimate().is_none());
+    }
+
+    #[test]
+    fn external_mode_reports_aligned_when_estimate_is_visible() {
+        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+        let out = core.tick(Micros(0), &Inputs::default());
+        assert!(!out.status.estimator.aligned);
+        let out = run(&mut core, 1, 5, rc(false, false));
+        assert!(out.status.estimator.aligned);
+        assert_eq!(out.status.estimator.resets, 0);
+    }
+
+    #[test]
+    fn bad_estimator_params_fail_core_construction() {
+        let mut c = cfg();
+        c.estimator.ekf.gps_gate = f32::NAN;
+        assert_eq!(
+            Core::new(c, F405_LEAN).err(),
+            Some(ConfigError::BadEstimator)
+        );
     }
 }

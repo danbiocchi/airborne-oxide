@@ -54,10 +54,12 @@ impl ImuAccumulator {
     /// (0, 4·nominal_dt]; otherwise (first sample, a gap, or time not
     /// increasing) it is `nominal_dt`. Non-finite samples are skipped and
     /// counted, and do not advance `last_t`.
-    pub fn push(&mut self, t: Micros, gyro: Vec3<f32>, accel: Vec3<f32>) {
+    ///
+    /// Returns the interval used, s, or `None` if the sample was skipped.
+    pub fn push(&mut self, t: Micros, gyro: Vec3<f32>, accel: Vec3<f32>) -> Option<f32> {
         if !gyro.is_finite() || !accel.is_finite() {
             self.skipped = self.skipped.saturating_add(1);
-            return;
+            return None;
         }
         let dt = self.interval(t);
         self.acc.dang += gyro * dt;
@@ -66,6 +68,7 @@ impl ImuAccumulator {
         self.acc.t_end = t;
         self.samples = self.samples.saturating_add(1);
         self.last_t = Some(t);
+        Some(dt)
     }
 
     /// The interval a sample at `t` is held for, s.
@@ -190,6 +193,17 @@ mod tests {
         assert!((d.dt - 4.0 * DT).abs() < 1e-7, "dt = {}", d.dt);
         assert!(d.dang.is_finite());
         assert_eq!(d.t_end, us(3000));
+    }
+
+    #[test]
+    fn push_returns_the_interval_used() {
+        let mut acc = ImuAccumulator::new(DT);
+        let z = Vec3::zero();
+        assert_eq!(acc.push(us(0), z, z), Some(DT));
+        assert_eq!(acc.push(us(2000), z, z), Some(0.002));
+        assert_eq!(acc.push(us(2000), z, z), Some(DT));
+        assert_eq!(acc.push(us(3000), Vec3::new(f32::NAN, 0.0, 0.0), z), None);
+        assert_eq!(acc.push(us(50_000), z, z), Some(DT));
     }
 
     #[test]
