@@ -131,6 +131,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
                 .is_multiple_of(self.battery_every)
                 .then(|| sensors::battery(t, self.battery.voltage_v, self.battery.current_a)),
             setpoint: setpoint.map(|s| oxide_core::io::Stamped::ideal(t, s)),
+            ..Inputs::default()
         };
 
         // 2. Core tick.

@@ -11,7 +11,8 @@ use crate::config::ConfigError;
 /// The core's tasks, in the order they run within a tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskId {
-    /// State estimate. M1a passes through an external (simulator) state.
+    /// State estimate: an external state, or the EKF's IMU integration and
+    /// output predictor (its filter step runs every `filter_period_ticks`).
     Estimator,
     /// Arming, kill switch and mode selection.
     Supervisor,
@@ -36,6 +37,10 @@ pub struct Profile {
     pub name: &'static str,
     pub base_period_us: u32,
     pub tasks: [TaskSpec; 5],
+    /// The EKF's prediction and fusion period, in base ticks (DESIGN §4.7:
+    /// 100–250 Hz, dividing the rate loop exactly). The estimator task itself
+    /// runs every tick: it integrates the IMU and runs the output predictor.
+    pub filter_period_ticks: u32,
 }
 
 const fn spec(id: TaskId, period_ticks: u32) -> TaskSpec {
@@ -53,6 +58,7 @@ pub const F405_LEAN: Profile = Profile {
         spec(TaskId::Attitude, 4),    // 250 Hz
         spec(TaskId::Rate, 1),        // 1 kHz
     ],
+    filter_period_ticks: 4, // 250 Hz
 };
 
 /// STM32H743 "full" profile: 4 kHz base tick.
@@ -66,6 +72,7 @@ pub const H743_FULL: Profile = Profile {
         spec(TaskId::Attitude, 8),    // 500 Hz
         spec(TaskId::Rate, 1),        // 4 kHz
     ],
+    filter_period_ticks: 16, // 250 Hz
 };
 
 impl Profile {
@@ -75,6 +82,12 @@ impl Profile {
             .iter()
             .find(|t| t.id == id)
             .map(|t| t.period_ticks)
+    }
+
+    /// EKF period in seconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn filter_dt(&self) -> f32 {
+        self.base_dt() * self.filter_period_ticks as f32
     }
 
     /// Base tick in seconds.
@@ -98,7 +111,10 @@ impl Profile {
                 return Err(ConfigError::BadProfile);
             }
         }
-        if self.base_period_us == 0 || self.tasks.iter().any(|t| t.period_ticks == 0) {
+        if self.base_period_us == 0
+            || self.filter_period_ticks == 0
+            || self.tasks.iter().any(|t| t.period_ticks == 0)
+        {
             return Err(ConfigError::BadProfile);
         }
         if self.period(TaskId::Rate) != Some(1) {

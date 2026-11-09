@@ -7,7 +7,7 @@ use crate::math::{Quat, Vec3};
 use crate::time::Micros;
 
 /// A sample with when it was measured and when the core received it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stamped<T> {
     pub t_sample: Micros,
     pub t_arrival: Micros,
@@ -84,6 +84,39 @@ pub struct BatterySample {
     pub current_a: f32,
 }
 
+/// GNSS fix. M1b carries position already converted to the local NED frame
+/// around the origin; latitude/longitude arrive with the GPS driver.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpsSample {
+    /// Antenna position, m, local North-East-Down.
+    pub position: Vec3<f32>,
+    /// Velocity, m/s, North-East-Down.
+    pub velocity: Vec3<f32>,
+    /// Receiver-reported 1σ horizontal position accuracy, m.
+    pub h_acc_m: f32,
+    /// Receiver-reported 1σ vertical position accuracy, m.
+    pub v_acc_m: f32,
+    /// Receiver-reported 1σ speed accuracy, m/s.
+    pub s_acc_mps: f32,
+    /// The receiver has a 3D fix. Samples without one are not fused.
+    pub fix_3d: bool,
+}
+
+/// Barometric altitude.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BaroSample {
+    /// Pressure altitude, m, positive up, from an arbitrary reference. The
+    /// estimator only uses changes relative to its value at alignment.
+    pub altitude_m: f32,
+}
+
+/// Magnetometer reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MagSample {
+    /// Magnetic field in the body frame (Forward-Right-Down), µT.
+    pub field_ut: Vec3<f32>,
+}
+
 /// Tier-2 trajectory setpoint (DESIGN §4.8).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrajectorySetpoint {
@@ -104,6 +137,9 @@ pub struct Inputs {
     pub rc: Option<Stamped<RcSample>>,
     pub battery: Option<Stamped<BatterySample>>,
     pub setpoint: Option<Stamped<TrajectorySetpoint>>,
+    pub gps: Option<Stamped<GpsSample>>,
+    pub baro: Option<Stamped<BaroSample>>,
+    pub mag: Option<Stamped<MagSample>>,
 }
 
 /// Flight mode.
@@ -116,6 +152,19 @@ pub enum FlightMode {
     Position,
     /// Follows tier-2 trajectory setpoints; holds position if they go stale.
     Offboard,
+}
+
+/// Estimator health (ADR-0002).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EstimatorStatus {
+    /// Tilt and heading have been initialised.
+    pub aligned: bool,
+    /// GPS is correcting horizontal position and velocity.
+    pub gps_aiding: bool,
+    /// Measurements rejected by the innovation gates since boot.
+    pub rejected: u32,
+    /// State resets since boot (position or velocity snapped to GPS).
+    pub resets: u32,
 }
 
 /// Health and status flags reported with every output.
@@ -131,6 +180,7 @@ pub struct Status {
     pub timing_faults: u32,
     /// No valid state estimate yet.
     pub no_estimate: bool,
+    pub estimator: EstimatorStatus,
 }
 
 /// Actuator commands and status. `motors` are normalised commands in

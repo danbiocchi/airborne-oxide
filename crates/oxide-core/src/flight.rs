@@ -7,8 +7,8 @@ use crate::control::{
     AttitudeTarget, PositionController, RateController, RateTarget, attitude_rate_setpoint,
 };
 use crate::io::{
-    BatterySample, FlightMode, ImuSample, Inputs, Outputs, RcSample, Stamped, StateSample, Status,
-    TrajectorySetpoint,
+    BatterySample, EstimatorStatus, FlightMode, ImuSample, Inputs, Outputs, RcSample, Stamped,
+    StateSample, Status, TrajectorySetpoint,
 };
 use crate::math::{Quat, Real, Vec3, wrap_pi};
 use crate::schedule::{Profile, TaskId};
@@ -147,6 +147,12 @@ impl<const N: usize> Core<N> {
 
     pub fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// The state estimate the controllers currently see (the published
+    /// one), or `None` before the estimator has a valid solution.
+    pub fn estimate(&self) -> Option<StateSample> {
+        self.estimate.visible
     }
 
     /// Runs one base tick. Call exactly once per base period.
@@ -413,6 +419,7 @@ impl<const N: usize> Core<N> {
             saturated: false,
             timing_faults: self.timing_faults,
             no_estimate: self.estimate.visible.is_none(),
+            estimator: EstimatorStatus::default(),
         };
         let t_valid = now.add_us(base_us);
         if !sup.armed {
@@ -489,7 +496,7 @@ fn leash(sp: Vec3<f32>, pos: Vec3<f32>, radius: f32) -> Vec3<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Gains, Limits, Rotor, Spin};
+    use crate::config::{EstimatorConfig, Gains, Limits, Rotor, Spin};
     use crate::schedule::F405_LEAN;
 
     fn cfg() -> VehicleConfig<4> {
@@ -514,6 +521,7 @@ mod tests {
             nominal_voltage_v: 22.2,
             gains: Gains::default(),
             limits: Limits::default(),
+            estimator: EstimatorConfig::default(),
         }
     }
 

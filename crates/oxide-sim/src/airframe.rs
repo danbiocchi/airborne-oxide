@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Airframes are data files, not code (DESIGN §6).
 
-use oxide_core::config::{Gains, Limits, Rotor, Spin, VehicleConfig};
+use oxide_core::config::{EstimatorConfig, Gains, Limits, Rotor, Spin, VehicleConfig};
 use oxide_core::math::Vec3;
 use serde::Deserialize;
 
@@ -150,6 +150,7 @@ impl Airframe {
             nominal_voltage_v: self.battery.nominal_voltage_v as f32,
             gains: Gains::default(),
             limits: Limits::default(),
+            estimator: EstimatorConfig::default(),
         })
     }
 }
