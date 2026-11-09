@@ -219,6 +219,14 @@ impl HoldMetrics {
             c.est_max_att_error_deg,
             "deg",
         );
+        if self.window_ticks == 0 {
+            // Otherwise a run too short to reach the window would pass
+            // every window limit with zeros.
+            out.push(format!(
+                "no ticks in the hold window (from {} s)",
+                c.window_start_s
+            ));
+        }
         if self.unarmed_ticks > 0 {
             out.push(format!(
                 "{} ticks not armed after {} s",
@@ -305,6 +313,18 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_never_reaches_the_window_fails() {
+        let c = HoldCriteria::default();
+        let m = HoldMetrics::new();
+        assert!(!m.passed(&c));
+        assert!(
+            m.failures(&c)
+                .iter()
+                .any(|f| f.contains("no ticks in the hold window"))
+        );
+    }
+
+    #[test]
     fn rms_and_max_and_window_edges() {
         let c = HoldCriteria::default();
         let mut m = HoldMetrics::new();
@@ -378,8 +398,9 @@ mod tests {
         m.add(&late, target(), &c);
         assert_eq!(m.unarmed_ticks, 1);
         assert_eq!(m.timing_faults, 2);
+        // Not armed, timing faults, resets, and no tick in the hold window.
         let f = m.failures(&c);
-        assert_eq!(f.len(), 3, "{f:?}");
+        assert_eq!(f.len(), 4, "{f:?}");
         let mut nan = rec(20.0, target());
         nan.position.x = f64::NAN;
         m.add(&nan, target(), &c);

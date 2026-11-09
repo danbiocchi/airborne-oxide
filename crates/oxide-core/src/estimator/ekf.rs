@@ -458,26 +458,31 @@ impl<T: Real> Ekf<T> {
 
     /// Heading innovation and sparse `H` for a body-frame field; `None`
     /// when the geometry is unusable.
+    ///
+    /// The measurement is the horizontal direction of the field rotated
+    /// into the world frame with the estimated attitude, `m_w = R(q)·m_body`,
+    /// which should point along the declination: `ν = D − atan2(m_w.y,
+    /// m_w.x)`. With the true field `B = Exp(δθ)·m_w ≈ m_w + δθ × m_w`,
+    /// to first order `ν = δθz − m_z·(m_x·δθx + m_y·δθy)/(m_x² + m_y²)`.
+    /// The tilt terms matter: a tilt error leaks into the heading in
+    /// proportion to the field's dip (×1.7 at 60° inclination). Treating
+    /// the innovation as a pure yaw error makes the filter overconfident
+    /// in yaw.
     fn heading_model(&self, mag_body: Vec3<T>) -> Option<(T, [(usize, T); 3])> {
         if !mag_body.is_finite() {
             return None;
         }
         let r = rot_matrix(self.x.q);
         let mw = mat3_vec(&r, mag_body);
-        let horiz = (mw.x * mw.x + mw.y * mw.y).sqrt();
+        let h2 = mw.x * mw.x + mw.y * mw.y;
         let total = mag_body.norm();
-        if !pos(total) || !at_least(horiz, T::from_f64(0.1) * total) {
-            return None;
-        }
-        let (r00, r10, r20) = (r.get(0, 0), r.get(1, 0), r.get(2, 0));
-        let c = r00 * r00 + r10 * r10;
-        if !at_least(c, T::from_f64(0.1)) {
+        if !pos(total) || !at_least(h2.sqrt(), T::from_f64(0.1) * total) {
             return None;
         }
         let nu = wrap_pi(self.prm.declination - mw.y.atan2(mw.x));
         let h = [
-            (ITH, -r00 * r20 / c),
-            (ITH + 1, -r10 * r20 / c),
+            (ITH, -mw.x * mw.z / h2),
+            (ITH + 1, -mw.y * mw.z / h2),
             (ITH + 2, T::ONE),
         ];
         Some((nu, h))
@@ -692,26 +697,33 @@ mod tests {
             let mag = q.inverse_rotate(B_NED);
             let (nu, h) = ekf.heading_model(mag).unwrap();
             assert!(nu.abs() < 1e-9, "consistent field gives zero innovation");
+            // The innovation the filter sees when the true attitude is
+            // `Exp(δθ) ⊗ q` (the error-state convention) and the sensor
+            // reads the field in the true body frame.
+            let nu_for = |dth: Vec3<f64>| {
+                let q_true = Quat::from_rotation_vector(dth) * q;
+                ekf.heading_model(q_true.inverse_rotate(B_NED)).unwrap().0
+            };
             for (k, &(idx, hk)) in h.iter().enumerate() {
                 assert_eq!(idx, ITH + k);
-                let yaw_at = |s: f64| {
-                    let mut e = [0.0; 3];
-                    e[k] = s;
-                    (Quat::from_rotation_vector(Vec3::new(e[0], e[1], e[2])) * ekf.x.q).yaw()
-                };
-                let num = wrap_pi(yaw_at(eps) - yaw_at(-eps)) / (2.0 * eps);
+                let mut e = [0.0; 3];
+                e[k] = eps;
+                let d = Vec3::new(e[0], e[1], e[2]);
+                let num = (nu_for(d) - nu_for(-d)) / (2.0 * eps);
                 assert!(
                     (num - hk).abs() < 1e-6,
                     "H[{k}] analytic {hk} numeric {num}"
                 );
             }
-            // A true attitude off by a pure yaw δθz gives ν ≈ δθz. (Tilt
-            // errors couple in through the field's inclination; the
-            // yaw-only H deliberately ignores that, as PX4's does.)
-            let q_true = Quat::from_rotation_vector(Vec3::new(0.0, 0.0, 3e-3)) * q;
-            let (nu, _) = ekf.heading_model(q_true.inverse_rotate(B_NED)).unwrap();
-            assert!((nu - 3e-3).abs() < 1e-5, "nu {nu}");
+            // A pure yaw error shows up one to one.
+            assert!((nu_for(Vec3::new(0.0, 0.0, 3e-3)) - 3e-3).abs() < 1e-5);
         }
+        // The dip of the field couples tilt into heading: with the field
+        // 60° below the horizon, a tilt error about north reads as a
+        // heading error tan(60°) ≈ 1.73 times as large, opposite in sign.
+        let ekf = Ekf::<f64>::new(&EkfParams::default(), Quat::identity());
+        let (_, h) = ekf.heading_model(B_NED).unwrap();
+        assert!((h[0].1 + 43.30 / 25.0).abs() < 1e-12 && h[1].1.abs() < 1e-12);
     }
 
     #[test]

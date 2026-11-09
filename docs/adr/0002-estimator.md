@@ -19,7 +19,7 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
 5. **Measurements.**
    - **GPS:** north/east position and NED velocity, gated as groups. The first fix resets position and velocity. If GPS is rejected continuously for `gps_timeout_us` (5 s), or returns after aiding has timed out, position and velocity reset to it. Position rejections are timed on their own as well: a position jump with a consistent velocity would otherwise keep the whole-fix timer cleared for ever. M1b's GPS sample is already in the local NED frame; latitude/longitude conversion arrives with the GPS driver.
    - **Barometer:** the height reference. Height is measured from the barometer reading at alignment. GPS height is not fused yet.
-   - **Magnetometer:** fused as heading only (tilt-compensated with the estimated attitude, plus a configured declination), not as a 3-axis field. Hard/soft-iron calibration and field states arrive with S2's magnetometer errors.
+   - **Magnetometer:** fused as the horizontal direction of the measured field, rotated into the world frame with the estimated attitude and compared with the configured declination. Field strength and dip are not needed. The Jacobian is the exact first-order one, `ν = δθz − m_z(m_x·δθx + m_y·δθy)/(m_x² + m_y²)`: a tilt error leaks into the heading in proportion to the field's dip (×1.7 at 60° inclination). The usual "innovation is a yaw error" simplification drops those tilt terms. In testing that made the filter overconfident in yaw (0.4° claimed, 2.5° actual) and let the error feed back into tilt and accelerometer bias whenever a gust accelerated the vehicle. Hard/soft-iron calibration and field states arrive with S2's magnetometer errors.
    - **Gates** in standard deviations: GPS 5, baro 5, heading 3 (PX4 defaults).
 
 6. **Alignment.** The vehicle must be still for `align_time_us` (1 s). Tilt comes from the mean specific force, heading from the mean magnetometer field, and the initial gyro bias from the mean rate over the still window. Without that last step the turn-on bias drifts the heading by several degrees before the filter learns it.
@@ -28,7 +28,9 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
 
 8. **Rate loop.** The rate controller uses the gyro through a second-order Butterworth low-pass (`Gains::gyro_cutoff_hz`, 80 Hz) minus the EKF's gyro bias.
 
-9. **The estimate seen by controllers** exists once the filter is aligned and GPS has been fused once. Dead reckoning continues after a GPS timeout. Position-invalid handling and attitude-only flight belong to the M1c failsafes.
+9. **Accelerometer-bias prior.** `init_accel_bias_sigma` is 0.1 m/s², not PX4's 0.2. In hover a horizontal accelerometer bias cannot be told from a tilt error, so the filter's tilt uncertainty settles at about prior/g, and the estimate is free to wander that far. The simulated IMU's switch-on bias is 0.05 m/s² (a calibrated sensor); the prior allows twice that. Over 200 gust-hold seeds the worst attitude error in flight fell from 2.9° to 2.1°. What remains is a 3σ accelerometer bias seen through the magnetic dip. Yawing the vehicle or a better accelerometer calibration reduces it further.
+
+10. **The estimate seen by controllers** exists once the filter is aligned and GPS has been fused once. Dead reckoning continues after a GPS timeout. Position-invalid handling and attitude-only flight belong to the M1c failsafes.
 
 ## Consequences
 

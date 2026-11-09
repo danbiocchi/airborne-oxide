@@ -174,6 +174,12 @@ pub struct EkfParams {
     pub init_vel_sigma_mps: f32,
     pub init_pos_sigma_m: f32,
     pub init_gyro_bias_sigma: f32,
+    /// Accelerometer switch-on bias, m/s². In hover a horizontal
+    /// accelerometer bias cannot be told from a tilt error, so this prior
+    /// bounds how far the tilt estimate can wander (0.1 m/s² ≈ 0.6°). The
+    /// default assumes a calibrated IMU (residual about 0.05 m/s²) and
+    /// allows twice that; PX4's 0.2 (`EKF2_ABIAS_INIT`) is for uncalibrated
+    /// sensors.
     pub init_accel_bias_sigma: f32,
     /// The vehicle must sit still this long before the filter aligns, µs.
     pub align_time_us: u32,
@@ -204,7 +210,7 @@ impl Default for EkfParams {
             init_vel_sigma_mps: 0.5,
             init_pos_sigma_m: 1.0,
             init_gyro_bias_sigma: 0.02,
-            init_accel_bias_sigma: 0.2,
+            init_accel_bias_sigma: 0.1,
             align_time_us: 1_000_000,
             gps_timeout_us: 5_000_000,
             output_tau_s: 0.25,

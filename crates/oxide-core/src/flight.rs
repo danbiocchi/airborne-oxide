@@ -161,6 +161,12 @@ impl<const N: usize> Core<N> {
         &self.profile
     }
 
+    /// The estimator, for logging and tests (its filter state, covariance
+    /// and health counters).
+    pub fn estimator(&self) -> &Estimator {
+        &self.estimator
+    }
+
     /// The state estimate the controllers currently see (the published
     /// one), or `None` before the estimator has a valid solution.
     pub fn estimate(&self) -> Option<StateSample> {

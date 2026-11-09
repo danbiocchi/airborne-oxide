@@ -41,6 +41,8 @@ This flies the scripted hover-and-step scenario in real time and opens the viewe
 | `--joystick` | You fly it with a USB joystick instead of the script |
 | `--scenario gust-hold` | Fly the hold-in-gusts scenario (realistic sensors, wind, EKF) instead of the default `hover-step` |
 | `--seed 3` | Run index for `gust-hold` (default 0) |
+
+`--scenario` and `--seed` have no effect with `--joystick`: joystick flights use the true state and calm air.
 | `--profile h743` | Use the H743 task schedule instead of the F405 one |
 | `--speed 4` | Run at 4× real time (`0` = as fast as possible) |
 | `--save flight.rrd` | Write a recording file instead of opening the viewer (open it later with `rerun flight.rrd`) |
