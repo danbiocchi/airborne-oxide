@@ -43,7 +43,7 @@ fn torque_free_rotation_conserves_energy_and_momentum() {
     let momentum = |s: &BodyState<4>| s.attitude.rotate(m.inertia.hadamard(s.rate));
     let (e0, l0) = (energy(&s), momentum(&s));
     for _ in 0..10_000 {
-        s = m.rk4(&s, &[0.0; 4], 1e-3);
+        s = m.rk4(&s, &[0.0; 4], 1e-3, Vec3::zero());
     }
     let (e1, l1) = (energy(&s), momentum(&s));
     assert!(
@@ -66,7 +66,7 @@ fn hover_thrust_balances_weight_with_no_torque() {
         rotor_speed: [n; 4],
         ..BodyState::default()
     };
-    let loads = m.loads(&s);
+    let loads = m.loads(&s, Vec3::zero());
     assert!((loads.force_body.z + m.mass_kg * GRAVITY).abs() < 1e-12);
     assert!(loads.torque_body.norm() < 1e-15, "{:?}", loads.torque_body);
 }
@@ -80,7 +80,7 @@ fn motor_reaches_commanded_speed() {
     let tau = m.motor_time_constant_s;
     let steps = (10.0 * tau / 1e-3) as usize;
     for _ in 0..steps {
-        s = m.rk4(&s, &cmd, 1e-3);
+        s = m.rk4(&s, &cmd, 1e-3, Vec3::zero());
     }
     for v in s.rotor_speed {
         assert!((v - 0.6).abs() < 0.6 * 1e-4 * 1.1, "{v}");
@@ -95,4 +95,49 @@ fn resting_imu_reads_one_g_up() {
     let imu = oxide_sim::sensors::imu(Micros::ZERO, sim.body(), Vec3::new(0.0, 0.0, -GRAVITY));
     assert!((imu.value.accel.z + 9.806_65).abs() < 1e-5);
     assert_eq!(sim.body().attitude, Quat::identity());
+}
+
+#[test]
+fn quadratic_drag_in_steady_wind_matches_closed_form() {
+    let mut m = model();
+    m.gravity = false;
+    m.rotor_drag_coeff = 0.0;
+    let wind = Vec3::new(3.0, 0.0, 0.0);
+    let k = 0.5 * oxide_sim::vehicle::AIR_DENSITY * m.drag_area.x / m.mass_kg;
+    let u0 = 3.0;
+    let mut s = BodyState::<4>::default();
+    let dt = 1e-3;
+    for _ in 0..2000 {
+        s = m.rk4(&s, &[0.0; 4], dt, wind);
+    }
+    let u = wind.x - s.velocity.x;
+    let expected = u0 / (1.0 + k * u0 * 2.0);
+    assert!(
+        ((u - expected) / expected).abs() < 1e-6,
+        "u = {u}, expected {expected}"
+    );
+}
+
+#[test]
+fn rotor_drag_decays_velocity_exponentially() {
+    let mut m = model();
+    m.gravity = false;
+    m.drag_area = Vec3::zero();
+    let n = 0.5;
+    let v0 = 5.0;
+    let mut s = BodyState::<4> {
+        velocity: Vec3::new(v0, 0.0, 0.0),
+        rotor_speed: [n; 4],
+        ..BodyState::default()
+    };
+    let dt = 1e-3;
+    for _ in 0..1000 {
+        s = m.rk4(&s, &[n; 4], dt, Vec3::zero());
+    }
+    let expected = v0 * Real::exp(-m.rotor_drag_coeff * 4.0 * n * 1.0 / m.mass_kg);
+    assert!(
+        ((s.velocity.x - expected) / expected).abs() < 1e-6,
+        "v = {}, expected {expected}",
+        s.velocity.x
+    );
 }
