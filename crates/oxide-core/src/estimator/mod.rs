@@ -23,7 +23,7 @@ use crate::io::{
 use crate::math::{Real, Vec3};
 use crate::schedule::Profile;
 use crate::time::Micros;
-use ekf::{Ekf, Fusion, initial_attitude};
+use ekf::{Ekf, Fusion, GYRO_BIAS_LIMIT, initial_attitude};
 use imu::{ImuAccumulator, ImuDelta};
 use output::OutputPredictor;
 use ring::Ring;
@@ -48,6 +48,8 @@ struct AlignWindow {
     dt: f32,
     /// Summed delta velocity, m/s.
     dvel: Vec3<f32>,
+    /// Summed delta angle, rad (its mean rate is the gyro bias at rest).
+    dang: Vec3<f32>,
     /// Running mean of the magnetometer, µT, and its sample count.
     mag_mean: Vec3<f32>,
     mag_n: u32,
@@ -325,9 +327,19 @@ impl Estimator {
             self.drain_alignment_obs(false);
             return;
         }
+        // Keep the ring within the delay horizon so that it fits from the
+        // first filter step on.
+        while self
+            .imu_ring
+            .front()
+            .is_some_and(|f| f.t_end.add_us(self.horizon_us) <= delta.t_end)
+        {
+            self.imu_ring.pop_front();
+        }
         self.imu_ring.push(delta);
         self.window.dt += dt;
         self.window.dvel += delta.dvel;
+        self.window.dang += delta.dang;
         self.drain_alignment_obs(true);
 
         let need = micros_to_s(u64::from(self.params.align_time_us));
@@ -341,13 +353,22 @@ impl Estimator {
             self.restart_alignment();
             return;
         };
-        self.ekf = Some(Ekf::new(&self.params, q0));
+        let mut ekf = Ekf::new(&self.params, q0);
+        // At rest the mean gyro rate is the turn-on bias (Earth rate is
+        // negligible).
+        let limit = <f32 as Real>::from_f64(GYRO_BIAS_LIMIT);
+        ekf.x.bg = (w.dang * (1.0 / w.dt)).clamp_abs(Vec3::splat(limit));
+        self.ekf = Some(ekf);
         self.baro_ref = (w.baro_n > 0).then_some(w.baro_mean);
         self.output.reset(now, q0, Vec3::zero(), Vec3::zero());
         for d in self.imu_ring.iter() {
             self.output.record_at(d.t_end);
         }
-        self.t_ekf = self.imu_ring.front().map_or(now, |d| d.t_end);
+        // The first predict integrates the front delta, so the initial
+        // state is valid at the start of that delta.
+        self.t_ekf = self.imu_ring.front().map_or(now, |d| {
+            Micros(d.t_end.0.saturating_sub(secs_to_micros(d.dt)))
+        });
         self.window = AlignWindow::default();
     }
 
@@ -500,6 +521,12 @@ fn count_f32(n: u32) -> f32 {
     n as f32
 }
 
+/// Seconds as whole microseconds (rounded; non-negative).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn secs_to_micros(s: f32) -> u64 {
+    (f64::from(s) * 1e6 + 0.5).max(0.0) as u64
+}
+
 /// Microseconds as seconds, f32.
 #[allow(clippy::cast_precision_loss)]
 fn micros_to_s(us: u64) -> f32 {
@@ -518,6 +545,7 @@ mod tests {
         est: Estimator,
         k: u64,
         accel: Vec3<f32>,
+        gyro: Vec3<f32>,
         gps_pos: Vec3<f32>,
         gps_latency_us: u64,
         /// Pending GPS fixes as (arrival, sample).
@@ -530,6 +558,7 @@ mod tests {
                 est: Estimator::new(params, &F405_LEAN).unwrap(),
                 k: 0,
                 accel: Vec3::new(0.0, 0.0, -GRAVITY),
+                gyro: Vec3::zero(),
                 gps_pos: Vec3::zero(),
                 gps_latency_us: 150_000,
                 pending: [None; 4],
@@ -544,7 +573,7 @@ mod tests {
         fn tick(&mut self) {
             let t = self.now();
             let imu = ImuSample {
-                gyro: Vec3::zero(),
+                gyro: self.gyro,
                 accel: self.accel,
             };
             self.est.push_imu(&Stamped::ideal(t, imu));
@@ -794,5 +823,160 @@ mod tests {
             est.update(t);
         }
         assert!(est.status().aligned);
+    }
+
+    #[test]
+    fn alignment_learns_gyro_bias_from_still_window() {
+        let bias = Vec3::new(0.01_f32, -0.008, 0.012);
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.gyro = bias;
+        while !rig.est.status().aligned {
+            rig.tick();
+            assert!(rig.now().0 < 3_000_000, "never aligned");
+        }
+        let err = (rig.est.gyro_bias() - bias).norm();
+        assert!(err < 1e-3, "bias error right after alignment {err}");
+        // Attitude stays at truth (identity) for the next 10 s.
+        let end = rig.now().0 + 10_000_000;
+        let mut worst = 0.0_f32;
+        while rig.now().0 < end {
+            rig.tick();
+            if let Some(e) = rig.est.estimate() {
+                worst = worst.max(e.attitude.to_rotation_vector().norm());
+            }
+        }
+        assert!(worst < 0.5_f32.to_radians(), "attitude error {worst} rad");
+        assert!(rig.est.estimate().is_some());
+    }
+
+    #[test]
+    fn imu_ring_fits_from_the_first_filter_step() {
+        let params = EkfParams::default();
+        let mut rig = Rig::new(&params);
+        let period_us = 4000u64;
+        let cap = u64::from(params.delay_horizon_us).div_ceil(period_us) as usize + 1;
+        let mut prev: Option<Micros> = None;
+        let mut steps = 0;
+        while rig.now().0 < 4_000_000 {
+            rig.tick();
+            if !rig.est.status().aligned {
+                continue;
+            }
+            // Only filter-step ticks change the ring.
+            if !rig.est.ticks.is_multiple_of(rig.est.period_ticks) {
+                continue;
+            }
+            assert!(
+                rig.est.imu_ring.len() <= cap,
+                "len {}",
+                rig.est.imu_ring.len()
+            );
+            let t = rig.est.t_ekf;
+            if let Some(p) = prev {
+                assert_eq!(t.since(p), period_us, "EKF time step at {:?}", rig.now());
+                steps += 1;
+            }
+            prev = Some(t);
+        }
+        assert!(steps > 100);
+    }
+
+    /// Truth for the motion test, t seconds after the start of motion:
+    /// yaw rate 0.5 rad/s for 6 s, then 2 m/s^2 north for 2 s, then coast.
+    fn motion_truth(t: f64) -> (Vec3<f64>, Vec3<f64>, Vec3<f64>, f64) {
+        // (position, velocity, world acceleration, yaw)
+        let yaw = 0.5 * t.min(6.0);
+        let ta = (t - 6.0).clamp(0.0, 2.0);
+        let acc = if (6.0..8.0).contains(&t) { 2.0 } else { 0.0 };
+        let v = 2.0 * ta;
+        let p = 0.5 * 2.0 * ta * ta + 4.0 * (t - 8.0).max(0.0);
+        (
+            Vec3::new(p, 0.0, 0.0),
+            Vec3::new(v, 0.0, 0.0),
+            Vec3::new(acc, 0.0, 0.0),
+            yaw,
+        )
+    }
+
+    #[test]
+    fn tracks_a_moving_vehicle_with_consistent_sensors() {
+        use crate::math::Quat;
+        let b_ned = Vec3::new(25.0_f64, 0.0, 43.3);
+        let g = f64::from(GRAVITY);
+        let mut est = Estimator::new(&EkfParams::default(), &F405_LEAN).unwrap();
+        let t0_us = 3_000_000u64;
+        let mut pending: [Option<(u64, Stamped<GpsSample>)>; 4] = [None; 4];
+        let (mut worst_p, mut worst_v, mut worst_a) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for k in 0..16_000u64 {
+            let t_us = k * 1000;
+            let t = Micros(t_us);
+            let ts = t_us.saturating_sub(t0_us) as f64 * 1e-6;
+            let (p, v, a, yaw) = motion_truth(ts);
+            let q = Quat::<f64>::from_euler(0.0, 0.0, yaw);
+            let rate = if (0.0..6.0).contains(&ts) && t_us >= t0_us {
+                0.5
+            } else {
+                0.0
+            };
+            let f_body = q.inverse_rotate(a - Vec3::new(0.0, 0.0, g));
+            let imu = ImuSample {
+                gyro: Vec3::new(0.0, 0.0, rate),
+                accel: f_body.cast(),
+            };
+            est.push_imu(&Stamped::ideal(t, imu));
+            if t_us % 20_000 == 0 {
+                est.push_baro(&Stamped::ideal(t, BaroSample { altitude_m: 123.0 }));
+                let m = q.inverse_rotate(b_ned);
+                est.push_mag(&Stamped::ideal(t, MagSample { field_ut: m.cast() }));
+            }
+            if t_us % 200_000 == 0 {
+                let s = Stamped {
+                    t_sample: t,
+                    t_arrival: t.add_us(150_000),
+                    value: GpsSample {
+                        position: p.cast(),
+                        velocity: v.cast(),
+                        h_acc_m: 0.6,
+                        v_acc_m: 1.0,
+                        s_acc_mps: 0.2,
+                        fix_3d: true,
+                    },
+                };
+                if let Some(slot) = pending.iter_mut().find(|x| x.is_none()) {
+                    *slot = Some((s.t_arrival.0, s));
+                }
+            }
+            for slot in &mut pending {
+                if let Some((arrive, s)) = *slot
+                    && arrive <= t_us
+                {
+                    est.push_gps(&s);
+                    *slot = None;
+                }
+            }
+            est.update(t);
+            if t_us >= t0_us {
+                let e = est.estimate().expect("estimate during motion");
+                let ep = (e.position.cast::<f64>() - p).norm();
+                let ev = (e.velocity.cast::<f64>() - v).norm();
+                let dq = (e.attitude.cast::<f64>() * q.conj())
+                    .to_rotation_vector()
+                    .norm();
+                worst_p = worst_p.max(ep);
+                worst_v = worst_v.max(ev);
+                worst_a = worst_a.max(dq);
+            }
+        }
+        eprintln!(
+            "motion worst: p {worst_p} m, v {worst_v} m/s, att {} deg",
+            worst_a.to_degrees()
+        );
+        assert!(worst_p < 0.15, "position error {worst_p} m");
+        assert!(worst_v < 0.1, "velocity error {worst_v} m/s");
+        assert!(
+            worst_a < 1.0_f64.to_radians(),
+            "attitude error {} deg",
+            worst_a.to_degrees()
+        );
     }
 }
