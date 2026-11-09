@@ -1,9 +1,9 @@
 # Airborne Oxide — System Design
 
-**Status:** Draft v0.2 (revised after design review), awaiting owner sign-off · **Date:** 2026-11-04 · **Owner:** Daniel Biocchi
+**Status:** v0.2 (revised after design review), accepted 2026-11-09 · **Date:** 2026-11-04 · **Owner:** Daniel Biocchi
 
-This document records every design decision made so far. No code is written until it is signed off.
-After sign-off, changes are recorded as short decision records (ADRs) in `docs/adr/` and folded back in here.
+This document records the design decisions the project was started from.
+Changes since are recorded as short decision records (ADRs) in `docs/adr/` and folded back in here.
 
 Decision numbers (Q1–Q39) refer to the design interview, and each is listed in [Appendix A](#appendix-a-decision-log).
 [Appendix B](#appendix-b-design-review-2026-11-04) lists what the independent design review changed.
@@ -133,6 +133,7 @@ Both profiles build from the same source; each profile picks its rates, capaciti
   - An output predictor brings the state forward to the current time at the rate-loop rate.
   - Innovations are gated.
 - The equations are derived symbolically (Python/SymPy) and emitted as generated Rust in f32 or f64 from one source. The generated functions are tested against the symbolic derivation; small kernels are checked for no NaN and no panic on bounded inputs.
+  - **First version (M1b, [ADR-0002](adr/0002-estimator.md)):** the 15 error-state equations are written by hand, generic over f32/f64, and checked against numerical derivatives in f64. Code generation follows when the state grows.
 - PX4's EKF2 is the benchmark reference in the simulator. An invariant EKF is a later simulator experiment.
 
 ### 4.8 Command authority and the command gateway (Q4, Q37)
@@ -307,7 +308,7 @@ Auto-disarm follows detected touchdown.
    - `mul_add` is banned outside the wrapper.
    - nalgebra is built with its `libm` feature.
    - No `-C target-cpu=native`, no fast-math.
-3. **RNG:** one pinned, stream-based RNG (e.g. ChaCha8 at a fixed crate version), with per-subsystem streams derived from the run seed.
+3. **RNG:** one pinned, stream-based RNG, with per-subsystem streams derived from the run seed. It is our own xoshiro256++ seeded through SplitMix64 (`oxide-sim::rng`), checked against the reference test vectors, so no dependency update can change a sequence. Normal variates use Box–Muller through the `libm` wrapper.
 4. **No `HashMap`/`HashSet` iteration** in simulation state. Use `BTreeMap` or indexed `Vec`s.
 5. **Physics libraries:** `rapier3d-f64`/`parry3d-f64` with `enhanced-determinism`, matching the f64 physics.
 6. **Cross-OS check:** CI runs the canonical scenarios on Linux and Windows and compares a hash of the full state trace. A mismatch fails the build.
@@ -333,6 +334,8 @@ Auto-disarm follows detected touchdown.
 | **S3** | Rendered camera images through a renderer bridge; the brain in the loop; the generative airframe design loop |
 | **S4** | Hardware-in-the-loop: the flight core on the real board, the simulator on the PC feeding sensors over USB/UART |
 | Ongoing | Calibration against real flight data (§5.9) |
+
+**S1 as built.** M1b delivered the S1 physics and the IMU, GPS, barometer, magnetometer and battery models. Turbulence is a first-order Gauss–Markov process per axis, because Dryden spectra need an airspeed that a hovering multirotor does not have; Dryden or von Kármán turbulence arrives with fixed-wing flight (S2b). The RC receiver model, timing jitter and the fault list arrive with M1c's scenario runner and fault injection.
 
 ### 5.5 Scenarios
 

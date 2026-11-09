@@ -17,12 +17,12 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
 4. **Output predictor.** A current-time state integrated with every IMU sample, pulled towards the EKF by comparing both at the same delayed time: attitude by a world-frame correction rate, velocity and position by a proportional correction applied to the stored history, all with time constant `output_tau_s` (0.25 s). EKF resets (GPS first fix, GPS timeout) shift the predictor and its history by the same amount.
 
 5. **Measurements.**
-   - **GPS:** north/east position and NED velocity, gated as groups. The first fix resets position and velocity. If GPS is rejected continuously for `gps_timeout_us` (5 s), or returns after aiding has timed out, position and velocity reset to it. M1b's GPS sample is already in the local NED frame; latitude/longitude conversion arrives with the GPS driver.
+   - **GPS:** north/east position and NED velocity, gated as groups. The first fix resets position and velocity. If GPS is rejected continuously for `gps_timeout_us` (5 s), or returns after aiding has timed out, position and velocity reset to it. Position rejections are timed on their own as well: a position jump with a consistent velocity would otherwise keep the whole-fix timer cleared for ever. M1b's GPS sample is already in the local NED frame; latitude/longitude conversion arrives with the GPS driver.
    - **Barometer:** the height reference. Height is measured from the barometer reading at alignment. GPS height is not fused yet.
    - **Magnetometer:** fused as heading only (tilt-compensated with the estimated attitude, plus a configured declination), not as a 3-axis field. Hard/soft-iron calibration and field states arrive with S2's magnetometer errors.
    - **Gates** in standard deviations: GPS 5, baro 5, heading 3 (PX4 defaults).
 
-6. **Alignment.** The vehicle must be still for `align_time_us` (1 s). Tilt comes from the mean specific force, heading from the mean magnetometer field.
+6. **Alignment.** The vehicle must be still for `align_time_us` (1 s). Tilt comes from the mean specific force, heading from the mean magnetometer field, and the initial gyro bias from the mean rate over the still window. Without that last step the turn-on bias drifts the heading by several degrees before the filter learns it.
 
 7. **Numerical hygiene.** Covariance is symmetrised and its diagonal clamped after every prediction and fusion. A non-finite diagonal resets the covariance and is counted. Bias states are clamped to PX4's limits (gyro 0.15 rad/s, accel 0.4 m/s²). The covariance-reset Jacobian after injection is neglected, as in PX4.
 

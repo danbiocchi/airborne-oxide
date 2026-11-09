@@ -39,6 +39,6 @@ The simulator has to test the *real* multi-rate behaviour of the flight core, no
 
 ## Deferred
 
-- The estimator task passes through an external state (simulator truth) until the EKF lands in M1b.
+- ~~The estimator task passes through an external state (simulator truth) until the EKF lands in M1b.~~ Done: see [ADR-0002](0002-estimator.md). The estimator task still runs every tick; the EKF's own step runs every `Profile::filter_period_ticks`. The external-state source remains for motion capture and tests.
 - RC-loss and other failsafes (M1c). Until then, an invalid RC frame is ignored and the previous decisions stand.
 - The full command gateway and link authority (M3). M1a only drops non-finite setpoints.
