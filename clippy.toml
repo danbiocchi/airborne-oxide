@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Determinism contract (DESIGN §5.2): every transcendental goes through
+# `oxide_core::math`, which is built on the pure-Rust `libm` crate.
+# The std versions call the platform maths library, which can differ by
+# one bit between Windows and Linux.
+disallowed-methods = [
+    { path = "f64::sin", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::cos", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::tan", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::asin", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::acos", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::atan", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::atan2", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::exp", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::ln", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::powf", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::powi", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::sqrt", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::hypot", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f64::mul_add", reason = "fused multiply-add only through oxide_core::math" },
+    { path = "f32::sin", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::cos", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::tan", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::asin", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::acos", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::atan", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::atan2", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::exp", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::ln", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::powf", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::powi", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::sqrt", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::hypot", reason = "use oxide_core::math (libm) for determinism" },
+    { path = "f32::mul_add", reason = "fused multiply-add only through oxide_core::math" },
+]

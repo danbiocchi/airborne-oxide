@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TOOLCHAIN: "1.97.0"
+
+jobs:
+  lint:
+    name: Format, clippy, no_std build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy --target thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Flight core builds for the STM32 target (no_std, no alloc)
+        run: cargo build -p oxide-core --target thumbv7em-none-eabihf --release --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "${{ env.TOOLCHAIN }}" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - name: Trace hashes of the canonical scenarios
+        shell: bash
+        run: |
+          cargo run --release --locked -q -p oxide-sim-cli -- hash --profile f405 >  hashes.txt
+          cargo run --release --locked -q -p oxide-sim-cli -- hash --profile h743 >> hashes.txt
+          cat hashes.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-${{ matrix.os }}
+          path: hashes.txt
+
+  determinism:
+    name: Linux and Windows traces are bit-identical
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hashes-*
+          path: hashes
+      - name: Compare (DESIGN §5.2 item 6)
+        run: |
+          cat hashes/hashes-ubuntu-latest/hashes.txt
+          cat hashes/hashes-windows-latest/hashes.txt
+          diff hashes/hashes-ubuntu-latest/hashes.txt hashes/hashes-windows-latest/hashes.txt
+
+  viewer:
+    name: Viewer builds (Rerun + joystick)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libudev-dev
+      - run: rustup toolchain install "$TOOLCHAIN" --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/oxide-viewer
+      - run: cargo fmt --manifest-path crates/oxide-viewer/Cargo.toml -- --check
+      - run: cargo clippy --locked --manifest-path crates/oxide-viewer/Cargo.toml -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Viewer licences (tool-crate exceptions, DESIGN §10)
+        working-directory: crates/oxide-viewer
+        run: cargo deny check licenses bans sources
+
+  deny:
+    name: Licences, advisories, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check advisories bans licenses sources

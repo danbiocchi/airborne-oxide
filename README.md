@@ -4,27 +4,47 @@
 
 Airborne Oxide is flight software for drones, written in Rust. It has three parts:
 
-1. **A simulator.** It is deterministic and runs much faster than real time, and it is calibrated against real flights. It is meant to be good enough to design flight algorithms *and* airframes in: generate many airframes, fly them all, 3D-print the best.
-2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that can fly multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
-3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and on smaller drones as AI hardware shrinks.
+1. **A simulator.** It is deterministic, runs much faster than real time, and is calibrated against real flights. The goal is to design flight algorithms *and* airframes in it: generate many airframes, fly them all, and 3D-print the best.
+2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that flies multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
+3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and will move onto smaller drones as AI hardware shrinks.
 
-> **Status: design phase.** No code yet. The full design is in [`docs/DESIGN.md`](docs/DESIGN.md).
+> **Status: milestone M1a.** The flight core flies a simulated 5" quad on true state, in lockstep with the simulator, on both chip profiles. Sensor models, the estimator and wind come next (M1b). See the [roadmap](docs/DESIGN.md#13-roadmap).
 
-## Planned layout
+## Try it
 
-| Crate | What it is |
+You need [Rust](https://rustup.rs); the pinned toolchain installs itself.
+
+```bash
+cargo run --release -p oxide-sim-cli -- run
+```
+
+This flies the hover-and-step scenario: arm on the ground, climb to 2 m, step 1 m north, turn 90°, then climb and step east. It prints the result, the speed relative to real time and the trace hash. Other options:
+
+```bash
+cargo run --release -p oxide-sim-cli -- run --profile h743 --csv flight.csv
+```
+
+`--profile` picks the chip's task schedule (`f405` or `h743`). `--csv` writes every tick to a file you can plot. To watch it in 3D, or fly it with your radio as a joystick, see [`crates/oxide-viewer`](crates/oxide-viewer/README.md).
+
+Run the tests:
+
+```bash
+cargo test --workspace
+```
+
+## Layout
+
+| Path | What it is |
 |---|---|
-| `oxide-core` | Flight core library (`no_std`, no heap) |
-| `oxide-fw-h743`, `oxide-fw-f405` | Board firmware |
-| `oxide-sim` | The simulator |
-| `oxide-lab` | The airframe lab |
-| `oxide-brain` | The companion-computer AI |
-
-## Documents
-
-- [`docs/DESIGN.md`](docs/DESIGN.md): architecture, decisions and roadmap
-- [`docs/research/prior-art-2026-11.md`](docs/research/prior-art-2026-11.md): survey of existing autopilots, simulators and tools
-- [`docs/hardware/viper.md`](docs/hardware/viper.md): setup review of the Titan Viper test VTOL
+| `crates/oxide-core` | Flight core library (`no_std`, no heap). Builds for `thumbv7em-none-eabihf`. |
+| `crates/oxide-sim` | Simulator: physics, battery, sensors, scenarios, lockstep loop |
+| `crates/oxide-sim-cli` | `oxide-sim` command-line runner |
+| `crates/oxide-viewer` | Optional Rerun viewer with joystick input (kept out of the default build) |
+| `airframes/` | Airframe data files |
+| `docs/DESIGN.md` | Architecture, decisions and roadmap |
+| `docs/adr/` | Decision records made after the design sign-off |
+| `docs/research/` | Prior-art survey and the design review |
+| `docs/hardware/viper.md` | Setup review of the Titan Viper test VTOL |
 
 ## License
 

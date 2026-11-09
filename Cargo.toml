@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[workspace]
+resolver = "3"
+members = ["crates/oxide-core", "crates/oxide-sim", "crates/oxide-sim-cli"]
+# The viewer pulls in Rerun and a joystick library. It is kept out of the
+# default build so CI and the flight crates stay small; build it with
+# `cargo run --release --manifest-path crates/oxide-viewer/Cargo.toml`
+# (see crates/oxide-viewer/README.md).
+exclude = ["crates/oxide-viewer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["Daniel Biocchi"]
+repository = "https://github.com/danbiocchi/airborne-oxide"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+oxide-core = { path = "crates/oxide-core" }
+oxide-sim = { path = "crates/oxide-sim" }
+libm = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# The determinism contract (DESIGN §5.2) bans std float transcendentals;
+# the list itself lives in clippy.toml.
+disallowed_methods = "deny"
+
+[profile.release]
+# Explicit, so release behaviour does not depend on defaults (DESIGN §9).
+overflow-checks = true
+debug = 1
+
+[profile.dev]
+overflow-checks = true
+# Simulation tests run millions of physics steps; optimise them a little.
+opt-level = 1

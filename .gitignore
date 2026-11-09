@@ -1,5 +1,5 @@
-# Rust build output
-/target
+# Rust build output (root and the separately built viewer)
+target/
 **/*.rs.bk
 
 # Editors and OS files
@@ -9,5 +9,8 @@
 .DS_Store
 Thumbs.db
 
-# Local data that should not be committed (flight logs, third-party models)
+# Local data that should not be committed (flight logs, third-party models,
+# simulator output)
 /local/
+*.rrd
+*.csv
