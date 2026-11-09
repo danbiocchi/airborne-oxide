@@ -25,6 +25,10 @@ thrust_expo = 1.0
 efficiency = 0.75
 # Electronics and idle draw, W.
 idle_power_w = 2.0
+# Rotor (induced / blade-flapping) drag, N per (m/s) of in-plane air-relative
+# velocity per unit of summed normalised rotor speed. About 0.1 N per m/s at
+# hover (sum of speeds ~1.8); compare PX4 EKF2_MCOEF 0.15 1/s x 0.65 kg.
+rotor_drag_coeff = 0.055
 
 # Rotor positions from the centre of mass, m (x forward, y right).
 # Order and spin follow the common Quad-X convention.

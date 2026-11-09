@@ -172,7 +172,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             self.model.speed_command(u, v)
         });
         let v_before = self.body.velocity;
-        let mut next = self.model.rk4(&self.body, &cmd, self.dt);
+        let mut next = self.model.rk4(&self.body, &cmd, self.dt, Vec3::zero());
         ground_contact(&mut next);
         if !next.is_finite() {
             // Never propagate NaN: freeze and let tests catch the anomaly.
@@ -187,7 +187,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         };
         self.specific_force_world = (next.velocity - v_before) * (1.0 / self.dt) - g;
         self.body = next;
-        let loads = self.model.loads(&self.body);
+        let loads = self.model.loads(&self.body, Vec3::zero());
         let electrical = loads.shaft_power_w / self.model.efficiency + self.model.idle_power_w;
         self.battery.draw(electrical, self.dt);
     }
