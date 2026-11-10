@@ -686,4 +686,21 @@ mod tests {
     fn run_still_accepts_estimator_and_sensors() {
         assert!(p(&["run", "--estimator", "truth", "--sensors", "ideal"]).is_ok());
     }
+
+    #[test]
+    fn scenario_command_lists_and_rejects_unknown_names() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(scenario_command(args(&["list"]).into_iter()).is_ok());
+        assert!(scenario_command(args(&["no-such-scenario"]).into_iter()).is_err());
+        assert!(scenario_command(args(&["gcs-loss", "--bogus"]).into_iter()).is_err());
+        assert!(scenario_command(args(&["gcs-loss", "--seed", "x"]).into_iter()).is_err());
+        assert!(scenario_command(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn scenario_command_flies_a_passing_scenario() {
+        let a = ["gcs-loss", "--profile", "h743", "--seed", "1"];
+        let r = scenario_command(a.iter().map(|s| (*s).to_string()));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
 }

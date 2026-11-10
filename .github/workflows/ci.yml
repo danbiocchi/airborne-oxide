@@ -55,13 +55,15 @@ jobs:
           path: hashes.txt
 
   monte-carlo:
-    name: Gust hold, 200 seeds (release)
+    name: Gust hold 200 seeds, fault scenarios (release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install "$TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked -p oxide-sim --test gust_hold -- --ignored --nocapture
+      - name: Fault scenarios and pairings, 10 runs each on both profiles (ADR-0003)
+        run: cargo test --release --locked -p oxide-sim --test fault_scenarios -- --ignored --nocapture
 
   determinism:
     name: Linux and Windows traces are bit-identical
