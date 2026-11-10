@@ -33,6 +33,11 @@ pub(super) struct SupervisorState {
     degraded: Option<NavState>,
     /// Estimator fault count when the vehicle was last disarmed or armed.
     fault_baseline: u32,
+    /// Since when a pilot state has been sitting still at low thrust.
+    ground_since: Option<Micros>,
+    /// The pilot was last seen sitting on the ground (still, low thrust).
+    /// Frozen while a failsafe state flies, cleared on disarm.
+    ground_hint: bool,
 }
 
 impl SupervisorState {
@@ -51,9 +56,16 @@ impl SupervisorState {
             prev_action: Action::None,
             degraded: None,
             fault_baseline: 0,
+            ground_since: None,
+            ground_hint: false,
         }
     }
 }
+
+/// Thrust below this fraction of hover, with no vertical motion, for
+/// `GROUND_HINT_US`, means a pilot state is sitting on the ground.
+const GROUND_HINT_THRUST: f32 = 0.5;
+const GROUND_HINT_US: u64 = 200_000;
 
 /// A duration in seconds as whole microseconds (negative and NaN give 0).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -164,6 +176,26 @@ impl<const N: usize> Core<N> {
             vertical_speed,
             &p,
         );
+        // A pilot state at low thrust and standing still is the vehicle on
+        // the ground, even before the touchdown detector has held for
+        // `touchdown_s` (just after arming, say).
+        if !s.armed {
+            self.sup_state.ground_since = None;
+            self.sup_state.ground_hint = false;
+        } else if matches!(
+            s.nav,
+            NavState::Stabilized | NavState::Altitude | NavState::Position
+        ) {
+            let still = vertical_speed.is_some_and(|v| v.abs() < p.touchdown_speed_mps);
+            let low = self.guidance.visible.thrust_n < GROUND_HINT_THRUST * self.cfg.weight_n();
+            if still && low {
+                let since = *self.sup_state.ground_since.get_or_insert(now);
+                self.sup_state.ground_hint = now.since(since) >= GROUND_HINT_US;
+            } else {
+                self.sup_state.ground_since = None;
+                self.sup_state.ground_hint = false;
+            }
+        }
         let loss_of_control = match state {
             Some(e) => self.sup_state.control.update(
                 now,
@@ -217,6 +249,12 @@ impl<const N: usize> Core<N> {
             PrearmFlags::POSITION,
             matches!(pilot_mode, FlightMode::Position | FlightMode::Offboard) && !valid.position,
         );
+        // Arming into Offboard needs a live brain, or the failsafe would be
+        // in force on the first run.
+        flags.set(
+            PrearmFlags::LINK,
+            pilot_mode == FlightMode::Offboard && !(brain_alive && setpoint_fresh),
+        );
         flags.set(
             PrearmFlags::BATTERY,
             !(battery_sample.is_some()
@@ -252,12 +290,23 @@ impl<const N: usize> Core<N> {
         }
         if !s.armed {
             self.sup_state.fault_baseline = fault_count;
+        } else if s.home.is_none()
+            && valid.position
+            && let Some(e) = state
+        {
+            // Armed without a position: home is the first position fix
+            // after arming, so that Rtl becomes available.
+            s.home = Some(e.position);
+            self.emit(now, EventKind::HomeSet);
         }
 
-        // 8. Failsafe.
+        // 8. Failsafe. A failsafe that begins with the pilot's vehicle on
+        // the ground disarms it (ADR-0003 §2).
+        let landed_fs =
+            landed || (self.sup_state.ground_hint && self.sup_state.prev_action == Action::None);
         let conditions = Conditions {
             armed: s.armed,
-            landed,
+            landed: landed_fs,
             mode: pilot_mode,
             rc_valid,
             rc_settled,
@@ -311,7 +360,7 @@ impl<const N: usize> Core<N> {
 
         // 9. and 11. Landed with a failsafe in force: disarm. In a landing
         // action that was already under way this is the touchdown.
-        if s.armed && decision.action != Action::None && landed {
+        if s.armed && decision.action != Action::None && landed_fs {
             let landing = matches!(
                 decision.action,
                 Action::Rtl | Action::Land | Action::LandNow

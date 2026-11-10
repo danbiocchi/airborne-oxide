@@ -24,6 +24,12 @@ const RTL_LEASH_M: f32 = 3.0;
 /// ground.
 const LAND_CONTACT_THRUST: f32 = 0.5;
 const LAND_CONTACT_S: f32 = 0.5;
+/// The same for a pilot holding the throttle down in Altitude or Position.
+const PILOT_CONTACT_THRUST: f32 = 0.8;
+/// A landing with neither height nor vertical speed flies a fixed thrust;
+/// after this long it must be on the ground, so the thrust drops to the
+/// minimum and touchdown can be detected, s.
+const BLIND_LAND_MAX_S: f32 = 60.0;
 
 /// Where Rtl is in its sequence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +52,9 @@ pub(super) struct GuidanceState {
     pub(super) rtl: RtlPhase,
     /// How long a landing descent has been standing still at low thrust, s.
     contact_s: f32,
+    /// How long a landing has been flying blind (no height, no vertical
+    /// speed), s.
+    blind_s: f32,
 }
 
 /// Horizontal hold at a point, in the best form the flags allow.
@@ -112,6 +121,7 @@ impl<const N: usize> Core<N> {
                 last_nav: None,
                 rtl: RtlPhase::Pending,
                 contact_s: 0.0,
+                blind_s: 0.0,
             };
             self.guidance.pending = AttitudeTarget {
                 attitude: state.attitude,
@@ -127,6 +137,7 @@ impl<const N: usize> Core<N> {
             g.yaw_sp = yaw_now;
             g.rtl = RtlPhase::Pending;
             g.contact_s = 0.0;
+            g.blind_s = 0.0;
             self.position_ctrl.reset();
             g.last_nav = Some(sup.nav);
         }
@@ -139,6 +150,8 @@ impl<const N: usize> Core<N> {
         let rc = self.valid_rc(now);
 
         let mut landing_now = false;
+        // The descent rate a pilot state's stick commands, m/s (0 if none).
+        let mut descent_cmd = 0.0_f32;
         let mut target = match (sup.nav, rc) {
             (NavState::Stabilized, Some(rc)) => {
                 g.yaw_sp = wrap_pi(g.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
@@ -161,6 +174,7 @@ impl<const N: usize> Core<N> {
                     Yaw::Free
                 };
                 let climb = deadband((rc.throttle - 0.5) * 2.0);
+                descent_cmd = (-climb * l.max_speed_down).max(0.0);
                 let want = if climb != 0.0 {
                     // The height setpoint follows the vehicle.
                     g.position_sp.z = state.position.z;
@@ -187,6 +201,7 @@ impl<const N: usize> Core<N> {
             }
             (NavState::Position, Some(rc)) => {
                 let vel = self.stick_velocity(&rc, yaw_now);
+                descent_cmd = vel.z.max(0.0);
                 if v.heading {
                     g.yaw_sp = wrap_pi(g.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
                 } else {
@@ -308,7 +323,13 @@ impl<const N: usize> Core<N> {
                 } else {
                     // No home or no position: fly as Hold.
                     self.refresh_hold_point(&mut g, &state.position, v);
-                    landing = g.rtl == RtlPhase::Landing;
+                    if g.rtl == RtlPhase::Landing {
+                        // Position lost part-way through the landing: hold
+                        // the height we are at (ADR-0003 §2). The phase is
+                        // decided afresh if the position comes back.
+                        g.rtl = RtlPhase::Pending;
+                        g.position_sp = state.position;
+                    }
                 }
                 landing_now = landing;
                 let (want, fallback) = if landing {
@@ -355,16 +376,35 @@ impl<const N: usize> Core<N> {
         // A descent that is commanded but not happening, at low thrust, is
         // the vehicle sitting on the ground. The velocity controller's
         // integral limit keeps its thrust above the touchdown threshold, so
-        // drop to the minimum thrust to let touchdown be detected.
+        // drop to the minimum thrust to let touchdown be detected. This
+        // covers landing states and a pilot holding the throttle down in
+        // Altitude or Position (ADR-0003 §2 "On the ground").
         let speed_known = v.altitude || v.velocity;
-        if landing_now
+        // A pilot's descent only counts when it is clearly a command to
+        // move, and the thrust bound is looser: the controller's integral
+        // takes seconds to wind the thrust down.
+        let pilot_descent = descent_cmd > 2.0 * fs.touchdown_speed_mps;
+        let contact_thrust = if landing_now {
+            LAND_CONTACT_THRUST
+        } else {
+            PILOT_CONTACT_THRUST
+        };
+        if (landing_now || pilot_descent)
             && speed_known
             && Real::abs(state.velocity.z) < fs.touchdown_speed_mps
-            && target.thrust_n < LAND_CONTACT_THRUST * weight
+            && target.thrust_n < contact_thrust * weight
         {
             g.contact_s += dt;
         } else {
             g.contact_s = 0.0;
+        }
+        if landing_now && !speed_known {
+            g.blind_s += dt;
+        } else {
+            g.blind_s = 0.0;
+        }
+        if g.blind_s >= BLIND_LAND_MAX_S {
+            target.thrust_n = l.min_thrust_fraction_of_hover * weight;
         }
         if g.contact_s >= LAND_CONTACT_S {
             target.thrust_n = l.min_thrust_fraction_of_hover * weight;
