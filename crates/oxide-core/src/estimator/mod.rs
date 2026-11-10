@@ -520,6 +520,11 @@ impl Estimator {
         if !g.fix_3d || !g.position.is_finite() || !g.velocity.is_finite() {
             return;
         }
+        // Without a heading, GPS velocity would be attributed to the wrong
+        // body axes and corrupt the tilt. Wait for the magnetometer.
+        if !self.heading_ok {
+            return;
+        }
         let sigma_p = g.h_acc_m.finite_or(0.0).max(self.params.gps_pos_noise_m);
         let sigma_v = g
             .s_acc_mps
