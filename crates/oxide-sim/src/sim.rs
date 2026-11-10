@@ -403,7 +403,13 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         });
         let v_before = self.body.velocity;
         let mut next = self.model.rk4(&self.body, &cmd, self.dt, wind);
-        ground_contact(&mut next);
+        // A vehicle at rest on the ground does not tip over. `ground_contact`
+        // zeroes the body rate after the step, so a rotation under unequal
+        // thrust would never reach the gyro and the estimator would diverge
+        // from the true attitude.
+        if ground_contact(&mut next) && next.velocity == Vec3::zero() {
+            next.attitude = self.body.attitude;
+        }
         if !next.is_finite() {
             // Never propagate NaN: freeze, and count it so the run can fail.
             self.physics_faults = self.physics_faults.saturating_add(1);
