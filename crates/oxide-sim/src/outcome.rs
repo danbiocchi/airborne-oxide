@@ -16,6 +16,10 @@ const GROUND_M: f64 = 0.02;
 const AIRBORNE_M: f64 = 0.3;
 
 /// `value > limit`, or `value` is NaN (so that NaN fails every limit).
+/// How long after a pilot override the action dropping to None counts as
+/// the takeover, s (the status lags the event by a status period, 20 ms).
+const OVERRIDE_WINDOW_S: f64 = 0.1;
+
 fn exceeds(value: f64, limit: f64) -> bool {
     value.is_nan() || value > limit
 }
@@ -33,8 +37,8 @@ pub struct FlightOutcome {
     /// The highest failsafe action reached.
     pub max_action: Action,
     /// True if, while armed, the action ever dropped to a lower-ranked one
-    /// other than Hold to None, without a pilot override since the action
-    /// last was None.
+    /// other than Hold to None, unless it dropped to None within
+    /// `OVERRIDE_WINDOW_S` after a pilot override.
     pub action_decreased: bool,
     pub armed_at_end: bool,
     pub nav_at_end: NavState,
@@ -61,10 +65,11 @@ pub struct FlightOutcome {
     pub physics_faults: u32,
     pub timing_faults: u32,
     // Recorder state.
-    overridden: bool,
     was_above: bool,
     touched_down: bool,
     prev_down_speed: f64,
+    /// Until this time, s, an action dropping to None is a pilot takeover.
+    override_until_s: f64,
     prev_action: Action,
     prev_armed: bool,
 }
@@ -98,10 +103,10 @@ impl FlightOutcome {
             non_finite: false,
             physics_faults: 0,
             timing_faults: 0,
-            overridden: false,
             was_above: false,
             touched_down: false,
             prev_down_speed: 0.0,
+            override_until_s: f64::NEG_INFINITY,
             prev_action: Action::None,
             prev_armed: false,
         }
@@ -118,7 +123,9 @@ impl FlightOutcome {
                     self.disarm_reason = Some(reason);
                     self.disarmed_at_s = Some(e.t.as_secs_f64());
                 }
-                EventKind::PilotOverride(_) => self.overridden = true,
+                EventKind::PilotOverride(_) => {
+                    self.override_until_s = e.t.as_secs_f64() + OVERRIDE_WINDOW_S;
+                }
                 _ => {}
             }
         }
@@ -131,12 +138,13 @@ impl FlightOutcome {
         // Escalation only: judged while armed (disarming resets everything).
         if s.armed && self.prev_armed && s.action < self.prev_action {
             let hold_ended = self.prev_action == Action::Hold && s.action == Action::None;
-            if !hold_ended && !self.overridden {
+            // The pilot's takeover ends the action (to None); the status
+            // follows the event by up to a status period, so a short window
+            // after the event excuses that one decrease.
+            let taken_over = s.action == Action::None && r.t.as_secs_f64() <= self.override_until_s;
+            if !hold_ended && !taken_over {
                 self.action_decreased = true;
             }
-        }
-        if s.action == Action::None || !s.armed {
-            self.overridden = false;
         }
         self.prev_action = s.action;
         self.prev_armed = s.armed;
@@ -258,6 +266,9 @@ pub struct Expect {
     pub max_touchdown_mps: f64,
     /// Tilt limit while armed, deg (not checked for `Terminated`).
     pub max_tilt_deg: f64,
+    /// The vehicle must have been at least this high at some time, m
+    /// (proves that the flight the fault hits really took place).
+    pub min_height_m: Option<f64>,
     /// The vehicle must never have been higher than this, m.
     pub max_height_m: Option<f64>,
     /// The vehicle must never have been further than this from home
@@ -283,6 +294,7 @@ impl Default for Expect {
             by_s: 0.0,
             max_touchdown_mps: 1.5,
             max_tilt_deg: 40.0,
+            min_height_m: None,
             max_height_m: None,
             max_distance_from_home_m: None,
         }
@@ -387,6 +399,14 @@ impl Expect {
             v.push(format!(
                 "highest action {:?} below the required {:?}",
                 o.max_action, self.min_action
+            ));
+        }
+        if let Some(limit) = self.min_height_m
+            && o.max_height_m < limit
+        {
+            v.push(format!(
+                "only reached {:.2} m high, required {limit} m",
+                o.max_height_m
             ));
         }
         if let Some(limit) = self.max_height_m
@@ -648,8 +668,28 @@ mod tests {
         assert!(run(&[(Action::Rtl, t), (Action::None, t)], None));
         // Land to Rtl neither.
         assert!(run(&[(Action::Land, t), (Action::Rtl, t)], None));
-        // A pilot override on the run excuses it.
+        // A pilot override (here in the same record) excuses the drop to None.
         assert!(!run(&[(Action::Rtl, t), (Action::None, t)], Some(1)));
+        // The status may lag the event by a few records.
+        assert!(!run(
+            &[(Action::Rtl, t), (Action::Rtl, t), (Action::None, t)],
+            Some(1)
+        ));
+        // An override that leaves Rtl in force excuses no drop to Hold.
+        assert!(run(
+            &[(Action::Rtl, t), (Action::Rtl, t), (Action::Hold, t)],
+            Some(1)
+        ));
+        // Nor a drop to None long after it (records are 0.1 s apart here).
+        assert!(run(
+            &[
+                (Action::Rtl, t),
+                (Action::Rtl, t),
+                (Action::Rtl, t),
+                (Action::None, t)
+            ],
+            Some(0)
+        ));
         // Disarming resets everything.
         assert!(!run(&[(Action::Land, t), (Action::None, false)], None));
         // The excuse ends when the action returns to None.
@@ -986,6 +1026,25 @@ mod tests {
             ),
         ));
         assert!(violations(&e, &term).contains("terminated"));
+    }
+
+    #[test]
+    fn min_height_proves_the_flight_happened() {
+        let e = Expect {
+            min_height_m: Some(4.0),
+            ending: Ending::Flying {
+                point: Vec3::zero(),
+                tolerance_m: 1.0,
+            },
+            ..Expect::default()
+        };
+        let mut grounded = FlightOutcome::new();
+        grounded.add(&flying(1.0, up(0.1), Action::None));
+        assert!(violations(&e, &grounded).contains("only reached"));
+        let mut flew = FlightOutcome::new();
+        flew.add(&flying(1.0, up(5.0), Action::None));
+        flew.add(&flying(2.0, up(0.0), Action::None));
+        assert!(!violations(&e, &flew).contains("only reached"));
     }
 
     #[test]

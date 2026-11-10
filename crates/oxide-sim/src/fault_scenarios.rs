@@ -229,7 +229,7 @@ fn rc_loss_on_ground() -> FaultScenario {
             ending: Ending::Landed {
                 within_m_of_home: Some(0.5),
             },
-            by_s: 8.0,
+            by_s: 6.5,
             ..Expect::default()
         },
     }
@@ -588,7 +588,7 @@ fn kill_in_rtl() -> FaultScenario {
 
 /// Every named scenario.
 pub fn all() -> Vec<FaultScenario> {
-    vec![
+    let list = vec![
         rc_loss_position(),
         rc_loss_override(),
         rc_loss_on_ground(),
@@ -617,7 +617,21 @@ pub fn all() -> Vec<FaultScenario> {
         geofence(),
         motor_loss(),
         kill_in_rtl(),
-    ]
+    ];
+    list.into_iter().map(require_flight).collect()
+}
+
+/// Height the vehicle must have reached before the fault, m: a run whose
+/// arming or climb silently failed must not pass.
+const MIN_FLIGHT_HEIGHT_M: f64 = 4.0;
+
+/// Requires every scenario but the one that stays on the ground to have
+/// climbed.
+fn require_flight(mut s: FaultScenario) -> FaultScenario {
+    if s.name != "rc-loss-on-ground" {
+        s.expect.min_height_m = Some(MIN_FLIGHT_HEIGHT_M);
+    }
+    s
 }
 
 /// The scenario called `name`, among the named ones and the pairings.
@@ -728,7 +742,17 @@ fn pair_battery(a: Failure, b: Failure) -> Option<BatterySpec> {
         Failure::BatteryLow => SOC_LOW,
         _ => SOC_CRITICAL,
     };
-    Some(battery_tripping_at(level, first_battery.1))
+    // Low precedes critical by about 5 s and already starts the return; with
+    // the geofence failure (15 s) critical therefore comes at 25 s, so that
+    // the low latch (about 20 s) does not pre-empt the fence.
+    let t = if first_battery.0 == Failure::BatteryCritical
+        && (a == Failure::Geofence || b == Failure::Geofence)
+    {
+        25.0
+    } else {
+        first_battery.1
+    };
+    Some(battery_tripping_at(level, t))
 }
 
 /// Every pairing of the seven common failures, one scenario each: the first
@@ -744,7 +768,7 @@ pub fn pairs() -> Vec<FaultScenario> {
         for &(b, nb) in FAILURES.iter().skip(i + 1) {
             let name = PAIR_NAMES.get(out.len()).copied().unwrap_or("pair");
             debug_assert_eq!(name, format!("pair-{na}+{nb}"));
-            out.push(pair(name, a, b));
+            out.push(require_flight(pair(name, a, b)));
         }
     }
     out
@@ -759,6 +783,14 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
     let mut script = offboard_script(sp(0.0, 0.0, 5.0), PAIR_DURATION_S);
     let mut faults = Vec::new();
     let mut battery_spec = None;
+    // The geofence failure goes first (15 s): later it would find the vehicle
+    // already returning, landing, or without a position to judge the fence by,
+    // or (brain crash) without the setpoint step that pushes it out.
+    // The barometer loss goes before a critical battery for a similar reason:
+    // it takes 10 s to show, and the landing the battery starts would be over
+    // by then.
+    let swap = b == Failure::Geofence || (b == Failure::BaroLoss && a == Failure::BatteryCritical);
+    let (a, b) = if swap { (b, a) } else { (a, b) };
     for (f, t) in [(a, 15.0), (b, 20.0)] {
         match f {
             Failure::RcLoss => faults.push(fault(FaultKind::RcLoss, t)),
@@ -776,7 +808,13 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
         || matches!(b, Failure::BatteryLow | Failure::BatteryCritical)
     {
         battery_spec = pair_battery(a, b);
-        failsafe.battery_critical_v = CRITICAL_V;
+        // The raised critical level is only for the critical failure: with
+        // it, a low-battery pack would latch critical about 5 s after low.
+        // The default level (3.3 V) is never reached by the battery model,
+        // so a pairing with only a low battery stays at BATTERY_LOW.
+        if [a, b].contains(&Failure::BatteryCritical) {
+            failsafe.battery_critical_v = CRITICAL_V;
+        }
     }
     let needed = [a, b]
         .iter()
@@ -792,6 +830,7 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
         failsafe: Some(failsafe),
         battery: battery_spec,
         expect: Expect {
+            reasons: a.reason().union(b.reason()),
             min_action: needed,
             ending: Ending::Down,
             by_s: PAIR_BY_S,
@@ -925,6 +964,35 @@ mod tests {
         let p = by_name("pair-battery-low+battery-critical").expect("pair");
         assert_eq!(p.expect.min_action, Action::LandNow);
         assert!(p.battery.is_some());
+    }
+
+    #[test]
+    fn pairs_require_both_failures_and_a_flight() {
+        for s in pairs() {
+            assert!(
+                s.expect.reasons != Reasons::empty() && s.expect.reasons != Reasons::ALL,
+                "{} requires fewer than two reasons",
+                s.name
+            );
+            assert_eq!(s.expect.min_height_m, Some(MIN_FLIGHT_HEIGHT_M));
+        }
+        let p = by_name("pair-brain-crash+geofence").expect("pair");
+        assert_eq!(
+            p.expect.reasons,
+            Reasons::BRAIN_LOST.union(Reasons::GEOFENCE)
+        );
+        // The geofence failure always takes the first slot: its setpoint step
+        // is at 15 s, and the other failure's fault (if any) at 20 s.
+        let p = by_name("pair-brain-crash+geofence").expect("pair");
+        assert!(p.script.setpoints.iter().any(|(t, _)| *t == 15.0));
+        assert!(p.faults.iter().all(|f| f.start_s == 20.0));
+        // A low-battery pairing keeps the default critical level.
+        let p = by_name("pair-battery-low+brain-crash").expect("pair");
+        let d = FailsafeParams::default();
+        assert_eq!(
+            p.failsafe.map(|f| f.battery_critical_v),
+            Some(d.battery_critical_v)
+        );
     }
 
     #[test]
