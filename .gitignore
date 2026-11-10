@@ -14,3 +14,6 @@ Thumbs.db
 /local/
 *.rrd
 *.csv
+
+# Temporary git worktrees used by coding agents
+/.claude/worktrees/

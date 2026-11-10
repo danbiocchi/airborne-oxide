@@ -8,7 +8,8 @@
 //! 3. integrate physics over `[t, t + base]` with the command valid at `t`.
 
 use oxide_core::Core;
-use oxide_core::io::{Inputs, Outputs, Status, TrajectorySetpoint};
+use oxide_core::config::EstimatorSource;
+use oxide_core::io::{Inputs, Outputs, StateSample, Status, TrajectorySetpoint};
 use oxide_core::math::{Quat, Vec3};
 use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
@@ -17,12 +18,48 @@ use crate::SimError;
 use crate::airframe::Airframe;
 use crate::battery::Battery;
 use crate::hash::TraceHash;
+use crate::rng::{Rng, Stream};
 use crate::scenario::Pilot;
-use crate::sensors;
+use crate::sensors::{self, SensorConfig, SensorSuite, Truth};
 use crate::vehicle::{BodyState, GRAVITY, VehicleModel, ground_contact};
+use crate::wind::{Wind, WindConfig};
 
-/// Battery monitor sample period, µs.
-const BATTERY_PERIOD_US: u64 = 10_000;
+/// Everything about a run that is not the airframe, profile or pilot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimOptions {
+    /// Run seed (`rng::run_seed` for scenario runs).
+    pub seed: u64,
+    pub sensors: SensorConfig,
+    pub wind: WindConfig,
+    /// Replaces the airframe's estimator source. With `External` the
+    /// simulator also sends ground truth as the `state` input; with `Ekf` it
+    /// does not.
+    pub estimator: EstimatorSource,
+}
+
+impl Default for SimOptions {
+    /// Seed 0, ideal sensors, calm wind, truth state.
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            sensors: SensorConfig::ideal(),
+            wind: WindConfig::calm(),
+            estimator: EstimatorSource::External,
+        }
+    }
+}
+
+impl SimOptions {
+    /// Realistic sensors, calm wind, EKF.
+    pub fn realistic(seed: u64) -> Self {
+        Self {
+            seed,
+            sensors: SensorConfig::realistic(),
+            wind: WindConfig::calm(),
+            estimator: EstimatorSource::Ekf,
+        }
+    }
+}
 
 /// What happened in one tick, for logging, viewers and tests.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,6 +77,13 @@ pub struct StepRecord<const N: usize> {
     pub battery_a: f64,
     pub status: Status,
     pub setpoint: Option<TrajectorySetpoint>,
+    /// The core's published state estimate after this tick.
+    pub estimate: Option<StateSample>,
+    /// Wind (air-mass velocity, NED, m/s) acting during this tick.
+    pub wind: Vec3<f64>,
+    /// Physics steps so far that produced a non-finite state (the vehicle
+    /// was frozen in place instead). Must be 0 in a healthy run.
+    pub physics_faults: u32,
 }
 
 pub struct Simulation<P: Pilot, const N: usize> {
@@ -51,25 +95,39 @@ pub struct Simulation<P: Pilot, const N: usize> {
     tick: u64,
     base_us: u64,
     dt: f64,
-    battery_every: u64,
+    sensors: SensorSuite<N>,
+    wind: Wind,
+    truth_state: bool,
     active: Outputs<N>,
     pending: Option<Outputs<N>>,
     specific_force_world: Vec3<f64>,
     hash: TraceHash,
+    physics_faults: u32,
 }
 
 impl<P: Pilot, const N: usize> Simulation<P, N> {
+    /// Ideal sensors, calm wind, truth state (`SimOptions::default()`).
     pub fn new(airframe: &Airframe, profile: Profile, pilot: P) -> Result<Self, SimError> {
+        Self::with_options(airframe, profile, pilot, SimOptions::default())
+    }
+
+    pub fn with_options(
+        airframe: &Airframe,
+        profile: Profile,
+        pilot: P,
+        options: SimOptions,
+    ) -> Result<Self, SimError> {
         let model = VehicleModel::<N>::from_airframe(airframe)?;
-        let core = Core::new(airframe.core_config::<N>()?, profile).map_err(SimError::Core)?;
+        let mut cfg = airframe.core_config::<N>()?;
+        cfg.estimator.source = options.estimator;
+        let core = Core::new(cfg, profile).map_err(SimError::Core)?;
         let base_us = u64::from(profile.base_period_us);
         // One time base: every period must be a whole number of ticks.
-        if base_us == 0
-            || !BATTERY_PERIOD_US.is_multiple_of(base_us)
-            || !crate::scenario::COMMAND_PERIOD_US.is_multiple_of(base_us)
-        {
+        if base_us == 0 || !crate::scenario::COMMAND_PERIOD_US.is_multiple_of(base_us) {
             return Err(SimError::TimeBase(base_us));
         }
+        let sensors = SensorSuite::new(options.sensors, options.seed, base_us)?;
+        let wind = Wind::new(options.wind, Rng::stream(options.seed, Stream::Wind));
         Ok(Self {
             core,
             model,
@@ -79,11 +137,14 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             tick: 0,
             base_us,
             dt: Micros(base_us).as_secs_f64(),
-            battery_every: BATTERY_PERIOD_US / base_us,
+            sensors,
+            wind,
+            truth_state: options.estimator == EstimatorSource::External,
             active: Outputs::off(Micros::ZERO),
             pending: None,
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
             hash: TraceHash::default(),
+            physics_faults: 0,
         })
     }
 
@@ -108,6 +169,16 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     pub fn core(&self) -> &Core<N> {
         &self.core
     }
+    pub fn sensors(&self) -> &SensorSuite<N> {
+        &self.sensors
+    }
+    pub fn wind(&self) -> &Wind {
+        &self.wind
+    }
+    /// Physics steps so far that produced a non-finite state.
+    pub fn physics_faults(&self) -> u32 {
+        self.physics_faults
+    }
     /// Hash of every state so far (DESIGN §5.2 item 6).
     pub fn trace_hash(&self) -> u64 {
         self.hash.value()
@@ -117,19 +188,30 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     pub fn step(&mut self) -> StepRecord<N> {
         let t = self.time();
 
-        // 1. Sensors at t.
+        // 1. Wind and sensors at t.
+        let wind = self.wind.sample(t);
+        let frame = self.sensors.sample(
+            t,
+            &Truth {
+                body: &self.body,
+                specific_force_world: self.specific_force_world,
+                battery_v: self.battery.voltage_v,
+                battery_a: self.battery.current_a,
+                max_omega: self.model.max_omega,
+            },
+        );
         let setpoint = self.pilot.setpoint(t);
         let inputs = Inputs {
-            imu: Some(sensors::imu(t, &self.body, self.specific_force_world)),
-            state: Some(sensors::state(t, &self.body)),
+            imu: frame.imu,
+            gps: frame.gps,
+            baro: frame.baro,
+            mag: frame.mag,
+            battery: frame.battery,
+            state: self.truth_state.then(|| sensors::state(t, &self.body)),
             rc: self
                 .pilot
                 .rc(t)
                 .map(|r| oxide_core::io::Stamped::ideal(t, r)),
-            battery: self
-                .tick
-                .is_multiple_of(self.battery_every)
-                .then(|| sensors::battery(t, self.battery.voltage_v, self.battery.current_a)),
             setpoint: setpoint.map(|s| oxide_core::io::Stamped::ideal(t, s)),
         };
 
@@ -156,25 +238,29 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             battery_a: self.battery.current_a,
             status: out.status,
             setpoint,
+            estimate: self.core.estimate(),
+            wind,
+            physics_faults: self.physics_faults,
         };
-        self.integrate();
+        self.integrate(wind);
         self.pending = Some(out);
         self.hash_state();
         self.tick = self.tick.saturating_add(1);
         record
     }
 
-    fn integrate(&mut self) {
+    fn integrate(&mut self, wind: Vec3<f64>) {
         let v = self.battery.voltage_v;
         let cmd: [f64; N] = core::array::from_fn(|i| {
             let u = self.active.motors.get(i).copied().map_or(0.0, f64::from);
             self.model.speed_command(u, v)
         });
         let v_before = self.body.velocity;
-        let mut next = self.model.rk4(&self.body, &cmd, self.dt);
+        let mut next = self.model.rk4(&self.body, &cmd, self.dt, wind);
         ground_contact(&mut next);
         if !next.is_finite() {
-            // Never propagate NaN: freeze and let tests catch the anomaly.
+            // Never propagate NaN: freeze, and count it so the run can fail.
+            self.physics_faults = self.physics_faults.saturating_add(1);
             next = self.body;
             next.velocity = Vec3::zero();
             next.rate = Vec3::zero();
@@ -186,7 +272,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         };
         self.specific_force_world = (next.velocity - v_before) * (1.0 / self.dt) - g;
         self.body = next;
-        let loads = self.model.loads(&self.body);
+        let loads = self.model.loads(&self.body, wind);
         let electrical = loads.shaft_power_w / self.model.efficiency + self.model.idle_power_w;
         self.battery.draw(electrical, self.dt);
     }

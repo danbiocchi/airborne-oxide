@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Airframes are data files, not code (DESIGN §6).
 
-use oxide_core::config::{Gains, Limits, Rotor, Spin, VehicleConfig};
+use oxide_core::config::{EstimatorConfig, Gains, Limits, Rotor, Spin, VehicleConfig};
 use oxide_core::math::Vec3;
 use serde::Deserialize;
 
@@ -39,6 +39,9 @@ pub struct Propulsion {
     pub thrust_expo: f64,
     pub efficiency: f64,
     pub idle_power_w: f64,
+    /// Rotor drag, N per (m/s) per unit of summed normalised rotor speed.
+    #[serde(default)]
+    pub rotor_drag_coeff: f64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -93,6 +96,8 @@ impl Airframe {
             && p.efficiency <= 1.0
             && p.idle_power_w.is_finite()
             && p.idle_power_w >= 0.0
+            && p.rotor_drag_coeff.is_finite()
+            && p.rotor_drag_coeff >= 0.0
             && bat.cells > 0
             && positive(bat.capacity_mah)
             && bat.internal_resistance_ohm.is_finite()
@@ -150,6 +155,7 @@ impl Airframe {
             nominal_voltage_v: self.battery.nominal_voltage_v as f32,
             gains: Gains::default(),
             limits: Limits::default(),
+            estimator: EstimatorConfig::default(),
         })
     }
 }

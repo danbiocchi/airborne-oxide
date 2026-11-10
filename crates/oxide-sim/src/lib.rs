@@ -8,13 +8,17 @@
 pub mod airframe;
 pub mod battery;
 pub mod hash;
+pub mod metrics;
+pub mod montecarlo;
+pub mod rng;
 pub mod scenario;
 pub mod sensors;
 pub mod sim;
 pub mod vehicle;
+pub mod wind;
 
 pub use airframe::Airframe;
-pub use sim::{Simulation, StepRecord};
+pub use sim::{SimOptions, Simulation, StepRecord};
 
 use core::fmt;
 

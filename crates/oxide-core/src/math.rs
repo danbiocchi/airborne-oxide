@@ -39,6 +39,9 @@ pub trait Real:
     fn asin(self) -> Self;
     fn atan2(self, x: Self) -> Self;
     fn exp(self) -> Self;
+    /// Natural logarithm.
+    fn ln(self) -> Self;
+    fn tan(self) -> Self;
     fn abs(self) -> Self;
     fn is_finite(self) -> bool;
 
@@ -92,6 +95,12 @@ impl Real for f32 {
     fn exp(self) -> Self {
         libm::expf(self)
     }
+    fn ln(self) -> Self {
+        libm::logf(self)
+    }
+    fn tan(self) -> Self {
+        libm::tanf(self)
+    }
     fn abs(self) -> Self {
         libm::fabsf(self)
     }
@@ -130,6 +139,12 @@ impl Real for f64 {
     }
     fn exp(self) -> Self {
         libm::exp(self)
+    }
+    fn ln(self) -> Self {
+        libm::log(self)
+    }
+    fn tan(self) -> Self {
+        libm::tan(self)
     }
     fn abs(self) -> Self {
         libm::fabs(self)
@@ -402,6 +417,35 @@ impl<T: Real> Quat<T> {
             self.z + d.z * k,
         )
     }
+    /// The rotation by rotation vector `v` (axis × angle, rad): the
+    /// exponential map. Exact for any angle; uses the series of
+    /// `sin(θ/2)/θ` near zero.
+    pub fn from_rotation_vector(v: Vec3<T>) -> Self {
+        let angle = v.norm();
+        let half = angle * T::HALF;
+        let k = if angle > T::from_f64(1e-4) {
+            half.sin() / angle
+        } else {
+            T::HALF - angle * angle / T::from_f64(48.0)
+        };
+        Self::new(half.cos(), v.x * k, v.y * k, v.z * k)
+    }
+    /// Rotation vector (axis × angle, rad) of a unit quaternion, the shorter
+    /// way round (angle in `[0, π]`): the logarithm map.
+    pub fn to_rotation_vector(self) -> Vec3<T> {
+        let q = if self.w < T::ZERO {
+            Self::new(-self.w, -self.x, -self.y, -self.z)
+        } else {
+            self
+        };
+        let s = q.vector().norm();
+        let k = if s > T::from_f64(1e-6) {
+            T::TWO * s.atan2(q.w) / s
+        } else {
+            T::TWO
+        };
+        q.vector() * k
+    }
     /// Converts between f32 and f64.
     pub fn cast<U: Real>(self) -> Quat<U> {
         Quat::new(
@@ -461,6 +505,29 @@ mod tests {
         // Same rotation up to sign.
         let d = (r.w * q.w + r.x * q.x + r.y * q.y + r.z * q.z).abs();
         assert!(close(d, 1.0, 1e-12));
+    }
+
+    #[test]
+    fn rotation_vector_round_trip() {
+        for v in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1e-7, -2e-7, 3e-8),
+            Vec3::new(0.3, -0.2, 1.1),
+            Vec3::new(-2.0, 1.0, 0.5),
+        ] {
+            let q = Quat::<f64>::from_rotation_vector(v);
+            assert!(close(q.norm(), 1.0, 1e-12));
+            let back = q.to_rotation_vector();
+            assert!((back - v).norm() < 1e-12, "{v:?} -> {back:?}");
+        }
+        // Matches the axis-angle constructor.
+        let q = Quat::<f64>::from_rotation_vector(Vec3::new(0.0, 0.0, 0.5));
+        let r = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.5);
+        assert!(close(q.w, r.w, 1e-12) && close(q.z, r.z, 1e-12));
+        // The logarithm takes the shorter way round.
+        let q = Quat::<f64>::from_rotation_vector(Vec3::new(0.0, 0.0, 3.0));
+        let neg = Quat::new(-q.w, -q.x, -q.y, -q.z);
+        assert!((neg.to_rotation_vector() - Vec3::new(0.0, 0.0, 3.0)).norm() < 1e-12);
     }
 
     #[test]

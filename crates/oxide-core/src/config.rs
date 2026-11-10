@@ -46,6 +46,9 @@ pub struct Gains {
     pub rate_d: Vec3<f32>,
     /// Derivative low-pass cutoff, Hz.
     pub rate_d_cutoff_hz: f32,
+    /// Gyro low-pass cutoff for the rate loop (second-order Butterworth),
+    /// Hz. Zero or negative turns it off.
+    pub gyro_cutoff_hz: f32,
     /// Attitude loop: rate demand per rad of error, 1/s.
     pub attitude_p: Vec3<f32>,
     /// Velocity loop: acceleration demand per m/s of error, 1/s (x, y, z).
@@ -72,6 +75,7 @@ impl Default for Gains {
             rate_i: Vec3::new(40.0, 40.0, 10.0),
             rate_d: Vec3::new(0.3, 0.3, 0.0),
             rate_d_cutoff_hz: 60.0,
+            gyro_cutoff_hz: 80.0,
             attitude_p: Vec3::new(6.5, 6.5, 3.0),
             velocity_p: Vec3::new(4.0, 4.0, 4.0),
             velocity_i: Vec3::new(0.4, 0.4, 0.8),
@@ -124,6 +128,103 @@ impl Default for Limits {
     }
 }
 
+/// Where the state estimate comes from (DESIGN §4.7, ADR-0002).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EstimatorSource {
+    /// The `state` input is the estimate: simulator truth or motion capture.
+    #[default]
+    External,
+    /// The error-state EKF on IMU, GPS, barometer and magnetometer.
+    Ekf,
+}
+
+/// EKF tuning (ADR-0002). Noise values are 1σ. Defaults follow PX4 EKF2
+/// where a counterpart exists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EkfParams {
+    /// How far the filter runs behind real time, µs. Must exceed the largest
+    /// sensor latency (GPS); older measurements are dropped.
+    pub delay_horizon_us: u32,
+    /// Gyro process noise, rad/s (PX4 `EKF2_GYR_NOISE`).
+    pub gyro_noise: f32,
+    /// Accelerometer process noise, m/s² (`EKF2_ACC_NOISE`).
+    pub accel_noise: f32,
+    /// Gyro bias random walk, rad/s² (`EKF2_GYR_B_NOISE`).
+    pub gyro_bias_noise: f32,
+    /// Accelerometer bias random walk, m/s³ (`EKF2_ACC_B_NOISE`).
+    pub accel_bias_noise: f32,
+    /// Lower bound on GPS horizontal position noise, m. The receiver's
+    /// reported accuracy is used when it is larger.
+    pub gps_pos_noise_m: f32,
+    /// Lower bound on GPS velocity noise, m/s.
+    pub gps_vel_noise_mps: f32,
+    /// Barometric height noise, m.
+    pub baro_noise_m: f32,
+    /// Magnetic heading noise, rad.
+    pub yaw_noise_rad: f32,
+    /// Innovation gates, in standard deviations.
+    pub gps_gate: f32,
+    pub baro_gate: f32,
+    pub yaw_gate: f32,
+    /// Magnetic declination, rad, east positive.
+    pub mag_declination_rad: f32,
+    /// Initial 1σ uncertainties after alignment.
+    pub init_tilt_sigma_rad: f32,
+    pub init_yaw_sigma_rad: f32,
+    pub init_vel_sigma_mps: f32,
+    pub init_pos_sigma_m: f32,
+    pub init_gyro_bias_sigma: f32,
+    /// Accelerometer switch-on bias, m/s². In hover a horizontal
+    /// accelerometer bias cannot be told from a tilt error, so this prior
+    /// bounds how far the tilt estimate can wander (0.1 m/s² ≈ 0.6°). The
+    /// default assumes a calibrated IMU (residual about 0.05 m/s²) and
+    /// allows twice that; PX4's 0.2 (`EKF2_ABIAS_INIT`) is for uncalibrated
+    /// sensors.
+    pub init_accel_bias_sigma: f32,
+    /// The vehicle must sit still this long before the filter aligns, µs.
+    pub align_time_us: u32,
+    /// GPS aiding stops after this long without an accepted fix, µs.
+    pub gps_timeout_us: u32,
+    /// Output-predictor correction time constant, s.
+    pub output_tau_s: f32,
+}
+
+impl Default for EkfParams {
+    fn default() -> Self {
+        Self {
+            delay_horizon_us: 200_000,
+            gyro_noise: 0.015,
+            accel_noise: 0.35,
+            gyro_bias_noise: 1.0e-3,
+            accel_bias_noise: 3.0e-3,
+            gps_pos_noise_m: 0.5,
+            gps_vel_noise_mps: 0.3,
+            baro_noise_m: 0.5,
+            yaw_noise_rad: 0.15,
+            gps_gate: 5.0,
+            baro_gate: 5.0,
+            yaw_gate: 3.0,
+            mag_declination_rad: 0.0,
+            init_tilt_sigma_rad: 0.1,
+            init_yaw_sigma_rad: 0.3,
+            init_vel_sigma_mps: 0.5,
+            init_pos_sigma_m: 1.0,
+            init_gyro_bias_sigma: 0.02,
+            init_accel_bias_sigma: 0.1,
+            align_time_us: 1_000_000,
+            gps_timeout_us: 5_000_000,
+            output_tau_s: 0.25,
+        }
+    }
+}
+
+/// Estimator selection and tuning.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EstimatorConfig {
+    pub source: EstimatorSource,
+    pub ekf: EkfParams,
+}
+
 /// Everything the core needs to know about the vehicle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VehicleConfig<const N: usize> {
@@ -137,6 +238,7 @@ pub struct VehicleConfig<const N: usize> {
     pub nominal_voltage_v: f32,
     pub gains: Gains,
     pub limits: Limits,
+    pub estimator: EstimatorConfig,
 }
 
 /// Configuration problems found when the core is built.
@@ -152,6 +254,9 @@ pub enum ConfigError {
     BadThrustExpo,
     /// The scheduling profile is malformed.
     BadProfile,
+    /// An estimator parameter is out of range, or the delay horizon does not
+    /// fit the profile's filter rate and buffer sizes.
+    BadEstimator,
 }
 
 impl<const N: usize> VehicleConfig<N> {

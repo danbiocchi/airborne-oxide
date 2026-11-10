@@ -28,6 +28,9 @@ pub struct VehicleModel<const N: usize> {
     pub mass_kg: f64,
     pub inertia: Vec3<f64>,
     pub drag_area: Vec3<f64>,
+    /// Rotor (induced / blade-flapping) drag: N per m/s of in-plane
+    /// air-relative velocity per unit of summed normalised rotor speed.
+    pub rotor_drag_coeff: f64,
     pub rotors: [RotorModel; N],
     pub torque_coeff_m: f64,
     pub motor_time_constant_s: f64,
@@ -51,6 +54,7 @@ impl<const N: usize> VehicleModel<N> {
             mass_kg: a.body.mass_kg,
             inertia: Vec3::new(i[0], i[1], i[2]),
             drag_area: Vec3::new(d[0], d[1], d[2]),
+            rotor_drag_coeff: p.rotor_drag_coeff,
             rotors: specs.map(|r| RotorModel {
                 position: Vec3::new(r.position_m[0], r.position_m[1], 0.0),
                 spin: match r.spin {
@@ -154,12 +158,16 @@ pub struct Loads {
 }
 
 impl<const N: usize> VehicleModel<N> {
-    pub fn loads(&self, s: &BodyState<N>) -> Loads {
+    /// Loads at state `s` in a uniform wind (`wind_ned`, m/s, the velocity of
+    /// the air mass). Drag acts on the air-relative velocity.
+    pub fn loads(&self, s: &BodyState<N>, wind_ned: Vec3<f64>) -> Loads {
         let mut force = Vec3::zero();
         let mut torque = Vec3::zero();
         let mut power = 0.0;
+        let mut speed_sum = 0.0;
         for (r, n) in self.rotors.iter().zip(s.rotor_speed.iter()) {
             let n = n.max(0.0);
+            speed_sum += n;
             let thrust = r.max_thrust_n * n * n;
             let f = Vec3::new(0.0, 0.0, -thrust);
             force += f;
@@ -167,20 +175,27 @@ impl<const N: usize> VehicleModel<N> {
                 r.position.cross(f) + Vec3::new(0.0, 0.0, r.spin * self.torque_coeff_m * thrust);
             power += self.torque_coeff_m * thrust * n * self.max_omega;
         }
-        // Quadratic drag per body axis (no wind until M1b).
-        let vb = s.attitude.inverse_rotate(s.velocity);
+        // Quadratic body drag per axis plus linear rotor drag in the rotor
+        // plane, both on the air-relative velocity.
+        let vb = s.attitude.inverse_rotate(s.velocity - wind_ned);
         let drag = Vec3::new(vb.x * vb.x.abs(), vb.y * vb.y.abs(), vb.z * vb.z.abs())
             .hadamard(self.drag_area)
             * (-0.5 * AIR_DENSITY);
+        let rotor_drag = Vec3::new(vb.x, vb.y, 0.0) * (-self.rotor_drag_coeff * speed_sum);
         Loads {
-            force_body: force + drag,
+            force_body: force + drag + rotor_drag,
             torque_body: torque,
             shaft_power_w: power,
         }
     }
 
-    fn derivative(&self, s: &BodyState<N>, speed_cmd: &[f64; N]) -> Derivative<N> {
-        let loads = self.loads(s);
+    fn derivative(
+        &self,
+        s: &BodyState<N>,
+        speed_cmd: &[f64; N],
+        wind_ned: Vec3<f64>,
+    ) -> Derivative<N> {
+        let loads = self.loads(s, wind_ned);
         let g = if self.gravity {
             Vec3::new(0.0, 0.0, GRAVITY)
         } else {
@@ -206,12 +221,19 @@ impl<const N: usize> VehicleModel<N> {
         }
     }
 
-    /// One RK4 step of `dt` with rotor-speed commands held constant.
-    pub fn rk4(&self, s: &BodyState<N>, speed_cmd: &[f64; N], dt: f64) -> BodyState<N> {
-        let k1 = self.derivative(s, speed_cmd);
-        let k2 = self.derivative(&s.add(&k1, 0.5 * dt), speed_cmd);
-        let k3 = self.derivative(&s.add(&k2, 0.5 * dt), speed_cmd);
-        let k4 = self.derivative(&s.add(&k3, dt), speed_cmd);
+    /// One RK4 step of `dt` with rotor-speed commands and the wind
+    /// (`wind_ned`, m/s) held constant.
+    pub fn rk4(
+        &self,
+        s: &BodyState<N>,
+        speed_cmd: &[f64; N],
+        dt: f64,
+        wind_ned: Vec3<f64>,
+    ) -> BodyState<N> {
+        let k1 = self.derivative(s, speed_cmd, wind_ned);
+        let k2 = self.derivative(&s.add(&k1, 0.5 * dt), speed_cmd, wind_ned);
+        let k3 = self.derivative(&s.add(&k2, 0.5 * dt), speed_cmd, wind_ned);
+        let k4 = self.derivative(&s.add(&k3, dt), speed_cmd, wind_ned);
         let mut out = s.add(&k1, dt / 6.0);
         out = out.add(&k2, dt / 3.0);
         out = out.add(&k3, dt / 3.0);

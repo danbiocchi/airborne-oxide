@@ -54,6 +54,15 @@ jobs:
           name: hashes-${{ matrix.os }}
           path: hashes.txt
 
+  monte-carlo:
+    name: Gust hold, 200 seeds (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked -p oxide-sim --test gust_hold -- --ignored --nocapture
+
   determinism:
     name: Linux and Windows traces are bit-identical
     needs: test
