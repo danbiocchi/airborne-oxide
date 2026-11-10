@@ -183,8 +183,18 @@ pub struct EkfParams {
     pub init_accel_bias_sigma: f32,
     /// The vehicle must sit still this long before the filter aligns, µs.
     pub align_time_us: u32,
-    /// GPS aiding stops after this long without an accepted fix, µs.
+    /// GPS aiding stops after this long without an accepted fix, µs. Also
+    /// how long horizontal velocity stays valid (ADR-0003 §1).
     pub gps_timeout_us: u32,
+    /// Horizontal position stays valid this long after the last accepted
+    /// GPS fix, µs.
+    pub pos_timeout_us: u32,
+    /// Height stays valid this long after the last accepted barometer
+    /// reading, µs.
+    pub baro_timeout_us: u32,
+    /// Heading stays valid this long after the last accepted magnetometer
+    /// reading, µs.
+    pub mag_timeout_us: u32,
     /// Output-predictor correction time constant, s.
     pub output_tau_s: f32,
 }
@@ -213,6 +223,9 @@ impl Default for EkfParams {
             init_accel_bias_sigma: 0.1,
             align_time_us: 1_000_000,
             gps_timeout_us: 5_000_000,
+            pos_timeout_us: 1_500_000,
+            baro_timeout_us: 5_000_000,
+            mag_timeout_us: 30_000_000,
             output_tau_s: 0.25,
         }
     }
@@ -223,6 +236,103 @@ impl Default for EkfParams {
 pub struct EstimatorConfig {
     pub source: EstimatorSource,
     pub ekf: EkfParams,
+}
+
+/// Failsafe timings, thresholds and flight-action settings (ADR-0003).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FailsafeParams {
+    /// RC counts as lost after this long without a valid frame, µs.
+    pub rc_timeout_us: u32,
+    /// RC must be valid this long without a gap before pilot input counts
+    /// (arming, override), s.
+    pub rc_valid_min_s: f32,
+    /// After RC loss in a pilot mode: hold this long, then return, s.
+    pub rc_loss_hold_s: f32,
+    /// The ground station counts as lost after this long without a
+    /// heartbeat, µs.
+    pub gcs_timeout_us: u32,
+    /// Offboard with no human link: continue this long, then return, s.
+    pub no_link_rtl_s: f32,
+    /// The brain counts as lost when its progress counter has not advanced
+    /// for this long, µs.
+    pub brain_timeout_us: u32,
+    /// After brain loss: hold this long, then return, s.
+    pub brain_loss_rtl_s: f32,
+    /// Tier-2 setpoints count as stale after this long, µs.
+    pub setpoint_timeout_us: u32,
+    /// After losing position with nobody flying: hold this long, then
+    /// land, s.
+    pub gps_loss_land_s: f32,
+    /// A Hold ends when its reasons have been clear this long, s.
+    pub clear_hysteresis_s: f32,
+    /// Battery low and critical thresholds, V per cell, on the filtered,
+    /// load-compensated voltage.
+    pub battery_low_v: f32,
+    pub battery_critical_v: f32,
+    /// The voltage must stay below a threshold this long to latch, s.
+    pub battery_debounce_s: f32,
+    /// Battery voltage low-pass time constant, s.
+    pub battery_filter_tau_s: f32,
+    /// Geofence radius around home, m. Zero disables it.
+    pub fence_radius_m: f32,
+    /// Geofence height above home, m. Zero disables it.
+    pub fence_altitude_m: f32,
+    /// Loss of control: attitude error above this for
+    /// `loc_error_s`, rad.
+    pub loc_error_rad: f32,
+    pub loc_error_s: f32,
+    /// Loss of control: tilt above this for `loc_tilt_s`, rad.
+    pub loc_tilt_rad: f32,
+    pub loc_tilt_s: f32,
+    /// Return altitude above home, m.
+    pub rtl_altitude_m: f32,
+    /// Return ground speed, m/s.
+    pub rtl_speed_mps: f32,
+    /// Landing descent rate, m/s.
+    pub land_speed_mps: f32,
+    /// Landing without a valid height: thrust as a fraction of hover
+    /// thrust.
+    pub land_blind_thrust: f32,
+    /// Touchdown: thrust below this fraction of hover thrust…
+    pub touchdown_thrust: f32,
+    /// …and vertical speed below this, m/s…
+    pub touchdown_speed_mps: f32,
+    /// …for this long, s.
+    pub touchdown_s: f32,
+}
+
+impl Default for FailsafeParams {
+    fn default() -> Self {
+        Self {
+            rc_timeout_us: 500_000,
+            rc_valid_min_s: 1.0,
+            rc_loss_hold_s: 3.0,
+            gcs_timeout_us: 3_000_000,
+            no_link_rtl_s: 60.0,
+            brain_timeout_us: 2_000_000,
+            brain_loss_rtl_s: 10.0,
+            setpoint_timeout_us: 500_000,
+            gps_loss_land_s: 30.0,
+            clear_hysteresis_s: 1.0,
+            battery_low_v: 3.5,
+            battery_critical_v: 3.3,
+            battery_debounce_s: 2.0,
+            battery_filter_tau_s: 2.0,
+            fence_radius_m: 0.0,
+            fence_altitude_m: 0.0,
+            loc_error_rad: 45.0_f32.to_radians(),
+            loc_error_s: 0.5,
+            loc_tilt_rad: 75.0_f32.to_radians(),
+            loc_tilt_s: 0.25,
+            rtl_altitude_m: 10.0,
+            rtl_speed_mps: 3.0,
+            land_speed_mps: 0.7,
+            land_blind_thrust: 0.9,
+            touchdown_thrust: 0.3,
+            touchdown_speed_mps: 0.25,
+            touchdown_s: 1.0,
+        }
+    }
 }
 
 /// Everything the core needs to know about the vehicle.
@@ -239,6 +349,11 @@ pub struct VehicleConfig<const N: usize> {
     pub gains: Gains,
     pub limits: Limits,
     pub estimator: EstimatorConfig,
+    pub failsafe: FailsafeParams,
+    /// Battery cells in series.
+    pub battery_cells: u8,
+    /// Battery internal resistance, Ω, for load compensation.
+    pub battery_resistance_ohm: f32,
 }
 
 /// Configuration problems found when the core is built.
@@ -257,6 +372,8 @@ pub enum ConfigError {
     /// An estimator parameter is out of range, or the delay horizon does not
     /// fit the profile's filter rate and buffer sizes.
     BadEstimator,
+    /// A failsafe parameter or the battery description is out of range.
+    BadFailsafe,
 }
 
 impl<const N: usize> VehicleConfig<N> {

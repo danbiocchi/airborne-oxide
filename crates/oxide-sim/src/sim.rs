@@ -213,6 +213,8 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
                 .rc(t)
                 .map(|r| oxide_core::io::Stamped::ideal(t, r)),
             setpoint: setpoint.map(|s| oxide_core::io::Stamped::ideal(t, s)),
+            gcs_heartbeat: None,
+            brain_heartbeat: None,
         };
 
         // 2. Core tick.

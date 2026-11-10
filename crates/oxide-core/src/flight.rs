@@ -9,8 +9,8 @@ use crate::control::{
 use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
 use crate::io::{
-    BatterySample, EstimatorStatus, FlightMode, ImuSample, Inputs, Outputs, RcSample, Stamped,
-    StateSample, Status, TrajectorySetpoint,
+    BatterySample, EstimatorStatus, EventList, FlightMode, ImuSample, Inputs, Outputs, RcSample,
+    Stamped, StateSample, Status, TrajectorySetpoint,
 };
 use crate::math::{Quat, Real, Vec3, wrap_pi};
 use crate::schedule::{Profile, TaskId};
@@ -378,7 +378,7 @@ impl<const N: usize> Core<N> {
         let rc = self.valid_rc(now);
         let l = self.cfg.limits;
         let target = match (sup.mode, rc) {
-            (FlightMode::Stabilized, Some(rc)) => {
+            (FlightMode::Stabilized | FlightMode::Altitude, Some(rc)) => {
                 self.guide_state.yaw_sp =
                     wrap_pi(self.guide_state.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
                 self.guide_state.position_sp = est.position;
@@ -422,14 +422,16 @@ impl<const N: usize> Core<N> {
             }
             // No valid RC in a stick mode: hold position (M1a; M1c adds the
             // RC-loss failsafe).
-            (FlightMode::Stabilized | FlightMode::Position, None) => self.position_ctrl.update(
-                self.guide_state.position_sp,
-                Vec3::zero(),
-                self.guide_state.yaw_sp,
-                &est,
-                dt,
-                &self.cfg,
-            ),
+            (FlightMode::Stabilized | FlightMode::Altitude | FlightMode::Position, None) => {
+                self.position_ctrl.update(
+                    self.guide_state.position_sp,
+                    Vec3::zero(),
+                    self.guide_state.yaw_sp,
+                    &est,
+                    dt,
+                    &self.cfg,
+                )
+            }
         };
         self.guidance.pending = target;
     }
@@ -476,6 +478,7 @@ impl<const N: usize> Core<N> {
             timing_faults: self.timing_faults,
             no_estimate: self.estimate.visible.is_none(),
             estimator: self.estimator_status(),
+            ..Status::default()
         };
         let t_valid = now.add_us(base_us);
         if !sup.armed {
@@ -484,6 +487,7 @@ impl<const N: usize> Core<N> {
                 t_valid,
                 motors: [0.0; N],
                 status,
+                events: EventList::new(),
             };
         }
         let target = self.attitude.visible;
@@ -528,6 +532,7 @@ impl<const N: usize> Core<N> {
             t_valid,
             motors,
             status,
+            events: EventList::new(),
         }
     }
 }
@@ -557,7 +562,7 @@ fn leash(sp: Vec3<f32>, pos: Vec3<f32>, radius: f32) -> Vec3<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EstimatorConfig, Gains, Limits, Rotor, Spin};
+    use crate::config::{EstimatorConfig, FailsafeParams, Gains, Limits, Rotor, Spin};
     use crate::io::{BaroSample, GpsSample, MagSample};
     use crate::schedule::F405_LEAN;
 
@@ -584,6 +589,9 @@ mod tests {
             gains: Gains::default(),
             limits: Limits::default(),
             estimator: EstimatorConfig::default(),
+            failsafe: FailsafeParams::default(),
+            battery_cells: 6,
+            battery_resistance_ohm: 0.025,
         }
     }
 

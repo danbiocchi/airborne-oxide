@@ -7,6 +7,7 @@
 
 pub mod airframe;
 pub mod battery;
+pub mod faults;
 pub mod hash;
 pub mod metrics;
 pub mod montecarlo;

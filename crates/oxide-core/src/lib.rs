@@ -25,11 +25,13 @@ pub mod allocation;
 pub mod config;
 pub mod control;
 pub mod estimator;
+pub mod failsafe;
 pub mod filters;
 pub mod flight;
 pub mod io;
 pub mod linalg;
 pub mod math;
+pub mod monitor;
 pub mod schedule;
 pub mod time;
 
