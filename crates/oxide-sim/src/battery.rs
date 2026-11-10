@@ -6,8 +6,9 @@
 use crate::airframe::BatterySpec;
 
 /// LiPo open-circuit voltage per cell versus state of charge.
-const OCV_TABLE: [(f64, f64); 9] = [
-    (0.00, 3.30),
+const OCV_TABLE: [(f64, f64); 10] = [
+    (0.00, 3.00),
+    (0.02, 3.30),
     (0.05, 3.50),
     (0.10, 3.60),
     (0.20, 3.70),
@@ -77,7 +78,9 @@ mod tests {
     #[test]
     fn ocv_endpoints_and_monotonic() {
         assert!((cell_ocv(1.0) - 4.2).abs() < 1e-12);
-        assert!((cell_ocv(0.0) - 3.3).abs() < 1e-12);
+        assert!((cell_ocv(0.0) - 3.0).abs() < 1e-12);
+        // The critical level (3.3 V) lies inside the curve, not at its end.
+        assert!((cell_ocv(0.02) - 3.3).abs() < 1e-12);
         let mut last = 0.0;
         for i in 0..=100 {
             let v = cell_ocv(f64::from(i) / 100.0);
