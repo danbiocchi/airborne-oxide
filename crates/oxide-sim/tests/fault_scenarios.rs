@@ -3,11 +3,13 @@
 //! flight and checks that the vehicle does what the ADR says.
 
 use oxide_core::io::NavState;
+use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
-use oxide_sim::fault_scenarios::{FaultScenario, all, build, by_name, fly, pairs};
+use oxide_sim::fault_scenarios::{FaultScenario, all, build_with_wind, by_name, fly, pairs};
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::outcome::{FlightOutcome, event_line};
+use oxide_sim::wind::Gust;
 
 const PROFILES: [Profile; 2] = [F405_LEAN, H743_FULL];
 
@@ -113,35 +115,52 @@ fn fault_scenario_is_deterministic() {
 }
 
 /// In an Rtl or Land descent the thrust is never cut to the minimum while the
-/// vehicle is clearly in the air (no false ground contact), over 10 seeds.
+/// vehicle is clearly in the air (no false ground contact), over 10 seeds,
+/// in still air, in a steady 3 m/s updraft and with a 6 m/s up-gust. (The sim
+/// vehicle is not carried up by these, so the sign of the speed test is
+/// pinned by a core test instead: `contact_is_not_declared_on_a_vehicle_rising`.)
 #[test]
 fn landing_thrust_is_not_cut_in_the_air() {
     // geofence: Rtl from 5 m, lands at home. gps-loss: Land.
     for name in ["geofence", "gps-loss", "battery-low"] {
-        let s = by_name(name).expect("scenario");
-        for index in 0..10_u64 {
-            let mut sim = build(&s, F405_LEAN, index).expect("simulation setup");
-            let end = Micros((s.script.duration_s * 1e6).round() as u64);
-            let mut landing_seen = false;
-            sim.run_until(end, |r| {
-                let landing = matches!(
-                    r.status.nav,
-                    NavState::Rtl | NavState::Land | NavState::LandNow
-                );
-                landing_seen |= landing;
-                let mean = r.motors.iter().sum::<f32>() / r.motors.len() as f32;
-                // The minimum thrust is a motor command of about 0.14.
-                if r.status.armed && landing && -r.position.z > 0.2 {
-                    assert!(
-                        mean > 0.2,
-                        "{name} index {index}: thrust cut {:.2} m up at {:.2} s (nav {:?})",
-                        -r.position.z,
-                        r.t.as_secs_f64(),
-                        r.status.nav
+        for air in ["still", "updraft", "up-gust"] {
+            let s = by_name(name).expect("scenario");
+            for index in 0..10_u64 {
+                let mut sim = build_with_wind(&s, F405_LEAN, index, |mut w| {
+                    match air {
+                        "updraft" => w.steady_ned.z = -3.0,
+                        "up-gust" => w.gusts.push(Gust {
+                            start_s: 20.0,
+                            duration_s: 15.0,
+                            peak_ned: Vec3::new(0.0, 0.0, -6.0),
+                        }),
+                        _ => {}
+                    }
+                    w
+                })
+                .expect("simulation setup");
+                let end = Micros((s.script.duration_s * 1e6).round() as u64);
+                let mut landing_seen = false;
+                sim.run_until(end, |r| {
+                    let landing = matches!(
+                        r.status.nav,
+                        NavState::Rtl | NavState::Land | NavState::LandNow
                     );
-                }
-            });
-            assert!(landing_seen, "{name} index {index} never landed");
+                    landing_seen |= landing;
+                    let mean = r.motors.iter().sum::<f32>() / r.motors.len() as f32;
+                    // The minimum thrust is a motor command of about 0.14.
+                    if r.status.armed && landing && -r.position.z > 0.2 {
+                        assert!(
+                            mean > 0.2,
+                            "{name} ({air}) index {index}: thrust cut {:.2} m up at {:.2} s (nav {:?})",
+                            -r.position.z,
+                            r.t.as_secs_f64(),
+                            r.status.nav
+                        );
+                    }
+                });
+                assert!(landing_seen, "{name} ({air}) index {index} never landed");
+            }
         }
     }
 }

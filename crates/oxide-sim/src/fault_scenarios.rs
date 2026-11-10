@@ -799,6 +799,12 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
     // The barometer loss goes before a critical battery for a similar reason:
     // it takes 10 s to show, and the landing the battery starts would be over
     // by then.
+    // So "critical battery first, then brain crash (or baro loss) during the
+    // LandNow" is not flown: with the battery first, the landing it starts is
+    // over before the brain-loss timeout (2 s) or the baro timeout (5 s plus
+    // the estimator's 10 s to show) can fire, so the second reason is never
+    // raised. Earlier, a stuck-armed bug hid this. The low-battery pack is
+    // sized so the (later) battery failure still latches in the second slot.
     let swap = b == Failure::Geofence
         || (b == Failure::BaroLoss && matches!(a, Failure::BatteryCritical | Failure::BatteryLow))
         || (b == Failure::BrainCrash && a == Failure::BatteryCritical);
@@ -871,10 +877,21 @@ pub fn build(
     profile: Profile,
     index: u64,
 ) -> Result<Simulation<Script, 4>, SimError> {
+    build_with_wind(scenario, profile, index, |w| w)
+}
+
+/// Like [`build`], with `adjust` applied to the run's wind (for example to
+/// add an updraft).
+pub fn build_with_wind(
+    scenario: &FaultScenario,
+    profile: Profile,
+    index: u64,
+    adjust: impl FnOnce(WindConfig) -> WindConfig,
+) -> Result<Simulation<Script, 4>, SimError> {
     let airframe = Airframe::reference_quad()?;
     let seed = run_seed(scenario.name, index);
     let options = SimOptions {
-        wind: fault_wind(seed),
+        wind: adjust(fault_wind(seed)),
         faults: scenario.faults.clone(),
         links: scenario.links,
         failsafe: scenario.failsafe,

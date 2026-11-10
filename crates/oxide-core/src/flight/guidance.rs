@@ -411,6 +411,14 @@ impl<const N: usize> Core<N> {
                 )
             }
         };
+        if landing_now && !speed_known(v) && g.blind_s < BLIND_INERTIAL_S {
+            // The inertial speed has no barometer behind it: a bias it did
+            // not calibrate would make the loop "slow" a descent that is not
+            // happening. Never above hover thrust, so the vehicle cannot
+            // accelerate upwards. (Not the 0.9 x hover blind thrust: holding
+            // a constant descent rate takes about hover thrust.)
+            target.thrust_n = target.thrust_n.min(hover);
+        }
         // Ground contact (ADR-0003 §2; see `CONTACT_DESCENT_MPS`): a descent
         // is commanded and the vehicle is not moving. A vertical speed is
         // available from the altitude or velocity flags, or, in the first
@@ -442,6 +450,14 @@ impl<const N: usize> Core<N> {
                 thrust_n: l.min_thrust_fraction_of_hover * weight,
             };
             self.position_ctrl.reset();
+            // The hold point is the ground under the vehicle: a pilot's
+            // stick held down must not leave it sunk below the ground, where
+            // the next hold would keep commanding a descent.
+            g.position_sp.z = state.position.z;
+            if sup.nav == NavState::Position {
+                g.position_sp.x = state.position.x;
+                g.position_sp.y = state.position.y;
+            }
         }
         self.guide_state = g;
         self.guidance.pending = target;
