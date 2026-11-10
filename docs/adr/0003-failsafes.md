@@ -66,7 +66,7 @@ A *reason* is a condition that is currently true. Each maps to an action, someti
 | `SETPOINT_STALE` | No tier-2 setpoint for 0.5 s | Offboard | `Hold` |
 | `BATTERY_LOW` | Filtered, load-compensated cell voltage below `battery_low_v` (3.5 V) for 2 s; latches | Armed | `Rtl` |
 | `BATTERY_CRITICAL` | Same, below `battery_critical_v` (3.3 V); latches | Armed | `LandNow` |
-| `GPS_LOST` | `position` invalid | Offboard, Hold, Rtl, Land; and Position when RC is lost | `Hold`; after `gps_loss_land_s` (30 s), `Land` |
+| `GPS_LOST` | `position` invalid | Offboard, or while another failsafe is in force | `Hold`; after `gps_loss_land_s` (30 s), `Land` |
 | `ESTIMATOR_UNHEALTHY` | `attitude` valid, but `altitude` or `heading` invalid, or the filter reported a numerical fault | Armed | `LandNow` |
 | `IMU_FAILURE` | `attitude` invalid | Armed | `Terminated` |
 | `GEOFENCE` | Further than `fence_radius_m` from home, or higher than `fence_altitude_m` above it. Zero disables that limit; both default to zero. | Armed, `position` valid | `Rtl` |
@@ -74,7 +74,7 @@ A *reason* is a condition that is currently true. Each maps to an action, someti
 
 **Interpretations of DESIGN §4.10.**
 - **RC loss and ground-station loss.** The table's rows overlap. Read together: in a pilot mode, losing RC alone starts Hold then Rtl, whatever the ground station does. In Offboard, losing RC alone changes nothing; losing every human link starts the `no_link_rtl_s` countdown. A ground station that never connected counts as absent, and losing it alone is never a failsafe.
-- **GPS loss with a pilot flying.** A pilot in `Position` with valid RC who loses GPS drops to `Altitude` and stays in control (§4.9 rule c). The 30 s landing timer only runs when nobody is flying: Offboard, a failsafe state, or RC lost.
+- **GPS loss with a pilot flying.** A pilot in `Position` with valid RC who loses GPS drops to `Altitude` and stays in control (§4.9 rule c). The 30 s landing timer only runs when nobody is flying: Offboard, or another failsafe in force (which includes RC lost). A Hold that is only waiting out its hysteresis does not count; otherwise the lost position would keep the Hold alive after the pilot is back, and land the vehicle under them.
 - **Brain loss.** Only the "no stored mission" branch exists (Hold, then Rtl). Missions stored on the core arrive in M3.
 - **Estimator unhealthy and IMU failure.** With one IMU and one filter there is no lane to switch to. Losing height or heading while attitude still works is "estimator unhealthy" and lands now. Losing attitude is "IMU failure" and is terminal, as DESIGN §4.10 says for single-IMU boards.
 - **Quad motor loss.** A quad cannot fly on three motors. The defined outcome is: the loss-of-control check fires, the event is logged, and the motors stop. A controlled spinning descent is later research.

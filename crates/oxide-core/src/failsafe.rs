@@ -109,17 +109,22 @@ impl Failsafe {
             return Decision::default();
         }
         let prev = self.action;
-        let reasons = evaluate(c, prev != Action::None);
-
-        for (bit, since) in REASONS.iter().zip(self.since.iter_mut()) {
-            if reasons.contains(*bit) {
-                if since.is_none() {
-                    *since = Some(now);
-                }
-            } else {
-                *since = None;
-            }
-        }
+        // Everything except GPS_LOST, which depends on whether another
+        // failsafe is in force.
+        let mut reasons = evaluate(c);
+        let not_gps = Reasons::ALL.difference(Reasons::GPS_LOST);
+        self.track(now, reasons, not_gps);
+        // GPS loss matters when nobody is flying: Offboard, or another
+        // failsafe in force (a latched action, or a reason that acts now).
+        // A Hold that is only waiting out its hysteresis does not count,
+        // or GPS_LOST would keep itself alive after the pilot is back.
+        let others = self.candidate(now, reasons, p);
+        let in_force = others != Action::None || self.latched != Action::None;
+        reasons.set(
+            Reasons::GPS_LOST,
+            !c.valid.position && (c.mode == FlightMode::Offboard || in_force),
+        );
+        self.track(now, reasons, Reasons::GPS_LOST);
         // A reason leaves the acknowledged set when it stops being true.
         self.acked = self.acked.intersection(reasons);
 
@@ -141,7 +146,7 @@ impl Failsafe {
                 .zip(self.ack_action.iter_mut())
             {
                 if reasons.contains(*bit) {
-                    *ack = reason_action(*bit, elapsed_s(now, *since), p);
+                    *ack = reason_action_us(*bit, elapsed_us(now, *since), p);
                 }
             }
             self.acked = reasons;
@@ -180,13 +185,29 @@ impl Failsafe {
             if !reasons.contains(*bit) {
                 continue;
             }
-            let a = reason_action(*bit, elapsed_s(now, *since), p);
+            let a = reason_action_us(*bit, elapsed_us(now, *since), p);
             if self.acked.contains(*bit) && a <= *ack {
                 continue;
             }
             best = best.max(a);
         }
         best
+    }
+
+    /// Starts or clears the timers of the reasons in `mask`.
+    fn track(&mut self, now: Micros, reasons: Reasons, mask: Reasons) {
+        for (bit, since) in REASONS.iter().zip(self.since.iter_mut()) {
+            if !mask.contains(*bit) {
+                continue;
+            }
+            if reasons.contains(*bit) {
+                if since.is_none() {
+                    *since = Some(now);
+                }
+            } else {
+                *since = None;
+            }
+        }
     }
 
     /// Latch and Hold hysteresis (rules 3 and 4).
@@ -203,7 +224,7 @@ impl Failsafe {
         let mut action = candidate.max(self.latched);
         if action == Action::None && prev == Action::Hold {
             let since = *self.clear_since.get_or_insert(now);
-            if elapsed_s(now, Some(since)) < p.clear_hysteresis_s {
+            if elapsed_us(now, Some(since)) < secs_to_us(p.clear_hysteresis_s) {
                 action = Action::Hold;
             } else {
                 self.clear_since = None;
@@ -215,8 +236,9 @@ impl Failsafe {
     }
 }
 
-/// Which reasons are true (ADR-0003 §3).
-fn evaluate(c: &Conditions, in_failsafe: bool) -> Reasons {
+/// Which reasons are true (ADR-0003 §3), except `GPS_LOST`, which
+/// `update` adds because it depends on the other reasons.
+fn evaluate(c: &Conditions) -> Reasons {
     let stick = matches!(
         c.mode,
         FlightMode::Stabilized | FlightMode::Altitude | FlightMode::Position
@@ -233,11 +255,6 @@ fn evaluate(c: &Conditions, in_failsafe: bool) -> Reasons {
     r.set(Reasons::BATTERY_LOW, c.battery_low);
     r.set(Reasons::BATTERY_CRITICAL, c.battery_critical);
     r.set(
-        Reasons::GPS_LOST,
-        !c.valid.position
-            && (offboard || in_failsafe || (c.mode == FlightMode::Position && !c.rc_valid)),
-    );
-    r.set(
         Reasons::ESTIMATOR_UNHEALTHY,
         c.valid.attitude && (!c.valid.altitude || !c.valid.heading || c.estimator_fault),
     );
@@ -247,21 +264,34 @@ fn evaluate(c: &Conditions, in_failsafe: bool) -> Reasons {
     r
 }
 
-/// Seconds from `since` to `now` (zero when `since` is unset).
-#[allow(clippy::cast_precision_loss)]
-fn elapsed_s(now: Micros, since: Option<Micros>) -> f32 {
-    match since {
-        Some(s) => now.since(s) as f32 / 1_000_000.0,
-        None => 0.0,
-    }
+/// Microseconds from `since` to `now` (zero when `since` is unset).
+fn elapsed_us(now: Micros, since: Option<Micros>) -> u64 {
+    since.map_or(0, |s| now.since(s))
+}
+
+/// A duration in seconds as whole microseconds. Negative and NaN give 0,
+/// so a corrupt delay escalates at once rather than never.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn secs_to_us(s: f32) -> u64 {
+    (f64::from(s) * 1e6 + 0.5) as u64
 }
 
 /// The action a single reason calls for after being true for `elapsed_s`.
 ///
 /// `reason` must be exactly one bit; anything else calls for no action.
 pub fn reason_action(reason: Reasons, elapsed_s: f32, p: &FailsafeParams) -> Action {
+    reason_action_us(reason, secs_to_us(elapsed_s), p)
+}
+
+/// [`reason_action`] with the elapsed time in whole microseconds, so the
+/// delays are exact however long they are.
+fn reason_action_us(reason: Reasons, elapsed_us: u64, p: &FailsafeParams) -> Action {
     let delayed = |first: Action, after: Action, limit_s: f32| {
-        if elapsed_s >= limit_s { after } else { first }
+        if elapsed_us >= secs_to_us(limit_s) {
+            after
+        } else {
+            first
+        }
     };
     if reason == Reasons::RC_LOST {
         delayed(Action::Hold, Action::Rtl, p.rc_loss_hold_s)
@@ -515,9 +545,10 @@ mod tests {
     }
 
     #[test]
-    fn gps_lost_counts_while_in_failsafe() {
+    fn gps_lost_counts_while_another_failsafe_is_in_force() {
         let mut f = Failsafe::new();
-        // Stabilized with RC lost: Hold, but position invalid is not yet a reason.
+        // Stabilized with RC lost and no position: nobody is flying, so the
+        // lost position counts at once, alongside RC_LOST.
         let nopos = Conditions {
             rc_valid: false,
             valid: no_pos(),
@@ -525,10 +556,116 @@ mod tests {
         };
         let d = run(&mut f, 0.0, &nopos);
         assert_eq!(d.action, Action::Hold);
-        assert!(!d.reasons.contains(Reasons::GPS_LOST));
-        // Next run the vehicle is in failsafe, so GPS loss now counts.
-        let d = run(&mut f, 0.1, &nopos);
+        assert!(d.reasons.contains(Reasons::RC_LOST));
         assert!(d.reasons.contains(Reasons::GPS_LOST));
+    }
+
+    #[test]
+    fn gps_lost_does_not_keep_itself_alive_when_the_pilot_is_back() {
+        let mut f = Failsafe::new();
+        let lost = Conditions {
+            mode: FlightMode::Position,
+            rc_valid: false,
+            valid: no_pos(),
+            ..healthy()
+        };
+        assert_eq!(run(&mut f, 0.0, &lost).action, Action::Hold);
+        // RC returns within the hold time. The Hold waits out its
+        // hysteresis, but with the pilot back the lost position is no
+        // longer a failsafe reason, so the Hold ends.
+        let back = Conditions {
+            rc_valid: true,
+            ..lost
+        };
+        let d = run(&mut f, 1.0, &back);
+        assert_eq!(d.action, Action::Hold);
+        assert!(!d.reasons.contains(Reasons::GPS_LOST));
+        let d = run(&mut f, 2.1, &back);
+        assert_eq!(d.action, Action::None);
+        // And it never lands the pilot's vehicle.
+        let d = run(&mut f, 60.0, &back);
+        assert_eq!(d.action, Action::None);
+        assert!(d.reasons.is_empty());
+    }
+
+    #[test]
+    fn gps_lost_counts_under_a_latched_return() {
+        let mut f = Failsafe::new();
+        let low = Conditions {
+            battery_low: true,
+            ..healthy()
+        };
+        assert_eq!(run(&mut f, 0.0, &low).action, Action::Rtl);
+        // The battery reading recovers, but the return is latched; losing
+        // position now counts, and lands after its delay.
+        let nopos = Conditions {
+            valid: no_pos(),
+            ..healthy()
+        };
+        let d = run(&mut f, 1.0, &nopos);
+        assert_eq!(d.action, Action::Rtl);
+        assert!(d.reasons.contains(Reasons::GPS_LOST));
+        assert_eq!(run(&mut f, 30.9, &nopos).action, Action::Rtl);
+        assert_eq!(run(&mut f, 31.0, &nopos).action, Action::Land);
+    }
+
+    #[test]
+    fn ranking_between_return_land_and_land_now() {
+        // Land outranks Rtl, and stays once reached.
+        let mut f = Failsafe::new();
+        let c = Conditions {
+            mode: FlightMode::Offboard,
+            battery_low: true,
+            valid: no_pos(),
+            ..healthy()
+        };
+        assert_eq!(run(&mut f, 0.0, &c).action, Action::Rtl);
+        assert_eq!(run(&mut f, 30.0, &c).action, Action::Land);
+        let cleared = Conditions {
+            mode: FlightMode::Offboard,
+            ..healthy()
+        };
+        assert_eq!(run(&mut f, 31.0, &cleared).action, Action::Land);
+        // LandNow outranks Land.
+        let critical = Conditions {
+            battery_critical: true,
+            ..c
+        };
+        assert_eq!(run(&mut f, 32.0, &critical).action, Action::LandNow);
+        assert_eq!(run(&mut f, 33.0, &cleared).action, Action::LandNow);
+    }
+
+    #[test]
+    fn rc_lost_applies_in_every_stick_mode() {
+        for mode in [
+            FlightMode::Stabilized,
+            FlightMode::Altitude,
+            FlightMode::Position,
+        ] {
+            let mut f = Failsafe::new();
+            let c = Conditions {
+                mode,
+                rc_valid: false,
+                ..healthy()
+            };
+            let d = run(&mut f, 0.0, &c);
+            assert!(d.reasons.contains(Reasons::RC_LOST), "{mode:?}");
+            assert_eq!(d.action, Action::Hold, "{mode:?}");
+            assert_eq!(run(&mut f, 3.0, &c).action, Action::Rtl, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn long_delays_are_exact_to_the_microsecond() {
+        let mut f = Failsafe::new();
+        let c = Conditions {
+            mode: FlightMode::Offboard,
+            valid: no_pos(),
+            ..healthy()
+        };
+        f.update(Micros(0), &c, &p());
+        assert_eq!(f.update(Micros(29_999_999), &c, &p()).action, Action::Hold);
+        assert_eq!(f.update(Micros(30_000_000), &c, &p()).action, Action::Land);
     }
 
     #[test]
