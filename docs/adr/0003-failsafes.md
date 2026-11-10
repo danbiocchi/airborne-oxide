@@ -50,7 +50,9 @@ What the vehicle is doing is one `NavState`:
 
 **Rtl** needs home (set at arming) and `position`. Without them it behaves as `Hold`. Within 1 m of home it skips the climb and lands.
 
-**Touchdown.** The vehicle is landed when, for 1 s, the commanded thrust is below 30 % of hover thrust and the estimated vertical speed is below 0.25 m/s. In `Land`, `LandNow` and the landing phase of `Rtl`, touchdown disarms the vehicle.
+**Touchdown.** The vehicle is landed when, for 1 s, the commanded thrust is below 30 % of hover thrust and the estimated vertical speed is below 0.25 m/s. In `Rtl`, `Land` and `LandNow`, touchdown disarms the vehicle.
+
+**On the ground.** A failsafe action that begins while the vehicle is landed disarms it at once. An armed vehicle sitting on the ground that loses its radio link must not take off to "return".
 
 ### 3. Failsafe events and default actions
 
@@ -90,6 +92,7 @@ A *reason* is a condition that is currently true. Each maps to an action, someti
 - **Kill switch** works at all times, as before.
 - **A valid link first.** RC must have been valid for `rc_valid_min_s` (1 s) without a gap.
 - **An explicit act.** The override is a *change* of the mode switch while a failsafe action is active. Moving sticks does nothing. RC returning does nothing on its own.
+- **The switch position in effect** only updates while RC is settled. A switch moved while the link was down therefore counts as a change once the link has been back for `rc_valid_min_s`.
 - **Effect.** The failsafe action ends and the vehicle enters the mode now selected, subject to degradation (§2). The reasons that were active are *acknowledged*: they do not act again until they clear and recur. A new reason, or an acknowledged one that escalates to a higher action, acts as normal.
 - **Restricted.** While `BATTERY_CRITICAL`, `ESTIMATOR_UNHEALTHY` or `IMU_FAILURE` is active the pilot can only take over into `Stabilized` or `Altitude`.
 - `Terminated` cannot be overridden.
@@ -109,7 +112,7 @@ Arming needs a rising edge of the arm switch with no pre-arm check failing. Each
 | `BATTERY` | No fresh battery reading, cell voltage outside 3.0–4.35 V, or `BATTERY_LOW` latched |
 | `CONFIG` | The configuration failed validation |
 
-A refused attempt logs the failing bits. On arming, home is set to the current position when `position` is valid. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
+A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
 
 ### 7. Events
 
