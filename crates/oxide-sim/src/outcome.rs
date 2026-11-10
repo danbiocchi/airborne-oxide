@@ -9,9 +9,13 @@ use oxide_core::io::{Action, DisarmReason, Event, EventKind, NavState, Reasons};
 use oxide_core::math::{Real, Vec3};
 
 use crate::sim::StepRecord;
+use crate::vehicle::GroundModel;
 
-/// Height above the ground below which the vehicle counts as touching it, m.
-const GROUND_M: f64 = 0.02;
+/// Height above the ground below which the vehicle counts as touching it, m:
+/// the ground model's contact condition (`z > -sag`).
+fn ground_m() -> f64 {
+    GroundModel::default().sag_m()
+}
 /// The vehicle must have been above this to have "come down", m.
 const AIRBORNE_M: f64 = 0.3;
 
@@ -183,11 +187,11 @@ impl FlightOutcome {
             }
         }
         // Touchdown speed: the downward speed of the record before the first
-        // one at the ground (the ground contact zeroes the velocity).
+        // one at the ground (in contact the ground decelerates the vehicle).
         if !self.touched_down {
             if height > AIRBORNE_M {
                 self.was_above = true;
-            } else if self.was_above && height < GROUND_M {
+            } else if self.was_above && height < ground_m() {
                 self.touched_down = true;
                 self.touchdown_speed_mps = Some(self.prev_down_speed.max(r.velocity.z).max(0.0));
             }
@@ -744,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn touchdown_speed_is_taken_before_the_ground_zeroes_it() {
+    fn touchdown_speed_is_taken_before_the_ground_slows_it() {
         let mut o = FlightOutcome::new();
         let mut a = flying(1.0, up(5.0), Action::Land);
         a.velocity = Vec3::new(0.0, 0.0, 0.7);

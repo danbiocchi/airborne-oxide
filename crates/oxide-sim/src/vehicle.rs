@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Multirotor physics: 6-DOF rigid body, first-order motors, quadratic body
-//! drag, gravity and a simple ground contact. f64, fixed-step RK4
+//! drag, gravity and a compliant ground. f64, fixed-step RK4
 //! (DESIGN §5.3). All maths goes through `oxide_core::math` (libm).
 
 use oxide_core::math::{Quat, Real, Vec3};
@@ -8,10 +8,68 @@ use oxide_core::math::{Quat, Real, Vec3};
 use crate::SimError;
 use crate::airframe::{Airframe, SpinSpec};
 
+/// Shortest time in which the ground's rate-proportional torques may stop a
+/// body rate (a numerical safeguard for the explicit integrator), s.
+const DAMPING_STEP_S: f64 = 0.5e-3;
 /// Standard gravity, m/s².
 pub const GRAVITY: f64 = 9.806_65;
 /// Sea-level air density, kg/m³.
 pub const AIR_DENSITY: f64 = 1.225;
+
+/// The ground: a compliant plane at NED z = 0 that the vehicle rests on.
+/// Contact forces are part of the physics derivative, so RK4 integrates them;
+/// they are a function of the state only (deterministic). The ground exists
+/// only while gravity is on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundModel {
+    /// Natural frequency of the vertical spring-damper, rad/s.
+    pub omega_rad_s: f64,
+    /// Damping ratio of the vertical spring-damper.
+    pub zeta: f64,
+    /// Coulomb friction coefficient (horizontal, and yaw through the legs).
+    pub friction: f64,
+    /// Horizontal speed over which friction ramps up to full, m/s.
+    pub friction_speed_mps: f64,
+    /// Yaw rate over which yaw friction ramps up to full, rad/s.
+    pub yaw_friction_rate_rad_s: f64,
+    /// Tilt at which the legs' restoring torque saturates, rad.
+    pub tilt_ref_rad: f64,
+}
+
+impl Default for GroundModel {
+    fn default() -> Self {
+        Self {
+            omega_rad_s: 30.0,
+            zeta: 1.0,
+            friction: 0.8,
+            friction_speed_mps: 0.05,
+            yaw_friction_rate_rad_s: 0.1,
+            tilt_ref_rad: 0.05,
+        }
+    }
+}
+
+impl GroundModel {
+    /// Static sag, m: the spring is in balance with the weight at z = 0.
+    pub fn sag_m(&self) -> f64 {
+        GRAVITY / (self.omega_rad_s * self.omega_rad_s)
+    }
+
+    /// True while the centre of mass at NED height `z` touches the ground.
+    pub fn in_contact(&self, z: f64) -> bool {
+        z > -self.sag_m()
+    }
+
+    /// Upward normal force on a body of `mass_kg` at NED `z` moving down at
+    /// `vz`, N. Never negative: the ground cannot pull.
+    pub fn normal_force_n(&self, mass_kg: f64, z: f64, vz: f64) -> f64 {
+        if !self.in_contact(z) {
+            return 0.0;
+        }
+        let w = self.omega_rad_s;
+        (mass_kg * (w * w * (z + self.sag_m()) + 2.0 * self.zeta * w * vz)).max(0.0)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RotorModel {
@@ -45,6 +103,7 @@ pub struct VehicleModel<const N: usize> {
     pub nominal_voltage_v: f64,
     /// Gravity on (false only for analytic tests).
     pub gravity: bool,
+    pub ground: GroundModel,
 }
 
 impl<const N: usize> VehicleModel<N> {
@@ -75,6 +134,7 @@ impl<const N: usize> VehicleModel<N> {
             idle_power_w: p.idle_power_w,
             nominal_voltage_v: a.battery.nominal_voltage_v,
             gravity: true,
+            ground: GroundModel::default(),
         })
     }
 
@@ -198,6 +258,73 @@ impl<const N: usize> VehicleModel<N> {
         }
     }
 
+    /// Mean horizontal distance of the rotors from the centre of mass, m
+    /// (the legs' lever arm).
+    pub fn lever_arm_m(&self) -> f64 {
+        let n = self.rotors.len().max(1) as f64;
+        self.rotors
+            .iter()
+            .map(|r| Real::sqrt(r.position.x * r.position.x + r.position.y * r.position.y))
+            .sum::<f64>()
+            / n
+    }
+
+    /// Ground contact: force on the centre of mass (world frame, N) and torque
+    /// (body frame, N·m). Zero when airborne.
+    fn ground_loads(&self, s: &BodyState<N>) -> (Vec3<f64>, Vec3<f64>) {
+        let gm = &self.ground;
+        if !self.gravity {
+            return (Vec3::zero(), Vec3::zero());
+        }
+        let fn_n = gm.normal_force_n(self.mass_kg, s.position.z, s.velocity.z);
+        if fn_n <= 0.0 {
+            return (Vec3::zero(), Vec3::zero());
+        }
+        // Friction opposes the horizontal velocity.
+        let vxy = Vec3::new(s.velocity.x, s.velocity.y, 0.0);
+        let f_fric = vxy * (-gm.friction * fn_n / (vxy.norm() + gm.friction_speed_mps));
+        let force = Vec3::new(f_fric.x, f_fric.y, -fn_n);
+
+        // Legs: restoring torque towards level, saturating at F_n·L, plus
+        // damping sized for critical damping at the static load, all scaled
+        // by F_n so they vanish at lift-off.
+        let l = self.lever_arm_m();
+        let down = s.attitude.rotate(Vec3::new(0.0, 0.0, 1.0));
+        // Rotation vector (world) that turns the body's down axis onto the
+        // vertical: axis = down × ẑ, angle = tilt.
+        let axis = Vec3::new(down.y, -down.x, 0.0);
+        let sin_t = axis.norm();
+        let tilt = Real::atan2(sin_t, down.z);
+        let tilt_vec = if sin_t > 1e-12 {
+            axis * (tilt / sin_t)
+        } else {
+            Vec3::zero()
+        };
+        let tb = s
+            .attitude
+            .inverse_rotate(tilt_vec * (fn_n * l / gm.tilt_ref_rad));
+        let limit = fn_n * l;
+        let w = self.mass_kg * GRAVITY;
+        let k0 = w * l / gm.tilt_ref_rad;
+        let scale = fn_n / w;
+        // Rate-proportional torques are capped so that none can reverse a
+        // body rate within `DAMPING_STEP_S`: with the contact force many
+        // times the weight (a hard landing) they would otherwise be stiffer
+        // than the 1 kHz base step can integrate. Below the cap they are
+        // exactly the formulas above.
+        let damp = |inertia: f64, rate: f64| {
+            let t = 2.0 * Real::sqrt(k0 * inertia) * scale * rate;
+            let cap = inertia * rate.abs() / DAMPING_STEP_S;
+            t.clamp(-cap, cap)
+        };
+        let tx = tb.x.clamp(-limit, limit) - damp(self.inertia.x, s.rate.x);
+        let ty = tb.y.clamp(-limit, limit) - damp(self.inertia.y, s.rate.y);
+        let yaw = gm.friction * fn_n * l * s.rate.z / (s.rate.z.abs() + gm.yaw_friction_rate_rad_s);
+        let cap = self.inertia.z * s.rate.z.abs() / DAMPING_STEP_S;
+        let tz = -yaw.clamp(-cap, cap);
+        (force, Vec3::new(tx, ty, tz))
+    }
+
     fn derivative(
         &self,
         s: &BodyState<N>,
@@ -210,9 +337,11 @@ impl<const N: usize> VehicleModel<N> {
         } else {
             Vec3::zero()
         };
-        let accel = g + s.attitude.rotate(loads.force_body) * (1.0 / self.mass_kg);
+        let (ground_force, ground_torque) = self.ground_loads(s);
+        let accel = g + (s.attitude.rotate(loads.force_body) + ground_force) * (1.0 / self.mass_kg);
         let jw = self.inertia.hadamard(s.rate);
-        let ang = (loads.torque_body - s.rate.cross(jw)).hadamard(self.inertia.map(|v| 1.0 / v));
+        let ang = (loads.torque_body + ground_torque - s.rate.cross(jw))
+            .hadamard(self.inertia.map(|v| 1.0 / v));
         let mut rotor_speed = [0.0; N];
         for ((d, n), c) in rotor_speed
             .iter_mut()
@@ -249,20 +378,5 @@ impl<const N: usize> VehicleModel<N> {
         out = out.add(&k4, dt / 6.0);
         out.attitude = out.attitude.normalized();
         out
-    }
-}
-
-/// Ground plane at NED z = 0. Placeholder until collisions arrive in S2:
-/// touching down stops all motion, and the vehicle rests until thrust lifts it.
-pub fn ground_contact<const N: usize>(s: &mut BodyState<N>) -> bool {
-    if s.position.z >= 0.0 {
-        s.position.z = 0.0;
-        if s.velocity.z >= 0.0 {
-            s.velocity = Vec3::zero();
-            s.rate = Vec3::zero();
-        }
-        true
-    } else {
-        false
     }
 }
