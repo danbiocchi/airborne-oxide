@@ -316,6 +316,17 @@ pub fn reason_names(r: Reasons) -> String {
     }
 }
 
+/// An event as one line: "  16.520 s  ReasonRaised(GPS_LOST)".
+pub fn event_line(e: &Event) -> String {
+    let what = match e.kind {
+        EventKind::ReasonRaised(r) => format!("ReasonRaised({})", reason_names(r)),
+        EventKind::ReasonCleared(r) => format!("ReasonCleared({})", reason_names(r)),
+        EventKind::PilotOverride(r) => format!("PilotOverride({})", reason_names(r)),
+        other => format!("{other:?}"),
+    };
+    format!("{:8.3} s  {what}", e.t.as_secs_f64())
+}
+
 impl Expect {
     /// One line per violation; empty when the outcome is as required.
     /// Always also: no non-finite values, no physics or timing faults, the

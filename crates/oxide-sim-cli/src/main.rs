@@ -270,7 +270,7 @@ fn csv_row(r: &StepRecord<4>) -> String {
     let g = |v: Option<f32>| v.map_or(String::new(), |x| format!("{x:.5}"));
     let h = |v: Option<f64>| v.map_or(String::new(), |x| format!("{x:.5}"));
     format!(
-        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:?},{:?}\n",
+        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:?},{:?},{},{},{},{}\n",
         r.t.as_secs_f64(),
         r.position.x,
         r.position.y,
@@ -305,10 +305,14 @@ fn csv_row(r: &StepRecord<4>) -> String {
         r.wind.z,
         r.status.nav,
         r.status.action,
+        g(est.map(|s| s.velocity.x)),
+        g(est.map(|s| s.velocity.y)),
+        g(est.map(|s| s.velocity.z)),
+        r.status.reasons.0,
     )
 }
 
-const CSV_HEADER: &[u8] = b"t,x,y,z,vx,vy,vz,roll,pitch,yaw,p,q,r,m0,m1,m2,m3,battery_v,battery_a,armed,sp_x,sp_y,sp_z,est_x,est_y,est_z,est_roll,est_pitch,est_yaw,wind_n,wind_e,wind_d,nav,action\n";
+const CSV_HEADER: &[u8] = b"t,x,y,z,vx,vy,vz,roll,pitch,yaw,p,q,r,m0,m1,m2,m3,battery_v,battery_a,armed,sp_x,sp_y,sp_z,est_x,est_y,est_z,est_roll,est_pitch,est_yaw,wind_n,wind_e,wind_d,nav,action,est_vx,est_vy,est_vz,reasons\n";
 
 /// What a finished run reports.
 struct Outcome {
@@ -554,7 +558,7 @@ fn scenario_command(
     println!("about      {}", scenario.about);
     println!("timeline");
     for e in &outcome.events {
-        println!("  {:8.3} s  {:?}", e.t.as_secs_f64(), e.kind);
+        println!("  {}", oxide_sim::outcome::event_line(e));
     }
     let p = outcome.position_at_end;
     println!("navigation {:?}", outcome.nav_sequence);
@@ -575,6 +579,15 @@ fn scenario_command(
         outcome
             .touchdown_speed_mps
             .map_or("none".into(), |v| format!("{v:.2} m/s"))
+    );
+    println!(
+        "disarmed   {} at {}",
+        outcome
+            .disarm_reason
+            .map_or("never".into(), |r| format!("{r:?}")),
+        outcome
+            .disarmed_at_s
+            .map_or("-".into(), |t| format!("{t:.2} s"))
     );
     println!("trace hash {:016x}", sim.trace_hash());
     let violations = scenario.expect.check(&outcome);

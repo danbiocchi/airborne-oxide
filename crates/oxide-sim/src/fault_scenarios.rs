@@ -162,7 +162,7 @@ fn rc_loss_position() -> FaultScenario {
     FaultScenario {
         name: "rc-loss-position",
         about: "Radio lost while the pilot flies Position 15 m out: Hold, then Rtl, and lands at home.",
-        script: position_script(true, 100.0),
+        script: position_script(true, 80.0),
         faults: vec![fault(FaultKind::RcLoss, 25.0)],
         links: LinkConfig::default(),
         failsafe: None,
@@ -173,7 +173,7 @@ fn rc_loss_position() -> FaultScenario {
             ending: Ending::Landed {
                 within_m_of_home: Some(2.0),
             },
-            by_s: 90.0,
+            by_s: 75.0,
             ..Expect::default()
         },
     }
@@ -252,7 +252,7 @@ fn no_human_link() -> FaultScenario {
     FaultScenario {
         name: "no-human-link",
         about: "Radio, then ground station lost in Offboard: after no_link_rtl_s (shortened to 10 s) it returns and lands at home.",
-        script: offboard_script(sp(0.0, 0.0, 5.0), 80.0),
+        script: offboard_script(sp(0.0, 0.0, 5.0), 70.0),
         faults: vec![
             fault(FaultKind::RcLoss, 15.0),
             fault(FaultKind::GcsLoss, 20.0),
@@ -266,7 +266,7 @@ fn no_human_link() -> FaultScenario {
             ending: Ending::Landed {
                 within_m_of_home: Some(2.0),
             },
-            by_s: 70.0,
+            by_s: 65.0,
             ..Expect::default()
         },
     }
@@ -276,7 +276,7 @@ fn gps_loss() -> FaultScenario {
     FaultScenario {
         name: "gps-loss",
         about: "GPS lost for good in Offboard: Hold, then after gps_loss_land_s (shortened to 10 s) Land, and it lands within 40 m of home.",
-        script: offboard_script(sp(0.0, 0.0, 5.0), 80.0),
+        script: offboard_script(sp(0.0, 0.0, 5.0), 70.0),
         faults: vec![fault(FaultKind::GpsLoss, 15.0)],
         links: LinkConfig::default(),
         failsafe: params(|p| p.gps_loss_land_s = 10.0),
@@ -287,7 +287,7 @@ fn gps_loss() -> FaultScenario {
             ending: Ending::Landed {
                 within_m_of_home: Some(40.0),
             },
-            by_s: 70.0,
+            by_s: 65.0,
             ..Expect::default()
         },
     }
@@ -416,7 +416,7 @@ fn brain_scenario(name: &'static str, about: &'static str, kind: FaultKind) -> F
     FaultScenario {
         name,
         about,
-        script: offboard_script(sp(15.0, 0.0, 5.0), 100.0),
+        script: offboard_script(sp(15.0, 0.0, 5.0), 90.0),
         faults: vec![fault(kind, 20.0)],
         links: LinkConfig::default(),
         failsafe: None,
@@ -427,7 +427,7 @@ fn brain_scenario(name: &'static str, about: &'static str, kind: FaultKind) -> F
             ending: Ending::Landed {
                 within_m_of_home: Some(2.0),
             },
-            by_s: 90.0,
+            by_s: 85.0,
             ..Expect::default()
         },
     }
@@ -481,19 +481,19 @@ fn gcs_loss() -> FaultScenario {
 fn battery_low() -> FaultScenario {
     FaultScenario {
         name: "battery-low",
-        about: "The battery runs down to its low level in flight: Rtl, and lands at home.",
-        script: offboard_script(sp(0.0, 0.0, 5.0), 90.0),
+        about: "A small battery runs down to its low level in flight (about 25 s): Rtl, and lands at home.",
+        script: offboard_script(sp(0.0, 0.0, 5.0), 60.0),
         faults: Vec::new(),
         links: LinkConfig::default(),
         failsafe: None,
-        battery: Some(battery(1500.0, 0.15)),
+        battery: Some(battery_tripping_at(SOC_LOW, 25.0)),
         expect: Expect {
             nav_contains: vec![NavState::Rtl],
             reasons: Reasons::BATTERY_LOW,
             ending: Ending::Landed {
                 within_m_of_home: Some(2.0),
             },
-            by_s: 80.0,
+            by_s: 50.0,
             ..Expect::default()
         },
     }
@@ -502,26 +502,26 @@ fn battery_low() -> FaultScenario {
 fn battery_critical() -> FaultScenario {
     FaultScenario {
         name: "battery-critical",
-        about: "The battery runs down through low to critical in flight: the vehicle lands now, wherever it is.",
-        script: offboard_script(sp(0.0, 0.0, 5.0), 90.0),
+        about: "A small battery runs down through low (about 12 s) to critical in flight: LandNow, and it lands. The critical level is raised to 3.4 V because the battery model bottoms out at 3.30 V.",
+        script: offboard_script(sp(0.0, 0.0, 5.0), 50.0),
         faults: Vec::new(),
         links: LinkConfig::default(),
-        failsafe: None,
-        battery: Some(battery(1500.0, 0.06)),
+        failsafe: params(|p| p.battery_critical_v = CRITICAL_V),
+        battery: Some(battery_tripping_at(SOC_LOW, 12.0)),
         expect: Expect {
             nav_contains: vec![NavState::LandNow],
             reasons: Reasons::BATTERY_CRITICAL,
             ending: Ending::Landed {
                 within_m_of_home: None,
             },
-            by_s: 80.0,
+            by_s: 40.0,
             ..Expect::default()
         },
     }
 }
 
 fn geofence() -> FaultScenario {
-    let mut script = offboard_script(sp(0.0, 0.0, 5.0), 100.0);
+    let mut script = offboard_script(sp(0.0, 0.0, 5.0), 80.0);
     script.setpoints.push((15.0, sp(20.0, 0.0, 5.0)));
     FaultScenario {
         name: "geofence",
@@ -538,7 +538,7 @@ fn geofence() -> FaultScenario {
             ending: Ending::Landed {
                 within_m_of_home: Some(2.0),
             },
-            by_s: 90.0,
+            by_s: 75.0,
             ..Expect::default()
         },
     }
@@ -649,6 +649,30 @@ const FAILURES: [(Failure, &str); 7] = [
     (Failure::BaroLoss, "baro-loss"),
 ];
 
+const PAIR_NAMES: [&str; 21] = [
+    "pair-rc-loss+gps-loss",
+    "pair-rc-loss+battery-low",
+    "pair-rc-loss+battery-critical",
+    "pair-rc-loss+brain-crash",
+    "pair-rc-loss+geofence",
+    "pair-rc-loss+baro-loss",
+    "pair-gps-loss+battery-low",
+    "pair-gps-loss+battery-critical",
+    "pair-gps-loss+brain-crash",
+    "pair-gps-loss+geofence",
+    "pair-gps-loss+baro-loss",
+    "pair-battery-low+battery-critical",
+    "pair-battery-low+brain-crash",
+    "pair-battery-low+geofence",
+    "pair-battery-low+baro-loss",
+    "pair-battery-critical+brain-crash",
+    "pair-battery-critical+geofence",
+    "pair-battery-critical+baro-loss",
+    "pair-brain-crash+geofence",
+    "pair-brain-crash+baro-loss",
+    "pair-geofence+baro-loss",
+];
+
 /// Pairings run long enough for the slowest ending.
 const PAIR_DURATION_S: f64 = 110.0;
 /// Time by which a pairing must be down, s.
@@ -669,18 +693,42 @@ impl Failure {
     }
 }
 
-/// Seconds a flight spends from arming until a hover battery at `soc`
-/// reaches the OCV of the given level: see `pair_battery`.
-fn pair_battery(
-    first: Failure,
-    second: Failure,
-    t_first: f64,
-    t_second: f64,
-) -> Option<BatterySpec> {
-    // The battery scenarios depend on how fast the hover drains the pack;
-    // the figures below come from `oxide-sim scenario battery-*`.
-    let _ = (first, second, t_first, t_second);
-    None
+/// Hover drain of the small pairing battery, state of charge per second.
+const PAIR_DRAIN_PER_S: f64 = 0.0048;
+/// Pairing battery capacity, mAh (hover drain 0.0048 of the charge per s).
+const PAIR_CAPACITY_MAH: f64 = 500.0;
+/// Cell voltage the battery model reaches at 2.5 % charge: the critical
+/// level used in the battery scenarios (see `battery_critical`).
+const CRITICAL_V: f32 = 3.4;
+/// Charge at which the model's open-circuit voltage is the low level (3.5 V).
+const SOC_LOW: f64 = 0.05;
+/// Charge at which it is `CRITICAL_V`.
+const SOC_CRITICAL: f64 = 0.025;
+/// Time from arming to the 2 s debounce and the voltage filter having
+/// latched a level that is reached at the same instant, s (measured).
+const LATCH_LAG_S: f64 = 3.0;
+
+/// A small battery that reaches the given level so that its latch comes at
+/// about `t_s` in a hovering flight armed at 3 s.
+fn battery_tripping_at(soc_level: f64, t_s: f64) -> BatterySpec {
+    battery(
+        PAIR_CAPACITY_MAH,
+        soc_level + PAIR_DRAIN_PER_S * (t_s - 3.0 - LATCH_LAG_S),
+    )
+}
+
+/// The battery for a pairing that has a battery failure: the first
+/// battery failure latches at its time (15 s, or 20 s as the second
+/// failure); with both, low at 15 s and critical about 5 s later.
+fn pair_battery(a: Failure, b: Failure) -> Option<BatterySpec> {
+    let first_battery = [(a, 15.0), (b, 20.0)]
+        .into_iter()
+        .find(|(f, _)| matches!(f, Failure::BatteryLow | Failure::BatteryCritical))?;
+    let level = match first_battery.0 {
+        Failure::BatteryLow => SOC_LOW,
+        _ => SOC_CRITICAL,
+    };
+    Some(battery_tripping_at(level, first_battery.1))
 }
 
 /// Every pairing of the seven common failures, one scenario each: the first
@@ -694,7 +742,8 @@ pub fn pairs() -> Vec<FaultScenario> {
     let mut out = Vec::with_capacity(21);
     for (i, &(a, na)) in FAILURES.iter().enumerate() {
         for &(b, nb) in FAILURES.iter().skip(i + 1) {
-            let name: &'static str = Box::leak(format!("pair-{na}+{nb}").into_boxed_str());
+            let name = PAIR_NAMES.get(out.len()).copied().unwrap_or("pair");
+            debug_assert_eq!(name, format!("pair-{na}+{nb}"));
             out.push(pair(name, a, b));
         }
     }
@@ -726,7 +775,8 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
     if matches!(a, Failure::BatteryLow | Failure::BatteryCritical)
         || matches!(b, Failure::BatteryLow | Failure::BatteryCritical)
     {
-        battery_spec = pair_battery(a, b, 15.0, 20.0);
+        battery_spec = pair_battery(a, b);
+        failsafe.battery_critical_v = CRITICAL_V;
     }
     let needed = [a, b]
         .iter()
@@ -801,4 +851,90 @@ pub fn fly(
     let end = Micros((scenario.script.duration_s * 1e6).round() as u64);
     sim.run_until(end, |r| outcome.add(r));
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_unique_and_pairs_are_21() {
+        let mut names: Vec<&str> = all().iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), 20);
+        let p = pairs();
+        assert_eq!(p.len(), 21);
+        names.extend(p.iter().map(|s| s.name));
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate scenario name");
+    }
+
+    #[test]
+    fn pair_names_match_their_failures() {
+        for (i, &(_, na)) in FAILURES.iter().enumerate() {
+            for &(_, nb) in FAILURES.iter().skip(i + 1) {
+                assert!(
+                    by_name(&format!("pair-{na}+{nb}")).is_some(),
+                    "pair-{na}+{nb}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn by_name_finds_scenarios() {
+        assert!(by_name("gps-loss-recovers").is_some());
+        assert!(by_name("no-such-scenario").is_none());
+    }
+
+    #[test]
+    fn every_scenario_builds_and_has_a_sensible_script() {
+        for s in all().into_iter().chain(pairs()) {
+            assert!(
+                build(&s, oxide_core::schedule::F405_LEAN, 0).is_ok(),
+                "{}",
+                s.name
+            );
+            assert!(
+                s.script.duration_s >= s.expect.by_s,
+                "{} ends before by_s",
+                s.name
+            );
+            // Arming into Offboard needs a setpoint from the start.
+            if s.script.mode.first().map(|m| m.1) == Some(2) {
+                assert!(
+                    matches!(s.script.setpoints.first(), Some((t, Some(_))) if *t == 0.0),
+                    "{}",
+                    s.name
+                );
+            }
+            // The scenario is documented.
+            assert!(!s.about.is_empty());
+        }
+    }
+
+    #[test]
+    fn pair_expectation_follows_the_failures() {
+        let p = by_name("pair-gps-loss+baro-loss").expect("pair");
+        assert_eq!(p.expect.min_action, Action::LandNow);
+        let p = by_name("pair-rc-loss+gps-loss").expect("pair");
+        assert_eq!(p.expect.min_action, Action::Land);
+        let p = by_name("pair-rc-loss+geofence").expect("pair");
+        assert_eq!(p.expect.min_action, Action::Rtl);
+        let p = by_name("pair-battery-low+battery-critical").expect("pair");
+        assert_eq!(p.expect.min_action, Action::LandNow);
+        assert!(p.battery.is_some());
+    }
+
+    #[test]
+    fn wind_is_light_and_repeatable() {
+        for seed in 0..50 {
+            let w = fault_wind(seed);
+            assert_eq!(w, fault_wind(seed));
+            assert!(w.steady_ned.norm() <= 2.0 && w.steady_ned.z == 0.0);
+            assert!((0.1..0.4).contains(&w.turbulence_sigma.x));
+            assert!(w.gusts.is_empty());
+        }
+    }
 }
