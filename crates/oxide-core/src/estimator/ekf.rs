@@ -498,6 +498,33 @@ impl<T: Real> Ekf<T> {
         self.fuse_scalar(&h, nu, sigma_rad, gate)
     }
 
+    /// The heading the magnetometer implies given the current tilt: the
+    /// current yaw plus the heading innovation. `None` when the geometry is
+    /// unusable.
+    pub fn mag_heading(&self, mag_body: Vec3<T>) -> Option<T> {
+        let (nu, _) = self.heading_model(mag_body)?;
+        let psi = wrap_pi(self.x.q.yaw() + nu);
+        psi.is_finite().then_some(psi)
+    }
+
+    /// Rotates the attitude about the world down axis so its yaw becomes
+    /// `yaw` (tilt unchanged), sets the heading variance (error index
+    /// `ITH + 2`) to `sigma²` and zeroes its cross-covariances. Returns the
+    /// yaw change applied (zero if an input is not finite).
+    pub fn reset_yaw(&mut self, yaw: T, sigma_rad: T) -> T {
+        if !yaw.is_finite() {
+            return T::ZERO;
+        }
+        let dpsi = wrap_pi(yaw - self.x.q.yaw());
+        if !dpsi.is_finite() {
+            return T::ZERO;
+        }
+        self.x.q =
+            (Quat::from_rotation_vector(Vec3::new(T::ZERO, T::ZERO, dpsi)) * self.x.q).normalized();
+        self.reset_cov(&[ITH + 2], sigma_rad);
+        dpsi
+    }
+
     /// Snaps north/east to `ne`, sets their variance to `sigma²` and zeroes
     /// their cross-covariances. Returns the position change.
     pub fn reset_position_ne(&mut self, ne: [T; 2], sigma_m: T) -> Vec3<T> {

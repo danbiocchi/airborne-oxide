@@ -6,7 +6,7 @@ use crate::config::{ConfigError, EstimatorSource, VehicleConfig};
 use crate::control::{
     AttitudeTarget, PositionController, RateController, RateTarget, attitude_rate_setpoint,
 };
-use crate::estimator::Estimator;
+use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
 use crate::io::{
     BatterySample, EstimatorStatus, FlightMode, ImuSample, Inputs, Outputs, RcSample, Stamped,
@@ -16,8 +16,9 @@ use crate::math::{Quat, Real, Vec3, wrap_pi};
 use crate::schedule::{Profile, TaskId};
 use crate::time::Micros;
 
-/// How old a sample may be before it is treated as missing, µs.
-const STATE_TIMEOUT_US: u64 = 100_000;
+/// How old a sample may be before it is treated as missing, µs (the same
+/// 100 ms the estimator applies to the IMU).
+const STATE_TIMEOUT_US: u64 = IMU_TIMEOUT_US;
 const RC_TIMEOUT_US: u64 = 500_000;
 const SETPOINT_TIMEOUT_US: u64 = 500_000;
 const BATTERY_TIMEOUT_US: u64 = 1_000_000;
@@ -270,8 +271,9 @@ impl<const N: usize> Core<N> {
     }
 
     fn fresh<T: Copy>(sample: Option<Stamped<T>>, now: Micros, timeout_us: u64) -> Option<T> {
+        // A sample stamped in the future is corrupt, not fresh.
         sample
-            .filter(|s| now.since(s.t_arrival) <= timeout_us)
+            .filter(|s| s.t_arrival <= now && now.since(s.t_arrival) <= timeout_us)
             .map(|s| s.value)
     }
 
@@ -326,7 +328,9 @@ impl<const N: usize> Core<N> {
                 s.killed = false;
             }
             let rising = rc.arm_switch && !self.sup_state.prev_arm_switch;
-            let have_estimate = self.estimate.visible.is_some();
+            let have_estimate = self.estimate.visible.is_some()
+                && (self.cfg.estimator.source != EstimatorSource::Ekf
+                    || self.estimator.status().gps_aiding);
             if !s.armed && rising && !s.killed && rc.throttle < ARM_MAX_THROTTLE && have_estimate {
                 s.armed = true;
             }
@@ -784,5 +788,92 @@ mod tests {
             Core::new(c, F405_LEAN).err(),
             Some(ConfigError::BadEstimator)
         );
+    }
+
+    #[test]
+    fn ekf_mode_imu_stall_drops_the_estimate() {
+        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
+        for k in 0..3000u64 {
+            core.tick(Micros(k * 1000), &ekf_inputs(k, rc(false, false)));
+        }
+        // Arm with a fresh rising edge.
+        let mut out = Outputs::off(Micros::ZERO);
+        for k in 3000..3300u64 {
+            out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(true, false)));
+        }
+        assert!(out.status.armed && !out.status.no_estimate);
+        // The IMU stops; everything else continues.
+        let mut flagged = None;
+        for k in 3300..3600u64 {
+            let mut i = ekf_inputs(k, rc(true, false));
+            i.imu = None;
+            out = core.tick(Micros(k * 1000), &i);
+            if out.status.no_estimate && flagged.is_none() {
+                flagged = Some(k - 3300);
+            }
+        }
+        let after = flagged.expect("no_estimate must be set");
+        assert!(after <= 150, "took {after} ms");
+        assert!(core.estimate().is_none());
+    }
+
+    #[test]
+    fn ekf_mode_arming_needs_gps_aiding() {
+        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
+        let step = |core: &mut Core<4>, k: u64, arm: bool, gps: bool| {
+            let mut i = ekf_inputs(k, rc(arm, false));
+            if !gps {
+                i.gps = None;
+            }
+            core.tick(Micros(k * 1000), &i)
+        };
+        for k in 0..3000u64 {
+            step(&mut core, k, false, true);
+        }
+        let out = step(&mut core, 3000, false, true);
+        assert!(out.status.estimator.gps_aiding);
+        // GPS lost for longer than the timeout (5 s) plus a second.
+        for k in 3001..9000u64 {
+            step(&mut core, k, false, false);
+        }
+        let mut armed = false;
+        for k in 9000..9150u64 {
+            let out = step(&mut core, k, true, false);
+            assert!(
+                core.estimate().is_some(),
+                "dead reckoning keeps the estimate"
+            );
+            assert!(!out.status.estimator.gps_aiding);
+            armed |= out.status.armed;
+        }
+        assert!(!armed, "must not arm without GPS aiding");
+        // GPS resumes; once fused, a new rising edge arms.
+        for k in 9150..9800u64 {
+            step(&mut core, k, false, true);
+        }
+        let out = step(&mut core, 9800, false, true);
+        assert!(out.status.estimator.gps_aiding);
+        let mut armed = false;
+        for k in 9801..10000u64 {
+            armed |= step(&mut core, k, true, true).status.armed;
+        }
+        assert!(armed, "arms again once GPS aids");
+    }
+
+    #[test]
+    fn a_future_stamped_sample_is_not_fresh() {
+        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+        run(&mut core, 0, 100, rc(false, false));
+        let mut armed = false;
+        for k in 100..200u64 {
+            let t = Micros(k * 1000);
+            let ahead = t.add_us(10_000_000);
+            let mut i = inputs(t, RcSample::default());
+            i.rc = Some(Stamped::ideal(ahead, rc(true, false)));
+            armed |= core.tick(t, &i).status.armed;
+        }
+        assert!(!armed, "a frame from the future must be ignored");
+        let out = run(&mut core, 200, 100, rc(true, false));
+        assert!(out.status.armed, "normal frames afterwards still work");
     }
 }

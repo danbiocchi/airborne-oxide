@@ -20,10 +20,10 @@ use crate::config::{ConfigError, EkfParams};
 use crate::io::{
     BaroSample, EstimatorStatus, GpsSample, ImuSample, MagSample, Stamped, StateSample,
 };
-use crate::math::{Real, Vec3};
+use crate::math::{Quat, Real, Vec3};
 use crate::schedule::Profile;
 use crate::time::Micros;
-use ekf::{Ekf, Fusion, GYRO_BIAS_LIMIT, initial_attitude};
+use ekf::{Ekf, Fusion, GYRO_BIAS_LIMIT, heading_from_mag, tilt_from_accel};
 use imu::{ImuAccumulator, ImuDelta};
 use output::OutputPredictor;
 use ring::Ring;
@@ -34,6 +34,10 @@ pub const IMU_BUFFER: usize = 64;
 pub const GPS_BUFFER: usize = 8;
 /// Barometer and magnetometer ring capacity.
 pub const OBS_BUFFER: usize = 32;
+
+/// Longest gap between accepted IMU samples before the estimate is dropped
+/// (ADR-0001 item 4: state staleness), µs.
+pub const IMU_TIMEOUT_US: u64 = 100_000;
 
 /// Stillness test for alignment: mean specific force within these multiples
 /// of g, and mean rate under `STILL_RATE` rad/s.
@@ -82,6 +86,8 @@ pub struct Estimator {
     period_ticks: u64,
     /// Filter period, s.
     filter_dt: f32,
+    /// Base tick, s (for the IMU accumulator).
+    base_dt: f32,
     ticks: u64,
 
     acc: ImuAccumulator,
@@ -98,6 +104,11 @@ pub struct Estimator {
     /// End time of the last delta the EKF consumed (its current time).
     t_ekf: Micros,
     gps: GpsTrack,
+    /// The yaw comes from the magnetometer (alignment saw one, or the first
+    /// usable reading since reset the heading).
+    heading_ok: bool,
+    /// `t_arrival` of the last IMU sample accepted.
+    last_imu_arrival: Option<Micros>,
     raw_gyro: Vec3<f32>,
     rejected: u32,
     resets: u32,
@@ -157,6 +168,7 @@ impl Estimator {
             gps_timeout_us: u64::from(p.gps_timeout_us),
             period_ticks: u64::from(profile.filter_period_ticks),
             filter_dt: profile.filter_dt(),
+            base_dt: profile.base_dt(),
             ticks: 0,
             acc: ImuAccumulator::new(profile.base_dt()),
             imu_ring: Ring::new(),
@@ -169,6 +181,8 @@ impl Estimator {
             baro_ref: None,
             t_ekf: Micros::ZERO,
             gps: GpsTrack::default(),
+            heading_ok: false,
+            last_imu_arrival: None,
             raw_gyro: Vec3::zero(),
             rejected: 0,
             resets: 0,
@@ -183,6 +197,7 @@ impl Estimator {
             return;
         };
         self.raw_gyro = v.gyro;
+        self.last_imu_arrival = Some(s.t_arrival);
         if let Some(ekf) = &self.ekf {
             self.output
                 .propagate(s.t_sample, v.gyro, v.accel, dt, ekf.x.bg, ekf.x.ba);
@@ -227,6 +242,13 @@ impl Estimator {
     /// Once per base tick, after this tick's samples were pushed. Every
     /// `filter_period_ticks`-th call runs the filter step.
     pub fn update(&mut self, now: Micros) {
+        if self.ekf.is_some()
+            && self
+                .last_imu_arrival
+                .is_none_or(|t| now.since(t) > IMU_TIMEOUT_US)
+        {
+            self.drop_to_unaligned();
+        }
         self.ticks = self.ticks.saturating_add(1);
         if !self.ticks.is_multiple_of(self.period_ticks) {
             return;
@@ -241,10 +263,11 @@ impl Estimator {
         }
     }
 
-    /// Current-time estimate: `Some` once aligned and GPS has been fused at
-    /// least once, and everything is finite.
+    /// Current-time estimate: `Some` once aligned, the heading is
+    /// initialised and GPS has been fused at least once, and everything is
+    /// finite.
     pub fn estimate(&self) -> Option<StateSample> {
-        if self.ekf.is_none() || !self.gps.fused {
+        if self.ekf.is_none() || !self.heading_ok || !self.gps.fused {
             return None;
         }
         let o = self.output.state();
@@ -276,7 +299,7 @@ impl Estimator {
             && self.t_ekf.since(self.gps.last_accept) <= self.gps_timeout_us
             && self.ekf.is_some();
         EstimatorStatus {
-            aligned: self.ekf.is_some(),
+            aligned: self.ekf.is_some() && self.heading_ok,
             gps_aiding: aiding,
             rejected: self.rejected,
             resets: self.resets,
@@ -293,6 +316,26 @@ impl Estimator {
     fn restart_alignment(&mut self) {
         self.window = AlignWindow::default();
         self.imu_ring.clear();
+        // Fixes measured before the vehicle was still say nothing about
+        // where it is now.
+        self.gps_ring.clear();
+    }
+
+    /// An IMU stall made the dead-reckoned state untrustworthy: back to the
+    /// unaligned state, counted as a reset.
+    fn drop_to_unaligned(&mut self) {
+        self.ekf = None;
+        self.acc = ImuAccumulator::new(self.base_dt);
+        self.imu_ring.clear();
+        self.gps_ring.clear();
+        self.baro_ring.clear();
+        self.mag_ring.clear();
+        self.window = AlignWindow::default();
+        self.baro_ref = None;
+        self.gps = GpsTrack::default();
+        self.heading_ok = false;
+        self.last_imu_arrival = None;
+        self.resets = self.resets.saturating_add(1);
     }
 
     /// Drains the mag and baro rings into the running means.
@@ -349,10 +392,13 @@ impl Estimator {
         let w = self.window;
         let accel = w.dvel * (1.0 / w.dt);
         let mag = (w.mag_n > 0).then_some(w.mag_mean);
-        let Some(q0) = initial_attitude(accel, mag, self.params.mag_declination_rad) else {
+        let Some((roll, pitch)) = tilt_from_accel(accel) else {
             self.restart_alignment();
             return;
         };
+        let heading =
+            mag.and_then(|m| heading_from_mag(m, roll, pitch, self.params.mag_declination_rad));
+        let q0 = Quat::from_euler(roll, pitch, heading.unwrap_or(0.0));
         let mut ekf = Ekf::new(&self.params, q0);
         // At rest the mean gyro rate is the turn-on bias (Earth rate is
         // negligible).
@@ -369,6 +415,15 @@ impl Estimator {
         self.t_ekf = self.imu_ring.front().map_or(now, |d| {
             Micros(d.t_end.0.saturating_sub(secs_to_micros(d.dt)))
         });
+        self.heading_ok = heading.is_some();
+        // Drop fixes measured before the filter's start time.
+        for _ in 0..self.gps_ring.len() {
+            if let Some(g) = self.gps_ring.pop_front()
+                && g.t_sample >= self.t_ekf
+            {
+                self.gps_ring.push(g);
+            }
+        }
         self.window = AlignWindow::default();
     }
 
@@ -443,6 +498,17 @@ impl Estimator {
 
     fn fuse_mag(&mut self, ekf: &mut Ekf<f32>, s: &Stamped<MagSample>) {
         if !s.value.field_ut.is_finite() {
+            return;
+        }
+        if !self.heading_ok {
+            // No heading at alignment: take the first usable reading as the
+            // heading instead of gating it against a guess.
+            if let Some(psi) = ekf.mag_heading(s.value.field_ut) {
+                let dpsi = ekf.reset_yaw(psi, self.params.init_yaw_sigma_rad);
+                self.output.rotate_yaw(dpsi);
+                self.heading_ok = true;
+                self.resets = self.resets.saturating_add(1);
+            }
             return;
         }
         let f = ekf.fuse_mag_heading(s.value.field_ut, self.params.yaw_noise_rad);
@@ -536,6 +602,7 @@ fn micros_to_s(us: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::wrap_pi;
     use crate::schedule::{F405_LEAN, H743_FULL};
 
     const MAG: Vec3<f32> = Vec3::new(25.0, 0.0, 43.3);
@@ -547,7 +614,14 @@ mod tests {
         accel: Vec3<f32>,
         gyro: Vec3<f32>,
         gps_pos: Vec3<f32>,
+        gps_vel: Vec3<f32>,
         gps_latency_us: u64,
+        /// Body-frame magnetic field the rig reports.
+        mag_field: Vec3<f32>,
+        /// No magnetometer samples before this time, µs.
+        mag_from_us: u64,
+        /// False stops the IMU samples (updates continue).
+        imu_on: bool,
         /// Pending GPS fixes as (arrival, sample).
         pending: [Option<(Micros, Stamped<GpsSample>)>; 4],
     }
@@ -560,7 +634,11 @@ mod tests {
                 accel: Vec3::new(0.0, 0.0, -GRAVITY),
                 gyro: Vec3::zero(),
                 gps_pos: Vec3::zero(),
+                gps_vel: Vec3::zero(),
                 gps_latency_us: 150_000,
+                mag_field: MAG,
+                mag_from_us: 0,
+                imu_on: true,
                 pending: [None; 4],
             }
         }
@@ -576,17 +654,23 @@ mod tests {
                 gyro: self.gyro,
                 accel: self.accel,
             };
-            self.est.push_imu(&Stamped::ideal(t, imu));
+            if self.imu_on {
+                self.est.push_imu(&Stamped::ideal(t, imu));
+            }
             if t.0.is_multiple_of(20_000) {
                 let alt = BaroSample { altitude_m: 123.0 };
                 self.est.push_baro(&Stamped::ideal(t, alt));
-                self.est
-                    .push_mag(&Stamped::ideal(t, MagSample { field_ut: MAG }));
+                if t.0 >= self.mag_from_us {
+                    let m = MagSample {
+                        field_ut: self.mag_field,
+                    };
+                    self.est.push_mag(&Stamped::ideal(t, m));
+                }
             }
             if t.0.is_multiple_of(200_000) {
                 let g = GpsSample {
                     position: self.gps_pos,
-                    velocity: Vec3::zero(),
+                    velocity: self.gps_vel,
                     h_acc_m: 0.6,
                     v_acc_m: 1.0,
                     s_acc_mps: 0.2,
@@ -820,6 +904,9 @@ mod tests {
                 accel: Vec3::new(0.0, 0.0, -GRAVITY),
             };
             est.push_imu(&Stamped::ideal(t, imu));
+            if k % 80 == 0 {
+                est.push_mag(&Stamped::ideal(t, MagSample { field_ut: MAG }));
+            }
             est.update(t);
         }
         assert!(est.status().aligned);
@@ -978,5 +1065,78 @@ mod tests {
             "attitude error {} deg",
             worst_a.to_degrees()
         );
+    }
+
+    #[test]
+    fn heading_is_initialised_from_the_first_magnetometer_sample() {
+        use crate::math::Quat;
+        let yaw = 120.0_f32.to_radians();
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.mag_field = Quat::from_euler(0.0, 0.0, yaw).inverse_rotate(MAG);
+        // Alignment would complete at about 1 s; the magnetometer starts at 3 s.
+        rig.mag_from_us = 3_000_000;
+        while rig.now().0 < 3_000_000 {
+            rig.tick();
+            assert!(rig.est.estimate().is_none(), "no estimate without heading");
+            assert!(!rig.est.status().aligned, "not aligned without heading");
+        }
+        rig.run_until(4.0);
+        let e = rig.est.estimate().expect("estimate within 1 s of the mag");
+        let err = wrap_pi(e.attitude.yaw() - yaw).abs();
+        assert!(err < 2.0_f32.to_radians(), "yaw error {err} rad");
+        assert!(rig.est.status().aligned);
+        let rejected = rig.est.status().rejected;
+        rig.run_until(9.0);
+        assert_eq!(rig.est.status().rejected, rejected, "mag must not be gated");
+        let e = rig.est.estimate().unwrap();
+        assert!(wrap_pi(e.attitude.yaw() - yaw).abs() < 2.0_f32.to_radians());
+    }
+
+    #[test]
+    fn imu_stall_invalidates_the_estimate_and_realigns() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(3.0);
+        assert!(rig.est.estimate().is_some());
+        let resets = rig.est.status().resets;
+        rig.imu_on = false;
+        rig.run_until(3.15);
+        assert!(rig.est.estimate().is_none());
+        assert!(!rig.est.status().aligned);
+        assert!(!rig.est.status().gps_aiding);
+        assert_eq!(rig.est.status().resets, resets + 1);
+        // IMU resumes with the rig still: aligns again, then GPS gives an estimate.
+        rig.imu_on = true;
+        rig.run_until(3.15 + 0.5);
+        assert!(!rig.est.status().aligned, "needs the full align time");
+        rig.run_until(3.15 + 1.3);
+        assert!(rig.est.status().aligned);
+        rig.run_until(3.15 + 3.0);
+        assert!(rig.est.estimate().is_some(), "estimate after the next fix");
+        assert!(rig.est.status().gps_aiding);
+    }
+
+    #[test]
+    fn gps_fixes_from_before_the_still_window_are_not_fused() {
+        let mut rig = Rig::new(&EkfParams::default());
+        // Moved around for 1 s: alignment keeps restarting.
+        rig.accel = Vec3::new(8.0, 0.0, -15.0);
+        rig.gps_pos = Vec3::new(10.0, 0.0, 0.0);
+        rig.gps_vel = Vec3::new(3.0, 0.0, 0.0);
+        rig.run_until(1.0);
+        // Set down.
+        rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
+        rig.gps_pos = Vec3::new(30.0, 0.0, 0.0);
+        rig.gps_vel = Vec3::zero();
+        let mut first = None;
+        while rig.now().as_secs_f64() < 9.0 {
+            rig.tick();
+            if let Some(e) = rig.est.estimate() {
+                first.get_or_insert(rig.now());
+                let dp = (e.position - Vec3::new(30.0, 0.0, 0.0)).norm();
+                assert!(dp < 1.0, "p = {:?} at {:?}", e.position, rig.now());
+                assert!(e.velocity.norm() < 0.3, "v = {:?}", e.velocity);
+            }
+        }
+        assert!(first.is_some(), "estimate must appear");
     }
 }

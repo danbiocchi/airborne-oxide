@@ -147,6 +147,18 @@ impl OutputPredictor {
         });
     }
 
+    /// Applies a world-frame yaw change made by the EKF (a heading reset)
+    /// to the current attitude and every history attitude. Position and
+    /// velocity are world-frame and do not change.
+    pub fn rotate_yaw(&mut self, dpsi: f32) {
+        if !dpsi.is_finite() {
+            return;
+        }
+        let r = Quat::from_rotation_vector(Vec3::new(0.0, 0.0, dpsi));
+        self.state.q = (r * self.state.q).normalized();
+        self.history.for_each_mut(|s| s.q = (r * s.q).normalized());
+    }
+
     pub fn state(&self) -> &OutputState {
         &self.state
     }
