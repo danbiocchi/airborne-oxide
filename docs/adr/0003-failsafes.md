@@ -52,7 +52,9 @@ What the vehicle is doing is one `NavState`:
 
 **Touchdown.** The vehicle is landed when, for 1 s, the commanded thrust is below 30 % of hover thrust and the estimated vertical speed is below 0.25 m/s. In `Rtl`, `Land` and `LandNow`, touchdown disarms the vehicle.
 
-**On the ground.** A failsafe action that begins while the vehicle is landed disarms it at once. An armed vehicle sitting on the ground that loses its radio link must not take off to "return".
+**Ground contact.** A descent controller pushing against the ground never winds its thrust down to 30 %: its integral limit stops it at about 40 %. So when a descent is commanded, the vehicle is not descending, and thrust is already low for 0.5 s, guidance drops to minimum thrust, which lets touchdown be detected. This applies in the landing states and when the pilot holds the throttle down in `Altitude` or `Position`. If the vehicle does start to move, the cut ends. A landing with no height or speed estimate at all cuts to minimum thrust after a fixed time, so it cannot sit on the ground under power for ever.
+
+**On the ground.** A failsafe action that begins while the vehicle is landed disarms it at once. An armed vehicle sitting on the ground that loses its radio link must not take off to "return". For this rule alone "landed" is wider than touchdown: a pilot state with thrust below half of hover and no vertical speed for 0.2 s also counts. A vehicle in the air at half thrust is accelerating downwards, so it cannot meet that test.
 
 ### 3. Failsafe events and default actions
 
