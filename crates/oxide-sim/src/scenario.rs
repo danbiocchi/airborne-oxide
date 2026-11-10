@@ -54,7 +54,7 @@ impl Default for HoverStep {
                 wp(11.0, 1.0, 0.0, -2.0, core::f32::consts::FRAC_PI_2),
                 wp(15.0, 1.0, 1.0, -3.0, core::f32::consts::FRAC_PI_2),
             ],
-            arm_at_s: 0.5,
+            arm_at_s: 1.5,
             duration_s: 20.0,
         }
     }

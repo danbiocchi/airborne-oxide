@@ -109,10 +109,11 @@ Arming needs a rising edge of the arm switch with no pre-arm check failing. Each
 | `NOT_STILL` | Body rate above 0.1 rad/s |
 | `ESTIMATOR` | `attitude` or `heading` invalid, or `altitude` invalid |
 | `POSITION` | The selected mode is Position or Offboard and `position` is invalid |
+| `LINK` | The selected mode is Offboard and the brain heartbeat or the tier-2 setpoints are not live |
 | `BATTERY` | No fresh battery reading, cell voltage outside 3.0–4.35 V, or `BATTERY_LOW` latched |
 | `CONFIG` | The configuration failed validation |
 
-A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
+A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. A vehicle armed without a position (Stabilized or Altitude, GPS not yet locked) gets its home at the first run where `position` becomes valid while armed; until then `Rtl` behaves as `Hold`. Home is never overwritten in flight and is cleared on disarm. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
 
 ### 7. Events
 

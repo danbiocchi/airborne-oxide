@@ -335,6 +335,8 @@ bitset! {
         BATTERY = 6;
         /// The configuration failed validation.
         CONFIG = 7;
+        /// Offboard is selected and the brain or its setpoints are not live.
+        LINK = 8;
     }
 }
 
