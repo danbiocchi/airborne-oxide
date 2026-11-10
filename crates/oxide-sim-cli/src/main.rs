@@ -55,7 +55,13 @@ struct Args {
 }
 
 fn parse() -> Result<Args, String> {
-    let mut it = std::env::args().skip(1);
+    parse_from(std::env::args().skip(1))
+}
+
+/// Options `montecarlo` honours; any other would be silently ignored.
+const MONTECARLO_OPTIONS: &[&str] = &["--profile", "--seeds", "--threads"];
+
+fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let command = it
         .next()
         .ok_or("missing command: run | hash | montecarlo")?;
@@ -71,7 +77,9 @@ fn parse() -> Result<Args, String> {
         seeds: 200,
         threads: 0,
     };
+    let mut given: Vec<String> = Vec::new();
     while let Some(flag) = it.next() {
+        given.push(flag.clone());
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
             "--profile" => {
@@ -117,6 +125,9 @@ fn parse() -> Result<Args, String> {
                 args.seeds = v
                     .parse()
                     .map_err(|_| format!("--seeds needs a non-negative integer, got {v}"))?;
+                if args.seeds == 0 {
+                    return Err("--seeds must be at least 1".into());
+                }
             }
             "--threads" => {
                 let v = value()?;
@@ -131,6 +142,15 @@ fn parse() -> Result<Args, String> {
         return Err(format!(
             "unknown command {} (run | hash | montecarlo)",
             args.command
+        ));
+    }
+    if args.command == "montecarlo"
+        && let Some(bad) = given
+            .iter()
+            .find(|g| g.starts_with("--") && !MONTECARLO_OPTIONS.contains(&g.as_str()))
+    {
+        return Err(format!(
+            "option {bad} does not apply to montecarlo (only --profile, --seeds, --threads)"
         ));
     }
     Ok(args)
@@ -449,6 +469,7 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
         worst("estimate max velocity (m/s)", |m| m.est_max_vel_error_mps);
         worst("estimate max attitude (deg)", |m| m.est_max_att_error_deg);
         worst("rejected measurements", |m| f64::from(m.rejected));
+        worst("physics faults", |m| f64::from(m.physics_faults));
     }
     println!("passed {passed}/{}", runs.len());
     println!("wall time {wall_s:.1} s");
@@ -482,5 +503,51 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(args: &[&str]) -> Result<Args, String> {
+        parse_from(args.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn montecarlo_rejects_zero_seeds() {
+        let e = p(&["montecarlo", "--seeds", "0"]).err().expect("error");
+        assert!(e.contains("--seeds"), "{e}");
+    }
+
+    #[test]
+    fn montecarlo_rejects_options_it_ignores() {
+        let e = p(&["montecarlo", "--estimator", "truth", "--sensors", "ideal"])
+            .err()
+            .expect("error");
+        assert!(e.contains("--estimator"), "{e}");
+        let e = p(&["montecarlo", "--seed", "3"]).err().expect("error");
+        assert!(e.contains("--seed"), "{e}");
+    }
+
+    #[test]
+    fn montecarlo_accepts_its_own_options() {
+        let a = p(&[
+            "montecarlo",
+            "--profile",
+            "h743",
+            "--seeds",
+            "5",
+            "--threads",
+            "2",
+        ])
+        .expect("valid");
+        assert_eq!((a.seeds, a.threads), (5, 2));
+        assert_eq!(a.profile.name, H743_FULL.name);
+    }
+
+    #[test]
+    fn run_still_accepts_estimator_and_sensors() {
+        assert!(p(&["run", "--estimator", "truth", "--sensors", "ideal"]).is_ok());
     }
 }

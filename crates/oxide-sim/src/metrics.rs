@@ -77,6 +77,8 @@ pub struct HoldMetrics {
     pub rejected: u32,
     /// From the last record's `status.estimator`.
     pub resets: u32,
+    /// From the last record: non-finite physics steps so far.
+    pub physics_faults: u32,
     sum_sq_h: f64,
     window_ticks: u64,
 }
@@ -104,6 +106,7 @@ impl HoldMetrics {
             timing_faults: 0,
             rejected: 0,
             resets: 0,
+            physics_faults: 0,
             sum_sq_h: 0.0,
             window_ticks: 0,
         }
@@ -122,6 +125,7 @@ impl HoldMetrics {
         self.timing_faults = r.status.timing_faults;
         self.rejected = r.status.estimator.rejected;
         self.resets = r.status.estimator.resets;
+        self.physics_faults = r.physics_faults;
 
         if t >= c.armed_from_s {
             if !r.status.armed {
@@ -245,6 +249,9 @@ impl HoldMetrics {
         if self.timing_faults > 0 {
             out.push(format!("{} timing faults", self.timing_faults));
         }
+        if self.physics_faults > 0 {
+            out.push(format!("{} non-finite physics steps", self.physics_faults));
+        }
         if self.resets > 1 {
             out.push(format!(
                 "{} estimator resets (1 expected: first GPS fix)",
@@ -305,6 +312,7 @@ mod tests {
                 rate: Vec3::zero(),
             }),
             wind: Vec3::zero(),
+            physics_faults: 0,
         }
     }
 
@@ -380,6 +388,23 @@ mod tests {
         m.add(&none, target(), &c);
         assert_eq!(m.no_estimate_ticks, 1);
         assert!(!m.passed(&c));
+    }
+
+    #[test]
+    fn a_physics_fault_fails_the_run() {
+        let c = HoldCriteria::default();
+        let mut m = HoldMetrics::new();
+        m.add(&rec(16.0, target()), target(), &c);
+        assert!(m.passed(&c), "{:?}", m.failures(&c));
+        let mut bad = rec(17.0, target());
+        bad.physics_faults = 1;
+        m.add(&bad, target(), &c);
+        assert_eq!(m.physics_faults, 1);
+        assert!(
+            m.failures(&c)
+                .iter()
+                .any(|f| f.contains("non-finite physics"))
+        );
     }
 
     #[test]

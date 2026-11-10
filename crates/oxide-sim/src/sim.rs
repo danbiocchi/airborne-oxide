@@ -81,6 +81,9 @@ pub struct StepRecord<const N: usize> {
     pub estimate: Option<StateSample>,
     /// Wind (air-mass velocity, NED, m/s) acting during this tick.
     pub wind: Vec3<f64>,
+    /// Physics steps so far that produced a non-finite state (the vehicle
+    /// was frozen in place instead). Must be 0 in a healthy run.
+    pub physics_faults: u32,
 }
 
 pub struct Simulation<P: Pilot, const N: usize> {
@@ -99,6 +102,7 @@ pub struct Simulation<P: Pilot, const N: usize> {
     pending: Option<Outputs<N>>,
     specific_force_world: Vec3<f64>,
     hash: TraceHash,
+    physics_faults: u32,
 }
 
 impl<P: Pilot, const N: usize> Simulation<P, N> {
@@ -140,6 +144,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             pending: None,
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
             hash: TraceHash::default(),
+            physics_faults: 0,
         })
     }
 
@@ -169,6 +174,10 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     }
     pub fn wind(&self) -> &Wind {
         &self.wind
+    }
+    /// Physics steps so far that produced a non-finite state.
+    pub fn physics_faults(&self) -> u32 {
+        self.physics_faults
     }
     /// Hash of every state so far (DESIGN §5.2 item 6).
     pub fn trace_hash(&self) -> u64 {
@@ -231,6 +240,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             setpoint,
             estimate: self.core.estimate(),
             wind,
+            physics_faults: self.physics_faults,
         };
         self.integrate(wind);
         self.pending = Some(out);
@@ -249,7 +259,8 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         let mut next = self.model.rk4(&self.body, &cmd, self.dt, wind);
         ground_contact(&mut next);
         if !next.is_finite() {
-            // Never propagate NaN: freeze and let tests catch the anomaly.
+            // Never propagate NaN: freeze, and count it so the run can fail.
+            self.physics_faults = self.physics_faults.saturating_add(1);
             next = self.body;
             next.velocity = Vec3::zero();
             next.rate = Vec3::zero();

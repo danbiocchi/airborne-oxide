@@ -87,3 +87,21 @@ fn gust_hold_is_deterministic_per_index() {
     assert_eq!(a.estimator, EstimatorSource::Ekf);
     assert_eq!(a.wind.gusts.len(), 3);
 }
+
+#[test]
+fn a_non_finite_body_state_is_counted_as_a_physics_fault() {
+    let a = Airframe::reference_quad().expect("reference airframe");
+    let mut sim = Simulation::<_, 4>::new(&a, F405_LEAN, HoverStep::default()).expect("sim");
+    for _ in 0..10 {
+        assert_eq!(sim.step().physics_faults, 0);
+    }
+    assert_eq!(sim.physics_faults(), 0);
+    let mut body = *sim.body();
+    body.velocity.x = f64::NAN;
+    sim.set_body(body);
+    let _ = sim.step();
+    // The record carries the count so far, including the faulty step.
+    let next = sim.step();
+    assert!(next.physics_faults >= 1, "faults {}", next.physics_faults);
+    assert!(sim.physics_faults() >= 1);
+}
