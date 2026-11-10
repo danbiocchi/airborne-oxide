@@ -31,7 +31,7 @@ fn hover_step_meets_requirements(profile: Profile) {
     let (log, _) = fly(profile, HoverStep::default(), 20);
     let name = profile.name;
 
-    for r in window(&log, 0.0, 0.5) {
+    for r in window(&log, 0.0, 1.5) {
         assert!(
             !r.status.armed && r.motors == [0.0; 4],
             "{name}: motors must be off before arming"
