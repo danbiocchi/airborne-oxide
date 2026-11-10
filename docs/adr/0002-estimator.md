@@ -23,6 +23,8 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
    - **Gates** in standard deviations: GPS 5, baro 5, heading 3 (PX4 defaults).
 
 6. **Alignment.** The vehicle must be still for `align_time_us` (1 s). Tilt comes from the mean specific force, heading from the mean magnetometer field, and the initial gyro bias from the mean rate over the still window. Without that last step the turn-on bias drifts the heading by several degrees before the filter learns it.
+   - **Heading is required.** If no usable magnetometer reading reached the still window, the filter starts without a heading, reports itself not aligned, and publishes no estimate. The first usable reading then sets the heading directly. Starting at heading 0 with an ordinary variance would instead make the gate reject every later reading.
+   - **GPS fixes from before the still window are discarded**, so a vehicle that was carried and then set down does not start from a position and velocity measured while it was moving.
 
 7. **Numerical hygiene.** Covariance is symmetrised and its diagonal clamped after every prediction and fusion. A non-finite diagonal resets the covariance and is counted. Bias states are clamped to PX4's limits (gyro 0.15 rad/s, accel 0.4 m/s²). The covariance-reset Jacobian after injection is neglected, as in PX4.
 
@@ -30,7 +32,9 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
 
 9. **Accelerometer-bias prior.** `init_accel_bias_sigma` is 0.1 m/s², not PX4's 0.2. In hover a horizontal accelerometer bias cannot be told from a tilt error, so the filter's tilt uncertainty settles at about prior/g, and the estimate is free to wander that far. The simulated IMU's switch-on bias is 0.05 m/s² (a calibrated sensor); the prior allows twice that. Over 200 gust-hold seeds the worst attitude error in flight fell from 2.9° to 2.1°. What remains is a 3σ accelerometer bias seen through the magnetic dip. Yawing the vehicle or a better accelerometer calibration reduces it further.
 
-10. **The estimate seen by controllers** exists once the filter is aligned and GPS has been fused once. Dead reckoning continues after a GPS timeout. Position-invalid handling and attitude-only flight belong to the M1c failsafes.
+10. **The estimate seen by controllers** exists once the filter is aligned (tilt and heading) and GPS has been fused once. Dead reckoning continues after a GPS timeout in flight; arming needs GPS to be aiding. Position-invalid handling and attitude-only flight belong to the M1c failsafes.
+
+11. **IMU stall.** If no IMU sample arrives for 100 ms (ADR-0001's state-staleness limit), the estimator drops its solution and has to align again, which needs the vehicle still. The estimate is reported missing from that moment. Recovering an estimate in the air after an IMU gap belongs to the M1c failsafes.
 
 ## Consequences
 
@@ -45,3 +49,5 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
 - 3-axis magnetometer fusion with field and bias states.
 - Wind and drag-specific-force states (rotor-drag fusion as in PX4's `EKF2_MCOEF`).
 - Selecting f64 on the H743 profile.
+- A heading reset after sustained magnetometer rejection. It needs an independent check of heading (GPS velocity during acceleration) to be safe near magnetic disturbances.
+- Keeping the covariance consistent when a bias state hits its clamp. Today the clamp is invisible to the covariance, as in PX4.
