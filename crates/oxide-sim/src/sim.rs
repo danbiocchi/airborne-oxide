@@ -8,7 +8,7 @@
 //! 3. integrate physics over `[t, t + base]` with the command valid at `t`.
 
 use oxide_core::Core;
-use oxide_core::config::EstimatorSource;
+use oxide_core::config::{EstimatorSource, FailsafeParams};
 use oxide_core::io::{
     BrainHeartbeat, EventList, GcsHeartbeat, Inputs, Outputs, RcSample, Stamped, StateSample,
     Status, TrajectorySetpoint,
@@ -18,7 +18,7 @@ use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
 
 use crate::SimError;
-use crate::airframe::Airframe;
+use crate::airframe::{Airframe, BatterySpec};
 use crate::battery::Battery;
 use crate::faults::{
     BRAIN_HEARTBEAT_PERIOD_US, Fault, FaultKind, GCS_HEARTBEAT_PERIOD_US, LinkConfig, active_at,
@@ -45,6 +45,10 @@ pub struct SimOptions {
     pub faults: Vec<Fault>,
     /// Ground-station and brain links (brain only by default).
     pub links: LinkConfig,
+    /// Replaces the airframe's failsafe parameters (None = the defaults).
+    pub failsafe: Option<FailsafeParams>,
+    /// Replaces the airframe's battery (for low-battery scenarios).
+    pub battery: Option<BatterySpec>,
 }
 
 impl Default for SimOptions {
@@ -57,6 +61,8 @@ impl Default for SimOptions {
             estimator: EstimatorSource::External,
             faults: Vec::new(),
             links: LinkConfig::default(),
+            failsafe: None,
+            battery: None,
         }
     }
 }
@@ -71,6 +77,8 @@ impl SimOptions {
             estimator: EstimatorSource::Ekf,
             faults: Vec::new(),
             links: LinkConfig::default(),
+            failsafe: None,
+            battery: None,
         }
     }
 }
@@ -138,9 +146,17 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         pilot: P,
         options: SimOptions,
     ) -> Result<Self, SimError> {
+        let mut airframe = airframe.clone();
+        if let Some(b) = options.battery {
+            airframe.battery = b;
+        }
+        let airframe = &airframe;
         let model = VehicleModel::<N>::from_airframe(airframe)?;
         let mut cfg = airframe.core_config::<N>()?;
         cfg.estimator.source = options.estimator;
+        if let Some(f) = options.failsafe {
+            cfg.failsafe = f;
+        }
         let core = Core::new(cfg, profile).map_err(SimError::Core)?;
         let base_us = u64::from(profile.base_period_us);
         // One time base: every period must be a whole number of ticks.
@@ -387,7 +403,13 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         });
         let v_before = self.body.velocity;
         let mut next = self.model.rk4(&self.body, &cmd, self.dt, wind);
-        ground_contact(&mut next);
+        // A vehicle at rest on the ground does not tip over. `ground_contact`
+        // zeroes the body rate after the step, so a rotation under unequal
+        // thrust would never reach the gyro and the estimator would diverge
+        // from the true attitude.
+        if ground_contact(&mut next) && next.velocity == Vec3::zero() {
+            next.attitude = self.body.attitude;
+        }
         if !next.is_finite() {
             // Never propagate NaN: freeze, and count it so the run can fail.
             self.physics_faults = self.physics_faults.saturating_add(1);

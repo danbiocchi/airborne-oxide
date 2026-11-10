@@ -7,10 +7,12 @@
 
 pub mod airframe;
 pub mod battery;
+pub mod fault_scenarios;
 pub mod faults;
 pub mod hash;
 pub mod metrics;
 pub mod montecarlo;
+pub mod outcome;
 pub mod rng;
 pub mod scenario;
 pub mod sensors;
