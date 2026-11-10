@@ -214,8 +214,10 @@ fn drop_from_thirty_centimetres_stays_shallow() {
 #[test]
 fn tilted_vehicle_returns_to_level() {
     let m = model();
-    let mut s = BodyState::<4>::default();
-    s.attitude = Quat::from_rotation_vector(Vec3::new(10f64.to_radians(), 0.0, 0.0));
+    let s = BodyState::<4> {
+        attitude: Quat::from_rotation_vector(Vec3::new(10f64.to_radians(), 0.0, 0.0)),
+        ..BodyState::default()
+    };
     let end = fall(&m, s, 1.0, |_| {});
     assert!(tilt_deg(&end) < 0.1, "tilt {}", tilt_deg(&end));
     assert!(end.rate.norm() < 0.05);

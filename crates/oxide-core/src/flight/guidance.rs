@@ -19,16 +19,28 @@ const RTL_ARRIVE_SPEED_MPS: f32 = 0.5;
 /// The moving Rtl setpoint stays within this distance of the vehicle, m.
 const RTL_LEASH_M: f32 = 3.0;
 
-/// A landing descent that is not moving, with the thrust demand below this
-/// fraction of hover, for `LAND_CONTACT_S` means the vehicle is on the
-/// ground.
-const LAND_CONTACT_THRUST: f32 = 0.5;
+/// A descent command of at least this, m/s, counts as a command to move.
+///
+/// A velocity loop told to descend at 0.5 m/s or more demands at least
+/// 1 m/s² downwards, and a vehicle in the air would pass 0.25 m/s
+/// (`touchdown_speed_mps`) within a quarter of a second. So when the
+/// estimated vertical speed stays below that for `LAND_CONTACT_S` while the
+/// command stands, something is holding the vehicle up: it is on the ground.
+/// Thrust is no part of the test: on the ground the position loop keeps
+/// demanding tilt and with it thrust, and the vertical loop's integral limit
+/// stops the thrust at about 40 %, so thrust says nothing about contact.
+const CONTACT_DESCENT_MPS: f32 = 0.5;
+/// How long the descent command must stand without motion, s.
 const LAND_CONTACT_S: f32 = 0.5;
-/// The same for a pilot holding the throttle down in Altitude or Position.
-const PILOT_CONTACT_THRUST: f32 = 0.8;
-/// A landing with neither height nor vertical speed flies a fixed thrust;
-/// after this long it must be on the ground, so the thrust drops to the
-/// minimum and touchdown can be detected, s.
+/// A landing with neither height nor vertical speed first descends on the
+/// estimator's inertial vertical speed alone. The accelerometer's vertical
+/// bias was calibrated by the barometer before it failed, so that speed
+/// drifts only by centimetres per second per second, far better than open
+/// loop thrust for a short descent. This long, s.
+const BLIND_INERTIAL_S: f32 = 30.0;
+/// After the inertial descent a landing flies a fixed thrust; after this long
+/// it must be on the ground, so the thrust drops to the minimum and
+/// touchdown can be detected, s.
 const BLIND_LAND_MAX_S: f32 = 60.0;
 
 /// Where Rtl is in its sequence.
@@ -50,7 +62,7 @@ pub(super) struct GuidanceState {
     pub(super) yaw_sp: f32,
     last_nav: Option<NavState>,
     pub(super) rtl: RtlPhase,
-    /// How long a landing descent has been standing still at low thrust, s.
+    /// How long a commanded descent has been standing still, s.
     contact_s: f32,
     /// How long a landing has been flying blind (no height, no vertical
     /// speed), s.
@@ -86,6 +98,27 @@ fn vertical_form(v: Validity, want: Vertical, fallback_thrust_n: f32) -> Vertica
         };
     }
     Vertical::Thrust(fallback_thrust_n)
+}
+
+/// Whether the estimate carries a vertical speed of its own.
+fn speed_known(v: Validity) -> bool {
+    v.altitude || v.velocity
+}
+
+/// The vertical form of a landing descent. With neither height nor speed
+/// valid, the first `BLIND_INERTIAL_S` still descend on the inertial vertical
+/// speed; after that, a fixed thrust.
+fn landing_vertical(
+    v: Validity,
+    blind_s: f32,
+    land_speed_mps: f32,
+    fallback_thrust_n: f32,
+) -> Vertical {
+    let want = Vertical::Velocity(land_speed_mps);
+    if !speed_known(v) && blind_s < BLIND_INERTIAL_S {
+        return want;
+    }
+    vertical_form(v, want, fallback_thrust_n)
 }
 
 fn yaw_form(v: Validity, yaw_sp: f32) -> Yaw {
@@ -251,10 +284,11 @@ impl<const N: usize> Core<N> {
             }
             (NavState::Land | NavState::LandNow, _) => {
                 landing_now = true;
+                descent_cmd = fs.land_speed_mps;
                 self.refresh_hold_point(&mut g, &state.position, v);
                 self.position_ctrl.update_axes(
                     horizontal_point(v, g.position_sp, [0.0, 0.0]),
-                    vertical_form(v, Vertical::Velocity(fs.land_speed_mps), landing_thrust),
+                    landing_vertical(v, g.blind_s, fs.land_speed_mps, landing_thrust),
                     yaw_form(v, g.yaw_sp),
                     &state,
                     dt,
@@ -332,10 +366,14 @@ impl<const N: usize> Core<N> {
                     }
                 }
                 landing_now = landing;
-                let (want, fallback) = if landing {
-                    (Vertical::Velocity(fs.land_speed_mps), landing_thrust)
+                if landing {
+                    descent_cmd = fs.land_speed_mps;
+                }
+                let vertical = if landing {
+                    landing_vertical(v, g.blind_s, fs.land_speed_mps, landing_thrust)
                 } else {
-                    (
+                    vertical_form(
+                        v,
                         Vertical::Position {
                             sp: g.position_sp.z,
                             vel_ff: 0.0,
@@ -345,7 +383,7 @@ impl<const N: usize> Core<N> {
                 };
                 self.position_ctrl.update_axes(
                     horizontal_point(v, g.position_sp, vff),
-                    vertical_form(v, want, fallback),
+                    vertical,
                     yaw_form(v, g.yaw_sp),
                     &state,
                     dt,
@@ -373,32 +411,22 @@ impl<const N: usize> Core<N> {
                 )
             }
         };
-        // A descent that is commanded but not happening, at low thrust, is
-        // the vehicle sitting on the ground. The velocity controller's
-        // integral limit keeps its thrust above the touchdown threshold, so
-        // drop to the minimum thrust to let touchdown be detected. This
-        // covers landing states and a pilot holding the throttle down in
-        // Altitude or Position (ADR-0003 §2 "On the ground").
-        let speed_known = v.altitude || v.velocity;
-        // A pilot's descent only counts when it is clearly a command to
-        // move, and the thrust bound is looser: the controller's integral
-        // takes seconds to wind the thrust down.
-        let pilot_descent = descent_cmd > 2.0 * fs.touchdown_speed_mps;
-        let contact_thrust = if landing_now {
-            LAND_CONTACT_THRUST
-        } else {
-            PILOT_CONTACT_THRUST
-        };
-        if (landing_now || pilot_descent)
-            && speed_known
+        // Ground contact (ADR-0003 §2; see `CONTACT_DESCENT_MPS`): a descent
+        // is commanded and the vehicle is not moving. A vertical speed is
+        // available from the altitude or velocity flags, or, in the first
+        // `BLIND_INERTIAL_S` of a blind landing, from the inertial estimate.
+        let inertial_blind = landing_now && !speed_known(v) && g.blind_s < BLIND_INERTIAL_S;
+        let speed_available = speed_known(v) || inertial_blind;
+        if descent_cmd >= CONTACT_DESCENT_MPS
+            && speed_available
             && Real::abs(state.velocity.z) < fs.touchdown_speed_mps
-            && target.thrust_n < contact_thrust * weight
         {
             g.contact_s += dt;
         } else {
+            // The vehicle moves, or the descent command ends: contact ends.
             g.contact_s = 0.0;
         }
-        if landing_now && !speed_known {
+        if landing_now && !speed_known(v) {
             g.blind_s += dt;
         } else {
             g.blind_s = 0.0;
@@ -407,7 +435,13 @@ impl<const N: usize> Core<N> {
             target.thrust_n = l.min_thrust_fraction_of_hover * weight;
         }
         if g.contact_s >= LAND_CONTACT_S {
-            target.thrust_n = l.min_thrust_fraction_of_hover * weight;
+            // On the ground: minimum thrust, level at the current yaw, and
+            // nothing left to wind up against the ground.
+            target = AttitudeTarget {
+                attitude: Quat::from_euler(0.0, 0.0, yaw_now),
+                thrust_n: l.min_thrust_fraction_of_hover * weight,
+            };
+            self.position_ctrl.reset();
         }
         self.guide_state = g;
         self.guidance.pending = target;
