@@ -43,7 +43,7 @@ What the vehicle is doing is one `NavState`:
 
 **Degradation.** Every state uses the best control its valid flags allow:
 - **Horizontal:** position hold needs `position`; otherwise velocity damping (zero velocity target) needs `velocity`; otherwise level attitude.
-- **Vertical:** height or climb-rate control needs `altitude`; otherwise a fixed descent thrust in landing states and hover thrust elsewhere.
+- **Vertical:** height control needs `altitude`. Without it, climb-rate control still works while `velocity` is valid, because GPS keeps correcting vertical speed. Without either: a fixed descent thrust in landing states and hover thrust elsewhere.
 - **Yaw:** holding a heading needs `heading`; otherwise zero yaw rate.
 
 **Pilot modes** degrade the same way (DESIGN §4.9 rule c): a requested `Position` or `Offboard` without `position` becomes `Altitude`; without `altitude` it becomes `Stabilized`. The change is logged as an event.
