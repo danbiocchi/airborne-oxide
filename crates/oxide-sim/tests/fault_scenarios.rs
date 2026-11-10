@@ -2,8 +2,10 @@
 //! M1c acceptance: the fault scenarios (ADR-0003). Each injects a failure in
 //! flight and checks that the vehicle does what the ADR says.
 
+use oxide_core::io::NavState;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
-use oxide_sim::fault_scenarios::{FaultScenario, all, by_name, fly, pairs};
+use oxide_core::time::Micros;
+use oxide_sim::fault_scenarios::{FaultScenario, all, build, by_name, fly, pairs};
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::outcome::{FlightOutcome, event_line};
 
@@ -108,4 +110,38 @@ fn fault_scenario_is_deterministic() {
     // A different run index is a different flight (different wind).
     let c = fly(&s, F405_LEAN, 3).expect("run");
     assert_ne!(a.position_at_end, c.position_at_end);
+}
+
+/// In an Rtl or Land descent the thrust is never cut to the minimum while the
+/// vehicle is clearly in the air (no false ground contact), over 10 seeds.
+#[test]
+fn landing_thrust_is_not_cut_in_the_air() {
+    // geofence: Rtl from 5 m, lands at home. gps-loss: Land.
+    for name in ["geofence", "gps-loss", "battery-low"] {
+        let s = by_name(name).expect("scenario");
+        for index in 0..10_u64 {
+            let mut sim = build(&s, F405_LEAN, index).expect("simulation setup");
+            let end = Micros((s.script.duration_s * 1e6).round() as u64);
+            let mut landing_seen = false;
+            sim.run_until(end, |r| {
+                let landing = matches!(
+                    r.status.nav,
+                    NavState::Rtl | NavState::Land | NavState::LandNow
+                );
+                landing_seen |= landing;
+                let mean = r.motors.iter().sum::<f32>() / r.motors.len() as f32;
+                // The minimum thrust is a motor command of about 0.14.
+                if r.status.armed && landing && -r.position.z > 0.2 {
+                    assert!(
+                        mean > 0.2,
+                        "{name} index {index}: thrust cut {:.2} m up at {:.2} s (nav {:?})",
+                        -r.position.z,
+                        r.t.as_secs_f64(),
+                        r.status.nav
+                    );
+                }
+            });
+            assert!(landing_seen, "{name} index {index} never landed");
+        }
+    }
 }

@@ -719,6 +719,12 @@ const SOC_CRITICAL: f64 = 0.02;
 /// latched a level that is reached at the same instant, s (measured).
 const LATCH_LAG_S: f64 = 3.0;
 
+/// Capacity of the battery of a pairing that has only the low-battery
+/// failure, mAh: large, so the critical level (6 % of the charge further
+/// down) does not follow within the flight and the pairing stays at
+/// `BATTERY_LOW`.
+const PAIR_LOW_ONLY_CAPACITY_MAH: f64 = 4000.0;
+
 /// A small battery that reaches the given level so that its latch comes at
 /// about `t_s` in a hovering flight armed at 3 s.
 fn battery_tripping_at(soc_level: f64, t_s: f64) -> BatterySpec {
@@ -749,6 +755,13 @@ fn pair_battery(a: Failure, b: Failure) -> Option<BatterySpec> {
     } else {
         first_battery.1
     };
+    if first_battery.0 == Failure::BatteryLow && ![a, b].contains(&Failure::BatteryCritical) {
+        let drain = PAIR_DRAIN_PER_S * PAIR_CAPACITY_MAH / PAIR_LOW_ONLY_CAPACITY_MAH;
+        return Some(battery(
+            PAIR_LOW_ONLY_CAPACITY_MAH,
+            level + drain * (t - 3.0 - LATCH_LAG_S),
+        ));
+    }
     Some(battery_tripping_at(level, t))
 }
 
@@ -786,7 +799,9 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
     // The barometer loss goes before a critical battery for a similar reason:
     // it takes 10 s to show, and the landing the battery starts would be over
     // by then.
-    let swap = b == Failure::Geofence || (b == Failure::BaroLoss && a == Failure::BatteryCritical);
+    let swap = b == Failure::Geofence
+        || (b == Failure::BaroLoss && matches!(a, Failure::BatteryCritical | Failure::BatteryLow))
+        || (b == Failure::BrainCrash && a == Failure::BatteryCritical);
     let (a, b) = if swap { (b, a) } else { (a, b) };
     for (f, t) in [(a, 15.0), (b, 20.0)] {
         match f {
