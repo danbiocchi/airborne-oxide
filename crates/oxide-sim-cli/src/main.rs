@@ -7,13 +7,17 @@
 //!                [--estimator truth|ekf] [--sensors ideal|realistic]
 //! oxide-sim hash [same options]
 //! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
+//! oxide-sim scenario list
+//! oxide-sim scenario NAME [--profile f405|h743] [--seed N] [--csv FILE]
 //! ```
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
 //! the libm paths. `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
-//! with 1 if any run fails.
+//! with 1 if any run fails. `scenario` flies a fault scenario (ADR-0003),
+//! prints its event timeline, a summary and every violated expectation, and
+//! exits with 1 if there are any; `--seed` is the run index.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -23,8 +27,10 @@ use oxide_core::config::EstimatorSource;
 use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
+use oxide_sim::fault_scenarios;
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold};
 use oxide_sim::montecarlo::run_indexed;
+use oxide_sim::outcome::FlightOutcome;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimError, SimOptions, Simulation, StepRecord};
@@ -264,7 +270,7 @@ fn csv_row(r: &StepRecord<4>) -> String {
     let g = |v: Option<f32>| v.map_or(String::new(), |x| format!("{x:.5}"));
     let h = |v: Option<f64>| v.map_or(String::new(), |x| format!("{x:.5}"));
     format!(
-        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4}\n",
+        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:?},{:?}\n",
         r.t.as_secs_f64(),
         r.position.x,
         r.position.y,
@@ -297,10 +303,12 @@ fn csv_row(r: &StepRecord<4>) -> String {
         r.wind.x,
         r.wind.y,
         r.wind.z,
+        r.status.nav,
+        r.status.action,
     )
 }
 
-const CSV_HEADER: &[u8] = b"t,x,y,z,vx,vy,vz,roll,pitch,yaw,p,q,r,m0,m1,m2,m3,battery_v,battery_a,armed,sp_x,sp_y,sp_z,est_x,est_y,est_z,est_roll,est_pitch,est_yaw,wind_n,wind_e,wind_d\n";
+const CSV_HEADER: &[u8] = b"t,x,y,z,vx,vy,vz,roll,pitch,yaw,p,q,r,m0,m1,m2,m3,battery_v,battery_a,armed,sp_x,sp_y,sp_z,est_x,est_y,est_z,est_roll,est_pitch,est_yaw,wind_n,wind_e,wind_d,nav,action\n";
 
 /// What a finished run reports.
 struct Outcome {
@@ -476,13 +484,128 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(passed == runs.len())
 }
 
+/// `oxide-sim scenario list | NAME [--profile P] [--seed N] [--csv FILE]`.
+fn scenario_command(
+    mut it: impl Iterator<Item = String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let first = it.next().ok_or("scenario needs list or a scenario name")?;
+    if first == "list" {
+        for s in fault_scenarios::all()
+            .into_iter()
+            .chain(fault_scenarios::pairs())
+        {
+            println!("{:<34} {}", s.name, s.about);
+        }
+        return Ok(true);
+    }
+    let scenario = fault_scenarios::by_name(&first)
+        .ok_or_else(|| format!("unknown scenario {first} (try: oxide-sim scenario list)"))?;
+    let (mut profile, mut index, mut csv_path) = (F405_LEAN, 0_u64, None);
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or(format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--profile" => {
+                profile = match value()?.as_str() {
+                    "f405" => F405_LEAN,
+                    "h743" => H743_FULL,
+                    other => return Err(format!("unknown profile {other} (f405 | h743)").into()),
+                }
+            }
+            "--seed" => {
+                let v = value()?;
+                index = v
+                    .parse()
+                    .map_err(|_| format!("--seed needs a non-negative integer, got {v}"))?;
+            }
+            "--csv" => csv_path = Some(value()?),
+            other => return Err(format!("unknown option {other}").into()),
+        }
+    }
+    let mut sim = fault_scenarios::build(&scenario, profile, index)?;
+    let mut csv = match &csv_path {
+        Some(p) => {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
+            f.write_all(CSV_HEADER)?;
+            Some(f)
+        }
+        None => None,
+    };
+    let mut outcome = FlightOutcome::new();
+    let mut io_error = None;
+    let end = Micros((scenario.script.duration_s * 1e6).round() as u64);
+    sim.run_until(end, |r| {
+        outcome.add(r);
+        if let Some(f) = csv.as_mut()
+            && let Err(err) = f.write_all(csv_row(r).as_bytes())
+        {
+            io_error.get_or_insert(err);
+        }
+    });
+    if let Some(err) = io_error {
+        return Err(err.into());
+    }
+    if let Some(mut f) = csv {
+        f.flush()?;
+    }
+    println!(
+        "scenario   {} (run {index}, profile {})",
+        scenario.name, profile.name
+    );
+    println!("about      {}", scenario.about);
+    println!("timeline");
+    for e in &outcome.events {
+        println!("  {:8.3} s  {:?}", e.t.as_secs_f64(), e.kind);
+    }
+    let p = outcome.position_at_end;
+    println!("navigation {:?}", outcome.nav_sequence);
+    println!(
+        "reasons    {}   highest action {:?}",
+        oxide_sim::outcome::reason_names(outcome.reasons_seen),
+        outcome.max_action
+    );
+    println!(
+        "end        t {:.2} s, N {:.2} E {:.2} D {:.2} m, armed {}, {:?}",
+        outcome.end_s, p.x, p.y, p.z, outcome.armed_at_end, outcome.nav_at_end
+    );
+    println!(
+        "limits     max height {:.2} m, max distance from home {:.2} m, max tilt {:.1} deg, touchdown {}",
+        outcome.max_height_m,
+        outcome.max_distance_from_home_m,
+        outcome.max_tilt_deg,
+        outcome
+            .touchdown_speed_mps
+            .map_or("none".into(), |v| format!("{v:.2} m/s"))
+    );
+    println!("trace hash {:016x}", sim.trace_hash());
+    let violations = scenario.expect.check(&outcome);
+    if violations.is_empty() {
+        println!("result     PASS");
+    } else {
+        println!("result     FAIL");
+        for v in &violations {
+            println!("  violated: {v}");
+        }
+    }
+    Ok(violations.is_empty())
+}
+
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("scenario") {
+        return match scenario_command(std::env::args().skip(2)) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let args = match parse() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!(
-                "usage: oxide-sim run|hash|montecarlo [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic] [--seeds N] [--threads T]"
+                "usage: oxide-sim run|hash|montecarlo|scenario [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic] [--seeds N] [--threads T]"
             );
             return ExitCode::from(2);
         }
