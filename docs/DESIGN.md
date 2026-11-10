@@ -335,7 +335,7 @@ Auto-disarm follows detected touchdown.
 | **S4** | Hardware-in-the-loop: the flight core on the real board, the simulator on the PC feeding sensors over USB/UART |
 | Ongoing | Calibration against real flight data (§5.9) |
 
-**S1 as built.** M1b delivered the S1 physics and the IMU, GPS, barometer, magnetometer and battery models. Turbulence is a first-order Gauss–Markov process per axis, because Dryden spectra need an airspeed that a hovering multirotor does not have; Dryden or von Kármán turbulence arrives with fixed-wing flight (S2b). The RC receiver model, timing jitter and the fault list arrive with M1c's scenario runner and fault injection.
+**S1 as built.** M1b delivered the S1 physics and the IMU, GPS, barometer, magnetometer and battery models. Turbulence is a first-order Gauss–Markov process per axis, because Dryden spectra need an airspeed that a hovering multirotor does not have; Dryden or von Kármán turbulence arrives with fixed-wing flight (S2b). The RC receiver model, timing jitter and the fault list arrive with M1c's scenario runner and fault injection. M1c part one added fault injection (motor loss; GPS, IMU, barometer and magnetometer loss; radio loss with the receiver's frame-lost and failsafe flags; ground-station loss; brain crash and hang), link heartbeats, and a compliant ground: a spring-damper with friction and leg torques in place of the instant stop, so a touchdown decelerates at a few g like real landing gear. Glitch frames, timing jitter, GPS jamming and stale RPM remain.
 
 ### 5.5 Scenarios
 
@@ -595,7 +595,7 @@ Each step ends in something you can watch working.
 | **M0** | This design, the design review, the repository reset | The owner signs off |
 | **M1a** | Workspace and CI; the core interface (§4.2); rigid-body, motor and battery physics; ideal sensors; cascaded PID on true state; the cross-OS determinism hash test | A quad hovers and takes steps in Rerun, and flies with the joystick |
 | **M1b** | The S1 sensor models; the estimator (§4.7); wind | Position hold in gusts on noisy sensors over 200 seeds |
-| **M1c** | The scenario runner and Monte-Carlo CI job; fault injection; the failsafe state machine (§4.10); arming; parameters; ULog and replay | The fault scenarios pass: sensor dropout, GPS loss, RC and link loss, brain crash. Quad motor loss has a defined, logged outcome. |
+| **M1c** | The scenario runner and Monte-Carlo CI job; fault injection; the failsafe state machine (§4.10); arming; parameters; ULog and replay. Delivered in three parts: (1) failsafes and fault scenarios ([ADR-0003](adr/0003-failsafes.md)), (2) parameters and scenario files, (3) logging and replay. | The fault scenarios pass: sensor dropout, GPS loss, RC and link loss, brain crash. Quad motor loss has a defined, logged outcome. |
 | **M1d** | Bridge-semantics spike; ArduPilot SITL bridge; tuning parity; the gate-criteria ADR | **Benchmark gate 1** |
 | **F405 bring-up** (after M1b; doesn't block S1) | RTIC 2 + Embassy spike; drivers for IMU, baro, PWM and plain DShot300, UART and SBUS; measured budgets. Bidirectional DShot is a separate later task with its own spike. | Real sensor data flowing through `oxide-core` on the F405, within budget |
 | **M2 (S2)** | S2 fidelity; airframe lab A1, scorecard and auto-tune; Python bindings; system identification; PX4 bridge; H743 bring-up | A1 reproduces the Viper manual's L/D and drag/power curves within stated bands; a sim-vs-real report (§5.9 metrics) on real multirotor hover logs. **Benchmark gate 2.** |

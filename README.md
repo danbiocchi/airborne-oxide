@@ -8,7 +8,7 @@ Airborne Oxide is flight software for drones, written in Rust. It has three part
 2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that flies multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
 3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and will move onto smaller drones as AI hardware shrinks.
 
-> **Status: milestone M1b.** The flight core flies a simulated 5" quad on its own state estimate: an error-state EKF fed by simulated IMU, GPS, barometer and magnetometer with noise, bias, vibration and GPS latency. It holds position in gusty wind across 200 random seeds on both chip profiles. Fault injection, failsafes and scenario files come next (M1c). See the [roadmap](docs/DESIGN.md#13-roadmap).
+> **Status: milestone M1c, part one.** The flight core flies a simulated 5" quad on its own state estimate and now handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. Each is a scenario flown across random seeds on both chip profiles, as is every pairing of the common ones. Parameters, scenario files, logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
 
 ## Try it
 
@@ -32,7 +32,13 @@ The M1b scenario holds a point at 2 m in gusty wind on noisy sensors, using the 
 cargo run --release -p oxide-sim-cli -- run --scenario gust-hold --seed 7
 ```
 
-Fly 200 seeds on every core and print the worst case of each pass criterion:
+Fly a failure and print what the flight core did about it, event by event (`scenario list` shows them all):
+
+```bash
+cargo run --release -p oxide-sim-cli -- scenario rc-loss-position
+```
+
+Fly 200 gust-hold seeds on every core and print the worst case of each pass criterion:
 
 ```bash
 cargo run --release -p oxide-sim-cli -- montecarlo --seeds 200
@@ -44,10 +50,14 @@ Run the tests:
 cargo test --workspace
 ```
 
-The full 200-seed acceptance test is separate, because it needs a release build:
+The full acceptance tests are separate, because they need a release build: 200 gust-hold seeds, and every fault scenario and pairing over 10 seeds, each on both chip profiles.
 
 ```bash
 cargo test --release -p oxide-sim --test gust_hold -- --ignored --nocapture
+```
+
+```bash
+cargo test --release -p oxide-sim --test fault_scenarios -- --ignored --nocapture
 ```
 
 ## Layout
@@ -55,7 +65,7 @@ cargo test --release -p oxide-sim --test gust_hold -- --ignored --nocapture
 | Path | What it is |
 |---|---|
 | `crates/oxide-core` | Flight core library (`no_std`, no heap). Builds for `thumbv7em-none-eabihf`. |
-| `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, scenarios, Monte-Carlo runner, lockstep loop |
+| `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, fault injection, scenarios, Monte-Carlo runner, lockstep loop |
 | `crates/oxide-sim-cli` | `oxide-sim` command-line runner |
 | `crates/oxide-viewer` | Optional Rerun viewer with joystick input (kept out of the default build) |
 | `airframes/` | Airframe data files |
