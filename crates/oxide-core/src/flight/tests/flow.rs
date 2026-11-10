@@ -32,6 +32,16 @@ struct Rig {
     imu_on: bool,
     /// After arming, centre the throttle of a rig that hovers.
     hover_after_arm: bool,
+    /// A responsive vertical world: the vehicle accelerates as the motor
+    /// commands say (external state: the state's vertical speed and height
+    /// follow; EKF: the accelerometer reads the thrust). Off by default, so
+    /// the state stays where the test put it.
+    world: bool,
+    /// Extra accelerometer reading on the down axis in `world` EKF mode, m/s^2.
+    accel_bias_z: f32,
+    mass_kg: f32,
+    max_thrust_n: f32,
+    nominal_v: f32,
     events: Vec<Event>,
     out: Outputs<4>,
 }
@@ -75,6 +85,11 @@ impl Rig {
             imu_glitch: false,
             imu_on: true,
             hover_after_arm: true,
+            world: false,
+            accel_bias_z: 0.0,
+            mass_kg: cfg.mass_kg,
+            max_thrust_n: cfg.rotors[0].max_thrust_n,
+            nominal_v: cfg.nominal_voltage_v,
             events: Vec::new(),
             out: Outputs::off(Micros::ZERO),
         }
@@ -83,6 +98,9 @@ impl Rig {
     /// External state, hovering at 5 m.
     /// The same rig with another configuration.
     fn with_cfg(mut self, c: VehicleConfig<4>) -> Self {
+        self.mass_kg = c.mass_kg;
+        self.max_thrust_n = c.rotors[0].max_thrust_n;
+        self.nominal_v = c.nominal_voltage_v;
         self.core = Core::new(c, F405_LEAN).expect("valid config");
         self
     }
@@ -96,6 +114,18 @@ impl Rig {
         Self::new(true, mode_switch)
     }
 
+    /// Total rotor thrust of the last motor commands, N (square-law rotors,
+    /// full expo, at the rig's battery voltage).
+    fn thrust_n(&self) -> f32 {
+        let v = self.battery.map_or(self.nominal_v, |b| b.voltage_v);
+        let k = (v / self.nominal_v) * (v / self.nominal_v);
+        self.out
+            .motors
+            .iter()
+            .map(|u| self.max_thrust_n * u * u * k)
+            .sum()
+    }
+
     fn step(&mut self) {
         let t = Micros(self.k * 1000);
         let mut i = if self.ekf {
@@ -106,6 +136,16 @@ impl Rig {
                 ..Inputs::default()
             }
         };
+        if self.world
+            && self.ekf
+            && let Some(imu) = i.imu.as_mut()
+        {
+            imu.value.accel = Vec3::new(
+                0.0,
+                0.0,
+                -self.thrust_n() / self.mass_kg + self.accel_bias_z,
+            );
+        }
         i.rc = self.rc_on.then(|| Stamped::ideal(t, self.rc));
         i.battery = self.battery.map(|b| Stamped::ideal(t, b));
         if !self.gps_on {
@@ -145,6 +185,18 @@ impl Rig {
         }
         self.out = self.core.tick(t, &i);
         self.events.extend(self.out.events.iter().copied());
+        if self.world && !self.ekf {
+            let a = crate::GRAVITY - self.thrust_n() / self.mass_kg;
+            let thrust = self.thrust_n();
+            if let Some(s) = self.state.as_mut() {
+                s.velocity.z += a * 1.0e-3;
+                s.position.z += s.velocity.z * 1.0e-3;
+                if s.position.z >= 0.0 && thrust < self.mass_kg * crate::GRAVITY {
+                    s.position.z = 0.0;
+                    s.velocity.z = 0.0;
+                }
+            }
+        }
         self.k += 1;
     }
 
@@ -339,6 +391,7 @@ fn arming_without_a_position_sets_no_home() {
 fn rc_loss_in_position_holds_then_returns_and_rc_back_changes_nothing() {
     let mut rig = Rig::external(1);
     rig.arm();
+    rig.world = true;
     rig.rc_on = false;
     // RC counts as lost after rc_timeout_us (0.5 s); the supervisor runs
     // at 50 Hz.
@@ -537,12 +590,19 @@ fn imu_stopping_while_armed_terminates_and_blocks_arming_until_released() {
 fn land_now_on_the_ground_touches_down_and_disarms() {
     // A critical battery lands now. The vehicle sits still on the ground,
     // so the command winds down and the touchdown condition then has to
-    // hold for touchdown_s.
-    let mut rig = Rig::external(1);
+    // hold for touchdown_s. The low level is set below the critical one so
+    // that the low-battery return (which, at home on the ground, lands and
+    // disarms within two seconds of its own) does not get there first: this
+    // test is about LandNow.
+    let mut c = cfg();
+    c.failsafe.battery_low_v = 3.0;
+    let mut rig = Rig::external(0).with_cfg(c);
     rig.state = Some(StateSample::default());
     rig.arm();
-    // Throttle centred: a hold at the ground, not a commanded descent.
-    rig.rc.throttle = 0.5;
+    // Stabilized with the throttle held up: the vehicle is not on the ground
+    // as far as the pilot-state ground rule is concerned (its thrust is not
+    // low), until LandNow takes it down.
+    rig.rc.throttle = 0.3;
     rig.battery = Some(BatterySample {
         voltage_v: 19.0,
         current_a: 0.0,
@@ -851,6 +911,9 @@ fn a_fully_blind_landing_eventually_drops_thrust_and_disarms() {
     rig.arm();
     rig.rc.throttle = 0.5;
     rig.run(1.0);
+    // The accelerometer reads the thrust the core commands, so the
+    // inertial vertical speed responds to the descent it flies.
+    rig.world = true;
     rig.gps_on = false;
     rig.baro_on = false;
     assert!(rig.run_until(15.0, |r| r.nav() == NavState::LandNow));
@@ -898,6 +961,7 @@ fn home_is_set_at_the_first_position_after_arming_without_one() {
 fn hovering(mode_switch: u8, c: VehicleConfig<4>) -> Rig {
     let mut rig = Rig::external(mode_switch).with_cfg(c);
     rig.arm();
+    rig.world = true;
     rig.run(0.5);
     assert!(rig.out.status.armed);
     rig
@@ -1117,4 +1181,205 @@ fn home_is_forgotten_on_disarm_kept_in_flight_and_set_again_on_rearming() {
     rig.arm();
     assert_eq!(rig.core.home(), Some(Vec3::new(4.0, 3.0, -6.0)));
     assert_eq!(rig.count(|k| matches!(k, EventKind::HomeSet)), 2);
+}
+
+// ---- Ground contact by motion (guidance.rs, ADR-0003 §2) ----
+
+/// Lowest motor command: the minimum thrust (0.1 x weight) is a command of
+/// about 0.14; hover is about 0.5.
+const CUT: f32 = 0.2;
+
+fn min_motor(rig: &Rig) -> f32 {
+    rig.out.motors.iter().copied().fold(f32::MAX, f32::min)
+}
+
+/// A Stabilized rig at 5 m with the throttle up (so it does not count as on
+/// the ground) and a critical battery, run until LandNow starts. The low
+/// level is set below the critical one so the return does not get there
+/// first.
+fn critical_battery_rig() -> Rig {
+    let mut c = cfg();
+    c.failsafe.battery_low_v = 3.0;
+    let mut rig = Rig::external(0).with_cfg(c);
+    rig.arm();
+    rig.rc.throttle = 0.3;
+    rig.battery = Some(BatterySample {
+        voltage_v: 19.0,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(10.0, |r| r.nav() == NavState::LandNow));
+    rig
+}
+
+#[test]
+fn contact_is_declared_on_a_still_vehicle_whatever_the_horizontal_error() {
+    let mut rig = critical_battery_rig();
+    // The state does not respond to the descent, and the held point is 5 m
+    // away: the position loop demands tilt and thrust, which says nothing
+    // about contact.
+    if let Some(s) = rig.state.as_mut() {
+        s.position.x += 5.0;
+    }
+    assert!(rig.run_until(0.4, |r| min_motor(r) > CUT), "not yet");
+    assert!(
+        rig.run_until(1.0, |r| min_motor(r) < CUT),
+        "no contact: motors {:?}",
+        rig.out.motors
+    );
+    // The attitude target is level, not leaning towards the held point.
+    let down = rig
+        .core
+        .guidance
+        .visible
+        .attitude
+        .rotate(Vec3::new(0.0, 0.0, 1.0));
+    assert!(down.x.abs() < 1e-4 && down.y.abs() < 1e-4, "{down:?}");
+    // And the touchdown follows.
+    assert!(rig.run_until(5.0, |r| !r.out.status.armed));
+    assert!(rig.saw(EventKind::Disarmed(DisarmReason::Touchdown)));
+}
+
+#[test]
+fn contact_is_not_declared_in_the_first_second_of_a_descent_from_hover() {
+    let mut rig = Rig::external(1);
+    rig.arm();
+    // From here the state accelerates as the motors command.
+    rig.world = true;
+    rig.run(0.5);
+    rig.rc_on = false;
+    assert!(rig.run_until(6.0, |r| r.nav() == NavState::Rtl));
+    // Rtl at home lands at once: a descent from hover.
+    let mut min_seen = f32::MAX;
+    for _ in 0..1000 {
+        rig.step();
+        min_seen = min_seen.min(min_motor(&rig));
+    }
+    assert!(min_seen > CUT, "thrust cut in the air: {min_seen}");
+    let vz = rig.state.map_or(0.0, |s| s.velocity.z);
+    assert!(vz > 0.3, "not descending: {vz}");
+}
+
+#[test]
+fn contact_ends_as_soon_as_the_state_moves() {
+    let mut rig = critical_battery_rig();
+    assert!(rig.run_until(1.0, |r| min_motor(r) < CUT), "no contact");
+    // The ground gives way: the state starts falling.
+    if let Some(s) = rig.state.as_mut() {
+        s.velocity.z = 1.0;
+    }
+    assert!(
+        rig.run_until(0.2, |r| min_motor(r) > CUT),
+        "contact did not end: {:?}",
+        rig.out.motors
+    );
+}
+
+#[test]
+fn a_blind_landing_descends_on_the_inertial_vertical_speed() {
+    let mut rig = Rig::ekf(1);
+    rig.arm();
+    rig.rc.throttle = 0.5;
+    rig.run(1.0);
+    rig.world = true;
+    rig.gps_on = false;
+    rig.baro_on = false;
+    assert!(rig.run_until(15.0, |r| r.nav() == NavState::LandNow));
+    assert!(!rig.out.status.valid.altitude && !rig.out.status.valid.velocity);
+    // A fixed thrust would hold 0.9 x hover; the velocity loop on the
+    // accelerometer-derived speed settles on the descent rate instead.
+    rig.run(8.0);
+    let vz = rig.core.estimate().map_or(0.0, |e| e.velocity.z);
+    assert!((vz - 0.7).abs() < 0.3, "inertial descent rate {vz}");
+    assert!(rig.out.status.armed);
+}
+
+#[test]
+fn a_blind_landing_never_commands_more_than_hover_thrust() {
+    // The accelerometer's vertical bias was not fully calibrated when the
+    // barometer went: the dead-reckoned speed over-reads the descent, and a
+    // velocity loop on it would raise thrust above hover and climb.
+    let mut rig = Rig::ekf(1);
+    rig.arm();
+    rig.rc.throttle = 0.5;
+    rig.run(1.0);
+    rig.world = true;
+    rig.accel_bias_z = 2.0;
+    rig.gps_on = false;
+    rig.baro_on = false;
+    assert!(rig.run_until(15.0, |r| r.nav() == NavState::LandNow));
+    // The state change takes a tick to reach guidance.
+    rig.run(0.01);
+    // `thrust_n` scales with the battery voltage; so does the limit.
+    let kv = rig.battery.map_or(1.0, |b| {
+        (b.voltage_v / rig.nominal_v) * (b.voltage_v / rig.nominal_v)
+    });
+    let limit = rig.mass_kg * crate::GRAVITY * kv * 1.02;
+    let mut peak = 0.0_f32;
+    for _ in 0..20_000 {
+        rig.step();
+        peak = peak.max(rig.thrust_n());
+    }
+    assert!(peak <= limit, "blind thrust {peak} N above hover {limit} N");
+}
+
+/// Thrust of the last motor commands as a fraction of the vehicle's weight.
+fn thrust_over_weight(rig: &Rig) -> f32 {
+    let kv = rig.battery.map_or(1.0, |b| {
+        (b.voltage_v / rig.nominal_v) * (b.voltage_v / rig.nominal_v)
+    });
+    rig.thrust_n() / kv / (rig.mass_kg * crate::GRAVITY)
+}
+
+#[test]
+fn stick_held_down_on_the_ground_in_position_leaves_nothing_wound_up() {
+    // The pilot holds the throttle down on the ground: contact is declared.
+    // The held point must not keep sinking into the ground meanwhile, or
+    // the centred stick that follows would still command a descent.
+    let mut rig = Rig::external(1);
+    rig.state = Some(StateSample::default());
+    rig.rc.throttle = 0.0;
+    rig.arm();
+    assert!(rig.run_until(3.0, |r| min_motor(r) < CUT), "no contact");
+    rig.run(6.0);
+    rig.rc.throttle = 0.5;
+    rig.run(0.5);
+    assert!(rig.out.status.armed);
+    let t = thrust_over_weight(&rig);
+    assert!(
+        (0.85..1.15).contains(&t),
+        "thrust {t} x weight after release"
+    );
+}
+
+#[test]
+fn land_now_from_a_centred_position_hold_on_the_ground_disarms() {
+    let mut c = cfg();
+    c.failsafe.battery_low_v = 3.0;
+    let mut rig = Rig::external(1).with_cfg(c);
+    rig.state = Some(StateSample::default());
+    rig.arm();
+    rig.rc.throttle = 0.5;
+    rig.battery = Some(BatterySample {
+        voltage_v: 19.0,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(40.0, |r| !r.out.status.armed));
+    assert!(rig.saw(EventKind::Disarmed(DisarmReason::Touchdown)));
+    assert_eq!(rig.out.motors, [0.0; 4]);
+}
+
+#[test]
+fn contact_is_not_declared_on_a_vehicle_rising() {
+    // An up-gust carries the vehicle up while a descent is commanded: an
+    // upward speed is motion, not a vehicle held by the ground.
+    let mut rig = critical_battery_rig();
+    if let Some(s) = rig.state.as_mut() {
+        s.velocity.z = -0.6;
+    }
+    let mut min_seen = f32::MAX;
+    for _ in 0..1500 {
+        rig.step();
+        min_seen = min_seen.min(min_motor(&rig));
+    }
+    assert!(min_seen > CUT, "thrust cut on a rising vehicle: {min_seen}");
 }

@@ -502,11 +502,11 @@ fn battery_low() -> FaultScenario {
 fn battery_critical() -> FaultScenario {
     FaultScenario {
         name: "battery-critical",
-        about: "A small battery runs down through low (about 12 s) to critical in flight: LandNow, and it lands. The critical level is raised to 3.4 V because the battery model bottoms out at 3.30 V.",
+        about: "A small battery runs down through low (about 12 s) to critical in flight: LandNow, and it lands.",
         script: offboard_script(sp(0.0, 0.0, 5.0), 50.0),
         faults: Vec::new(),
         links: LinkConfig::default(),
-        failsafe: params(|p| p.battery_critical_v = CRITICAL_V),
+        failsafe: None,
         battery: Some(battery_tripping_at(SOC_LOW, 12.0)),
         expect: Expect {
             nav_contains: vec![NavState::LandNow],
@@ -711,16 +711,19 @@ impl Failure {
 const PAIR_DRAIN_PER_S: f64 = 0.0048;
 /// Pairing battery capacity, mAh (hover drain 0.0048 of the charge per s).
 const PAIR_CAPACITY_MAH: f64 = 500.0;
-/// Cell voltage the battery model reaches at 2.5 % charge: the critical
-/// level used in the battery scenarios (see `battery_critical`).
-const CRITICAL_V: f32 = 3.4;
 /// Charge at which the model's open-circuit voltage is the low level (3.5 V).
 const SOC_LOW: f64 = 0.05;
-/// Charge at which it is `CRITICAL_V`.
-const SOC_CRITICAL: f64 = 0.025;
+/// Charge at which it is the critical level (3.3 V).
+const SOC_CRITICAL: f64 = 0.02;
 /// Time from arming to the 2 s debounce and the voltage filter having
 /// latched a level that is reached at the same instant, s (measured).
 const LATCH_LAG_S: f64 = 3.0;
+
+/// Capacity of the battery of a pairing that has only the low-battery
+/// failure, mAh: large, so the critical level (6 % of the charge further
+/// down) does not follow within the flight and the pairing stays at
+/// `BATTERY_LOW`.
+const PAIR_LOW_ONLY_CAPACITY_MAH: f64 = 4000.0;
 
 /// A small battery that reaches the given level so that its latch comes at
 /// about `t_s` in a hovering flight armed at 3 s.
@@ -742,7 +745,7 @@ fn pair_battery(a: Failure, b: Failure) -> Option<BatterySpec> {
         Failure::BatteryLow => SOC_LOW,
         _ => SOC_CRITICAL,
     };
-    // Low precedes critical by about 5 s and already starts the return; with
+    // Low precedes critical by about 6 s and already starts the return; with
     // the geofence failure (15 s) critical therefore comes at 25 s, so that
     // the low latch (about 20 s) does not pre-empt the fence.
     let t = if first_battery.0 == Failure::BatteryCritical
@@ -752,6 +755,13 @@ fn pair_battery(a: Failure, b: Failure) -> Option<BatterySpec> {
     } else {
         first_battery.1
     };
+    if first_battery.0 == Failure::BatteryLow && ![a, b].contains(&Failure::BatteryCritical) {
+        let drain = PAIR_DRAIN_PER_S * PAIR_CAPACITY_MAH / PAIR_LOW_ONLY_CAPACITY_MAH;
+        return Some(battery(
+            PAIR_LOW_ONLY_CAPACITY_MAH,
+            level + drain * (t - 3.0 - LATCH_LAG_S),
+        ));
+    }
     Some(battery_tripping_at(level, t))
 }
 
@@ -789,7 +799,15 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
     // The barometer loss goes before a critical battery for a similar reason:
     // it takes 10 s to show, and the landing the battery starts would be over
     // by then.
-    let swap = b == Failure::Geofence || (b == Failure::BaroLoss && a == Failure::BatteryCritical);
+    // So "critical battery first, then brain crash (or baro loss) during the
+    // LandNow" is not flown: with the battery first, the landing it starts is
+    // over before the brain-loss timeout (2 s) or the baro timeout (5 s plus
+    // the estimator's 10 s to show) can fire, so the second reason is never
+    // raised. Earlier, a stuck-armed bug hid this. The low-battery pack is
+    // sized so the (later) battery failure still latches in the second slot.
+    let swap = b == Failure::Geofence
+        || (b == Failure::BaroLoss && matches!(a, Failure::BatteryCritical | Failure::BatteryLow))
+        || (b == Failure::BrainCrash && a == Failure::BatteryCritical);
     let (a, b) = if swap { (b, a) } else { (a, b) };
     for (f, t) in [(a, 15.0), (b, 20.0)] {
         match f {
@@ -808,13 +826,6 @@ fn pair(name: &'static str, a: Failure, b: Failure) -> FaultScenario {
         || matches!(b, Failure::BatteryLow | Failure::BatteryCritical)
     {
         battery_spec = pair_battery(a, b);
-        // The raised critical level is only for the critical failure: with
-        // it, a low-battery pack would latch critical about 5 s after low.
-        // The default level (3.3 V) is never reached by the battery model,
-        // so a pairing with only a low battery stays at BATTERY_LOW.
-        if [a, b].contains(&Failure::BatteryCritical) {
-            failsafe.battery_critical_v = CRITICAL_V;
-        }
     }
     let needed = [a, b]
         .iter()
@@ -866,10 +877,21 @@ pub fn build(
     profile: Profile,
     index: u64,
 ) -> Result<Simulation<Script, 4>, SimError> {
+    build_with_wind(scenario, profile, index, |w| w)
+}
+
+/// Like [`build`], with `adjust` applied to the run's wind (for example to
+/// add an updraft).
+pub fn build_with_wind(
+    scenario: &FaultScenario,
+    profile: Profile,
+    index: u64,
+    adjust: impl FnOnce(WindConfig) -> WindConfig,
+) -> Result<Simulation<Script, 4>, SimError> {
     let airframe = Airframe::reference_quad()?;
     let seed = run_seed(scenario.name, index);
     let options = SimOptions {
-        wind: fault_wind(seed),
+        wind: adjust(fault_wind(seed)),
         faults: scenario.faults.clone(),
         links: scenario.links,
         failsafe: scenario.failsafe,
@@ -986,8 +1008,8 @@ mod tests {
         let p = by_name("pair-brain-crash+geofence").expect("pair");
         assert!(p.script.setpoints.iter().any(|(t, _)| *t == 15.0));
         assert!(p.faults.iter().all(|f| f.start_s == 20.0));
-        // A low-battery pairing keeps the default critical level.
-        let p = by_name("pair-battery-low+brain-crash").expect("pair");
+        // Battery pairings keep the default critical level.
+        let p = by_name("pair-battery-critical+brain-crash").expect("pair");
         let d = FailsafeParams::default();
         assert_eq!(
             p.failsafe.map(|f| f.battery_critical_v),
