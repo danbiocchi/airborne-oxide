@@ -313,6 +313,7 @@ mod tests {
             }),
             wind: Vec3::zero(),
             physics_faults: 0,
+            events: oxide_core::io::EventList::new(),
         }
     }
 

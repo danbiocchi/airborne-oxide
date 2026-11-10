@@ -32,6 +32,9 @@ pub struct VehicleModel<const N: usize> {
     /// air-relative velocity per unit of summed normalised rotor speed.
     pub rotor_drag_coeff: f64,
     pub rotors: [RotorModel; N],
+    /// Per-rotor fraction of normal thrust (and so reaction torque and shaft
+    /// power). 1.0 = healthy, 0.0 = dead. Set by the simulation's faults.
+    pub rotor_scale: [f64; N],
     pub torque_coeff_m: f64,
     pub motor_time_constant_s: f64,
     pub thrust_expo: f64,
@@ -63,6 +66,7 @@ impl<const N: usize> VehicleModel<N> {
                 },
                 max_thrust_n: p.max_thrust_n,
             }),
+            rotor_scale: [1.0; N],
             torque_coeff_m: p.torque_coeff_m,
             motor_time_constant_s: p.motor_time_constant_s,
             thrust_expo: p.thrust_expo,
@@ -165,10 +169,15 @@ impl<const N: usize> VehicleModel<N> {
         let mut torque = Vec3::zero();
         let mut power = 0.0;
         let mut speed_sum = 0.0;
-        for (r, n) in self.rotors.iter().zip(s.rotor_speed.iter()) {
+        for ((r, n), k) in self
+            .rotors
+            .iter()
+            .zip(s.rotor_speed.iter())
+            .zip(self.rotor_scale.iter())
+        {
             let n = n.max(0.0);
             speed_sum += n;
-            let thrust = r.max_thrust_n * n * n;
+            let thrust = r.max_thrust_n * n * n * k;
             let f = Vec3::new(0.0, 0.0, -thrust);
             force += f;
             torque +=
