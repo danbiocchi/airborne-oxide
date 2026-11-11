@@ -32,3 +32,6 @@ pub mod store;
 
 pub use flash::{Flash, FlashError};
 pub use store::{Error, Iter, MountReport, Store};
+
+#[cfg(test)]
+mod tests;
