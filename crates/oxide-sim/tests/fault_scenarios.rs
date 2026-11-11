@@ -114,22 +114,26 @@ fn fault_scenario_is_deterministic() {
     assert_ne!(a.position_at_end, c.position_at_end);
 }
 
-/// In an Rtl or Land descent the thrust is never cut to the minimum while the
-/// vehicle is clearly in the air (no false ground contact), over 10 seeds,
-/// in still air, in a steady 3 m/s updraft and with a 6 m/s up-gust. (The sim
-/// vehicle is not carried up by these, so the sign of the speed test is
-/// pinned by a core test instead: `contact_is_not_declared_on_a_vehicle_rising`.)
+/// Landings in wind: in an Rtl or Land descent the thrust is never cut to the
+/// minimum while the vehicle is clearly in the air, over 10 seeds, in still
+/// air, in a steady 3 m/s upward wind and with a 6 m/s upward gust.
+///
+/// This is NOT a test of false ground contact against a real upward
+/// disturbance: wind acts on the sim vehicle only through drag, so it never
+/// lifts the vehicle against its command, and `SimOptions` has no honest way
+/// to push it up. That the contact test cannot fire on a rising vehicle is
+/// covered at unit level in the core (`contact_is_not_declared_on_a_vehicle_rising`).
 #[test]
-fn landing_thrust_is_not_cut_in_the_air() {
+fn landing_thrust_is_not_cut_in_the_air_in_wind() {
     // geofence: Rtl from 5 m, lands at home. gps-loss: Land.
     for name in ["geofence", "gps-loss", "battery-low"] {
-        for air in ["still", "updraft", "up-gust"] {
+        for air in ["still", "up-wind", "up-gust-wind"] {
             let s = by_name(name).expect("scenario");
             for index in 0..10_u64 {
                 let mut sim = build_with_wind(&s, F405_LEAN, index, |mut w| {
                     match air {
-                        "updraft" => w.steady_ned.z = -3.0,
-                        "up-gust" => w.gusts.push(Gust {
+                        "up-wind" => w.steady_ned.z = -3.0,
+                        "up-gust-wind" => w.gusts.push(Gust {
                             start_s: 20.0,
                             duration_s: 15.0,
                             peak_ned: Vec3::new(0.0, 0.0, -6.0),
