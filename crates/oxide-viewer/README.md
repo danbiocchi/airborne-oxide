@@ -39,13 +39,21 @@ This flies the scripted hover-and-step scenario in real time and opens the viewe
 | Option | Effect |
 |---|---|
 | `--joystick` | You fly it with a USB joystick instead of the script |
-| `--scenario gust-hold` | Fly the hold-in-gusts scenario (realistic sensors, wind, EKF) instead of the default `hover-step` |
-| `--seed 3` | Run index for `gust-hold` (default 0) |
-
-`--scenario` and `--seed` have no effect with `--joystick`: joystick flights use the true state and calm air.
+| `--scenario NAME` | Fly a scripted scenario instead of the default `hover-step`: `gust-hold` (realistic sensors, wind, EKF), or any fault scenario or pairing, such as `rc-loss-position` or `pair-rc-loss+gps-loss`. An unknown name lists the available ones |
+| `--seed 3` | Run index for `gust-hold` and the fault scenarios (default 0) |
 | `--profile h743` | Use the H743 task schedule instead of the F405 one |
 | `--speed 4` | Run at 4× real time (`0` = as fast as possible) |
 | `--save flight.rrd` | Write a recording file instead of opening the viewer (open it later with `rerun flight.rrd`) |
+
+`--scenario` and `--seed` have no effect with `--joystick`: joystick flights use the true state and calm air.
+
+## Watching a failure
+
+Fault scenarios script a failure (lost RC link, lost GPS, low battery, a crashed brain and so on) and let the flight core's failsafes deal with it. The viewer shows what the core is doing: every event (`Armed`, `RC_LOST raised`, `action None -> Hold`, `nav Position -> Hold`, `Touchdown`, `Disarmed(Touchdown)`) is a line in the `events` text log at its simulation time, and is also printed to the terminal as it happens. The `plots/failsafe_action_rank` plot shows the failsafe action (0 None, 1 Hold, 2 Rtl, 3 Land, 4 LandNow, 5 Terminate), and `plots/valid/*` shows each estimate validity flag (0 or 1). Once the vehicle has armed, a yellow marker shows home in the 3D view, so a return flight can be followed.
+
+```bash
+cargo run --release --manifest-path crates/oxide-viewer/Cargo.toml -- --scenario rc-loss-position --speed 2
+```
 
 ## Flying with the Taranis X9D+
 
