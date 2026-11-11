@@ -232,7 +232,6 @@ pub(crate) fn in_range<S: Section>(s: &S) -> bool {
 }
 
 /// Writes every default of the table held by `s`.
-#[allow(dead_code)] // used by the Default impls in the next step
 pub(crate) fn fill_defaults<S: Section>(s: &mut S) {
     for (i, def) in PARAMS.iter().enumerate() {
         // A default the table cannot store is a bug the pinned-defaults test

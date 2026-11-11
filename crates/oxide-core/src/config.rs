@@ -65,6 +65,7 @@ pub struct Gains {
 
 impl Default for Gains {
     /// Starting gains for a small multirotor; auto-tuned per airframe later.
+    /// The values are the defaults in the parameter table.
     ///
     /// The outer loops were chosen on a reduced model (position P → velocity
     /// PI → acceleration with a 0.12 s lag, 50 Hz, one-period delay) for
@@ -72,18 +73,21 @@ impl Default for Gains {
     /// (0.95 / 1.8 / 0.4) leave a slow closed-loop pole near −0.2 rad/s that
     /// gives a 14 % overshoot and a 4 s tail without trajectory smoothing.
     fn default() -> Self {
-        Self {
-            rate_p: Vec3::new(28.0, 28.0, 12.0),
-            rate_i: Vec3::new(40.0, 40.0, 10.0),
-            rate_d: Vec3::new(0.3, 0.3, 0.0),
-            rate_d_cutoff_hz: 60.0,
-            gyro_cutoff_hz: 80.0,
-            attitude_p: Vec3::new(6.5, 6.5, 3.0),
-            velocity_p: Vec3::new(4.0, 4.0, 4.0),
-            velocity_i: Vec3::new(0.4, 0.4, 0.8),
-            velocity_d: Vec3::new(0.0, 0.0, 0.0),
-            position_p: Vec3::new(1.5, 1.5, 1.5),
-        }
+        let z = Vec3::new(0.0, 0.0, 0.0);
+        let mut g = Self {
+            rate_p: z,
+            rate_i: z,
+            rate_d: z,
+            rate_d_cutoff_hz: 0.0,
+            gyro_cutoff_hz: 0.0,
+            attitude_p: z,
+            velocity_p: z,
+            velocity_i: z,
+            velocity_d: z,
+            position_p: z,
+        };
+        crate::params::fill_defaults(&mut g);
+        g
     }
 }
 
@@ -116,21 +120,24 @@ pub struct Limits {
 }
 
 impl Default for Limits {
+    /// The defaults in the parameter table.
     fn default() -> Self {
-        Self {
-            max_tilt_rad: 35.0_f32.to_radians(),
-            max_tilt_stabilized_rad: 45.0_f32.to_radians(),
-            max_rate: Vec3::new(3.8, 3.8, 3.5),
-            max_speed_xy: 5.0,
-            max_speed_up: 3.0,
-            max_speed_down: 1.5,
-            max_yaw_rate: 2.0,
-            rate_integral_limit: 30.0,
-            velocity_integral_limit: 3.0,
-            min_thrust_fraction_of_hover: 0.1,
-            idle_command: 0.05,
-            stick_deadband: 0.05,
-        }
+        let mut l = Self {
+            max_tilt_rad: 0.0,
+            max_tilt_stabilized_rad: 0.0,
+            max_rate: Vec3::new(0.0, 0.0, 0.0),
+            max_speed_xy: 0.0,
+            max_speed_up: 0.0,
+            max_speed_down: 0.0,
+            max_yaw_rate: 0.0,
+            rate_integral_limit: 0.0,
+            velocity_integral_limit: 0.0,
+            min_thrust_fraction_of_hover: 0.0,
+            idle_command: 0.0,
+            stick_deadband: 0.0,
+        };
+        crate::params::fill_defaults(&mut l);
+        l
     }
 }
 
@@ -206,34 +213,37 @@ pub struct EkfParams {
 }
 
 impl Default for EkfParams {
+    /// The defaults in the parameter table.
     fn default() -> Self {
-        Self {
-            delay_horizon_us: 200_000,
-            gyro_noise: 0.015,
-            accel_noise: 0.35,
-            gyro_bias_noise: 1.0e-3,
-            accel_bias_noise: 3.0e-3,
-            gps_pos_noise_m: 0.5,
-            gps_vel_noise_mps: 0.3,
-            baro_noise_m: 0.5,
-            yaw_noise_rad: 0.15,
-            gps_gate: 5.0,
-            baro_gate: 5.0,
-            yaw_gate: 3.0,
+        let mut e = Self {
+            delay_horizon_us: 0,
+            gyro_noise: 0.0,
+            accel_noise: 0.0,
+            gyro_bias_noise: 0.0,
+            accel_bias_noise: 0.0,
+            gps_pos_noise_m: 0.0,
+            gps_vel_noise_mps: 0.0,
+            baro_noise_m: 0.0,
+            yaw_noise_rad: 0.0,
+            gps_gate: 0.0,
+            baro_gate: 0.0,
+            yaw_gate: 0.0,
             mag_declination_rad: 0.0,
-            init_tilt_sigma_rad: 0.1,
-            init_yaw_sigma_rad: 0.3,
-            init_vel_sigma_mps: 0.5,
-            init_pos_sigma_m: 1.0,
-            init_gyro_bias_sigma: 0.02,
-            init_accel_bias_sigma: 0.1,
-            align_time_us: 1_000_000,
-            gps_timeout_us: 5_000_000,
-            pos_timeout_us: 1_500_000,
-            baro_timeout_us: 5_000_000,
-            mag_timeout_us: 30_000_000,
-            output_tau_s: 0.25,
-        }
+            init_tilt_sigma_rad: 0.0,
+            init_yaw_sigma_rad: 0.0,
+            init_vel_sigma_mps: 0.0,
+            init_pos_sigma_m: 0.0,
+            init_gyro_bias_sigma: 0.0,
+            init_accel_bias_sigma: 0.0,
+            align_time_us: 0,
+            gps_timeout_us: 0,
+            pos_timeout_us: 0,
+            baro_timeout_us: 0,
+            mag_timeout_us: 0,
+            output_tau_s: 0.0,
+        };
+        crate::params::fill_defaults(&mut e);
+        e
     }
 }
 
@@ -256,10 +266,22 @@ impl EkfParams {
 }
 
 /// Estimator selection and tuning.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EstimatorConfig {
     pub source: EstimatorSource,
     pub ekf: EkfParams,
+}
+
+impl Default for EstimatorConfig {
+    /// The defaults in the parameter table.
+    fn default() -> Self {
+        let mut c = Self {
+            source: EstimatorSource::External,
+            ekf: EkfParams::default(),
+        };
+        crate::params::fill_defaults(&mut c);
+        c
+    }
 }
 
 /// Failsafe timings, thresholds and flight-action settings (ADR-0003).
@@ -326,36 +348,39 @@ pub struct FailsafeParams {
 }
 
 impl Default for FailsafeParams {
+    /// The defaults in the parameter table.
     fn default() -> Self {
-        Self {
-            rc_timeout_us: 500_000,
-            rc_valid_min_s: 1.0,
-            rc_loss_hold_s: 3.0,
-            gcs_timeout_us: 3_000_000,
-            no_link_rtl_s: 60.0,
-            brain_timeout_us: 2_000_000,
-            brain_loss_rtl_s: 10.0,
-            setpoint_timeout_us: 500_000,
-            gps_loss_land_s: 30.0,
-            clear_hysteresis_s: 1.0,
-            battery_low_v: 3.5,
-            battery_critical_v: 3.3,
-            battery_debounce_s: 2.0,
-            battery_filter_tau_s: 2.0,
+        let mut f = Self {
+            rc_timeout_us: 0,
+            rc_valid_min_s: 0.0,
+            rc_loss_hold_s: 0.0,
+            gcs_timeout_us: 0,
+            no_link_rtl_s: 0.0,
+            brain_timeout_us: 0,
+            brain_loss_rtl_s: 0.0,
+            setpoint_timeout_us: 0,
+            gps_loss_land_s: 0.0,
+            clear_hysteresis_s: 0.0,
+            battery_low_v: 0.0,
+            battery_critical_v: 0.0,
+            battery_debounce_s: 0.0,
+            battery_filter_tau_s: 0.0,
             fence_radius_m: 0.0,
             fence_altitude_m: 0.0,
-            loc_error_rad: 45.0_f32.to_radians(),
-            loc_error_s: 0.5,
-            loc_tilt_rad: 75.0_f32.to_radians(),
-            loc_tilt_s: 0.25,
-            rtl_altitude_m: 10.0,
-            rtl_speed_mps: 3.0,
-            land_speed_mps: 0.7,
-            land_blind_thrust: 0.9,
-            touchdown_thrust: 0.3,
-            touchdown_speed_mps: 0.25,
-            touchdown_s: 1.0,
-        }
+            loc_error_rad: 0.0,
+            loc_error_s: 0.0,
+            loc_tilt_rad: 0.0,
+            loc_tilt_s: 0.0,
+            rtl_altitude_m: 0.0,
+            rtl_speed_mps: 0.0,
+            land_speed_mps: 0.0,
+            land_blind_thrust: 0.0,
+            touchdown_thrust: 0.0,
+            touchdown_speed_mps: 0.0,
+            touchdown_s: 0.0,
+        };
+        crate::params::fill_defaults(&mut f);
+        f
     }
 }
 
