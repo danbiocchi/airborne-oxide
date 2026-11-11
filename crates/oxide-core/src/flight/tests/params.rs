@@ -79,8 +79,10 @@ fn live_change_in_flight_takes_effect_with_one_event() {
 fn disarmed_only_parameter_is_refused_while_armed_then_accepted() {
     let (mut core, k0) = armed_core(cfg());
     let before = *core.config();
+    let mut k = k0;
     for id in [ParamId::EKF_GYR_NOISE, ParamId::RATE_GYRO_CUTOFF] {
-        let out = step(&mut core, k0, stick(0.0), Some(set(id, 0.02)));
+        let out = step(&mut core, k, stick(0.0), Some(set(id, 0.02)));
+        k += 1;
         let ev = events(&out);
         assert_eq!(
             ev,
@@ -92,13 +94,14 @@ fn disarmed_only_parameter_is_refused_while_armed_then_accepted() {
     }
     let out = step(
         &mut core,
-        k0 + 1,
+        k,
         stick(0.0),
         Some(ParamSet {
             id: ParamId::EKF_SOURCE,
             value: ParamValue::I32(1),
         }),
     );
+    k += 1;
     assert_eq!(
         events(&out),
         vec![EventKind::ParamRefused {
@@ -110,7 +113,6 @@ fn disarmed_only_parameter_is_refused_while_armed_then_accepted() {
     assert!(!core.params_unsaved());
 
     // Disarm (switch low for long enough), then it is accepted.
-    let mut k = k0 + 2;
     for _ in 0..200 {
         step(&mut core, k, rc(false, false), None);
         k += 1;
@@ -130,6 +132,64 @@ fn disarmed_only_parameter_is_refused_while_armed_then_accepted() {
         core.param(ParamId::EKF_GYR_NOISE),
         Some(ParamValue::F32(0.02))
     );
+    assert_eq!(out.status.timing_faults, 0, "no tick number was used twice");
+}
+
+/// Steps with `rc_sample` until `want` is among the events; returns the tick
+/// it happened on.
+fn run_until(
+    core: &mut Core<4>,
+    from: u64,
+    rc_sample: RcSample,
+    want: impl Fn(&EventKind) -> bool,
+) -> u64 {
+    for k in from..from + 2000 {
+        let out = step(core, k, rc_sample, None);
+        if events(&out).iter().any(&want) {
+            return k;
+        }
+    }
+    panic!("the event never came");
+}
+
+fn refused_armed(id: ParamId) -> Vec<EventKind> {
+    vec![EventKind::ParamRefused {
+        id,
+        why: ParamError::Armed,
+    }]
+}
+
+#[test]
+fn a_disarmed_only_set_on_the_tick_after_the_arm_decision_is_refused() {
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    run(&mut core, 0, 1100, rc(false, false));
+    let k = run_until(&mut core, 1100, rc(true, false), |e| {
+        matches!(e, EventKind::Armed)
+    });
+    // The decision is made but not yet published: only `pending` says armed.
+    assert!(core.supervision.pending.armed);
+    assert!(!core.supervision.visible.armed);
+    let id = ParamId::EKF_GYR_NOISE;
+    let out = step(&mut core, k + 1, rc(true, false), Some(set(id, 0.02)));
+    assert_eq!(events(&out), refused_armed(id));
+    assert_eq!(core.param(id), Some(ParamValue::F32(0.015)));
+    assert_eq!(out.status.timing_faults, 0);
+}
+
+#[test]
+fn a_disarmed_only_set_on_the_tick_after_the_disarm_decision_is_refused() {
+    let (mut core, k0) = armed_core(cfg());
+    let k = run_until(&mut core, k0, rc(false, false), |e| {
+        matches!(e, EventKind::Disarmed(_))
+    });
+    // The decision is made but not yet published: only `visible` says armed.
+    assert!(!core.supervision.pending.armed);
+    assert!(core.supervision.visible.armed);
+    let id = ParamId::EKF_GYR_NOISE;
+    let out = step(&mut core, k + 1, rc(false, false), Some(set(id, 0.02)));
+    assert_eq!(events(&out), refused_armed(id));
+    assert_eq!(core.param(id), Some(ParamValue::F32(0.015)));
+    assert_eq!(out.status.timing_faults, 0);
 }
 
 #[test]
