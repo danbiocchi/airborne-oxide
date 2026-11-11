@@ -110,6 +110,9 @@ pub struct Limits {
     pub min_thrust_fraction_of_hover: f32,
     /// Motor command while armed with no demand (keeps props spinning).
     pub idle_command: f32,
+    /// Stick deadband: a stick within this of centre reads as centred, and
+    /// the rest of the travel is rescaled to the full range.
+    pub stick_deadband: f32,
 }
 
 impl Default for Limits {
@@ -126,6 +129,7 @@ impl Default for Limits {
             velocity_integral_limit: 3.0,
             min_thrust_fraction_of_hover: 0.1,
             idle_command: 0.05,
+            stick_deadband: 0.05,
         }
     }
 }

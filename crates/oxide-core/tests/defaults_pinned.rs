@@ -76,6 +76,7 @@ fn defaults_are_pinned() {
         l.min_thrust_fraction_of_hover,
         0x3dcccccd,
     );
+    f("l.stick_deadband", l.stick_deadband, 0x3d4c_cccd);
     f("l.idle_command", l.idle_command, 0x3d4ccccd);
     assert_eq!(e.delay_horizon_us, 200000, "e.delay_horizon_us");
     f("e.gyro_noise", e.gyro_noise, 0x3c75c28f);

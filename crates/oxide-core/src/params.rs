@@ -486,6 +486,8 @@ declare_params! {
             "Minimum collective thrust while flying, as a fraction of hover thrust. Must stay below LAND_TD_THRUST.";
         f32 LIM_IDLE = idle_command: 0.05, 0.0, 1.0, "", Limits, live,
             "Motor command while armed with no demand, 0 to 1.";
+        f32 LIM_STICK_DB = stick_deadband: 0.05, 0.0, 0.5, "", Limits, live,
+            "Stick deadband: a stick within this of centre reads as centred, and the rest of the travel is rescaled to the full range.";
     }
     EkfParams {
         secs EKF_HORIZON = delay_horizon_us: 0.2, MIN_US, 0.5, "s", Estimator, disarmed,

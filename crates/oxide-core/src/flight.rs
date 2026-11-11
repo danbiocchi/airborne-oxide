@@ -39,8 +39,6 @@ const KILL_CONFIRMATIONS: u8 = 3;
 const ARM_MAX_THROTTLE: f32 = 0.1;
 /// Body rate must be below this to arm, rad/s.
 const ARM_MAX_RATE: f32 = 0.1;
-/// Stick deadband.
-const DEADBAND: f32 = 0.05;
 /// Position mode keeps its setpoint within this distance of the vehicle, m.
 const POSITION_LEASH_M: f32 = 2.0;
 /// Capacity of the event queue.
@@ -498,14 +496,16 @@ impl<const N: usize> Core<N> {
     }
 }
 
-fn deadband(v: f32) -> f32 {
+/// A stick position with the deadband `db` (`Limits::stick_deadband`) cut
+/// out and the rest rescaled to the full range.
+fn deadband(v: f32, db: f32) -> f32 {
     let v = v.finite_or(0.0).clamp(-1.0, 1.0);
-    if Real::abs(v) < DEADBAND {
+    if Real::abs(v) < db {
         0.0
     } else if v > 0.0 {
-        (v - DEADBAND) / (1.0 - DEADBAND)
+        (v - db) / (1.0 - db)
     } else {
-        (v + DEADBAND) / (1.0 - DEADBAND)
+        (v + db) / (1.0 - db)
     }
 }
 
