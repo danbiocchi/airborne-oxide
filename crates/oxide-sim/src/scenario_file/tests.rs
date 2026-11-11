@@ -454,3 +454,43 @@ fn type_and_value_errors_from_the_toml_layer_name_the_key() {
         "sim.sensors",
     );
 }
+
+// ---- Judging a flight -----------------------------------------------------------
+
+#[test]
+fn the_hold_of_gust_hold_is_judged_as_fly_gust_hold_judges_it() {
+    use crate::metrics::{HoldCriteria, fly_gust_hold};
+    let f = fault_scenarios::by_name("gust-hold").expect("gust-hold");
+    for (profile, index) in [(F405_LEAN, 0), (F405_LEAN, 5), (H743_FULL, 2)] {
+        let v = f.fly_checked(profile, index, &[]).expect("flies");
+        let want = fly_gust_hold(profile, index, &HoldCriteria::default()).expect("flies");
+        assert_eq!(v.hold, Some(want), "{} index {index}", profile.name);
+        assert_eq!(v.violations, want.failures(&HoldCriteria::default()));
+    }
+}
+
+#[test]
+fn a_fault_scenario_is_judged_by_its_expect() {
+    let f = fault_scenarios::by_name("brain-crash").expect("scenario");
+    let v = f.fly_checked(F405_LEAN, 0, &[]).expect("flies");
+    assert_eq!(v.hold, None);
+    assert!(v.violations.is_empty(), "{:?}", v.violations);
+    // A requirement the flight cannot meet is reported.
+    let mut strict = f.clone();
+    strict.expect.as_mut().expect("expect").max_height_m = Some(1.0);
+    let v = strict.fly_checked(F405_LEAN, 0, &[]).expect("flies");
+    assert!(!v.violations.is_empty());
+    // A file with nothing to check has nothing to break.
+    let v = fault_scenarios::by_name("hover-step")
+        .expect("hover-step")
+        .fly_checked(F405_LEAN, 0, &[])
+        .expect("flies");
+    assert!(v.violations.is_empty() && v.hold.is_none());
+}
+
+#[test]
+fn a_hold_without_a_point_to_hold_is_refused() {
+    let e = refused("[expect.hold]\nwindow_start_s = 1.0\n");
+    assert_eq!(e.key, "expect.hold", "{e}");
+    assert!(e.reason.contains("setpoint"), "{e}");
+}

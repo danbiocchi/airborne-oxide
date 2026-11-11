@@ -95,12 +95,12 @@ use serde::Deserialize;
 use crate::SimError;
 use crate::airframe::{Airframe, BatterySpec, ordered_params};
 use crate::faults::{Fault, FaultKind, LinkConfig, validate_faults};
-use crate::metrics::HoldCriteria;
+use crate::metrics::{HoldCriteria, HoldMetrics};
 use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, REASON_NAMES};
 use crate::rng::{Rng, Stream, run_seed};
 use crate::scenario::Script;
 use crate::sensors::SensorConfig;
-use crate::sim::{SimOptions, Simulation, apply_param};
+use crate::sim::{SimOptions, Simulation, StepRecord, apply_param};
 use crate::wind::{Gust, WindConfig};
 
 #[cfg(test)]
@@ -311,6 +311,72 @@ impl BatteryOverride {
     }
 }
 
+/// The point a hold scenario must hold (NED, m): the position of the last
+/// setpoint the brain sends.
+fn hold_target(pilot: &Script) -> Option<Vec3<f64>> {
+    pilot
+        .setpoints
+        .iter()
+        .rev()
+        .find_map(|(_, sp)| sp.map(|sp| sp.position.cast::<f64>()))
+}
+
+/// What one flight did against what its file asks: [`Checker`]'s result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Verdict {
+    pub outcome: FlightOutcome,
+    /// The hold statistics, when the file has `[expect.hold]`.
+    pub hold: Option<HoldMetrics>,
+    /// Every expectation the flight broke, in words; empty = passed. A file
+    /// with neither `[expect]` nor `[expect.hold]` has none to break.
+    pub violations: Vec<String>,
+}
+
+/// Collects a flight's outcome and hold statistics step by step, then judges
+/// them against the file's `[expect]` and `[expect.hold]`.
+#[derive(Clone, Debug)]
+pub struct Checker {
+    outcome: FlightOutcome,
+    hold: Option<(HoldMetrics, HoldCriteria, Vec3<f64>)>,
+    expect: Option<Expect>,
+}
+
+impl Checker {
+    pub fn new(file: &ScenarioFile) -> Self {
+        let hold = file
+            .hold
+            .and_then(|c| hold_target(&file.pilot).map(|target| (HoldMetrics::new(), c, target)));
+        Self {
+            outcome: FlightOutcome::new(),
+            hold,
+            expect: file.expect.clone(),
+        }
+    }
+
+    pub fn add(&mut self, r: &StepRecord<ROTORS>) {
+        self.outcome.add(r);
+        if let Some((m, c, target)) = &mut self.hold {
+            m.add(r, *target, c);
+        }
+    }
+
+    pub fn finish(self) -> Verdict {
+        let mut violations = self
+            .expect
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.check(&self.outcome));
+        let hold = self.hold.map(|(m, c, _)| {
+            violations.extend(m.failures(&c));
+            m
+        });
+        Verdict {
+            outcome: self.outcome,
+            hold,
+            violations,
+        }
+    }
+}
+
 /// A scenario as loaded from a file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScenarioFile {
@@ -416,6 +482,25 @@ impl ScenarioFile {
         let mut options = self.options_with(&airframe, index, params);
         options.wind = adjust(options.wind);
         Simulation::<_, ROTORS>::with_options(&airframe, profile, self.pilot.clone(), options)
+    }
+
+    /// The time the run ends.
+    pub fn end(&self) -> Micros {
+        Micros((self.duration_s * 1e6).round() as u64)
+    }
+
+    /// Flies run `index` on `profile` to the end, with `params` applied after
+    /// the file's own, and judges it against `[expect]` and `[expect.hold]`.
+    pub fn fly_checked(
+        &self,
+        profile: Profile,
+        index: u64,
+        params: &[(String, f64)],
+    ) -> core::result::Result<Verdict, SimError> {
+        let mut sim = self.build_with_params(profile, index, params)?;
+        let mut checker = Checker::new(self);
+        sim.run_until(self.end(), |r| checker.add(r));
+        Ok(checker.finish())
     }
 
     /// Flies run `index` on `profile` to the end and returns what happened.
@@ -914,6 +999,12 @@ fn convert(raw: RawFile) -> Result<ScenarioFile> {
         None => (None, None),
     };
     let run = convert_run(raw.run)?;
+    if hold.is_some() && hold_target(&pilot).is_none() {
+        return Err(ScenarioError::new(
+            "expect.hold",
+            "needs a [[pilot.setpoint]] with a position: that is the point to hold",
+        ));
+    }
     Ok(ScenarioFile {
         name: raw.name,
         about: raw.about.unwrap_or_default(),

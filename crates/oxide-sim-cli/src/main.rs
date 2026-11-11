@@ -8,7 +8,8 @@
 //! oxide-sim hash [same options]
 //! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
 //! oxide-sim scenario list
-//! oxide-sim scenario NAME [--profile f405|h743] [--seed N] [--csv FILE]
+//! oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE]
+//! oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
 //! oxide-sim params list | json | doc
 //! ```
 //! `run`, `hash`, `montecarlo` and `scenario` also take `--params FILE.toml`
@@ -23,11 +24,18 @@
 //! (run 0, `<profile> <name>#0 <hash>`), so that it also covers ground contact,
 //! landings, failsafes and a crash. `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
-//! with 1 if any run fails. `scenario` flies a fault scenario (ADR-0003),
-//! prints its event timeline, a summary and every violated expectation, and
-//! exits with 1 if there are any; `--seed` is the run index.
+//! with 1 if any run fails. `scenario` flies a scenario (ADR-0003, ADR-0004
+//! §7): a name among the embedded ones (`scenario list`), or the path of a
+//! scenario file (an argument ending in `.toml` or containing a path
+//! separator is a path). It prints its event timeline, a summary and every
+//! violated expectation, and exits with 1 if there are any; `--seed` is the
+//! run index. `scenarios DIR` flies every `*.toml` of a directory in
+//! parallel, on the profiles given (default: each file's `[run] profiles`)
+//! and `--seeds` runs (default: each file's `[run] seeds`), prints one line
+//! per scenario and profile and exits with 1 if any run fails.
 
 mod params_cmd;
+mod scenarios_cmd;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -40,8 +48,8 @@ use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
 use oxide_sim::montecarlo::run_indexed;
-use oxide_sim::outcome::FlightOutcome;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
+use oxide_sim::scenario_file::{self, Checker, ScenarioFile};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimError, SimOptions, Simulation, StepRecord};
 
@@ -587,26 +595,38 @@ fn params_command(mut it: impl Iterator<Item = String>) -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// `oxide-sim scenario list | NAME [--profile P] [--seed N] [--csv FILE]
+/// The scenario `arg` names: a path when it ends in `.toml` or has a path
+/// separator, else one of the embedded scenarios.
+fn resolve_scenario(arg: &str) -> Result<ScenarioFile, Box<dyn std::error::Error>> {
+    if arg.ends_with(".toml") || arg.contains('/') || arg.contains('\\') {
+        return Ok(scenario_file::load_path(arg)?);
+    }
+    fault_scenarios::by_name(arg).ok_or_else(|| {
+        format!(
+            "unknown scenario {arg} (try: oxide-sim scenario list; a file is given by its path, e.g. ./{arg}.toml)"
+        )
+        .into()
+    })
+}
+
+/// `oxide-sim scenario list | NAME|PATH [--profile P] [--seed N] [--csv FILE]
 /// [--params FILE] [--param NAME=VALUE]`.
 fn scenario_command(
     mut it: impl Iterator<Item = String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let first = it.next().ok_or("scenario needs list or a scenario name")?;
+    let first = it
+        .next()
+        .ok_or("scenario needs list, a scenario name or the path of a scenario file")?;
     if first == "list" {
         if let Some(extra) = it.next() {
             return Err(format!("unexpected argument {extra} after list").into());
         }
-        for s in fault_scenarios::all()
-            .into_iter()
-            .chain(fault_scenarios::pairs())
-        {
+        for s in fault_scenarios::embedded() {
             println!("{:<34} {}", s.name, s.about);
         }
         return Ok(true);
     }
-    let scenario = fault_scenarios::by_name(&first)
-        .ok_or_else(|| format!("unknown scenario {first} (try: oxide-sim scenario list)"))?;
+    let scenario = resolve_scenario(&first)?;
     let (mut profile, mut index, mut csv_path) = (F405_LEAN, 0_u64, None);
     let mut params_file: Option<String> = None;
     let mut param_flags: Vec<(String, f64)> = Vec::new();
@@ -642,11 +662,10 @@ fn scenario_command(
         }
         None => None,
     };
-    let mut outcome = FlightOutcome::new();
+    let mut checker = Checker::new(&scenario);
     let mut io_error = None;
-    let end = Micros((scenario.duration_s * 1e6).round() as u64);
-    sim.run_until(end, |r| {
-        outcome.add(r);
+    sim.run_until(scenario.end(), |r| {
+        checker.add(r);
         if let Some(f) = csv.as_mut()
             && let Err(err) = f.write_all(csv_row(r).as_bytes())
         {
@@ -659,6 +678,8 @@ fn scenario_command(
     if let Some(mut f) = csv {
         f.flush()?;
     }
+    let verdict = checker.finish();
+    let outcome = &verdict.outcome;
     println!(
         "scenario   {} (run {index}, profile {})",
         scenario.name, profile.name
@@ -697,26 +718,40 @@ fn scenario_command(
             .disarmed_at_s
             .map_or("-".into(), |t| format!("{t:.2} s"))
     );
+    if let Some(h) = &verdict.hold {
+        println!(
+            "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {:.3} m",
+            h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m, h.est_max_h_error_m
+        );
+    }
     println!("trace hash {:016x}", sim.trace_hash());
-    let violations = scenario
-        .expect
-        .as_ref()
-        .map_or_else(Vec::new, |e| e.check(&outcome));
-    if violations.is_empty() {
+    if scenario.expect.is_none() && scenario.hold.is_none() {
+        println!("result     PASS (the file states no expectations)");
+    } else if verdict.violations.is_empty() {
         println!("result     PASS");
     } else {
         println!("result     FAIL");
-        for v in &violations {
+        for v in &verdict.violations {
             println!("  violated: {v}");
         }
     }
-    Ok(violations.is_empty())
+    Ok(verdict.violations.is_empty())
 }
 
 fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("params") {
         return match params_command(std::env::args().skip(2)) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if std::env::args().nth(1).as_deref() == Some("scenarios") {
+        return match scenarios_cmd::run(std::env::args().skip(2)) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::from(2)
@@ -738,7 +773,7 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!(
-                "usage: oxide-sim run|hash|montecarlo|scenario|params [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic] [--seeds N] [--threads T] [--params FILE] [--param NAME=VALUE]; oxide-sim params list|json|doc"
+                "usage: oxide-sim run|hash|montecarlo|scenario|scenarios|params [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic] [--seeds N] [--threads T] [--params FILE] [--param NAME=VALUE]; oxide-sim scenario list|NAME|PATH; oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]; oxide-sim params list|json|doc"
             );
             return ExitCode::from(2);
         }
@@ -971,6 +1006,37 @@ mod tests {
     #[test]
     fn scenario_command_flies_a_passing_scenario() {
         let a = ["gcs-loss", "--profile", "h743", "--seed", "1"];
+        let r = scenario_command(a.iter().map(|s| (*s).to_string()));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    #[test]
+    fn scenario_command_flies_a_file_by_path_and_names_the_ways_to_name_one() {
+        let path = temp_file(
+            "mine.toml",
+            "name = \"mine\"\nduration_s = 2.0\n[expect]\nmin_height_m = 4.0\n",
+        );
+        let r = scenario_command([path.clone()].into_iter());
+        assert!(
+            matches!(r, Ok(false)),
+            "a path flies, and its expectation fails: {r:?}"
+        );
+        let r = scenario_command(["hover-step".to_string()].into_iter());
+        assert!(
+            matches!(r, Ok(true)),
+            "an embedded scenario without [expect]: {r:?}"
+        );
+        let e = scenario_command(["nope".to_string()].into_iter()).expect_err("unknown");
+        assert!(e.to_string().contains("path"), "{e}");
+        let e = scenario_command(["./no-such-file.toml".to_string()].into_iter())
+            .expect_err("missing file");
+        assert!(e.to_string().contains("no-such-file.toml"), "{e}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scenario_command_judges_a_hold_scenario() {
+        let a = ["gust-hold", "--seed", "1"];
         let r = scenario_command(a.iter().map(|s| (*s).to_string()));
         assert!(matches!(r, Ok(true)), "{r:?}");
     }
