@@ -481,19 +481,21 @@ fn gcs_loss() -> FaultScenario {
 fn battery_low() -> FaultScenario {
     FaultScenario {
         name: "battery-low",
-        about: "A small battery runs down to its low level in flight (about 25 s): Rtl, and lands at home.",
-        script: offboard_script(sp(0.0, 0.0, 5.0), 60.0),
+        about: "A battery runs down to its low level 15 m out (about 25 s) and never to critical: Rtl flies back, and lands at home.",
+        script: offboard_script(sp(15.0, 0.0, 5.0), 70.0),
         faults: Vec::new(),
         links: LinkConfig::default(),
         failsafe: None,
-        battery: Some(battery_tripping_at(SOC_LOW, 25.0)),
+        battery: Some(low_only_battery(SOC_LOW, 25.0)),
         expect: Expect {
             nav_contains: vec![NavState::Rtl],
+            nav_never: vec![NavState::LandNow],
             reasons: Reasons::BATTERY_LOW,
+            reasons_never: Reasons::BATTERY_CRITICAL,
             ending: Ending::Landed {
                 within_m_of_home: Some(2.0),
             },
-            by_s: 50.0,
+            by_s: 55.0,
             ..Expect::default()
         },
     }
@@ -734,6 +736,17 @@ fn battery_tripping_at(soc_level: f64, t_s: f64) -> BatterySpec {
     )
 }
 
+/// A large pack that reaches `soc_level` so that its latch comes at about
+/// `t_s`, and drains so slowly that the critical level (further down) does not
+/// follow within the flight, so only `BATTERY_LOW` is raised.
+fn low_only_battery(soc_level: f64, t_s: f64) -> BatterySpec {
+    let drain = PAIR_DRAIN_PER_S * PAIR_CAPACITY_MAH / PAIR_LOW_ONLY_CAPACITY_MAH;
+    battery(
+        PAIR_LOW_ONLY_CAPACITY_MAH,
+        soc_level + drain * (t_s - 3.0 - LATCH_LAG_S),
+    )
+}
+
 /// The battery for a pairing that has a battery failure: the first
 /// battery failure latches at its time (15 s, or 20 s as the second
 /// failure); with both, low at 15 s and critical about 5 s later.
@@ -756,11 +769,7 @@ fn pair_battery(a: Failure, b: Failure) -> Option<BatterySpec> {
         first_battery.1
     };
     if first_battery.0 == Failure::BatteryLow && ![a, b].contains(&Failure::BatteryCritical) {
-        let drain = PAIR_DRAIN_PER_S * PAIR_CAPACITY_MAH / PAIR_LOW_ONLY_CAPACITY_MAH;
-        return Some(battery(
-            PAIR_LOW_ONLY_CAPACITY_MAH,
-            level + drain * (t - 3.0 - LATCH_LAG_S),
-        ));
+        return Some(low_only_battery(level, t));
     }
     Some(battery_tripping_at(level, t))
 }
