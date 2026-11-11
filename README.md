@@ -44,6 +44,13 @@ Fly 200 gust-hold seeds on every core and print the worst case of each pass crit
 cargo run --release -p oxide-sim-cli -- montecarlo --seeds 200
 ```
 
+List the tunable parameters, and fly with one changed (all of them are documented in [`docs/PARAMETERS.md`](docs/PARAMETERS.md); `--params FILE.toml` takes a `[params]` table):
+
+```bash
+cargo run --release -p oxide-sim-cli -- params list
+cargo run --release -p oxide-sim-cli -- run --param POS_X_P=1.2
+```
+
 Run the tests:
 
 ```bash
