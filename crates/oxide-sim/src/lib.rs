@@ -33,6 +33,8 @@ pub enum SimError {
     Core(oxide_core::config::ConfigError),
     /// A period is not a whole number of base ticks (µs value given).
     TimeBase(u64),
+    /// Fault number `index` of the options can never happen as written.
+    Fault { index: usize, reason: String },
 }
 
 impl fmt::Display for SimError {
@@ -44,6 +46,7 @@ impl fmt::Display for SimError {
                 f,
                 "periods must be whole multiples of the {us} µs base tick"
             ),
+            SimError::Fault { index, reason } => write!(f, "fault {index}: {reason}"),
         }
     }
 }

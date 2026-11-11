@@ -164,6 +164,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             return Err(SimError::TimeBase(base_us));
         }
         options.links.validate(base_us)?;
+        crate::faults::validate_faults(&options.faults, N, &options.links)?;
         let sensors = SensorSuite::new(options.sensors, options.seed, base_us)?;
         let wind = Wind::new(options.wind, Rng::stream(options.seed, Stream::Wind));
         Ok(Self {

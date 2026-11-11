@@ -9,7 +9,7 @@ use oxide_sim::faults::{Fault, FaultKind, LinkConfig};
 use oxide_sim::scenario::{COMMAND_PERIOD_US, Pilot};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::vehicle::{BodyState, GRAVITY, VehicleModel};
-use oxide_sim::{Airframe, SimOptions, Simulation};
+use oxide_sim::{Airframe, SimError, SimOptions, Simulation};
 
 /// 50 Hz RC whose roll stick changes with time, and 50 Hz setpoints.
 struct TestPilot;
@@ -364,15 +364,6 @@ fn motor_loss_sets_rotor_scale_inside_its_window_only() {
                 0.75,
                 None,
             ),
-            // Out of range: ignored.
-            fault(
-                FaultKind::MotorLoss {
-                    rotor: 9,
-                    scale: 0.0,
-                },
-                0.0,
-                None,
-            ),
         ],
         ..SimOptions::default()
     };
@@ -463,4 +454,72 @@ fn no_faults_is_bit_identical_to_default_run() {
         ..SimOptions::default()
     });
     assert_eq!(plain, explicit);
+}
+
+/// The error of building a simulation with these options.
+fn setup_error(options: SimOptions) -> Option<SimError> {
+    let a = Airframe::reference_quad().expect("airframe");
+    Simulation::<_, 4>::with_options(&a, F405_LEAN, TestPilot, options).err()
+}
+
+#[test]
+fn a_motor_loss_on_a_rotor_the_airframe_lacks_is_refused() {
+    let bad = FaultKind::MotorLoss {
+        rotor: 4,
+        scale: 0.0,
+    };
+    let e = setup_error(with_faults(vec![fault(bad, 5.0, None)])).expect("refused");
+    assert!(matches!(e, SimError::Fault { index: 0, .. }), "{e:?}");
+    assert!(e.to_string().contains("rotor 4"), "{e}");
+    // The last rotor that exists is fine.
+    let ok = FaultKind::MotorLoss {
+        rotor: 3,
+        scale: 0.0,
+    };
+    assert_eq!(setup_error(with_faults(vec![fault(ok, 5.0, None)])), None);
+}
+
+#[test]
+fn a_fault_window_that_ends_before_it_starts_is_refused() {
+    for (start, end) in [(5.0, 4.0), (5.0, 5.0), (5.0, f64::NAN)] {
+        let e = setup_error(with_faults(vec![
+            fault(FaultKind::GpsLoss, 1.0, None),
+            fault(FaultKind::BaroLoss, start, Some(end)),
+        ]))
+        .expect("refused");
+        assert!(
+            matches!(e, SimError::Fault { index: 1, .. }),
+            "{start}..{end}: {e:?}"
+        );
+    }
+    // A non-finite start is refused too (it would never start).
+    let e =
+        setup_error(with_faults(vec![fault(FaultKind::GpsLoss, f64::NAN, None)])).expect("refused");
+    assert!(matches!(e, SimError::Fault { index: 0, .. }), "{e:?}");
+    // A window that is not empty, and a permanent fault, are fine.
+    assert_eq!(
+        setup_error(with_faults(vec![
+            fault(FaultKind::GpsLoss, 5.0, Some(5.001)),
+            fault(FaultKind::BaroLoss, 5.0, None),
+        ])),
+        None
+    );
+}
+
+#[test]
+fn link_faults_need_their_link() {
+    let no_gcs = with_faults(vec![fault(FaultKind::GcsLoss, 5.0, None)]);
+    let e = setup_error(no_gcs.clone()).expect("refused");
+    assert!(e.to_string().contains("ground station"), "{e}");
+    let mut with_gcs = no_gcs;
+    with_gcs.links.gcs = true;
+    assert_eq!(setup_error(with_gcs), None);
+
+    for kind in [FaultKind::BrainCrash, FaultKind::BrainHang] {
+        let mut o = with_faults(vec![fault(kind, 5.0, None)]);
+        assert_eq!(setup_error(o.clone()), None, "{kind:?} with a brain");
+        o.links.brain = false;
+        let e = setup_error(o).expect("refused");
+        assert!(e.to_string().contains("brain"), "{kind:?}: {e}");
+    }
 }

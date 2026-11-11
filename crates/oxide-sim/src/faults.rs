@@ -122,6 +122,48 @@ impl LinkConfig {
     }
 }
 
+/// Refuses faults that could never act: a window that is not finite or ends
+/// at or before its start (`end_s: None` is a permanent fault), a motor loss on
+/// a rotor beyond the airframe's `rotors`, and a ground-station or brain fault
+/// when `links` has no such link. Such a fault would silently fly undisturbed.
+pub fn validate_faults(
+    faults: &[Fault],
+    rotors: usize,
+    links: &LinkConfig,
+) -> Result<(), SimError> {
+    for (index, f) in faults.iter().enumerate() {
+        let refuse = |reason: String| Err(SimError::Fault { index, reason });
+        if !f.start_s.is_finite() {
+            return refuse(format!("start {} s is not finite", f.start_s));
+        }
+        if let Some(end) = f.end_s
+            && !(end.is_finite() && end > f.start_s)
+        {
+            return refuse(format!(
+                "window {} s to {end} s ends before it starts (or is not finite)",
+                f.start_s
+            ));
+        }
+        match f.kind {
+            FaultKind::MotorLoss { rotor, .. } if rotor >= rotors => {
+                return refuse(format!(
+                    "motor loss on rotor {rotor}, but the airframe has {rotors} rotors"
+                ));
+            }
+            FaultKind::GcsLoss if !links.gcs => {
+                return refuse(
+                    "ground-station loss, but the options have no ground station".into(),
+                );
+            }
+            FaultKind::BrainCrash | FaultKind::BrainHang if !links.brain => {
+                return refuse(format!("{:?}, but the options have no brain link", f.kind));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
