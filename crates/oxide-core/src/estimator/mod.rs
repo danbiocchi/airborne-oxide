@@ -129,57 +129,16 @@ pub struct Estimator {
     resets: u32,
 }
 
-/// True for a finite, strictly positive value (false for NaN).
-fn pos(x: f32) -> bool {
-    x.is_finite() && x > 0.0
-}
-
 impl Estimator {
-    /// Fails with [`ConfigError::BadEstimator`] if a parameter is non-finite
-    /// or non-positive where it must be positive (noises, gates, horizon,
-    /// time constant, align time, GPS timeout, initial sigmas), or if the
-    /// delay horizon does not fit the IMU buffer: `ceil(delay_horizon_us /
-    /// filter period) + 2 > IMU_BUFFER`. A malformed profile fails with
+    /// Fails with [`ConfigError::BadEstimator`] if a parameter is outside its
+    /// range in the parameter table (non-finite, or non-positive where it
+    /// must be positive), or if the delay horizon does not fit the IMU
+    /// buffer (see [`EkfParams::validate`]). A malformed profile fails with
     /// [`ConfigError::BadProfile`].
     pub fn new(params: &EkfParams, profile: &Profile) -> Result<Self, ConfigError> {
         profile.validate()?;
+        params.validate(profile)?;
         let p = params;
-        let positive = [
-            p.gyro_noise,
-            p.accel_noise,
-            p.gyro_bias_noise,
-            p.accel_bias_noise,
-            p.gps_pos_noise_m,
-            p.gps_vel_noise_mps,
-            p.baro_noise_m,
-            p.yaw_noise_rad,
-            p.gps_gate,
-            p.baro_gate,
-            p.yaw_gate,
-            p.output_tau_s,
-            p.init_tilt_sigma_rad,
-            p.init_yaw_sigma_rad,
-            p.init_vel_sigma_mps,
-            p.init_pos_sigma_m,
-            p.init_gyro_bias_sigma,
-            p.init_accel_bias_sigma,
-        ];
-        if !positive.iter().all(|x| pos(*x))
-            || !p.mag_declination_rad.is_finite()
-            || p.delay_horizon_us == 0
-            || p.align_time_us == 0
-            || p.gps_timeout_us == 0
-            || p.pos_timeout_us == 0
-            || p.baro_timeout_us == 0
-            || p.mag_timeout_us == 0
-        {
-            return Err(ConfigError::BadEstimator);
-        }
-        let period_us = u64::from(profile.filter_period_ticks) * u64::from(profile.base_period_us);
-        let needed = u64::from(p.delay_horizon_us).div_ceil(period_us.max(1)) + 2;
-        if period_us == 0 || needed > IMU_BUFFER as u64 {
-            return Err(ConfigError::BadEstimator);
-        }
         Ok(Self {
             params: *p,
             horizon_us: u64::from(p.delay_horizon_us),

@@ -23,7 +23,7 @@ fn defaults_are_pinned() {
     let g = Gains::default();
     let l = Limits::default();
     let ec = EstimatorConfig::default();
-    let e = ec.ekf;
+    let e: EkfParams = ec.ekf;
     let fs = FailsafeParams::default();
     assert_eq!(ec.source, EstimatorSource::External);
     f("g.rate_p.x", g.rate_p.x, 0x41e00000);

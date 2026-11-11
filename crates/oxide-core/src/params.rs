@@ -5,12 +5,11 @@
 //! The configuration structs stay the storage; the table describes their
 //! fields and [`get`] and [`set`] read and write them.
 
-// Until the accessors and the `Default` impls use the declarations.
-#![allow(dead_code)]
-
 use crate::config::{
     ConfigError, EkfParams, EstimatorConfig, EstimatorSource, FailsafeParams, Gains, Limits,
+    VehicleConfig,
 };
+use crate::schedule::Profile;
 
 /// A parameter's value. `f32` and `i32` are the two types MAVLink carries
 /// without loss.
@@ -233,6 +232,7 @@ pub(crate) fn in_range<S: Section>(s: &S) -> bool {
 }
 
 /// Writes every default of the table held by `s`.
+#[allow(dead_code)] // used by the Default impls in the next step
 pub(crate) fn fill_defaults<S: Section>(s: &mut S) {
     for (i, def) in PARAMS.iter().enumerate() {
         // A default the table cannot store is a bug the pinned-defaults test
@@ -599,4 +599,95 @@ declare_params! {
         f32 LAND_TD_TIME = touchdown_s: 1.0, TINY, DUR, "s", Land, live,
             "Touchdown: for this long.";
     }
+}
+
+// ---- access ----
+
+fn load_cfg<const N: usize>(cfg: &VehicleConfig<N>, id: ParamId) -> Option<Stored> {
+    Section::load(&cfg.gains, id)
+        .or_else(|| Section::load(&cfg.limits, id))
+        .or_else(|| Section::load(&cfg.estimator.ekf, id))
+        .or_else(|| Section::load(&cfg.estimator, id))
+        .or_else(|| Section::load(&cfg.failsafe, id))
+}
+
+fn store_cfg<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    id: ParamId,
+    v: ParamValue,
+) -> Result<(), ParamError> {
+    if Section::store(&mut cfg.gains, id, v)?
+        || Section::store(&mut cfg.limits, id, v)?
+        || Section::store(&mut cfg.estimator.ekf, id, v)?
+        || Section::store(&mut cfg.estimator, id, v)?
+        || Section::store(&mut cfg.failsafe, id, v)?
+    {
+        Ok(())
+    } else {
+        Err(ParamError::Unknown)
+    }
+}
+
+/// The current value of a parameter; `None` for an unknown id. A parameter
+/// held as whole microseconds reads in seconds.
+pub fn get<const N: usize>(cfg: &VehicleConfig<N>, id: ParamId) -> Option<ParamValue> {
+    load_cfg(cfg, id).map(to_value)
+}
+
+/// Changes one parameter. The value must be of the parameter's type, finite
+/// and within `[min, max]`, and the configuration with the change must pass
+/// [`VehicleConfig::validate`] and the estimator's checks against `profile`
+/// (rules that involve more than one field). A refused change leaves `cfg`
+/// untouched. Whether the vehicle is armed is the caller's business: see
+/// [`ParamDef::live`].
+pub fn set<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    id: ParamId,
+    value: ParamValue,
+) -> Result<(), ParamError> {
+    let def = PARAMS.get(id.index()).ok_or(ParamError::Unknown)?;
+    if value.kind() != def.kind {
+        return Err(ParamError::WrongType);
+    }
+    if let ParamValue::F32(v) = value
+        && !v.is_finite()
+    {
+        return Err(ParamError::NotFinite);
+    }
+    let mut next = *cfg;
+    store_cfg(&mut next, id, value)?;
+    let stored = load_cfg(&next, id).ok_or(ParamError::Unknown)?;
+    if !stored_in_range(def, stored) {
+        return Err(ParamError::OutOfRange);
+    }
+    next.validate().map_err(ParamError::Invalid)?;
+    next.estimator
+        .ekf
+        .validate(profile)
+        .map_err(ParamError::Invalid)?;
+    *cfg = next;
+    Ok(())
+}
+
+/// The parameter called `name`.
+pub fn find(name: &str) -> Option<ParamId> {
+    PARAMS
+        .iter()
+        .position(|d| d.name == name)
+        .and_then(|i| u16::try_from(i).ok())
+        .map(ParamId)
+}
+
+/// The stable storage key of a parameter name: 32-bit FNV-1a. Reordering the
+/// table never changes what a stored key means.
+pub const fn key(name: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    let mut rest = name.as_bytes();
+    while let [first, tail @ ..] = rest {
+        h ^= *first as u32;
+        h = h.wrapping_mul(0x0100_0193);
+        rest = tail;
+    }
+    h
 }
