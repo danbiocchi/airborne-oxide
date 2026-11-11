@@ -257,3 +257,20 @@ fn thrust_above_weight_lifts_off_and_below_does_not() {
         "z = {z}"
     );
 }
+
+#[test]
+fn a_vehicle_dropped_inverted_is_not_righted_by_the_ground() {
+    let m = model();
+    let mut s = BodyState::<4>::default();
+    s.position.z = -0.3;
+    s.attitude = Quat::from_rotation_vector(Vec3::new(170f64.to_radians(), 0.0, 0.0));
+    assert!((tilt_deg(&s) - 170.0).abs() < 1e-6);
+    let end = fall(&m, s, 5.0, |_| {});
+    // It lies on the ground (the legs still carry it) but stays upside down.
+    assert!(end.position.z.abs() < 0.05, "z = {}", end.position.z);
+    assert!(
+        tilt_deg(&end) > 90.0,
+        "righted itself to {} deg",
+        tilt_deg(&end)
+    );
+}

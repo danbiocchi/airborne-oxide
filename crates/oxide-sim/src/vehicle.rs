@@ -285,7 +285,7 @@ impl<const N: usize> VehicleModel<N> {
         let f_fric = vxy * (-gm.friction * fn_n / (vxy.norm() + gm.friction_speed_mps));
         let force = Vec3::new(f_fric.x, f_fric.y, -fn_n);
 
-        // Legs: restoring torque towards level, saturating at F_n·L, plus
+        // Legs: restoring torque towards level (while upright), saturating at F_n·L, plus
         // damping sized for critical damping at the static load, all scaled
         // by F_n so they vanish at lift-off.
         let l = self.lever_arm_m();
@@ -300,9 +300,14 @@ impl<const N: usize> VehicleModel<N> {
         } else {
             Vec3::zero()
         };
-        let tb = s
-            .attitude
-            .inverse_rotate(tilt_vec * (fn_n * l / gm.tilt_ref_rad));
+        // The legs only right a vehicle whose up axis is above the horizon
+        // (tilt below 90 deg); one that lies upside down is not turned over.
+        let restoring = if down.z > 0.0 {
+            tilt_vec * (fn_n * l / gm.tilt_ref_rad)
+        } else {
+            Vec3::zero()
+        };
+        let tb = s.attitude.inverse_rotate(restoring);
         let limit = fn_n * l;
         let w = self.mass_kg * GRAVITY;
         let k0 = w * l / gm.tilt_ref_rad;
