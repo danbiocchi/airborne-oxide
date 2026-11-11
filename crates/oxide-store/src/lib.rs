@@ -26,6 +26,8 @@
 pub mod crc;
 pub mod flash;
 pub mod layout;
+#[cfg(any(test, feature = "std"))]
+pub mod sim;
 pub mod store;
 
 pub use flash::{Flash, FlashError};
