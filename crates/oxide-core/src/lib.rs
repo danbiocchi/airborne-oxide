@@ -32,6 +32,7 @@ pub mod io;
 pub mod linalg;
 pub mod math;
 pub mod monitor;
+pub mod params;
 pub mod schedule;
 pub mod time;
 
