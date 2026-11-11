@@ -509,7 +509,12 @@ impl<const N: usize> Core<N> {
             g.position_sp.x = position.x;
             g.position_sp.y = position.y;
         }
-        if !v.heading || !was.heading {
+        // `Stabilized` flies on the gyro-integrated yaw, which is smooth with
+        // or without a heading, and its setpoint accumulates the pilot's
+        // stick: there only the reset at the edge re-bases it. Pinning it to
+        // the yaw on every run would take the yaw stick away.
+        let returned = v.heading && !was.heading;
+        if returned || (!v.heading && nav != NavState::Stabilized) {
             g.yaw_sp = yaw_now;
         }
         let return_height =

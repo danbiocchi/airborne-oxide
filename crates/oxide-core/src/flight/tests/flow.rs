@@ -1843,3 +1843,53 @@ fn a_landing_with_the_default_speeds_still_disarms_on_the_ground() {
     assert!(rig.run_until(10.0, |r| r.nav() == NavState::LandNow));
     assert!(rig.run_until(60.0, |r| !r.out.status.armed));
 }
+
+#[test]
+fn the_yaw_stick_still_turns_a_stabilized_vehicle_without_a_heading() {
+    // Stabilized flies on the gyro-integrated yaw, which is smooth with or
+    // without a magnetometer, so the pilot keeps the yaw stick. The setpoint
+    // must accumulate the stick, not be pinned to the current yaw.
+    let no_heading = Validity {
+        heading: false,
+        velocity: false,
+        position: false,
+        ..Validity::ALL
+    };
+    let mut core = guidance_core();
+    let p = Vec3::new(0.0, 0.0, -5.0);
+    let stick = RcSample {
+        yaw: 1.0,
+        throttle: 0.5,
+        arm_switch: true,
+        ..RcSample::default()
+    };
+    // One second of full yaw stick; the made-up estimate's yaw stays at 0.
+    for k in 0..250 {
+        core.rc = Some(Stamped::ideal(Micros(k * 4000), stick));
+        guide(&mut core, k, NavState::Stabilized, no_heading, p, 0.0, None);
+    }
+    let rate = core.cfg.limits.max_yaw_rate;
+    assert!(
+        core.guide_state.yaw_sp > 0.5 * rate,
+        "yaw_sp {} after 1 s of full stick at up to {rate} rad/s",
+        core.guide_state.yaw_sp
+    );
+    // The magnetometer returns and the estimator resets its yaw: the
+    // setpoint is re-based on it, so the vehicle does not swing back.
+    let centred = RcSample { yaw: 0.0, ..stick };
+    core.rc = Some(Stamped::ideal(Micros(250 * 4000), centred));
+    guide(
+        &mut core,
+        250,
+        NavState::Stabilized,
+        Validity::ALL,
+        p,
+        -2.0,
+        None,
+    );
+    assert!(
+        (core.guide_state.yaw_sp + 2.0).abs() < 1e-6,
+        "yaw_sp {}",
+        core.guide_state.yaw_sp
+    );
+}
