@@ -99,8 +99,8 @@ fn scenario_dir() -> std::path::PathBuf {
 
 #[test]
 fn exported_files_load_back_to_the_same_scenario() {
-    let files = export::fault_files();
-    assert_eq!(files.len(), 41);
+    let files = export::all_files();
+    assert_eq!(files.len(), 43);
     for f in files {
         let text = export::to_toml(&f);
         let back = load_str(&text).unwrap_or_else(|e| panic!("{}: {e}\n{text}", f.name));
@@ -214,4 +214,64 @@ fn the_files_in_scenarios_are_what_the_exporter_writes() {
         on_disk, expected,
         "files in scenarios/ and scenarios defined in code differ"
     );
+}
+
+// ---- hover-step and gust-hold ---------------------------------------------------
+
+use crate::scenario::{GustHold, HoverStep, gust_hold};
+use oxide_core::schedule::{F405_LEAN, H743_FULL};
+
+/// Hash of the Rust `HoverStep` flight (seed 0, ideal sensors, true state).
+fn hover_step_hash(profile: Profile) -> u64 {
+    let airframe = Airframe::reference_quad().expect("airframe");
+    let mut sim =
+        Simulation::<_, 4>::new(&airframe, profile, HoverStep::default()).expect("builds");
+    sim.run_until(Micros(20_000_000), |_| {});
+    sim.trace_hash()
+}
+
+fn file_hash(f: &ScenarioFile, profile: Profile, index: u64) -> u64 {
+    let mut sim = f.build(profile, index).expect("builds");
+    sim.run_until(Micros((f.duration_s * 1e6).round() as u64), |_| {});
+    sim.trace_hash()
+}
+
+#[test]
+fn hover_step_as_a_script_flies_the_same_flight() {
+    let f = export::from_hover_step(&HoverStep::default());
+    // The hashes `oxide-sim hash` prints.
+    assert_eq!(hover_step_hash(F405_LEAN), 0x3de1_6d7a_9847_deaf);
+    assert_eq!(hover_step_hash(H743_FULL), 0x9ff0_2684_5c34_2fbd);
+    for profile in [F405_LEAN, H743_FULL] {
+        // The Rust flight always has seed 0; ideal sensors and a calm wind
+        // leave nothing for another seed to change.
+        for index in 0..2 {
+            assert_eq!(
+                file_hash(&f, profile, index),
+                hover_step_hash(profile),
+                "{} index {index}",
+                profile.name
+            );
+        }
+    }
+}
+
+#[test]
+fn gust_hold_as_a_script_flies_the_same_flight() {
+    let f = export::from_gust_hold(&GustHold::default());
+    let airframe = Airframe::reference_quad().expect("airframe");
+    for profile in [F405_LEAN, H743_FULL] {
+        for index in 0..2 {
+            let (pilot, options) = gust_hold(index);
+            let mut sim = Simulation::<_, 4>::with_options(&airframe, profile, pilot, options)
+                .expect("builds");
+            sim.run_until(Micros(40_000_000), |_| {});
+            assert_eq!(
+                file_hash(&f, profile, index),
+                sim.trace_hash(),
+                "{} index {index}",
+                profile.name
+            );
+        }
+    }
 }

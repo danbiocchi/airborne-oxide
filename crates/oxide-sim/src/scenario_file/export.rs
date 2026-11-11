@@ -12,6 +12,7 @@ use oxide_core::params::{self, PARAMS, ParamValue};
 
 use super::*;
 use crate::fault_scenarios::{self, FaultScenario};
+use crate::scenario::{GUST_HOLD_ID, GustHold, HoverStep};
 
 /// An `f64` in its shortest form that reads back as the same bits.
 fn num(v: f64) -> String {
@@ -310,6 +311,20 @@ pub fn to_toml(s: &ScenarioFile) -> String {
         }
     }
 
+    if let Some(h) = &s.hold {
+        line!("\n[expect.hold]");
+        line!("window_start_s = {}", num(h.window_start_s));
+        line!("armed_from_s = {}", num(h.armed_from_s));
+        line!("max_h_error_m = {}", num(h.max_h_error_m));
+        line!("rms_h_error_m = {}", num(h.rms_h_error_m));
+        line!("max_v_error_m = {}", num(h.max_v_error_m));
+        line!("max_tilt_deg = {}", num(h.max_tilt_deg));
+        line!("est_max_h_error_m = {}", num(h.est_max_h_error_m));
+        line!("est_max_v_error_m = {}", num(h.est_max_v_error_m));
+        line!("est_max_vel_error_mps = {}", num(h.est_max_vel_error_mps));
+        line!("est_max_att_error_deg = {}", num(h.est_max_att_error_deg));
+    }
+
     line!("\n[run]");
     line!("seeds = {}", s.run.seeds);
     let profiles: Vec<String> = s.run.profiles.iter().map(|p| quoted(p.name())).collect();
@@ -411,7 +426,109 @@ pub fn fault_files() -> Vec<ScenarioFile> {
         .collect()
 }
 
+/// `hover-step` as a file: the built-in `HoverStep` pilot is a script.
+pub fn from_hover_step(h: &HoverStep) -> ScenarioFile {
+    ScenarioFile {
+        name: "hover-step".to_string(),
+        about: "Arms on the ground, takes off to 2 m, then steps in x, yaw and xyz with ideal sensors and the true state: the M1a flight.".to_string(),
+        airframe: REFERENCE_AIRFRAME.to_string(),
+        duration_s: h.duration_s,
+        sensors: SensorPreset::Ideal,
+        estimator: EstimatorSource::External,
+        links: LinkConfig::default(),
+        wind: WindSpec::Calm,
+        battery: None,
+        params: Vec::new(),
+        faults: Vec::new(),
+        pilot: Script {
+            arm_at_s: h.arm_at_s,
+            mode: vec![(0.0, 2)],
+            setpoints: h
+                .waypoints
+                .iter()
+                .map(|w| {
+                    (
+                        w.from_s,
+                        Some(TrajectorySetpoint {
+                            position: w.position,
+                            velocity: Vec3::zero(),
+                            yaw: w.yaw,
+                        }),
+                    )
+                })
+                .collect(),
+            duration_s: h.duration_s,
+            ..Script::default()
+        },
+        expect: None,
+        hold: None,
+        run: RunSpec {
+            seeds: 1,
+            profiles: vec![RunProfile::F405, RunProfile::H743],
+        },
+    }
+}
+
+/// `gust-hold` as a file: the built-in `GustHold` pilot is a script, the wind
+/// of `scenario::gust_hold_wind` is the random generator with its ranges.
+pub fn from_gust_hold(g: &GustHold) -> ScenarioFile {
+    let setpoint = |position| {
+        Some(TrajectorySetpoint {
+            position,
+            velocity: Vec3::zero(),
+            yaw: g.yaw,
+        })
+    };
+    ScenarioFile {
+        name: GUST_HOLD_ID.to_string(),
+        about: "The M1b acceptance flight: arm on the ground, climb to 2 m and hold in gusty wind on noisy sensors with the EKF.".to_string(),
+        airframe: REFERENCE_AIRFRAME.to_string(),
+        duration_s: g.duration_s,
+        sensors: SensorPreset::Realistic,
+        estimator: EstimatorSource::Ekf,
+        links: LinkConfig::default(),
+        // `scenario::gust_hold_wind`.
+        wind: WindSpec::Random(RandomWind {
+            steady_speed_mps: [0.0, 4.0],
+            sigma_h_mps: [0.2, 0.8],
+            sigma_v_ratio: 0.5,
+            tau_s: 2.0,
+            gusts: Some(RandomGusts {
+                count: 3,
+                start_s: [15.0, 35.0],
+                duration_s: [1.0, 4.0],
+                peak_h_mps: [1.0, 4.0],
+                peak_v_mps: [-0.5, 0.5],
+            }),
+        }),
+        battery: None,
+        params: Vec::new(),
+        faults: Vec::new(),
+        pilot: Script {
+            arm_at_s: g.arm_at_s,
+            mode: vec![(0.0, 2)],
+            setpoints: vec![
+                (0.0, setpoint(Vec3::zero())),
+                (g.takeoff_at_s, setpoint(g.hold)),
+            ],
+            duration_s: g.duration_s,
+            ..Script::default()
+        },
+        expect: None,
+        hold: Some(HoldCriteria::default()),
+        run: RunSpec {
+            seeds: 200,
+            profiles: vec![RunProfile::F405, RunProfile::H743],
+        },
+    }
+}
+
 /// Every scenario there is.
 pub fn all_files() -> Vec<ScenarioFile> {
-    fault_files()
+    let mut files = vec![
+        from_hover_step(&HoverStep::default()),
+        from_gust_hold(&GustHold::default()),
+    ];
+    files.extend(fault_files());
+    files
 }

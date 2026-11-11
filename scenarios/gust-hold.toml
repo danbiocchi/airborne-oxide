@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name = "gust-hold"
+about = "The M1b acceptance flight: arm on the ground, climb to 2 m and hold in gusty wind on noisy sensors with the EKF."
+airframe = "quad-x-5in"
+duration_s = 40.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "random"
+steady_speed_mps = [0.0, 4.0]
+sigma_h_mps = [0.2, 0.8]
+sigma_v_ratio = 0.5
+tau_s = 2.0
+
+[wind.gusts]
+count = 3
+start_s = [15.0, 35.0]
+duration_s = [1.0, 4.0]
+peak_h_mps = [1.0, 4.0]
+peak_v_mps = [-0.5, 0.5]
+
+[pilot]
+arm_at_s = 3.0
+
+[[pilot.mode]]
+t = 0.0
+switch = "offboard"
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, -0.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 4.0
+position = [0.0, 0.0, 2.0]
+yaw = 0.0
+
+[expect.hold]
+window_start_s = 15.0
+armed_from_s = 3.5
+max_h_error_m = 1.5
+rms_h_error_m = 0.5
+max_v_error_m = 1.0
+max_tilt_deg = 35.0
+est_max_h_error_m = 1.0
+est_max_v_error_m = 1.0
+est_max_vel_error_mps = 0.5
+est_max_att_error_deg = 3.0
+
+[run]
+seeds = 200
+profiles = ["f405", "h743"]
