@@ -597,6 +597,9 @@ fn scenario_command(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let first = it.next().ok_or("scenario needs list or a scenario name")?;
     if first == "list" {
+        if let Some(extra) = it.next() {
+            return Err(format!("unexpected argument {extra} after list").into());
+        }
         for s in fault_scenarios::all()
             .into_iter()
             .chain(fault_scenarios::pairs())
@@ -808,6 +811,17 @@ mod tests {
     fn scenario_command_lists_and_rejects_unknown_names() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert!(scenario_command(args(&["list"]).into_iter()).is_ok());
+        // Nothing may follow `list`.
+        for extra in [
+            &["list", "--seed", "3"][..],
+            &["list", "x"],
+            &["list", "--bogus"],
+        ] {
+            assert!(
+                scenario_command(args(extra).into_iter()).is_err(),
+                "{extra:?}"
+            );
+        }
         assert!(scenario_command(args(&["no-such-scenario"]).into_iter()).is_err());
         assert!(scenario_command(args(&["gcs-loss", "--bogus"]).into_iter()).is_err());
         assert!(scenario_command(args(&["gcs-loss", "--seed", "x"]).into_iter()).is_err());

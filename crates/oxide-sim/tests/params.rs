@@ -73,6 +73,14 @@ fn each_error_names_the_parameter_the_value_and_the_reason() {
         e.contains("EKF_SOURCE") && e.contains("0.5") && e.contains("whole number"),
         "{e}"
     );
+    // A whole number too large for an i32 is out of range, not the wrong type.
+    for v in [3.0e9, -3.0e9, 2_147_483_648.0, 1.0e30] {
+        let e = refused(&[("EKF_SOURCE", v)]);
+        assert!(
+            e.contains("EKF_SOURCE") && e.contains("range") && !e.contains("whole number"),
+            "{v}: {e}"
+        );
+    }
     let e = refused(&[("POS_X_P", 1.0e9)]);
     assert!(
         e.contains("POS_X_P") && e.contains("1000000000") && e.contains("range"),

@@ -102,7 +102,8 @@ fn describe(e: ParamError) -> String {
 }
 
 /// Sets the parameter `name` on `cfg` through `oxide_core::params::set`. An
-/// `i32` parameter needs a whole number; an `f32` one takes `value as f32`.
+/// `i32` parameter needs a whole number (one too large for an `i32` is out
+/// of range); an `f32` one takes `value as f32`.
 /// A refused change leaves `cfg` untouched.
 #[allow(clippy::cast_possible_truncation)]
 pub fn apply_param<const N: usize>(
@@ -122,12 +123,12 @@ pub fn apply_param<const N: usize>(
     let v = match def.kind {
         ParamKind::F32 => ParamValue::F32(value as f32),
         ParamKind::I32 => {
-            if !value.is_finite()
-                || value.fract() != 0.0
-                || value < f64::from(i32::MIN)
-                || value > f64::from(i32::MAX)
-            {
+            if !value.is_finite() || value.fract() != 0.0 {
                 return Err(fail(ParamError::WrongType));
+            }
+            // A whole number, but one an i32 cannot hold.
+            if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+                return Err(fail(ParamError::OutOfRange));
             }
             ParamValue::I32(value as i32)
         }
