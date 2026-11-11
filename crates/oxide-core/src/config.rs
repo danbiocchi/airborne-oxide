@@ -183,8 +183,18 @@ pub struct EkfParams {
     pub init_accel_bias_sigma: f32,
     /// The vehicle must sit still this long before the filter aligns, µs.
     pub align_time_us: u32,
-    /// GPS aiding stops after this long without an accepted fix, µs.
+    /// GPS aiding stops after this long without an accepted fix, µs. Also
+    /// how long horizontal velocity stays valid (ADR-0003 §1).
     pub gps_timeout_us: u32,
+    /// Horizontal position stays valid this long after the last accepted
+    /// GPS fix, µs.
+    pub pos_timeout_us: u32,
+    /// Height stays valid this long after the last accepted barometer
+    /// reading, µs.
+    pub baro_timeout_us: u32,
+    /// Heading stays valid this long after the last accepted magnetometer
+    /// reading, µs.
+    pub mag_timeout_us: u32,
     /// Output-predictor correction time constant, s.
     pub output_tau_s: f32,
 }
@@ -213,6 +223,9 @@ impl Default for EkfParams {
             init_accel_bias_sigma: 0.1,
             align_time_us: 1_000_000,
             gps_timeout_us: 5_000_000,
+            pos_timeout_us: 1_500_000,
+            baro_timeout_us: 5_000_000,
+            mag_timeout_us: 30_000_000,
             output_tau_s: 0.25,
         }
     }
@@ -223,6 +236,216 @@ impl Default for EkfParams {
 pub struct EstimatorConfig {
     pub source: EstimatorSource,
     pub ekf: EkfParams,
+}
+
+/// Failsafe timings, thresholds and flight-action settings (ADR-0003).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FailsafeParams {
+    /// RC counts as lost after this long without a valid frame, µs.
+    pub rc_timeout_us: u32,
+    /// RC must be valid this long without a gap before pilot input counts
+    /// (arming, override), s.
+    pub rc_valid_min_s: f32,
+    /// After RC loss in a pilot mode: hold this long, then return, s.
+    pub rc_loss_hold_s: f32,
+    /// The ground station counts as lost after this long without a
+    /// heartbeat, µs.
+    pub gcs_timeout_us: u32,
+    /// Offboard with no human link: continue this long, then return, s.
+    pub no_link_rtl_s: f32,
+    /// The brain counts as lost when its progress counter has not advanced
+    /// for this long, µs.
+    pub brain_timeout_us: u32,
+    /// After brain loss: hold this long, then return, s.
+    pub brain_loss_rtl_s: f32,
+    /// Tier-2 setpoints count as stale after this long, µs.
+    pub setpoint_timeout_us: u32,
+    /// After losing position with nobody flying: hold this long, then
+    /// land, s.
+    pub gps_loss_land_s: f32,
+    /// A Hold ends when its reasons have been clear this long, s.
+    pub clear_hysteresis_s: f32,
+    /// Battery low and critical thresholds, V per cell, on the filtered,
+    /// load-compensated voltage.
+    pub battery_low_v: f32,
+    pub battery_critical_v: f32,
+    /// The voltage must stay below a threshold this long to latch, s.
+    pub battery_debounce_s: f32,
+    /// Battery voltage low-pass time constant, s.
+    pub battery_filter_tau_s: f32,
+    /// Geofence radius around home, m. Zero disables it.
+    pub fence_radius_m: f32,
+    /// Geofence height above home, m. Zero disables it.
+    pub fence_altitude_m: f32,
+    /// Loss of control: attitude error above this for
+    /// `loc_error_s`, rad.
+    pub loc_error_rad: f32,
+    pub loc_error_s: f32,
+    /// Loss of control: tilt above this for `loc_tilt_s`, rad.
+    pub loc_tilt_rad: f32,
+    pub loc_tilt_s: f32,
+    /// Return altitude above home, m.
+    pub rtl_altitude_m: f32,
+    /// Return ground speed, m/s.
+    pub rtl_speed_mps: f32,
+    /// Landing descent rate, m/s.
+    pub land_speed_mps: f32,
+    /// Landing without a valid height: thrust as a fraction of hover
+    /// thrust.
+    pub land_blind_thrust: f32,
+    /// Touchdown: thrust below this fraction of hover thrust…
+    pub touchdown_thrust: f32,
+    /// …and vertical speed below this, m/s…
+    pub touchdown_speed_mps: f32,
+    /// …for this long, s.
+    pub touchdown_s: f32,
+}
+
+impl Default for FailsafeParams {
+    fn default() -> Self {
+        Self {
+            rc_timeout_us: 500_000,
+            rc_valid_min_s: 1.0,
+            rc_loss_hold_s: 3.0,
+            gcs_timeout_us: 3_000_000,
+            no_link_rtl_s: 60.0,
+            brain_timeout_us: 2_000_000,
+            brain_loss_rtl_s: 10.0,
+            setpoint_timeout_us: 500_000,
+            gps_loss_land_s: 30.0,
+            clear_hysteresis_s: 1.0,
+            battery_low_v: 3.5,
+            battery_critical_v: 3.3,
+            battery_debounce_s: 2.0,
+            battery_filter_tau_s: 2.0,
+            fence_radius_m: 0.0,
+            fence_altitude_m: 0.0,
+            loc_error_rad: 45.0_f32.to_radians(),
+            loc_error_s: 0.5,
+            loc_tilt_rad: 75.0_f32.to_radians(),
+            loc_tilt_s: 0.25,
+            rtl_altitude_m: 10.0,
+            rtl_speed_mps: 3.0,
+            land_speed_mps: 0.7,
+            land_blind_thrust: 0.9,
+            touchdown_thrust: 0.3,
+            touchdown_speed_mps: 0.25,
+            touchdown_s: 1.0,
+        }
+    }
+}
+
+impl FailsafeParams {
+    /// A commanded descent counts as a command to move when it is at least
+    /// this many times `touchdown_speed_mps` (ground contact, ADR-0003 §2).
+    /// The landing speed must reach it too, or a landing could not be told
+    /// from standing on the ground.
+    pub const CONTACT_DESCENT_RATIO: f32 = 2.0;
+
+    /// The slowest commanded descent that counts as a command to move, m/s.
+    pub fn contact_descent_mps(&self) -> f32 {
+        Self::CONTACT_DESCENT_RATIO * self.touchdown_speed_mps
+    }
+
+    /// Shortest accepted timeout, µs: below this a single late frame at
+    /// the slowest supervisor rate would count as a loss.
+    pub const MIN_TIMEOUT_US: u32 = 50_000;
+    /// Longest accepted timeout, µs (an hour, like the durations): a
+    /// timeout that never runs out is a loss that is never detected.
+    pub const MAX_TIMEOUT_US: u32 = 3_600_000_000;
+    /// Longest accepted duration, s.
+    pub const MAX_DURATION_S: f32 = 3600.0;
+    /// Accepted battery thresholds, V per cell. The monitor treats a cell
+    /// voltage outside 3.0 to 4.35 V as implausible and refuses to arm, so a
+    /// threshold below 3.0 could only fire after the pack had passed the
+    /// point where it could be armed. A latch clears on the ground only
+    /// above the threshold plus 0.1 V, and a full cell reads 4.2 V, so a
+    /// threshold above 4.0 V could latch a fresh pack for good.
+    pub const BATTERY_THRESHOLD_RANGE_V: (f32, f32) = (3.0, 4.0);
+
+    /// Checks every parameter. Returns [`ConfigError::BadFailsafe`] for a
+    /// non-finite or out-of-range value, or for one that would disable a
+    /// protection or make a manoeuvre unable to finish (a zero return
+    /// speed, a landing too slow to tell from standing on the ground).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let finite = |v: f32| v.is_finite();
+        let duration = |v: f32| (0.0..=Self::MAX_DURATION_S).contains(&v);
+        let positive_duration = |v: f32| v > 0.0 && v <= Self::MAX_DURATION_S;
+        let (v_min, v_max) = Self::BATTERY_THRESHOLD_RANGE_V;
+        let floats = [
+            self.rc_valid_min_s,
+            self.rc_loss_hold_s,
+            self.no_link_rtl_s,
+            self.brain_loss_rtl_s,
+            self.gps_loss_land_s,
+            self.clear_hysteresis_s,
+            self.battery_low_v,
+            self.battery_critical_v,
+            self.battery_debounce_s,
+            self.battery_filter_tau_s,
+            self.fence_radius_m,
+            self.fence_altitude_m,
+            self.loc_error_rad,
+            self.loc_error_s,
+            self.loc_tilt_rad,
+            self.loc_tilt_s,
+            self.rtl_altitude_m,
+            self.rtl_speed_mps,
+            self.land_speed_mps,
+            self.land_blind_thrust,
+            self.touchdown_thrust,
+            self.touchdown_speed_mps,
+            self.touchdown_s,
+        ];
+        let timeouts = [
+            self.rc_timeout_us,
+            self.gcs_timeout_us,
+            self.brain_timeout_us,
+            self.setpoint_timeout_us,
+        ];
+        let durations = [
+            self.rc_valid_min_s,
+            self.rc_loss_hold_s,
+            self.no_link_rtl_s,
+            self.brain_loss_rtl_s,
+            self.gps_loss_land_s,
+            self.clear_hysteresis_s,
+            self.battery_debounce_s,
+            self.loc_error_s,
+            self.loc_tilt_s,
+        ];
+        let angle = |v: f32| v > 0.0 && v <= core::f32::consts::PI;
+        let ok = floats.iter().all(|v| finite(*v))
+            && timeouts
+                .iter()
+                .all(|t| (Self::MIN_TIMEOUT_US..=Self::MAX_TIMEOUT_US).contains(t))
+            && durations.iter().all(|v| duration(*v))
+            && positive_duration(self.touchdown_s)
+            && positive_duration(self.battery_filter_tau_s)
+            && (v_min..=v_max).contains(&self.battery_low_v)
+            && (v_min..=v_max).contains(&self.battery_critical_v)
+            && self.battery_critical_v <= self.battery_low_v
+            && self.fence_radius_m >= 0.0
+            && self.fence_altitude_m >= 0.0
+            && angle(self.loc_error_rad)
+            && angle(self.loc_tilt_rad)
+            && self.rtl_altitude_m >= 0.0
+            && self.rtl_speed_mps >= 0.1
+            && self.touchdown_speed_mps > 0.0
+            && self.land_speed_mps >= self.contact_descent_mps()
+            && self.touchdown_thrust > 0.0
+            && self.touchdown_thrust < 1.0
+            // A blind landing flies this fixed thrust with no vertical speed
+            // known, where low thrust alone reads as landed: it must stay
+            // above the touchdown thrust or the motors would stop in the air.
+            && self.land_blind_thrust > self.touchdown_thrust
+            && self.land_blind_thrust <= 1.0;
+        if ok {
+            Ok(())
+        } else {
+            Err(ConfigError::BadFailsafe)
+        }
+    }
 }
 
 /// Everything the core needs to know about the vehicle.
@@ -239,6 +462,11 @@ pub struct VehicleConfig<const N: usize> {
     pub gains: Gains,
     pub limits: Limits,
     pub estimator: EstimatorConfig,
+    pub failsafe: FailsafeParams,
+    /// Battery cells in series.
+    pub battery_cells: u8,
+    /// Battery internal resistance, Ω, for load compensation.
+    pub battery_resistance_ohm: f32,
 }
 
 /// Configuration problems found when the core is built.
@@ -257,6 +485,9 @@ pub enum ConfigError {
     /// An estimator parameter is out of range, or the delay horizon does not
     /// fit the profile's filter rate and buffer sizes.
     BadEstimator,
+    /// A failsafe parameter or the battery description is out of range, or
+    /// the minimum thrust is not below the touchdown thrust.
+    BadFailsafe,
 }
 
 impl<const N: usize> VehicleConfig<N> {
@@ -282,6 +513,21 @@ impl<const N: usize> VehicleConfig<N> {
         }
         if !pos(self.nominal_voltage_v) {
             return Err(ConfigError::BadMassProperties);
+        }
+        self.failsafe.validate()?;
+        // On ground contact guidance commands the minimum thrust, and
+        // touchdown needs the thrust below `touchdown_thrust`: at or above
+        // it a landed vehicle would never disarm.
+        if !(0.0..self.failsafe.touchdown_thrust)
+            .contains(&self.limits.min_thrust_fraction_of_hover)
+        {
+            return Err(ConfigError::BadFailsafe);
+        }
+        if self.battery_cells < 1
+            || !self.battery_resistance_ohm.is_finite()
+            || self.battery_resistance_ohm < 0.0
+        {
+            return Err(ConfigError::BadFailsafe);
         }
         Ok(())
     }

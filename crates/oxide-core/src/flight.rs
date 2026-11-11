@@ -1,35 +1,50 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The flight core: one `tick` per base period (DESIGN §4.2, ADR-0001).
+//!
+//! The supervisor (arming, failsafes, navigation state) lives in
+//! `supervisor`, the guidance task in `guidance` (ADR-0003).
+
+mod guidance;
+mod supervisor;
+#[cfg(test)]
+mod tests;
 
 use crate::allocation::{Mixer, command_for_fraction};
 use crate::config::{ConfigError, EstimatorSource, VehicleConfig};
 use crate::control::{
     AttitudeTarget, PositionController, RateController, RateTarget, attitude_rate_setpoint,
 };
+use crate::estimator::ring::Ring;
 use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
 use crate::io::{
-    BatterySample, EstimatorStatus, FlightMode, ImuSample, Inputs, Outputs, RcSample, Stamped,
-    StateSample, Status, TrajectorySetpoint,
+    Action, BatterySample, BrainHeartbeat, EVENTS_PER_TICK, EstimatorStatus, Event, EventKind,
+    EventList, FlightMode, GcsHeartbeat, ImuSample, Inputs, NavState, Outputs, PrearmFlags,
+    RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
 };
-use crate::math::{Quat, Real, Vec3, wrap_pi};
+use crate::math::{Real, Vec3};
 use crate::schedule::{Profile, TaskId};
 use crate::time::Micros;
+
+use guidance::GuidanceState;
+use supervisor::SupervisorState;
 
 /// How old a sample may be before it is treated as missing, µs (the same
 /// 100 ms the estimator applies to the IMU).
 const STATE_TIMEOUT_US: u64 = IMU_TIMEOUT_US;
-const RC_TIMEOUT_US: u64 = 500_000;
-const SETPOINT_TIMEOUT_US: u64 = 500_000;
 const BATTERY_TIMEOUT_US: u64 = 1_000_000;
 /// Consecutive supervisor runs that must see the kill switch (DESIGN §4.9).
 const KILL_CONFIRMATIONS: u8 = 3;
 /// Throttle must be below this to arm.
 const ARM_MAX_THROTTLE: f32 = 0.1;
+/// Body rate must be below this to arm, rad/s.
+const ARM_MAX_RATE: f32 = 0.1;
 /// Stick deadband.
 const DEADBAND: f32 = 0.05;
 /// Position mode keeps its setpoint within this distance of the vehicle, m.
 const POSITION_LEASH_M: f32 = 2.0;
+/// Capacity of the event queue.
+const EVENT_QUEUE: usize = 32;
 
 /// Output of a task under the logical-execution-time rule: computed into
 /// `pending`, visible to other tasks only after the next release.
@@ -45,25 +60,28 @@ impl<T: Copy> Let<T> {
     }
 }
 
+/// The published estimate: a state and which parts of it to trust.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Estimate {
+    state: Option<StateSample>,
+    valid: Validity,
+    /// The estimator's state resets so far (zero for the external source).
+    /// A change means the estimate jumped rather than moved.
+    resets: u32,
+}
+
 /// Supervisor decisions.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Supervision {
     armed: bool,
     killed: bool,
+    /// The pilot's mode.
     mode: FlightMode,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct SupervisorState {
-    kill_count: u8,
-    prev_arm_switch: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct GuidanceState {
-    position_sp: Vec3<f32>,
-    yaw_sp: f32,
-    last_mode: Option<FlightMode>,
+    nav: NavState,
+    home: Option<Vec3<f32>>,
+    reasons: Reasons,
+    action: Action,
+    prearm: PrearmFlags,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,13 +108,18 @@ pub struct Core<const N: usize> {
     rc: Option<Stamped<RcSample>>,
     battery: Option<Stamped<BatterySample>>,
     setpoint: Option<Stamped<TrajectorySetpoint>>,
+    gcs: Option<Stamped<GcsHeartbeat>>,
+    /// The brain's last progress value, and the arrival time at which it
+    /// last changed (the first heartbeat counts as a change).
+    brain_progress: Option<u32>,
+    brain_changed_at: Option<Micros>,
 
     estimator: Estimator,
     /// Rate-loop gyro low-pass, and its latest output (body, rad/s).
     gyro_lpf: LowPass2,
     gyro_filtered: Vec3<f32>,
 
-    estimate: Let<Option<StateSample>>,
+    estimate: Let<Estimate>,
     supervision: Let<Supervision>,
     guidance: Let<AttitudeTarget>,
     attitude: Let<RateTarget>,
@@ -105,6 +128,9 @@ pub struct Core<const N: usize> {
     guide_state: GuidanceState,
     position_ctrl: PositionController,
     rate_ctrl: RateController,
+
+    events: Ring<Option<Event>, EVENT_QUEUE>,
+    events_dropped: u32,
 }
 
 impl<const N: usize> Core<N> {
@@ -140,6 +166,9 @@ impl<const N: usize> Core<N> {
             rc: None,
             battery: None,
             setpoint: None,
+            gcs: None,
+            brain_progress: None,
+            brain_changed_at: None,
             estimator,
             gyro_lpf,
             gyro_filtered: Vec3::zero(),
@@ -147,10 +176,12 @@ impl<const N: usize> Core<N> {
             supervision: Let::default(),
             guidance: Let::default(),
             attitude: Let::default(),
-            sup_state: SupervisorState::default(),
+            sup_state: SupervisorState::new(),
             guide_state: GuidanceState::default(),
             position_ctrl: PositionController::default(),
             rate_ctrl: RateController::default(),
+            events: Ring::new(),
+            events_dropped: 0,
         })
     }
 
@@ -169,9 +200,22 @@ impl<const N: usize> Core<N> {
     }
 
     /// The state estimate the controllers currently see (the published
-    /// one), or `None` before the estimator has a valid solution.
+    /// one), or `None` while attitude is not valid. Which parts of the state
+    /// to trust is in `Status::valid`: with the EKF, position or heading can
+    /// be stale or wrong while this is `Some`.
     pub fn estimate(&self) -> Option<StateSample> {
-        self.estimate.visible
+        let e = self.estimate.visible;
+        e.state.filter(|_| e.valid.attitude)
+    }
+
+    /// Home, set at arming when position was valid.
+    pub fn home(&self) -> Option<Vec3<f32>> {
+        self.supervision.visible.home
+    }
+
+    /// Events dropped because the queue (32 events) overflowed.
+    pub fn events_dropped(&self) -> u32 {
+        self.events_dropped
     }
 
     /// Runs one base tick. Call exactly once per base period.
@@ -212,7 +256,8 @@ impl<const N: usize> Core<N> {
             self.run_estimator(now);
         }
         if sup {
-            self.run_supervisor(now);
+            #[allow(clippy::cast_precision_loss)]
+            self.run_supervisor(now, base_dt * self.periods.supervisor as f32);
         }
         if gui {
             #[allow(clippy::cast_precision_loss)]
@@ -255,8 +300,12 @@ impl<const N: usize> Core<N> {
         if inputs.state.is_some() {
             self.state = inputs.state;
         }
-        if inputs.rc.is_some() {
-            self.rc = inputs.rc;
+        if let Some(rc) = inputs.rc {
+            self.rc = Some(rc);
+            if !rc.value.is_valid() {
+                // A bad frame is a gap, even if no supervisor run sees it.
+                self.sup_state.rc_valid_since = None;
+            }
         }
         if inputs.battery.is_some() {
             self.battery = inputs.battery;
@@ -266,6 +315,16 @@ impl<const N: usize> Core<N> {
             let v = sp.value;
             if v.position.is_finite() && v.velocity.is_finite() && v.yaw.is_finite() {
                 self.setpoint = Some(sp);
+            }
+        }
+        if inputs.gcs_heartbeat.is_some() {
+            self.gcs = inputs.gcs_heartbeat;
+        }
+        if let Some(hb) = inputs.brain_heartbeat {
+            let BrainHeartbeat { progress } = hb.value;
+            if self.brain_progress != Some(progress) {
+                self.brain_progress = Some(progress);
+                self.brain_changed_at = Some(hb.t_arrival);
             }
         }
     }
@@ -278,182 +337,84 @@ impl<const N: usize> Core<N> {
     }
 
     fn valid_rc(&self, now: Micros) -> Option<RcSample> {
-        Self::fresh(self.rc, now, RC_TIMEOUT_US).filter(RcSample::is_valid)
+        Self::fresh(self.rc, now, u64::from(self.cfg.failsafe.rc_timeout_us))
+            .filter(RcSample::is_valid)
     }
 
     fn run_estimator(&mut self, now: Micros) {
         if self.cfg.estimator.source == EstimatorSource::Ekf {
             self.estimator.update(now);
-            self.estimate.pending = self.estimator.estimate();
+            let state = self.estimator.state();
+            let valid = if state.is_some() {
+                self.estimator.validity()
+            } else {
+                Validity::NONE
+            };
+            self.estimate.pending = Estimate {
+                state,
+                valid,
+                resets: self.estimator.status().resets,
+            };
             return;
         }
         // External: the estimate is the `state` input (simulator ground
         // truth, motion capture).
-        self.estimate.pending = Self::fresh(self.state, now, STATE_TIMEOUT_US).filter(|s| {
+        let state = Self::fresh(self.state, now, STATE_TIMEOUT_US).filter(|s| {
             s.position.is_finite()
                 && s.velocity.is_finite()
                 && s.attitude.is_finite()
                 && s.rate.is_finite()
         });
+        self.estimate.pending = Estimate {
+            state,
+            valid: if state.is_some() {
+                Validity::ALL
+            } else {
+                Validity::NONE
+            },
+            resets: 0,
+        };
     }
 
     fn estimator_status(&self) -> EstimatorStatus {
         match self.cfg.estimator.source {
             EstimatorSource::Ekf => self.estimator.status(),
             EstimatorSource::External => EstimatorStatus {
-                aligned: self.estimate.visible.is_some(),
+                aligned: self.estimate.visible.valid.attitude,
                 ..EstimatorStatus::default()
             },
         }
     }
 
-    fn run_supervisor(&mut self, now: Micros) {
-        let mut s = self.supervision.visible;
-        // M1a: without a valid RC frame, decisions stay as they are. RC-loss
-        // failsafes arrive in M1c.
-        if let Some(rc) = self.valid_rc(now) {
-            self.sup_state.kill_count = if rc.kill_switch {
-                self.sup_state
-                    .kill_count
-                    .saturating_add(1)
-                    .min(KILL_CONFIRMATIONS)
-            } else {
-                0
-            };
-            if self.sup_state.kill_count >= KILL_CONFIRMATIONS {
-                s.killed = true;
-                s.armed = false;
-            }
-            if s.killed && !rc.kill_switch && !rc.arm_switch {
-                s.killed = false;
-            }
-            let rising = rc.arm_switch && !self.sup_state.prev_arm_switch;
-            let have_estimate = self.estimate.visible.is_some()
-                && (self.cfg.estimator.source != EstimatorSource::Ekf
-                    || self.estimator.status().gps_aiding);
-            if !s.armed && rising && !s.killed && rc.throttle < ARM_MAX_THROTTLE && have_estimate {
-                s.armed = true;
-            }
-            if s.armed && !rc.arm_switch {
-                s.armed = false;
-            }
-            s.mode = match rc.mode_switch {
-                0 => FlightMode::Stabilized,
-                1 => FlightMode::Position,
-                _ => FlightMode::Offboard,
-            };
-            self.sup_state.prev_arm_switch = rc.arm_switch;
-        }
-        self.supervision.pending = s;
-    }
-
-    fn run_guidance(&mut self, now: Micros, dt: f32) {
-        let sup = self.supervision.visible;
-        let Some(est) = self.estimate.visible else {
-            self.position_ctrl.reset();
-            self.guidance.pending = AttitudeTarget::default();
-            return;
-        };
-        let current_yaw = est.attitude.yaw();
-        if !sup.armed {
-            self.position_ctrl.reset();
-            self.guide_state = GuidanceState {
-                position_sp: est.position,
-                yaw_sp: current_yaw,
-                last_mode: None,
-            };
-            self.guidance.pending = AttitudeTarget {
-                attitude: est.attitude,
-                thrust_n: 0.0,
-            };
-            return;
-        }
-        if self.guide_state.last_mode != Some(sup.mode) {
-            // Entering a mode: hold where we are.
-            self.guide_state.position_sp = est.position;
-            self.guide_state.yaw_sp = current_yaw;
-            self.position_ctrl.reset();
-            self.guide_state.last_mode = Some(sup.mode);
-        }
-        let rc = self.valid_rc(now);
-        let l = self.cfg.limits;
-        let target = match (sup.mode, rc) {
-            (FlightMode::Stabilized, Some(rc)) => {
-                self.guide_state.yaw_sp =
-                    wrap_pi(self.guide_state.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
-                self.guide_state.position_sp = est.position;
-                let roll = rc.roll.clamp(-1.0, 1.0) * l.max_tilt_stabilized_rad;
-                let pitch = -rc.pitch.clamp(-1.0, 1.0) * l.max_tilt_stabilized_rad;
-                AttitudeTarget {
-                    attitude: Quat::from_euler(roll, pitch, self.guide_state.yaw_sp),
-                    thrust_n: rc.throttle.clamp(0.0, 1.0) * self.cfg.total_max_thrust_n(),
-                }
-            }
-            (FlightMode::Position, Some(rc)) => {
-                let v = self.stick_velocity(&rc, current_yaw);
-                self.guide_state.yaw_sp =
-                    wrap_pi(self.guide_state.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
-                let next = self.guide_state.position_sp + v * dt;
-                self.guide_state.position_sp = leash(next, est.position, POSITION_LEASH_M);
-                self.position_ctrl.update(
-                    self.guide_state.position_sp,
-                    v,
-                    self.guide_state.yaw_sp,
-                    &est,
-                    dt,
-                    &self.cfg,
-                )
-            }
-            (FlightMode::Offboard, _) => {
-                let mut vff = Vec3::zero();
-                if let Some(sp) = Self::fresh(self.setpoint, now, SETPOINT_TIMEOUT_US) {
-                    self.guide_state.position_sp = sp.position;
-                    self.guide_state.yaw_sp = wrap_pi(sp.yaw);
-                    vff = sp.velocity;
-                }
-                self.position_ctrl.update(
-                    self.guide_state.position_sp,
-                    vff,
-                    self.guide_state.yaw_sp,
-                    &est,
-                    dt,
-                    &self.cfg,
-                )
-            }
-            // No valid RC in a stick mode: hold position (M1a; M1c adds the
-            // RC-loss failsafe).
-            (FlightMode::Stabilized | FlightMode::Position, None) => self.position_ctrl.update(
-                self.guide_state.position_sp,
-                Vec3::zero(),
-                self.guide_state.yaw_sp,
-                &est,
-                dt,
-                &self.cfg,
-            ),
-        };
-        self.guidance.pending = target;
-    }
-
-    /// Stick velocity demand in NED for position mode.
-    fn stick_velocity(&self, rc: &RcSample, yaw: f32) -> Vec3<f32> {
-        let l = &self.cfg.limits;
-        let fwd = deadband(rc.pitch) * l.max_speed_xy;
-        let right = deadband(rc.roll) * l.max_speed_xy;
-        let (s, c) = (Real::sin(yaw), Real::cos(yaw));
-        let climb = deadband((rc.throttle - 0.5) * 2.0);
-        let vz = if climb > 0.0 {
-            -climb * l.max_speed_up
+    /// Estimated gyro bias, rad/s (zero for the external source).
+    fn gyro_bias(&self) -> Vec3<f32> {
+        if self.cfg.estimator.source == EstimatorSource::Ekf {
+            self.estimator.gyro_bias()
         } else {
-            -climb * l.max_speed_down
-        };
-        Vec3::new(fwd * c - right * s, fwd * s + right * c, vz)
+            Vec3::zero()
+        }
+    }
+
+    /// The body rate the rate loop uses: the filtered, bias-corrected gyro
+    /// while the IMU is fresh, else the estimate's rate.
+    fn loop_gyro(&self, now: Micros) -> Option<Vec3<f32>> {
+        Self::fresh(self.imu, now, STATE_TIMEOUT_US)
+            .map(|_| self.gyro_filtered - self.gyro_bias())
+            .or_else(|| self.estimate.visible.state.map(|e| e.rate))
+    }
+
+    fn emit(&mut self, now: Micros, kind: EventKind) {
+        let dropped = self.events.push(Some(Event { t: now, kind }));
+        if dropped.is_some() {
+            self.events_dropped = self.events_dropped.saturating_add(1);
+        }
     }
 
     fn run_attitude(&mut self) {
         let sup = self.supervision.visible;
         let target = self.guidance.visible;
-        self.attitude.pending = match self.estimate.visible {
-            Some(est) if sup.armed => RateTarget {
+        self.attitude.pending = match self.estimate.visible.state {
+            Some(est) if sup.armed && self.estimate.visible.valid.attitude => RateTarget {
                 rate: attitude_rate_setpoint(
                     est.attitude,
                     target.attitude,
@@ -468,34 +429,44 @@ impl<const N: usize> Core<N> {
 
     fn run_rate(&mut self, now: Micros, dt: f32, base_us: u64) -> Outputs<N> {
         let sup = self.supervision.visible;
-        let mut status = Status {
+        let est = self.estimate.visible;
+        let status = Status {
             armed: sup.armed,
             killed: sup.killed,
             mode: sup.mode,
             saturated: false,
             timing_faults: self.timing_faults,
-            no_estimate: self.estimate.visible.is_none(),
+            no_estimate: !est.valid.attitude,
             estimator: self.estimator_status(),
+            nav: sup.nav,
+            valid: est.valid,
+            reasons: sup.reasons,
+            action: sup.action,
+            prearm: sup.prearm,
+            home_set: sup.home.is_some(),
         };
+        let mut events = EventList::new();
+        for _ in 0..EVENTS_PER_TICK {
+            match self.events.pop_front() {
+                Some(Some(e)) => {
+                    events.push(e);
+                }
+                _ => break,
+            }
+        }
         let t_valid = now.add_us(base_us);
+        let mut out = Outputs {
+            t_valid,
+            motors: [0.0; N],
+            status,
+            events,
+        };
         if !sup.armed {
             self.rate_ctrl.reset();
-            return Outputs {
-                t_valid,
-                motors: [0.0; N],
-                status,
-            };
+            return out;
         }
         let target = self.attitude.visible;
-        let bias = if self.cfg.estimator.source == EstimatorSource::Ekf {
-            self.estimator.gyro_bias()
-        } else {
-            Vec3::zero()
-        };
-        let gyro = Self::fresh(self.imu, now, STATE_TIMEOUT_US)
-            .map(|_| self.gyro_filtered - bias)
-            .or_else(|| self.estimate.visible.map(|e| e.rate))
-            .unwrap_or_else(Vec3::zero);
+        let gyro = self.loop_gyro(now).unwrap_or_else(Vec3::zero);
         // Don't wind up the integrator while sitting on the ground.
         let airborne_ish = target.thrust_n >= 0.5 * self.cfg.weight_n();
         let alpha = self.rate_ctrl.update(
@@ -508,7 +479,7 @@ impl<const N: usize> Core<N> {
         );
         let torque = self.cfg.inertia.hadamard(alpha);
         let alloc = self.mixer.mix(torque, target.thrust_n);
-        status.saturated = alloc.saturated;
+        out.status.saturated = alloc.saturated;
 
         // Battery sag lowers motor speed for a given command; compensate.
         let comp = Self::fresh(self.battery, now, BATTERY_TIMEOUT_US)
@@ -519,16 +490,11 @@ impl<const N: usize> Core<N> {
                 r * r
             });
         let idle = self.cfg.limits.idle_command;
-        let mut motors = [0.0_f32; N];
-        for (m, f) in motors.iter_mut().zip(alloc.fraction.iter()) {
+        for (m, f) in out.motors.iter_mut().zip(alloc.fraction.iter()) {
             let frac = (*f * comp).clamp(0.0, 1.0);
             *m = command_for_fraction(frac, self.cfg.thrust_expo).max(idle);
         }
-        Outputs {
-            t_valid,
-            motors,
-            status,
-        }
+        out
     }
 }
 
@@ -551,329 +517,5 @@ fn leash(sp: Vec3<f32>, pos: Vec3<f32>, radius: f32) -> Vec3<f32> {
         pos + d * (radius / n)
     } else {
         sp
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{EstimatorConfig, Gains, Limits, Rotor, Spin};
-    use crate::io::{BaroSample, GpsSample, MagSample};
-    use crate::schedule::F405_LEAN;
-
-    fn cfg() -> VehicleConfig<4> {
-        let a = 0.08;
-        let r = |x: f32, y: f32, spin| Rotor {
-            x,
-            y,
-            spin,
-            max_thrust_n: 8.0,
-            torque_coeff_m: 0.016,
-        };
-        VehicleConfig {
-            mass_kg: 0.65,
-            inertia: Vec3::new(1.6e-3, 1.6e-3, 2.8e-3),
-            rotors: [
-                r(a, a, Spin::Ccw),
-                r(-a, -a, Spin::Ccw),
-                r(a, -a, Spin::Cw),
-                r(-a, a, Spin::Cw),
-            ],
-            thrust_expo: 1.0,
-            nominal_voltage_v: 22.2,
-            gains: Gains::default(),
-            limits: Limits::default(),
-            estimator: EstimatorConfig::default(),
-        }
-    }
-
-    fn rc(arm: bool, kill: bool) -> RcSample {
-        RcSample {
-            arm_switch: arm,
-            kill_switch: kill,
-            mode_switch: 2,
-            ..RcSample::default()
-        }
-    }
-
-    fn inputs(t: Micros, rc_sample: RcSample) -> Inputs {
-        Inputs {
-            state: Some(Stamped::ideal(t, StateSample::default())),
-            rc: Some(Stamped::ideal(t, rc_sample)),
-            ..Inputs::default()
-        }
-    }
-
-    /// Runs `ticks` ticks from `start` with a fixed RC frame.
-    fn run(core: &mut Core<4>, start: u64, ticks: u64, rc_sample: RcSample) -> Outputs<4> {
-        let mut out = Outputs::off(Micros::ZERO);
-        for k in start..start + ticks {
-            let t = Micros(k * 1000);
-            out = core.tick(t, &inputs(t, rc_sample));
-        }
-        out
-    }
-
-    #[test]
-    fn outputs_are_valid_one_period_later() {
-        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
-        let out = core.tick(Micros(0), &Inputs::default());
-        assert_eq!(out.t_valid, Micros(1000));
-        assert_eq!(out.motors, [0.0; 4]);
-    }
-
-    #[test]
-    fn arms_on_rising_edge_and_kill_latches() {
-        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
-        let out = run(&mut core, 0, 100, rc(false, false));
-        assert!(!out.status.armed);
-        let out = run(&mut core, 100, 100, rc(true, false));
-        assert!(out.status.armed);
-        assert!(out.motors.iter().all(|m| *m >= 0.05));
-        // Kill needs three consecutive supervisor runs (50 Hz → 60 ms).
-        let out = run(&mut core, 200, 20, rc(true, true));
-        assert!(out.status.armed, "one frame of kill must not disarm");
-        let out = run(&mut core, 220, 100, rc(true, true));
-        assert!(!out.status.armed && out.status.killed);
-        assert_eq!(out.motors, [0.0; 4]);
-        // Releasing kill alone does not re-arm or clear the latch.
-        let out = run(&mut core, 320, 100, rc(true, false));
-        assert!(!out.status.armed && out.status.killed);
-        // Arm switch off clears the latch; a new rising edge re-arms.
-        let out = run(&mut core, 420, 100, rc(false, false));
-        assert!(!out.status.killed);
-        let out = run(&mut core, 520, 100, rc(true, false));
-        assert!(out.status.armed);
-    }
-
-    #[test]
-    fn invalid_rc_frames_are_ignored() {
-        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
-        run(&mut core, 0, 100, rc(false, false));
-        let bad = RcSample {
-            failsafe: true,
-            ..rc(true, false)
-        };
-        let out = run(&mut core, 100, 100, bad);
-        assert!(!out.status.armed, "a failsafe frame must not arm");
-    }
-
-    #[test]
-    fn counts_timing_faults() {
-        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
-        core.tick(Micros(0), &Inputs::default());
-        let out = core.tick(Micros(2500), &Inputs::default());
-        assert_eq!(out.status.timing_faults, 1);
-    }
-
-    fn ekf_cfg() -> VehicleConfig<4> {
-        let mut c = cfg();
-        c.estimator.source = EstimatorSource::Ekf;
-        c
-    }
-
-    /// Stationary level vehicle on the ground: IMU at 1 kHz, GPS at 5 Hz with
-    /// 150 ms latency, baro and mag at 50 Hz.
-    fn ekf_inputs(k: u64, rc_sample: RcSample) -> Inputs {
-        let t = Micros(k * 1000);
-        let mut i = Inputs {
-            imu: Some(Stamped::ideal(
-                t,
-                ImuSample {
-                    gyro: Vec3::zero(),
-                    accel: Vec3::new(0.0, 0.0, -crate::GRAVITY),
-                },
-            )),
-            rc: Some(Stamped::ideal(t, rc_sample)),
-            ..Inputs::default()
-        };
-        if k.is_multiple_of(20) {
-            i.baro = Some(Stamped::ideal(t, BaroSample { altitude_m: 40.0 }));
-            i.mag = Some(Stamped::ideal(
-                t,
-                MagSample {
-                    field_ut: Vec3::new(25.0, 0.0, 43.3),
-                },
-            ));
-        }
-        // The fix measured 150 ms ago arrives now.
-        if k >= 150 && (k - 150).is_multiple_of(200) {
-            let ts = Micros((k - 150) * 1000);
-            i.gps = Some(Stamped {
-                t_sample: ts,
-                t_arrival: t,
-                value: GpsSample {
-                    h_acc_m: 0.6,
-                    v_acc_m: 1.0,
-                    s_acc_mps: 0.2,
-                    fix_3d: true,
-                    ..GpsSample::default()
-                },
-            });
-        }
-        i
-    }
-
-    #[test]
-    fn ekf_mode_aligns_estimates_and_arms_only_with_an_estimate() {
-        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
-        let mut first_estimate = None;
-        let mut armed_before = false;
-        // Arm switch is high from the start (no rising edge to use later).
-        for k in 0..3000u64 {
-            let out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(true, false)));
-            if core.estimate().is_none() {
-                armed_before |= out.status.armed;
-                assert!(out.status.no_estimate);
-                assert!(!out.status.estimator.aligned || k > 500);
-            } else if first_estimate.is_none() {
-                first_estimate = Some(k);
-            }
-        }
-        assert!(!armed_before, "must not arm without an estimate");
-        let first = first_estimate.expect("estimate by 3 s");
-        assert!(first > 900, "no estimate before alignment (k = {first})");
-        let e = core.estimate().expect("estimate at 3 s");
-        assert!(e.position.norm() < 0.1, "p = {:?}", e.position);
-        assert!(
-            e.attitude.to_rotation_vector().norm() < 1.0_f32.to_radians(),
-            "attitude = {:?}",
-            e.attitude
-        );
-        // The switch was already high when the estimate appeared: no arm.
-        let out = core.tick(Micros(3_000_000), &ekf_inputs(3000, rc(true, false)));
-        assert!(!out.status.armed);
-        assert!(out.status.estimator.aligned && out.status.estimator.gps_aiding);
-        // A fresh rising edge arms.
-        let mut armed = false;
-        for k in 3001..3200u64 {
-            let out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(false, false)));
-            armed |= out.status.armed;
-        }
-        assert!(!armed);
-        for k in 3200..3400u64 {
-            let out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(true, false)));
-            armed |= out.status.armed;
-        }
-        assert!(armed, "arming works once the estimate exists");
-    }
-
-    #[test]
-    fn ekf_mode_ignores_the_external_state_input() {
-        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
-        for k in 0..500u64 {
-            let t = Micros(k * 1000);
-            let mut i = ekf_inputs(k, rc(false, false));
-            i.state = Some(Stamped::ideal(t, StateSample::default()));
-            core.tick(t, &i);
-        }
-        assert!(core.estimate().is_none());
-    }
-
-    #[test]
-    fn external_mode_reports_aligned_when_estimate_is_visible() {
-        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
-        let out = core.tick(Micros(0), &Inputs::default());
-        assert!(!out.status.estimator.aligned);
-        let out = run(&mut core, 1, 5, rc(false, false));
-        assert!(out.status.estimator.aligned);
-        assert_eq!(out.status.estimator.resets, 0);
-    }
-
-    #[test]
-    fn bad_estimator_params_fail_core_construction() {
-        let mut c = cfg();
-        c.estimator.ekf.gps_gate = f32::NAN;
-        assert_eq!(
-            Core::new(c, F405_LEAN).err(),
-            Some(ConfigError::BadEstimator)
-        );
-    }
-
-    #[test]
-    fn ekf_mode_imu_stall_drops_the_estimate() {
-        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
-        for k in 0..3000u64 {
-            core.tick(Micros(k * 1000), &ekf_inputs(k, rc(false, false)));
-        }
-        // Arm with a fresh rising edge.
-        let mut out = Outputs::off(Micros::ZERO);
-        for k in 3000..3300u64 {
-            out = core.tick(Micros(k * 1000), &ekf_inputs(k, rc(true, false)));
-        }
-        assert!(out.status.armed && !out.status.no_estimate);
-        // The IMU stops; everything else continues.
-        let mut flagged = None;
-        for k in 3300..3600u64 {
-            let mut i = ekf_inputs(k, rc(true, false));
-            i.imu = None;
-            out = core.tick(Micros(k * 1000), &i);
-            if out.status.no_estimate && flagged.is_none() {
-                flagged = Some(k - 3300);
-            }
-        }
-        let after = flagged.expect("no_estimate must be set");
-        assert!(after <= 150, "took {after} ms");
-        assert!(core.estimate().is_none());
-    }
-
-    #[test]
-    fn ekf_mode_arming_needs_gps_aiding() {
-        let mut core = Core::new(ekf_cfg(), F405_LEAN).expect("valid config");
-        let step = |core: &mut Core<4>, k: u64, arm: bool, gps: bool| {
-            let mut i = ekf_inputs(k, rc(arm, false));
-            if !gps {
-                i.gps = None;
-            }
-            core.tick(Micros(k * 1000), &i)
-        };
-        for k in 0..3000u64 {
-            step(&mut core, k, false, true);
-        }
-        let out = step(&mut core, 3000, false, true);
-        assert!(out.status.estimator.gps_aiding);
-        // GPS lost for longer than the timeout (5 s) plus a second.
-        for k in 3001..9000u64 {
-            step(&mut core, k, false, false);
-        }
-        let mut armed = false;
-        for k in 9000..9150u64 {
-            let out = step(&mut core, k, true, false);
-            assert!(
-                core.estimate().is_some(),
-                "dead reckoning keeps the estimate"
-            );
-            assert!(!out.status.estimator.gps_aiding);
-            armed |= out.status.armed;
-        }
-        assert!(!armed, "must not arm without GPS aiding");
-        // GPS resumes; once fused, a new rising edge arms.
-        for k in 9150..9800u64 {
-            step(&mut core, k, false, true);
-        }
-        let out = step(&mut core, 9800, false, true);
-        assert!(out.status.estimator.gps_aiding);
-        let mut armed = false;
-        for k in 9801..10000u64 {
-            armed |= step(&mut core, k, true, true).status.armed;
-        }
-        assert!(armed, "arms again once GPS aids");
-    }
-
-    #[test]
-    fn a_future_stamped_sample_is_not_fresh() {
-        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
-        run(&mut core, 0, 100, rc(false, false));
-        let mut armed = false;
-        for k in 100..200u64 {
-            let t = Micros(k * 1000);
-            let ahead = t.add_us(10_000_000);
-            let mut i = inputs(t, RcSample::default());
-            i.rc = Some(Stamped::ideal(ahead, rc(true, false)));
-            armed |= core.tick(t, &i).status.armed;
-        }
-        assert!(!armed, "a frame from the future must be ignored");
-        let out = run(&mut core, 200, 100, rc(true, false));
-        assert!(out.status.armed, "normal frames afterwards still work");
     }
 }

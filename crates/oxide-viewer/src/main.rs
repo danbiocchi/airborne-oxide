@@ -2,12 +2,14 @@
 //! `oxide-viewer`: fly the simulator in real time and watch it in Rerun.
 //!
 //! ```text
-//! oxide-viewer [--profile f405|h743] [--scenario hover-step|gust-hold] [--seed N]
+//! oxide-viewer [--profile f405|h743] [--scenario NAME] [--seed N]
 //!              [--joystick] [--speed X] [--save FILE.rrd]
 //! ```
 //! Without `--joystick` it flies a scripted scenario: `hover-step` (default,
-//! ideal sensors, calm air) or `gust-hold` (realistic sensors, wind, EKF;
-//! `--seed` picks the run index). With `--joystick` a USB joystick (the
+//! ideal sensors, calm air), `gust-hold` (realistic sensors, wind, EKF) or
+//! any fault scenario or pairing of `oxide_sim::fault_scenarios`
+//! (`--seed` picks the run index). The flight core's events are shown as a
+//! text log and printed, and the failsafe action and validity as plots. With `--joystick` a USB joystick (the
 //! Taranis in USB-joystick mode) is the pilot.
 //! Rerun is a visualiser only; it never feeds back into the simulation.
 
@@ -17,19 +19,37 @@ mod joystick;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use oxide_core::io::{RcSample, TrajectorySetpoint};
+use oxide_core::io::{
+    Action, DisarmReason, EventKind, NavState, RcSample, Reasons, TrajectorySetpoint, Validity,
+};
+use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
+use oxide_sim::fault_scenarios;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
 
 /// Rerun is updated at this rate, Hz.
 const VIEW_RATE_HZ: u64 = 50;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Scenario {
     HoverStep,
     GustHold,
+    /// A fault scenario or pairing, by name.
+    Fault(Box<fault_scenarios::FaultScenario>),
+}
+
+/// Every scenario name `--scenario` accepts.
+fn scenario_names() -> Vec<&'static str> {
+    let mut names = vec!["hover-step", "gust-hold"];
+    names.extend(
+        fault_scenarios::all()
+            .iter()
+            .chain(fault_scenarios::pairs().iter())
+            .map(|s| s.name),
+    );
+    names
 }
 
 struct Args {
@@ -65,7 +85,15 @@ fn parse() -> Result<Args, String> {
                 args.scenario = match value()?.as_str() {
                     "hover-step" => Scenario::HoverStep,
                     "gust-hold" => Scenario::GustHold,
-                    other => return Err(format!("unknown scenario {other}")),
+                    other => match fault_scenarios::by_name(other) {
+                        Some(s) => Scenario::Fault(Box::new(s)),
+                        None => {
+                            return Err(format!(
+                                "unknown scenario {other}\navailable scenarios:\n  {}",
+                                scenario_names().join("\n  ")
+                            ));
+                        }
+                    },
                 }
             }
             "--seed" => {
@@ -177,6 +205,120 @@ fn attitude_error_deg(truth: oxide_core::math::Quat<f64>, est: oxide_core::math:
         .to_degrees()
 }
 
+/// Names of the failsafe reasons, in bit order.
+const REASON_NAMES: [(Reasons, &str); 11] = [
+    (Reasons::RC_LOST, "RC_LOST"),
+    (Reasons::NO_HUMAN_LINK, "NO_HUMAN_LINK"),
+    (Reasons::BRAIN_LOST, "BRAIN_LOST"),
+    (Reasons::SETPOINT_STALE, "SETPOINT_STALE"),
+    (Reasons::BATTERY_LOW, "BATTERY_LOW"),
+    (Reasons::BATTERY_CRITICAL, "BATTERY_CRITICAL"),
+    (Reasons::GPS_LOST, "GPS_LOST"),
+    (Reasons::ESTIMATOR_UNHEALTHY, "ESTIMATOR_UNHEALTHY"),
+    (Reasons::IMU_FAILURE, "IMU_FAILURE"),
+    (Reasons::GEOFENCE, "GEOFENCE"),
+    (Reasons::LOSS_OF_CONTROL, "LOSS_OF_CONTROL"),
+];
+
+/// The names of the reasons set in `r`, joined with `|`.
+fn reason_names(r: Reasons) -> String {
+    let names: Vec<&str> = REASON_NAMES
+        .iter()
+        .filter(|(bit, _)| r.contains(*bit))
+        .map(|(_, n)| *n)
+        .collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join("|")
+    }
+}
+
+/// A readable line for an event of the flight core.
+fn describe(kind: EventKind) -> String {
+    match kind {
+        EventKind::Armed => "Armed".to_string(),
+        EventKind::Disarmed(why) => format!(
+            "Disarmed({})",
+            match why {
+                DisarmReason::Switch => "Switch",
+                DisarmReason::Kill => "Kill",
+                DisarmReason::Touchdown => "Touchdown",
+                DisarmReason::Terminated => "Terminated",
+            }
+        ),
+        EventKind::ArmRefused(flags) => format!("Arm refused (pre-arm flags {:#06x})", flags.0),
+        EventKind::NavChanged { from, to } => format!("nav {from:?} -> {to:?}"),
+        EventKind::ModeDegraded { requested, flown } => {
+            format!("mode {requested:?} degraded, flying {flown:?}")
+        }
+        EventKind::ReasonRaised(r) => format!("{} raised", reason_names(r)),
+        EventKind::ReasonCleared(r) => format!("{} cleared", reason_names(r)),
+        EventKind::ActionChanged { from, to } => format!("action {from:?} -> {to:?}"),
+        EventKind::PilotOverride(r) => format!("Pilot override of {}", reason_names(r)),
+        EventKind::Touchdown => "Touchdown".to_string(),
+        EventKind::HomeSet => "Home set".to_string(),
+    }
+}
+
+/// Failsafe action rank, 0 (None) to 5 (Terminate).
+fn action_rank(a: Action) -> f64 {
+    match a {
+        Action::None => 0.0,
+        Action::Hold => 1.0,
+        Action::Rtl => 2.0,
+        Action::Land => 3.0,
+        Action::LandNow => 4.0,
+        Action::Terminate => 5.0,
+    }
+}
+
+/// Logs one plot sample per validity flag, 1 for valid.
+fn log_validity(rec: &rerun::RecordingStream, v: Validity) -> Result<(), Box<dyn Error>> {
+    for (name, on) in [
+        ("attitude", v.attitude),
+        ("heading", v.heading),
+        ("altitude", v.altitude),
+        ("velocity", v.velocity),
+        ("position", v.position),
+    ] {
+        rec.log(
+            format!("plots/valid/{name}"),
+            &rerun::Scalars::new([if on { 1.0 } else { 0.0 }]),
+        )?;
+    }
+    Ok(())
+}
+
+/// Logs the tick's events as text log entries at their simulation time and
+/// prints them. Returns the truth position at the first `Armed` event.
+fn log_events(
+    rec: &rerun::RecordingStream,
+    r: &StepRecord<4>,
+) -> Result<Option<Vec3<f64>>, Box<dyn Error>> {
+    let mut armed_at = None;
+    for e in r.events.iter() {
+        let msg = describe(e.kind);
+        println!("[{:8.3} s] {msg}", e.t.as_secs_f64());
+        rec.set_duration_secs("sim_time", e.t.as_secs_f64());
+        let level = match e.kind {
+            EventKind::ReasonRaised(_)
+            | EventKind::ArmRefused(_)
+            | EventKind::ModeDegraded { .. } => rerun::TextLogLevel::WARN,
+            EventKind::NavChanged {
+                to: NavState::Terminated,
+                ..
+            } => rerun::TextLogLevel::ERROR,
+            _ => rerun::TextLogLevel::INFO,
+        };
+        rec.log("events", &rerun::TextLog::new(msg).with_level(level))?;
+        if e.kind == EventKind::Armed && armed_at.is_none() {
+            armed_at = Some(r.position);
+        }
+    }
+    Ok(armed_at)
+}
+
 fn log_step(
     rec: &rerun::RecordingStream,
     r: &StepRecord<4>,
@@ -264,6 +406,11 @@ fn log_step(
         )?;
     }
     let e = r.attitude.to_euler();
+    rec.log(
+        "plots/failsafe_action_rank",
+        &rerun::Scalars::new([action_rank(r.status.action)]),
+    )?;
+    log_validity(rec, r.status.valid)?;
     rec.log("plots/altitude_m", &rerun::Scalars::new([-r.position.z]))?;
     rec.log("plots/roll_deg", &rerun::Scalars::new([e.x.to_degrees()]))?;
     rec.log("plots/pitch_deg", &rerun::Scalars::new([e.y.to_degrees()]))?;
@@ -280,36 +427,53 @@ fn log_step(
 
 fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let airframe = Airframe::reference_quad()?;
-    let mut options = SimOptions::default();
-    let (pilot, duration) = if args.joystick {
+    let profile = args.profile;
+    if args.joystick {
         #[cfg(feature = "joystick")]
         {
-            (
-                AnyPilot::Joystick(Box::new(joystick::JoystickPilot::new()?)),
-                None,
-            )
+            let pilot = AnyPilot::Joystick(Box::new(joystick::JoystickPilot::new()?));
+            let sim =
+                Simulation::<_, 4>::with_options(&airframe, profile, pilot, SimOptions::default())?;
+            return drive(args, sim, None);
         }
         #[cfg(not(feature = "joystick"))]
         {
             return Err("built without the `joystick` feature".into());
         }
-    } else {
-        match args.scenario {
-            Scenario::HoverStep => {
-                let s = HoverStep::default();
-                let d = Micros((s.duration_s * 1e6) as u64);
-                (AnyPilot::Scripted(s), Some(d))
-            }
-            Scenario::GustHold => {
-                let (s, o) = gust_hold(args.seed);
-                options = o;
-                let d = Micros((s.duration_s * 1e6) as u64);
-                (AnyPilot::GustHold(s), Some(d))
-            }
+    }
+    match &args.scenario {
+        Scenario::HoverStep => {
+            let s = HoverStep::default();
+            let d = Micros((s.duration_s * 1e6) as u64);
+            let sim = Simulation::<_, 4>::with_options(
+                &airframe,
+                profile,
+                AnyPilot::Scripted(s),
+                SimOptions::default(),
+            )?;
+            drive(args, sim, Some(d))
         }
-    };
-    let mut sim = Simulation::<_, 4>::with_options(&airframe, args.profile, pilot, options)?;
+        Scenario::GustHold => {
+            let (s, o) = gust_hold(args.seed);
+            let d = Micros((s.duration_s * 1e6) as u64);
+            let sim =
+                Simulation::<_, 4>::with_options(&airframe, profile, AnyPilot::GustHold(s), o)?;
+            drive(args, sim, Some(d))
+        }
+        Scenario::Fault(f) => {
+            let sim = fault_scenarios::build(f, profile, args.seed)?;
+            let d = Micros((f.script.duration_s * 1e6).round() as u64);
+            drive(args, sim, Some(d))
+        }
+    }
+}
 
+/// Flies `sim` (until `duration`, or until stopped) and shows it in Rerun.
+fn drive<P: Pilot>(
+    args: &Args,
+    mut sim: Simulation<P, 4>,
+    duration: Option<Micros>,
+) -> Result<(), Box<dyn Error>> {
     let builder = rerun::RecordingStreamBuilder::new("airborne_oxide");
     let rec = match &args.save {
         Some(path) => builder.save(path)?,
@@ -321,6 +485,7 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let view_every = (1_000_000 / VIEW_RATE_HZ / base_us).max(1);
     let mut trail: Vec<[f32; 3]> = Vec::new();
     let mut est_trail: Vec<[f32; 3]> = Vec::new();
+    let mut home_marked = false;
     let start = Instant::now();
     let mut ticks: u64 = 0;
     loop {
@@ -331,6 +496,19 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         }
         let r = sim.step();
         ticks += 1;
+        // Events are logged on every tick so none is missed between view frames.
+        let armed_at = log_events(&rec, &r)?;
+        if let (Some(p), false) = (armed_at, home_marked) {
+            home_marked = true;
+            rec.set_duration_secs("sim_time", r.t.as_secs_f64());
+            rec.log(
+                "world/home",
+                &rerun::Points3D::new([v3(p)])
+                    .with_radii([0.15])
+                    .with_colors([rerun::Color::from_rgb(240, 220, 60)])
+                    .with_labels(["home"]),
+            )?;
+        }
         if ticks.is_multiple_of(view_every) {
             trail.push(v3(r.position));
             if trail.len() > 3000 {
@@ -367,7 +545,7 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!(
-                "usage: oxide-viewer [--profile f405|h743] [--scenario hover-step|gust-hold] [--seed N] [--joystick] [--speed X] [--save FILE.rrd]"
+                "usage: oxide-viewer [--profile f405|h743] [--scenario NAME] [--seed N] [--joystick] [--speed X] [--save FILE.rrd]"
             );
             return std::process::ExitCode::from(2);
         }

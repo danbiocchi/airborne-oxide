@@ -141,3 +141,136 @@ fn rotor_drag_decays_velocity_exponentially() {
         s.velocity.x
     );
 }
+
+// ---- The compliant ground (DESIGN §5.3) ----
+
+/// Steps a model with all motors off.
+fn fall(
+    m: &VehicleModel<4>,
+    mut s: BodyState<4>,
+    secs: f64,
+    mut each: impl FnMut(&BodyState<4>),
+) -> BodyState<4> {
+    let dt = 1e-3;
+    for _ in 0..(secs / dt) as usize {
+        s = m.rk4(&s, &[0.0; 4], dt, Vec3::zero());
+        each(&s);
+    }
+    s
+}
+
+fn tilt_deg(s: &BodyState<4>) -> f64 {
+    let d = s.attitude.rotate(Vec3::new(0.0, 0.0, 1.0));
+    Real::atan2(Real::sqrt(d.x * d.x + d.y * d.y), d.z).to_degrees()
+}
+
+#[test]
+fn at_rest_on_the_ground_nothing_moves() {
+    let m = model();
+    let s = fall(&m, BodyState::<4>::default(), 10.0, |_| {});
+    assert!(s.position.norm() < 1e-9, "{:?}", s.position);
+    assert!(s.velocity.norm() < 1e-9, "{:?}", s.velocity);
+    assert!(tilt_deg(&s) < 1e-9);
+    assert!(s.rate.norm() < 1e-9);
+}
+
+#[test]
+fn touchdown_at_point_seven_is_gentle_and_settles() {
+    let m = model();
+    let mut s = BodyState::<4>::default();
+    // Arrives at the ground at 0.7 m/s.
+    s.position.z = -m.ground.sag_m();
+    s.velocity.z = 0.7;
+    let mut peak = 0.0_f64;
+    let mut prev_v = s.velocity.z;
+    let mut left_ground_after = false;
+    let mut touched = false;
+    let end = fall(&m, s, 1.0, |b| {
+        // Net acceleration seen by the body (specific force magnitude).
+        peak = peak.max(((b.velocity.z - prev_v) / 1e-3 - GRAVITY).abs());
+        prev_v = b.velocity.z;
+        if m.ground.in_contact(b.position.z) {
+            touched = true;
+        } else if touched {
+            left_ground_after = true;
+        }
+    });
+    assert!(touched);
+    assert!(peak < 8.0 * GRAVITY, "peak {} g", peak / GRAVITY);
+    assert!(end.position.z.abs() < 1e-3, "z = {}", end.position.z);
+    assert!(!left_ground_after);
+}
+
+#[test]
+fn drop_from_thirty_centimetres_stays_shallow() {
+    let m = model();
+    let mut s = BodyState::<4>::default();
+    s.position.z = -0.3;
+    let mut deepest = 0.0_f64;
+    fall(&m, s, 2.0, |b| deepest = deepest.max(b.position.z));
+    assert!(deepest < 0.05, "deepest {deepest} m");
+}
+
+#[test]
+fn tilted_vehicle_returns_to_level() {
+    let m = model();
+    let s = BodyState::<4> {
+        attitude: Quat::from_rotation_vector(Vec3::new(10f64.to_radians(), 0.0, 0.0)),
+        ..BodyState::default()
+    };
+    let end = fall(&m, s, 1.0, |_| {});
+    assert!(tilt_deg(&end) < 0.1, "tilt {}", tilt_deg(&end));
+    assert!(end.rate.norm() < 0.05);
+}
+
+#[test]
+fn sliding_stops_within_half_a_metre() {
+    let m = model();
+    let mut s = BodyState::<4>::default();
+    s.velocity.x = 2.0;
+    let end = fall(&m, s, 3.0, |_| {});
+    assert!(end.position.x < 0.5, "slid {} m", end.position.x);
+    assert!(end.position.x > 0.1);
+    assert!(end.velocity.norm() < 1e-2);
+}
+
+#[test]
+fn thrust_above_weight_lifts_off_and_below_does_not() {
+    let m = model();
+    let hover = Real::sqrt(m.mass_kg * GRAVITY / (4.0 * m.rotors[0].max_thrust_n));
+    let run = |factor: f64| {
+        let n = hover * Real::sqrt(factor);
+        let mut s = BodyState::<4> {
+            rotor_speed: [n; 4],
+            ..BodyState::default()
+        };
+        for _ in 0..1000 {
+            s = m.rk4(&s, &[n; 4], 1e-3, Vec3::zero());
+        }
+        s.position.z
+    };
+    assert!(run(1.05) < -0.01, "no lift-off");
+    // Below weight the ground still carries the rest: it stays in contact.
+    let z = run(0.95);
+    assert!(
+        m.ground.in_contact(z) && z.abs() < m.ground.sag_m(),
+        "z = {z}"
+    );
+}
+
+#[test]
+fn a_vehicle_dropped_inverted_is_not_righted_by_the_ground() {
+    let m = model();
+    let mut s = BodyState::<4>::default();
+    s.position.z = -0.3;
+    s.attitude = Quat::from_rotation_vector(Vec3::new(170f64.to_radians(), 0.0, 0.0));
+    assert!((tilt_deg(&s) - 170.0).abs() < 1e-6);
+    let end = fall(&m, s, 5.0, |_| {});
+    // It lies on the ground (the legs still carry it) but stays upside down.
+    assert!(end.position.z.abs() < 0.05, "z = {}", end.position.z);
+    assert!(
+        tilt_deg(&end) > 90.0,
+        "righted itself to {} deg",
+        tilt_deg(&end)
+    );
+}

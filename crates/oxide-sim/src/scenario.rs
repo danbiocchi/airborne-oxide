@@ -54,7 +54,7 @@ impl Default for HoverStep {
                 wp(11.0, 1.0, 0.0, -2.0, core::f32::consts::FRAC_PI_2),
                 wp(15.0, 1.0, 1.0, -3.0, core::f32::consts::FRAC_PI_2),
             ],
-            arm_at_s: 0.5,
+            arm_at_s: 1.5,
             duration_s: 20.0,
         }
     }
@@ -192,6 +192,77 @@ pub fn gust_hold(index: u64) -> (GustHold, SimOptions) {
     (GustHold::default(), options)
 }
 
+/// A scripted flight: what the pilot's radio and the brain send over time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Script {
+    /// The arm switch goes up at this time…
+    pub arm_at_s: f64,
+    /// …and down at this time, if any.
+    pub disarm_at_s: Option<f64>,
+    /// The kill switch goes on at this time, if any.
+    pub kill_at_s: Option<f64>,
+    /// Mode switch position from each time on (sorted; the first entry
+    /// should be at 0).
+    pub mode: Vec<(f64, u8)>,
+    /// Sticks [roll, pitch, yaw, throttle] from each time on (default
+    /// centred, throttle 0).
+    pub sticks: Vec<(f64, [f32; 4])>,
+    /// Tier-2 setpoint from each time on; `None` = the brain sends no
+    /// setpoints from then.
+    pub setpoints: Vec<(f64, Option<TrajectorySetpoint>)>,
+    pub duration_s: f64,
+}
+
+/// The value of the last entry whose time is at or before `t_s`.
+fn latest<T: Copy>(list: &[(f64, T)], t_s: f64) -> Option<T> {
+    list.iter()
+        .rev()
+        .find(|(from, _)| *from <= t_s)
+        .map(|e| e.1)
+}
+
+impl Default for Script {
+    /// Nothing happens: mode 0, no arming, no setpoints, 10 s.
+    fn default() -> Self {
+        Self {
+            arm_at_s: f64::INFINITY,
+            disarm_at_s: None,
+            kill_at_s: None,
+            mode: vec![(0.0, 0)],
+            sticks: Vec::new(),
+            setpoints: Vec::new(),
+            duration_s: 10.0,
+        }
+    }
+}
+
+impl Pilot for Script {
+    fn rc(&mut self, t: Micros) -> Option<RcSample> {
+        if !t.0.is_multiple_of(COMMAND_PERIOD_US) {
+            return None;
+        }
+        let ts = t.as_secs_f64();
+        let [roll, pitch, yaw, throttle] = latest(&self.sticks, ts).unwrap_or([0.0; 4]);
+        Some(RcSample {
+            roll,
+            pitch,
+            yaw,
+            throttle,
+            arm_switch: ts >= self.arm_at_s && self.disarm_at_s.is_none_or(|d| ts < d),
+            kill_switch: self.kill_at_s.is_some_and(|k| ts >= k),
+            mode_switch: latest(&self.mode, ts).unwrap_or(0),
+            ..RcSample::default()
+        })
+    }
+
+    fn setpoint(&mut self, t: Micros) -> Option<TrajectorySetpoint> {
+        if !t.0.is_multiple_of(COMMAND_PERIOD_US) {
+            return None;
+        }
+        latest(&self.setpoints, t.as_secs_f64()).flatten()
+    }
+}
+
 /// Sends nothing: for open-loop and analytic tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NoPilot;
@@ -202,5 +273,46 @@ impl Pilot for NoPilot {
     }
     fn setpoint(&mut self, _t: Micros) -> Option<TrajectorySetpoint> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sp(x: f32) -> TrajectorySetpoint {
+        TrajectorySetpoint {
+            position: Vec3::new(x, 0.0, 0.0),
+            ..TrajectorySetpoint::default()
+        }
+    }
+
+    #[test]
+    fn script_follows_its_timeline() {
+        let mut s = Script {
+            arm_at_s: 1.0,
+            disarm_at_s: Some(3.0),
+            kill_at_s: Some(4.0),
+            mode: vec![(0.0, 1), (2.0, 2)],
+            sticks: vec![(0.5, [0.1, 0.2, 0.3, 0.4])],
+            setpoints: vec![(0.0, Some(sp(1.0))), (2.0, None), (3.0, Some(sp(2.0)))],
+            duration_s: 5.0,
+        };
+        let at = |s: &mut Script, t_s: f64| s.rc(Micros((t_s * 1e6) as u64)).expect("frame");
+        let r = at(&mut s, 0.0);
+        assert!(!r.arm_switch && r.mode_switch == 1 && r.throttle == 0.0);
+        let r = at(&mut s, 1.0);
+        assert!(r.arm_switch && r.roll == 0.1 && r.throttle == 0.4);
+        assert_eq!(at(&mut s, 2.0).mode_switch, 2);
+        assert!(!at(&mut s, 3.0).arm_switch);
+        assert!(!at(&mut s, 3.98).kill_switch);
+        assert!(at(&mut s, 4.0).kill_switch);
+        let sp_at = |s: &mut Script, t_s: f64| s.setpoint(Micros((t_s * 1e6) as u64));
+        assert_eq!(sp_at(&mut s, 1.0), Some(sp(1.0)));
+        assert_eq!(sp_at(&mut s, 2.5), None);
+        assert_eq!(sp_at(&mut s, 3.0), Some(sp(2.0)));
+        // Off the command grid nothing is sent.
+        assert!(s.rc(Micros(1_010_000)).is_none());
+        assert!(s.setpoint(Micros(1_010_000)).is_none());
     }
 }

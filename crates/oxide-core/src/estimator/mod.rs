@@ -18,7 +18,7 @@ pub mod ring;
 use crate::GRAVITY;
 use crate::config::{ConfigError, EkfParams};
 use crate::io::{
-    BaroSample, EstimatorStatus, GpsSample, ImuSample, MagSample, Stamped, StateSample,
+    BaroSample, EstimatorStatus, GpsSample, ImuSample, MagSample, Stamped, StateSample, Validity,
 };
 use crate::math::{Quat, Real, Vec3};
 use crate::schedule::Profile;
@@ -73,6 +73,12 @@ struct GpsTrack {
     reject_since: Option<Micros>,
     /// Same, counting only the position part of the fix.
     pos_reject_since: Option<Micros>,
+    /// Same, counting only the velocity part of the fix.
+    vel_reject_since: Option<Micros>,
+    /// `t_sample` of the last fix whose velocity was accepted (or reset to).
+    vel_accept: Option<Micros>,
+    /// `t_sample` of the last fix whose position was accepted (or reset to).
+    pos_accept: Option<Micros>,
 }
 
 /// The estimator: alignment, the delayed-horizon EKF and the output
@@ -82,6 +88,9 @@ pub struct Estimator {
     params: EkfParams,
     horizon_us: u64,
     gps_timeout_us: u64,
+    pos_timeout_us: u64,
+    baro_timeout_us: u64,
+    mag_timeout_us: u64,
     /// Filter period in base ticks (at least 1).
     period_ticks: u64,
     /// Filter period, s.
@@ -107,6 +116,12 @@ pub struct Estimator {
     /// The yaw comes from the magnetometer (alignment saw one, or the first
     /// usable reading since reset the heading).
     heading_ok: bool,
+    /// `t_sample` of the last accepted barometer fusion.
+    baro_accept: Option<Micros>,
+    /// `t_sample` of the last accepted magnetometer fusion (or heading reset).
+    mag_accept: Option<Micros>,
+    /// Covariance resets of filters that were since dropped.
+    dropped_faults: u32,
     /// `t_arrival` of the last IMU sample accepted.
     last_imu_arrival: Option<Micros>,
     raw_gyro: Vec3<f32>,
@@ -154,6 +169,9 @@ impl Estimator {
             || p.delay_horizon_us == 0
             || p.align_time_us == 0
             || p.gps_timeout_us == 0
+            || p.pos_timeout_us == 0
+            || p.baro_timeout_us == 0
+            || p.mag_timeout_us == 0
         {
             return Err(ConfigError::BadEstimator);
         }
@@ -166,6 +184,9 @@ impl Estimator {
             params: *p,
             horizon_us: u64::from(p.delay_horizon_us),
             gps_timeout_us: u64::from(p.gps_timeout_us),
+            pos_timeout_us: u64::from(p.pos_timeout_us),
+            baro_timeout_us: u64::from(p.baro_timeout_us),
+            mag_timeout_us: u64::from(p.mag_timeout_us),
             period_ticks: u64::from(profile.filter_period_ticks),
             filter_dt: profile.filter_dt(),
             base_dt: profile.base_dt(),
@@ -182,6 +203,9 @@ impl Estimator {
             t_ekf: Micros::ZERO,
             gps: GpsTrack::default(),
             heading_ok: false,
+            baro_accept: None,
+            mag_accept: None,
+            dropped_faults: 0,
             last_imu_arrival: None,
             raw_gyro: Vec3::zero(),
             rejected: 0,
@@ -284,6 +308,53 @@ impl Estimator {
         .then_some(est)
     }
 
+    /// Which parts of the estimate are valid, evaluated at the filter's
+    /// time (ADR-0003 §1). All false until the filter exists.
+    pub fn validity(&self) -> Validity {
+        if self.ekf.is_none() {
+            return Validity::NONE;
+        }
+        let recent =
+            |t: Option<Micros>, timeout: u64| t.is_some_and(|t| self.t_ekf.since(t) <= timeout);
+        let heading = self.heading_ok && recent(self.mag_accept, self.mag_timeout_us);
+        let altitude = recent(self.baro_accept, self.baro_timeout_us);
+        let velocity = heading && recent(self.gps.vel_accept, self.gps_timeout_us);
+        let position = velocity && recent(self.gps.pos_accept, self.pos_timeout_us);
+        Validity {
+            attitude: true,
+            heading,
+            altitude,
+            velocity,
+            position,
+        }
+    }
+
+    /// The current-time state whenever the filter is running, even if
+    /// position or heading is not valid; `None` if it holds a non-finite
+    /// value. Use [`Estimator::validity`] to know what to trust.
+    pub fn state(&self) -> Option<StateSample> {
+        self.ekf.as_ref()?;
+        let o = self.output.state();
+        let est = StateSample {
+            position: o.p,
+            velocity: o.v,
+            attitude: o.q,
+            rate: self.output.rate(),
+        };
+        (est.position.is_finite()
+            && est.velocity.is_finite()
+            && est.attitude.is_finite()
+            && est.rate.is_finite())
+        .then_some(est)
+    }
+
+    /// Numerical faults (covariance resets) reported by the filter so far,
+    /// including those of filters since dropped.
+    pub fn faults(&self) -> u32 {
+        self.dropped_faults
+            .saturating_add(self.ekf.as_ref().map_or(0, Ekf::faults))
+    }
+
     /// Estimated gyro bias, rad/s; zero before alignment.
     pub fn gyro_bias(&self) -> Vec3<f32> {
         self.ekf.as_ref().map_or_else(Vec3::zero, |e| e.x.bg)
@@ -324,6 +395,9 @@ impl Estimator {
     /// An IMU stall made the dead-reckoned state untrustworthy: back to the
     /// unaligned state, counted as a reset.
     fn drop_to_unaligned(&mut self) {
+        if let Some(e) = &self.ekf {
+            self.dropped_faults = self.dropped_faults.saturating_add(e.faults());
+        }
         self.ekf = None;
         self.acc = ImuAccumulator::new(self.base_dt);
         self.imu_ring.clear();
@@ -334,6 +408,8 @@ impl Estimator {
         self.baro_ref = None;
         self.gps = GpsTrack::default();
         self.heading_ok = false;
+        self.baro_accept = None;
+        self.mag_accept = None;
         self.last_imu_arrival = None;
         self.resets = self.resets.saturating_add(1);
     }
@@ -416,6 +492,11 @@ impl Estimator {
             Micros(d.t_end.0.saturating_sub(secs_to_micros(d.dt)))
         });
         self.heading_ok = heading.is_some();
+        // The alignment readings count as accepted ones, so that the
+        // sensor timeouts (and the recovery after them) run from here even
+        // if no later reading is ever accepted.
+        self.mag_accept = heading.map(|_| self.t_ekf);
+        self.baro_accept = self.baro_ref.map(|_| self.t_ekf);
         // Drop fixes measured before the filter's start time.
         for _ in 0..self.gps_ring.len() {
             if let Some(g) = self.gps_ring.pop_front()
@@ -489,9 +570,19 @@ impl Estimator {
         match self.baro_ref {
             // No barometer reading at alignment: the first one defines zero.
             None => self.baro_ref = Some(alt),
+            Some(_) if self.baro_timed_out() => {
+                // The height estimate was dead-reckoned through the gap, so
+                // keep it and re-reference the barometer to it:
+                // altitude - baro_ref = -p.z.
+                self.baro_ref = Some(alt + ekf.x.p.z);
+                self.baro_accept = Some(s.t_sample);
+                self.resets = self.resets.saturating_add(1);
+            }
             Some(r) => {
                 let f = ekf.fuse_height(alt - r, self.params.baro_noise_m);
-                self.note(f);
+                if matches!(self.note(f), Fusion::Accepted { .. }) {
+                    self.baro_accept = Some(s.t_sample);
+                }
             }
         }
     }
@@ -500,19 +591,37 @@ impl Estimator {
         if !s.value.field_ut.is_finite() {
             return;
         }
-        if !self.heading_ok {
-            // No heading at alignment: take the first usable reading as the
-            // heading instead of gating it against a guess.
+        // Without a heading, or after the magnetometer was silent for longer
+        // than its timeout (the yaw may have drifted outside any gate):
+        // take the first usable reading as the heading instead of gating
+        // it against a guess.
+        if !self.heading_ok || self.mag_timed_out() {
             if let Some(psi) = ekf.mag_heading(s.value.field_ut) {
                 let dpsi = ekf.reset_yaw(psi, self.params.init_yaw_sigma_rad);
                 self.output.rotate_yaw(dpsi);
                 self.heading_ok = true;
+                self.mag_accept = Some(s.t_sample);
                 self.resets = self.resets.saturating_add(1);
             }
             return;
         }
         let f = ekf.fuse_mag_heading(s.value.field_ut, self.params.yaw_noise_rad);
-        self.note(f);
+        if matches!(self.note(f), Fusion::Accepted { .. }) {
+            self.mag_accept = Some(s.t_sample);
+        }
+    }
+
+    /// The heading was last confirmed longer ago than `mag_timeout_us`
+    /// (at the filter's time), as [`Estimator::validity`] sees it.
+    fn mag_timed_out(&self) -> bool {
+        self.mag_accept
+            .is_some_and(|t| self.t_ekf.since(t) > self.mag_timeout_us)
+    }
+
+    /// Same for the barometer and `baro_timeout_us`.
+    fn baro_timed_out(&self) -> bool {
+        self.baro_accept
+            .is_some_and(|t| self.t_ekf.since(t) > self.baro_timeout_us)
     }
 
     fn fuse_gps(&mut self, ekf: &mut Ekf<f32>, s: &Stamped<GpsSample>) {
@@ -541,6 +650,23 @@ impl Estimator {
         let vel = self.note(ekf.fuse_gps_velocity(g.velocity, sigma_v));
         let accepted = |f: Fusion<f32>| matches!(f, Fusion::Accepted { .. });
         let rejected = |f: Fusion<f32>| matches!(f, Fusion::Rejected { .. });
+        // Position and velocity validity are tracked apart: a fix whose
+        // position was rejected must not keep the position valid.
+        if accepted(pos) {
+            self.gps.pos_accept = Some(t);
+        }
+        if accepted(vel) {
+            self.gps.vel_accept = Some(t);
+        }
+        // The velocity alone rejected while the position is accepted: a
+        // third timer, since neither of the others can see it.
+        let mut vel_stuck = false;
+        if rejected(vel) {
+            let since = *self.gps.vel_reject_since.get_or_insert(t);
+            vel_stuck = accepted(pos) && t.since(since) > self.gps_timeout_us;
+        } else if accepted(vel) {
+            self.gps.vel_reject_since = None;
+        }
         if accepted(pos) || accepted(vel) {
             self.gps.last_accept = t;
             self.gps.reject_since = None;
@@ -563,6 +689,13 @@ impl Estimator {
         }
         if stuck {
             self.reset_to_gps(ekf, s, sigma_p, sigma_v);
+        } else if vel_stuck {
+            let dv = ekf.reset_velocity(g.velocity, sigma_v);
+            self.output.shift(Vec3::zero(), dv);
+            self.resets = self.resets.saturating_add(1);
+            self.gps.vel_accept = Some(t);
+            self.gps.last_accept = t;
+            self.gps.vel_reject_since = None;
         }
     }
 
@@ -580,9 +713,12 @@ impl Estimator {
         self.output.shift(dp, dv);
         self.resets = self.resets.saturating_add(1);
         self.gps.fused = true;
+        self.gps.vel_accept = Some(s.t_sample);
+        self.gps.pos_accept = Some(s.t_sample);
         self.gps.last_accept = s.t_sample;
         self.gps.reject_since = None;
         self.gps.pos_reject_since = None;
+        self.gps.vel_reject_since = None;
     }
 }
 
@@ -623,10 +759,16 @@ mod tests {
         gps_latency_us: u64,
         /// Body-frame magnetic field the rig reports.
         mag_field: Vec3<f32>,
+        /// Altitude the barometer reports, m.
+        baro_alt: f32,
         /// No magnetometer samples before this time, µs.
         mag_from_us: u64,
         /// False stops the IMU samples (updates continue).
         imu_on: bool,
+        /// False stops the barometer, magnetometer and GPS samples.
+        baro_on: bool,
+        mag_on: bool,
+        gps_on: bool,
         /// Pending GPS fixes as (arrival, sample).
         pending: [Option<(Micros, Stamped<GpsSample>)>; 4],
     }
@@ -642,8 +784,12 @@ mod tests {
                 gps_vel: Vec3::zero(),
                 gps_latency_us: 150_000,
                 mag_field: MAG,
+                baro_alt: 123.0,
                 mag_from_us: 0,
                 imu_on: true,
+                baro_on: true,
+                mag_on: true,
+                gps_on: true,
                 pending: [None; 4],
             }
         }
@@ -663,16 +809,20 @@ mod tests {
                 self.est.push_imu(&Stamped::ideal(t, imu));
             }
             if t.0.is_multiple_of(20_000) {
-                let alt = BaroSample { altitude_m: 123.0 };
-                self.est.push_baro(&Stamped::ideal(t, alt));
-                if t.0 >= self.mag_from_us {
+                let alt = BaroSample {
+                    altitude_m: self.baro_alt,
+                };
+                if self.baro_on {
+                    self.est.push_baro(&Stamped::ideal(t, alt));
+                }
+                if self.mag_on && t.0 >= self.mag_from_us {
                     let m = MagSample {
                         field_ut: self.mag_field,
                     };
                     self.est.push_mag(&Stamped::ideal(t, m));
                 }
             }
-            if t.0.is_multiple_of(200_000) {
+            if self.gps_on && t.0.is_multiple_of(200_000) {
                 let g = GpsSample {
                     position: self.gps_pos,
                     velocity: self.gps_vel,
@@ -710,6 +860,108 @@ mod tests {
     }
 
     #[test]
+    fn validity_all_true_in_steady_state() {
+        let mut rig = Rig::new(&EkfParams::default());
+        assert_eq!(rig.est.validity(), Validity::NONE);
+        rig.run_until(4.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        assert!(rig.est.state().is_some());
+        assert_eq!(rig.est.faults(), 0);
+    }
+
+    #[test]
+    fn validity_all_false_before_alignment() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(0.9);
+        assert_eq!(rig.est.validity(), Validity::NONE);
+        assert!(rig.est.state().is_none());
+    }
+
+    #[test]
+    fn state_exists_without_gps() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.gps_on = false;
+        rig.run_until(3.0);
+        assert!(rig.est.estimate().is_none());
+        assert!(rig.est.state().is_some());
+        let v = rig.est.validity();
+        assert!(v.attitude && v.heading && v.altitude);
+        assert!(!v.velocity && !v.position);
+    }
+
+    #[test]
+    fn validity_gps_loss_drops_position_then_velocity() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        rig.gps_on = false;
+        // Fixes already in flight (150 ms latency) still arrive; the last
+        // accepted sample time is about 4.0 s.
+        rig.run_until(4.0 + 1.0);
+        let v = rig.est.validity();
+        assert!(v.position && v.velocity, "{v:?}");
+        rig.run_until(4.0 + 1.9);
+        let v = rig.est.validity();
+        assert!(!v.position, "{v:?}");
+        assert!(v.velocity && v.heading && v.altitude && v.attitude, "{v:?}");
+        rig.run_until(4.0 + 4.5);
+        assert!(rig.est.validity().velocity);
+        rig.run_until(4.0 + 5.6);
+        let v = rig.est.validity();
+        assert!(!v.velocity && !v.position, "{v:?}");
+        assert!(v.attitude && v.heading && v.altitude, "{v:?}");
+        assert!(rig.est.state().is_some());
+        // GPS returns: everything returns.
+        rig.gps_on = true;
+        rig.run_until(4.0 + 7.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+    }
+
+    #[test]
+    fn validity_baro_loss_drops_altitude() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        rig.baro_on = false;
+        rig.run_until(4.0 + 4.5);
+        assert!(rig.est.validity().altitude);
+        rig.run_until(4.0 + 5.5);
+        let v = rig.est.validity();
+        assert!(!v.altitude, "{v:?}");
+        assert!(v.attitude && v.heading && v.velocity && v.position, "{v:?}");
+        assert!(rig.est.state().is_some());
+        rig.baro_on = true;
+        rig.run_until(4.0 + 6.5);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+    }
+
+    #[test]
+    fn validity_mag_loss_drops_heading_velocity_position() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        rig.mag_on = false;
+        rig.run_until(4.0 + 29.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        rig.run_until(4.0 + 31.0);
+        let v = rig.est.validity();
+        assert!(v.attitude && v.altitude, "{v:?}");
+        assert!(!v.heading && !v.velocity && !v.position, "{v:?}");
+        assert!(rig.est.state().is_some());
+        rig.mag_on = true;
+        rig.run_until(4.0 + 33.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+    }
+
+    #[test]
+    fn validity_clears_when_the_filter_is_dropped() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        rig.imu_on = false;
+        rig.run_until(4.3);
+        assert_eq!(rig.est.validity(), Validity::NONE);
+        assert!(rig.est.state().is_none());
+    }
+
+    #[test]
     fn rejects_bad_parameters() {
         let ok = EkfParams::default();
         assert!(Estimator::new(&ok, &F405_LEAN).is_ok());
@@ -728,6 +980,9 @@ mod tests {
         assert_eq!(bad(|p| p.delay_horizon_us = 0), e);
         assert_eq!(bad(|p| p.align_time_us = 0), e);
         assert_eq!(bad(|p| p.gps_timeout_us = 0), e);
+        assert_eq!(bad(|p| p.pos_timeout_us = 0), e);
+        assert_eq!(bad(|p| p.baro_timeout_us = 0), e);
+        assert_eq!(bad(|p| p.mag_timeout_us = 0), e);
         assert_eq!(bad(|p| p.mag_declination_rad = f32::NAN), e);
     }
 
@@ -1143,5 +1398,74 @@ mod tests {
             }
         }
         assert!(first.is_some(), "estimate must appear");
+    }
+
+    #[test]
+    fn heading_resets_when_the_magnetometer_returns_after_its_timeout() {
+        use crate::math::Quat;
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        let resets = rig.est.status().resets;
+        rig.mag_on = false;
+        rig.run_until(4.0 + 35.0);
+        assert!(!rig.est.validity().heading);
+        // The vehicle was turned 90 degrees meanwhile: the old gate would
+        // reject the magnetometer for ever.
+        let yaw = 90.0_f32.to_radians();
+        rig.mag_field = Quat::from_euler(0.0, 0.0, yaw).inverse_rotate(MAG);
+        rig.mag_on = true;
+        rig.run_until(4.0 + 36.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        let e = rig.est.estimate().unwrap();
+        let err = wrap_pi(e.attitude.yaw() - yaw).abs();
+        assert!(err < 2.0_f32.to_radians(), "yaw error {err} rad");
+        assert_eq!(rig.est.status().resets, resets + 1);
+        rig.run_until(4.0 + 40.0);
+        assert_eq!(rig.est.status().resets, resets + 1, "one reset only");
+    }
+
+    #[test]
+    fn height_rereferences_when_the_barometer_returns_after_its_timeout() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        let resets = rig.est.status().resets;
+        rig.baro_on = false;
+        rig.run_until(4.0 + 8.0);
+        assert!(!rig.est.validity().altitude);
+        let z0 = rig.est.state().unwrap().position.z;
+        rig.baro_alt = 143.0;
+        rig.baro_on = true;
+        rig.run_until(4.0 + 9.0);
+        assert!(rig.est.validity().altitude);
+        let z1 = rig.est.state().unwrap().position.z;
+        assert!((z1 - z0).abs() < 0.2, "height moved {} m", z1 - z0);
+        assert_eq!(rig.est.status().resets, resets + 1);
+        rig.run_until(4.0 + 15.0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        assert!((rig.est.state().unwrap().position.z - z0).abs() < 0.2);
+        assert_eq!(rig.est.status().resets, resets + 1, "one reset only");
+    }
+
+    #[test]
+    fn velocity_resets_when_gps_velocity_alone_is_rejected_for_the_timeout() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        let resets = rig.est.status().resets;
+        assert_eq!(resets, 1);
+        // Position stays consistent; velocity is 5 m/s off.
+        rig.gps_vel = Vec3::new(5.0, 0.0, 0.0);
+        rig.run_until(4.0 + 3.0);
+        assert_eq!(rig.est.status().resets, resets, "not before the timeout");
+        rig.run_until(4.0 + 6.0);
+        assert_eq!(rig.est.status().resets, resets + 1);
+        let v = rig.est.validity();
+        assert!(v.velocity && v.position, "{v:?}");
+        // Snapped to the fix (the stationary rig's position then pulls it
+        // back, so look soon after the reset).
+        let e = rig.est.estimate().unwrap();
+        assert!(e.velocity.x > 3.5, "v = {:?}", e.velocity);
+        rig.run_until(4.0 + 9.0);
+        assert_eq!(rig.est.status().resets, resets + 1, "one reset only");
     }
 }

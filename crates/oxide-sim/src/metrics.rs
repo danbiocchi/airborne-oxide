@@ -131,7 +131,7 @@ impl HoldMetrics {
             if !r.status.armed {
                 self.unarmed_ticks += 1;
             }
-            if r.estimate.is_none() || r.status.no_estimate {
+            if r.estimate.is_none() || r.status.no_estimate || !r.status.valid.full() {
                 self.no_estimate_ticks += 1;
             }
         }
@@ -302,6 +302,7 @@ mod tests {
             battery_a: 0.0,
             status: Status {
                 armed: true,
+                valid: oxide_core::io::Validity::ALL,
                 ..Status::default()
             },
             setpoint: None,
@@ -313,6 +314,7 @@ mod tests {
             }),
             wind: Vec3::zero(),
             physics_faults: 0,
+            events: oxide_core::io::EventList::new(),
         }
     }
 
