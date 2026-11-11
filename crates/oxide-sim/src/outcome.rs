@@ -316,22 +316,25 @@ impl Default for Expect {
     }
 }
 
+/// Every failsafe reason with its name, in bit order. The names are the ones
+/// scenario files use.
+pub const REASON_NAMES: [(Reasons, &str); 11] = [
+    (Reasons::RC_LOST, "RC_LOST"),
+    (Reasons::NO_HUMAN_LINK, "NO_HUMAN_LINK"),
+    (Reasons::BRAIN_LOST, "BRAIN_LOST"),
+    (Reasons::SETPOINT_STALE, "SETPOINT_STALE"),
+    (Reasons::BATTERY_LOW, "BATTERY_LOW"),
+    (Reasons::BATTERY_CRITICAL, "BATTERY_CRITICAL"),
+    (Reasons::GPS_LOST, "GPS_LOST"),
+    (Reasons::ESTIMATOR_UNHEALTHY, "ESTIMATOR_UNHEALTHY"),
+    (Reasons::IMU_FAILURE, "IMU_FAILURE"),
+    (Reasons::GEOFENCE, "GEOFENCE"),
+    (Reasons::LOSS_OF_CONTROL, "LOSS_OF_CONTROL"),
+];
+
 /// Names of the bits set in `r`, e.g. "RC_LOST|GPS_LOST".
 pub fn reason_names(r: Reasons) -> String {
-    const NAMES: [(Reasons, &str); 11] = [
-        (Reasons::RC_LOST, "RC_LOST"),
-        (Reasons::NO_HUMAN_LINK, "NO_HUMAN_LINK"),
-        (Reasons::BRAIN_LOST, "BRAIN_LOST"),
-        (Reasons::SETPOINT_STALE, "SETPOINT_STALE"),
-        (Reasons::BATTERY_LOW, "BATTERY_LOW"),
-        (Reasons::BATTERY_CRITICAL, "BATTERY_CRITICAL"),
-        (Reasons::GPS_LOST, "GPS_LOST"),
-        (Reasons::ESTIMATOR_UNHEALTHY, "ESTIMATOR_UNHEALTHY"),
-        (Reasons::IMU_FAILURE, "IMU_FAILURE"),
-        (Reasons::GEOFENCE, "GEOFENCE"),
-        (Reasons::LOSS_OF_CONTROL, "LOSS_OF_CONTROL"),
-    ];
-    let v: Vec<&str> = NAMES
+    let v: Vec<&str> = REASON_NAMES
         .iter()
         .filter(|(bit, _)| r.contains(*bit))
         .map(|(_, n)| *n)
