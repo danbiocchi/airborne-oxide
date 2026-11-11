@@ -21,13 +21,14 @@ pub struct Airframe {
     #[serde(rename = "rotor")]
     pub rotors: Vec<RotorSpec>,
     pub battery: BatterySpec,
-    /// Optional `[params]` table of `NAME = value` (ADR-0004), in file order.
+    /// Optional `[params]` table of `NAME = value` (ADR-0004), applied in name
+    /// order (the TOML table is sorted by key).
     /// Applied before any command-line override.
     #[serde(default, deserialize_with = "ordered_params")]
     pub params: Vec<(String, f64)>,
 }
 
-/// A `[params]` table as `(name, value)` pairs in the order written, each
+/// A `[params]` table as `(name, value)` pairs in key (name) order, each
 /// value an integer or a float.
 pub fn ordered_params<'de, D: serde::Deserializer<'de>>(
     d: D,

@@ -120,7 +120,7 @@ One TOML file per scenario in `scenarios/`. A file holds:
 
 - The MAVLink parameter protocol itself (with communications).
 - Vehicle description as parameters (with the airframe lab).
-- Parameter groups that must change together in one step (a transaction). Until then, change them in an order that keeps the configuration valid.
+- Parameter groups that must change together in one step (a transaction). Until then, change them in an order that keeps the configuration valid. A `[params]` table in an airframe or scenario file is applied in name order (a TOML table is unordered, and the parser sorts it by key), so a file cannot choose the order; a joint change that is valid in only one order needs the transaction.
 - Per-parameter access levels for the brain (with the command gateway, M3).
 - The flash driver and the erase stall on the F405 (bring-up).
 - Terrain and missions in scenario files (they do not exist yet).
