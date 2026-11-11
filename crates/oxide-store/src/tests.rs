@@ -761,7 +761,7 @@ fn the_aliasing_keys_really_alias() {
 
 #[test]
 fn mount_picks_the_newer_sector_across_a_sequence_wrap() {
-    use crate::layout::{header_body, record_bytes, STATE_VALID};
+    use crate::layout::{STATE_VALID, header_body, record_bytes};
     let mut f = fresh();
     for (sector, seq, value) in [(0, u32::MAX, 100), (1, 0, 200)] {
         let b = f.bytes_mut(sector).unwrap();

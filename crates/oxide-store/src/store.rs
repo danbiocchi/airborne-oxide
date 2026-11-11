@@ -107,7 +107,7 @@ impl<F: Flash> Store<F> {
         };
         let h = [s.read_header(0)?, s.read_header(1)?];
         let best = match (h[0], h[1]) {
-            (Header::Valid(a), Header::Valid(b)) => Some(usize::from(b > a)),
+            (Header::Valid(a), Header::Valid(b)) => Some(usize::from(b.wrapping_sub(a) as i32 > 0)),
             (Header::Valid(_), _) => Some(0),
             (_, Header::Valid(_)) => Some(1),
             _ => None,
@@ -216,7 +216,8 @@ impl<F: Flash> Store<F> {
         let mut highest: Option<u32> = None;
         for sector in 0..2 {
             if let Header::Valid(q) | Header::Writing(q) = self.read_header(sector)? {
-                highest = Some(highest.map_or(q, |h| h.max(q)));
+                highest =
+                    Some(highest.map_or(q, |h| if q.wrapping_sub(h) as i32 > 0 { q } else { h }));
             }
         }
         // Erase the older sector first, so an interruption leaves the newer.
