@@ -24,8 +24,12 @@ struct Rig {
     brain_progress: u32,
     setpoint: Option<TrajectorySetpoint>,
     gps_on: bool,
+    /// East coordinate of every GPS fix in EKF mode, m.
+    gps_east: f32,
     baro_on: bool,
     mag_on: bool,
+    /// Field every magnetometer sample reads in EKF mode, µT (body frame).
+    mag_field: Vec3<f32>,
     gcs_on: bool,
     /// Feed one absurd (finite, but blowing up the covariance) accelerometer sample at the next step.
     imu_glitch: bool,
@@ -79,8 +83,10 @@ impl Rig {
                 yaw: 0.0,
             }),
             gps_on: true,
+            gps_east: 0.0,
             baro_on: true,
             mag_on: true,
+            mag_field: Vec3::new(25.0, 0.0, 43.3),
             gcs_on: false,
             imu_glitch: false,
             imu_on: true,
@@ -148,11 +154,17 @@ impl Rig {
         }
         i.rc = self.rc_on.then(|| Stamped::ideal(t, self.rc));
         i.battery = self.battery.map(|b| Stamped::ideal(t, b));
+        if let Some(g) = i.gps.as_mut() {
+            g.value.position.y = self.gps_east;
+        }
         if !self.gps_on {
             i.gps = None;
         }
         if !self.baro_on {
             i.baro = None;
+        }
+        if let Some(m) = i.mag.as_mut() {
+            m.value.field_ut = self.mag_field;
         }
         if !self.mag_on {
             i.mag = None;
@@ -1433,4 +1445,275 @@ fn zero_throttle_with_no_height_or_speed_is_not_landed_when_a_failsafe_starts() 
         rig.events
     );
     assert!(!rig.saw(EventKind::Disarmed(DisarmReason::Touchdown)));
+}
+
+/// Runs `secs` and returns the largest commanded tilt seen, rad.
+fn max_commanded_tilt(rig: &mut Rig, secs: f64) -> f32 {
+    let mut max = 0.0_f32;
+    rig.run_until(secs, |r| {
+        max = max.max(tilt_angle(r.core.guidance.visible.attitude));
+        false
+    });
+    max
+}
+
+#[test]
+fn hold_does_not_chase_the_old_point_when_gps_returns_with_a_position_reset() {
+    let mut rig = Rig::ekf(2);
+    rig.arm();
+    rig.run(1.0);
+    rig.gps_on = false;
+    rig.run(8.0);
+    assert_eq!(rig.nav(), NavState::Hold);
+    assert!(!rig.out.status.valid.position);
+    // The brain's setpoint is where the vehicle really is, so that the end of
+    // the failsafe (back to Offboard after a second) asks for nothing either.
+    rig.gps_east = 20.0;
+    rig.setpoint = Some(TrajectorySetpoint {
+        position: Vec3::new(0.0, 20.0, -5.0),
+        velocity: Vec3::zero(),
+        yaw: 0.0,
+    });
+    rig.gps_on = true;
+    let max = max_commanded_tilt(&mut rig, 4.0);
+    assert!(rig.out.status.valid.position, "position must be back");
+    assert!(
+        max < 5.0_f32.to_radians(),
+        "commanded tilt {} deg after the fix",
+        max.to_degrees()
+    );
+    let e = rig.core.estimate().expect("estimate");
+    assert!(
+        (e.position.y - 20.0).abs() < 1.0,
+        "estimate {:?}",
+        e.position
+    );
+    assert!(
+        (rig.core.guide_state.position_sp.y - e.position.y).abs() < 1.0,
+        "setpoint {:?}",
+        rig.core.guide_state.position_sp
+    );
+}
+
+/// A bare core whose guidance is driven directly with a made-up estimate.
+fn guidance_core() -> Core<4> {
+    Core::new(cfg(), F405_LEAN).expect("valid config")
+}
+
+/// One guidance run (4 ms) in `nav` with the given validity, position, yaw and
+/// home. The supervisor's armed flag is set; nothing else is simulated.
+fn guide(
+    core: &mut Core<4>,
+    k: u64,
+    nav: NavState,
+    valid: Validity,
+    position: Vec3<f32>,
+    yaw: f32,
+    home: Option<Vec3<f32>>,
+) {
+    core.supervision.visible = Supervision {
+        armed: true,
+        nav,
+        home,
+        ..Supervision::default()
+    };
+    core.estimate.visible = Estimate {
+        state: Some(StateSample {
+            position,
+            velocity: Vec3::new(0.0, 0.0, 0.7),
+            attitude: Quat::from_euler(0.0, 0.0, yaw),
+            ..StateSample::default()
+        }),
+        valid,
+    };
+    core.run_guidance(Micros(k * 4000), 0.004);
+}
+
+const FLYING_STATES: [NavState; 5] = [
+    NavState::Hold,
+    NavState::Land,
+    NavState::LandNow,
+    NavState::Rtl,
+    NavState::Offboard,
+];
+
+#[test]
+fn every_flying_state_takes_the_new_yaw_when_the_heading_returns() {
+    let no_heading = Validity {
+        heading: false,
+        velocity: false,
+        position: false,
+        ..Validity::ALL
+    };
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    for nav in FLYING_STATES {
+        let mut core = guidance_core();
+        let p = Vec3::new(0.0, 0.0, -5.0);
+        guide(&mut core, 0, nav, Validity::ALL, p, 0.0, home);
+        guide(&mut core, 1, nav, Validity::ALL, p, 0.0, home);
+        // Without a heading the setpoint follows the yaw.
+        guide(&mut core, 2, nav, no_heading, p, 0.3, home);
+        assert!((core.guide_state.yaw_sp - 0.3).abs() < 1e-6, "{nav:?}");
+        // The magnetometer is back and the estimator reset its yaw.
+        guide(&mut core, 3, nav, Validity::ALL, p, 1.4, home);
+        assert!(
+            (core.guide_state.yaw_sp - 1.4).abs() < 1e-6,
+            "{nav:?}: yaw_sp {}",
+            core.guide_state.yaw_sp
+        );
+        // Afterwards the setpoint is a setpoint again, not the yaw.
+        guide(&mut core, 4, nav, Validity::ALL, p, 1.5, home);
+        assert!(
+            (core.guide_state.yaw_sp - 1.4).abs() < 1e-6 || nav == NavState::Offboard,
+            "{nav:?}"
+        );
+    }
+}
+
+#[test]
+fn every_flying_state_takes_the_fix_as_its_point_when_the_position_returns() {
+    let no_position = Validity {
+        position: false,
+        ..Validity::ALL
+    };
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    for nav in [
+        NavState::Hold,
+        NavState::Land,
+        NavState::LandNow,
+        NavState::Offboard,
+    ] {
+        let mut core = guidance_core();
+        guide(
+            &mut core,
+            0,
+            nav,
+            Validity::ALL,
+            Vec3::new(0.0, 0.0, -5.0),
+            0.0,
+            home,
+        );
+        guide(
+            &mut core,
+            1,
+            nav,
+            no_position,
+            Vec3::new(3.0, 0.0, -5.0),
+            0.0,
+            home,
+        );
+        guide(
+            &mut core,
+            2,
+            nav,
+            Validity::ALL,
+            Vec3::new(25.0, 4.0, -5.0),
+            0.0,
+            home,
+        );
+        let sp = core.guide_state.position_sp;
+        assert!(
+            (sp.x - 25.0).abs() < 1e-6 && (sp.y - 4.0).abs() < 1e-6,
+            "{nav:?}: {sp:?}"
+        );
+    }
+}
+
+#[test]
+fn every_flying_state_takes_the_current_height_when_the_altitude_returns() {
+    let no_altitude = Validity {
+        altitude: false,
+        ..Validity::ALL
+    };
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    for nav in [
+        NavState::Hold,
+        NavState::Land,
+        NavState::LandNow,
+        NavState::Rtl,
+    ] {
+        let mut core = guidance_core();
+        guide(
+            &mut core,
+            0,
+            nav,
+            Validity::ALL,
+            Vec3::new(0.0, 0.0, -5.0),
+            0.0,
+            home,
+        );
+        guide(
+            &mut core,
+            1,
+            nav,
+            no_altitude,
+            Vec3::new(0.0, 0.0, -5.0),
+            0.0,
+            home,
+        );
+        // Away from the point the setpoint last followed.
+        guide(
+            &mut core,
+            2,
+            nav,
+            Validity::ALL,
+            Vec3::new(0.0, 0.0, -8.0),
+            0.0,
+            home,
+        );
+        let z = core.guide_state.position_sp.z;
+        assert!((z + 8.0).abs() < 1e-6, "{nav:?}: z {z}");
+    }
+}
+
+#[test]
+fn the_rtl_return_height_survives_a_barometer_outage() {
+    let no_altitude = Validity {
+        altitude: false,
+        ..Validity::ALL
+    };
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    let mut core = guidance_core();
+    // 10 m out, 3 m up: Rtl climbs to 10 m.
+    guide(
+        &mut core,
+        0,
+        NavState::Rtl,
+        Validity::ALL,
+        Vec3::new(10.0, 0.0, -3.0),
+        0.0,
+        home,
+    );
+    guide(
+        &mut core,
+        1,
+        NavState::Rtl,
+        Validity::ALL,
+        Vec3::new(10.0, 0.0, -3.0),
+        0.0,
+        home,
+    );
+    assert_eq!(core.guide_state.rtl, RtlPhase::Climb);
+    assert!((core.guide_state.position_sp.z + 10.0).abs() < 1e-6);
+    guide(
+        &mut core,
+        2,
+        NavState::Rtl,
+        no_altitude,
+        Vec3::new(10.0, 0.0, -3.0),
+        0.0,
+        home,
+    );
+    guide(
+        &mut core,
+        3,
+        NavState::Rtl,
+        Validity::ALL,
+        Vec3::new(10.0, 0.0, -6.0),
+        0.0,
+        home,
+    );
+    assert_eq!(core.guide_state.rtl, RtlPhase::Climb);
+    let z = core.guide_state.position_sp.z;
+    assert!((z + 10.0).abs() < 1e-6, "return height lost: {z}");
 }

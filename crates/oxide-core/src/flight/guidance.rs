@@ -67,6 +67,9 @@ pub(super) struct GuidanceState {
     /// How long a landing has been flying blind (no height, no vertical
     /// speed), s.
     blind_s: f32,
+    /// The validity flags guidance saw on its previous run, to find the edge
+    /// at which a sensor returns.
+    prev_valid: Validity,
 }
 
 /// Horizontal hold at a point, in the best form the flags allow.
@@ -155,6 +158,7 @@ impl<const N: usize> Core<N> {
                 rtl: RtlPhase::Pending,
                 contact_s: 0.0,
                 blind_s: 0.0,
+                prev_valid: v,
             };
             self.guidance.pending = AttitudeTarget {
                 attitude: state.attitude,
@@ -171,9 +175,11 @@ impl<const N: usize> Core<N> {
             g.rtl = RtlPhase::Pending;
             g.contact_s = 0.0;
             g.blind_s = 0.0;
+            g.prev_valid = v;
             self.position_ctrl.reset();
             g.last_nav = Some(sup.nav);
         }
+        Self::follow_returning_sensors(&mut g, &state.position, yaw_now, v, sup.nav);
 
         let l = self.cfg.limits;
         let fs = self.cfg.failsafe;
@@ -459,8 +465,42 @@ impl<const N: usize> Core<N> {
                 g.position_sp.y = state.position.y;
             }
         }
+        g.prev_valid = v;
         self.guide_state = g;
         self.guidance.pending = target;
+    }
+
+    /// Re-bases the setpoints on the estimate when a part of it comes back.
+    ///
+    /// The estimator resets position and yaw to the sensor when the sensor
+    /// returns after its timeout, and the matching flag turns valid on the
+    /// same estimate. Every reset happens only while the flag is false (the
+    /// timeouts exceed the validity windows), so the edge from invalid to
+    /// valid marks it. A setpoint kept from before the gap is then off by the
+    /// drift that built up, and the vehicle would fly or turn to it. So on the
+    /// edge the setpoint becomes the estimate; while the flag is false the
+    /// yaw setpoint follows the yaw. In `Rtl` climb and return the vertical
+    /// setpoint is the return height, a target that stays meaningful.
+    fn follow_returning_sensors(
+        g: &mut GuidanceState,
+        position: &Vec3<f32>,
+        yaw_now: f32,
+        v: Validity,
+        nav: NavState,
+    ) {
+        let was = g.prev_valid;
+        if v.position && !was.position {
+            g.position_sp.x = position.x;
+            g.position_sp.y = position.y;
+        }
+        if !v.heading || !was.heading {
+            g.yaw_sp = yaw_now;
+        }
+        let return_height =
+            nav == NavState::Rtl && matches!(g.rtl, RtlPhase::Climb | RtlPhase::Return);
+        if v.altitude && !was.altitude && !return_height {
+            g.position_sp.z = position.z;
+        }
     }
 
     /// While a part of the position is not valid the held point follows the
