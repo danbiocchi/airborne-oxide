@@ -26,5 +26,7 @@
 pub mod crc;
 pub mod flash;
 pub mod layout;
+pub mod store;
 
 pub use flash::{Flash, FlashError};
+pub use store::{Error, Iter, MountReport, Store};
