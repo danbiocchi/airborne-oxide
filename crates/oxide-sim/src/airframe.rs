@@ -121,6 +121,22 @@ pub struct BatterySpec {
     pub initial_state_of_charge: f64,
 }
 
+/// A parameter file: a `[params]` table of `NAME = value` and nothing else.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParamsFile {
+    #[serde(deserialize_with = "ordered_params")]
+    params: Vec<(String, f64)>,
+}
+
+/// Parses a parameter file (`--params FILE.toml`) into `(name, value)` pairs
+/// in file order.
+pub fn parse_params_file(text: &str) -> Result<Vec<(String, f64)>, SimError> {
+    toml::from_str::<ParamsFile>(text)
+        .map(|f| f.params)
+        .map_err(|e| SimError::Airframe(format!("parameter file: {e}")))
+}
+
 impl Airframe {
     pub fn from_toml(text: &str) -> Result<Self, SimError> {
         let a: Self = toml::from_str(text).map_err(|e| SimError::Airframe(e.to_string()))?;
