@@ -335,6 +335,19 @@ impl Default for FailsafeParams {
     }
 }
 
+impl FailsafeParams {
+    /// A commanded descent counts as a command to move when it is at least
+    /// this many times `touchdown_speed_mps` (ground contact, ADR-0003 §2).
+    /// The landing speed must reach it too, or a landing could not be told
+    /// from standing on the ground.
+    pub const CONTACT_DESCENT_RATIO: f32 = 2.0;
+
+    /// The slowest commanded descent that counts as a command to move, m/s.
+    pub fn contact_descent_mps(&self) -> f32 {
+        Self::CONTACT_DESCENT_RATIO * self.touchdown_speed_mps
+    }
+}
+
 /// Everything the core needs to know about the vehicle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VehicleConfig<const N: usize> {
