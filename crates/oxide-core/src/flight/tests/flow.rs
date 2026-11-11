@@ -590,12 +590,12 @@ fn imu_stopping_while_armed_terminates_and_blocks_arming_until_released() {
 fn land_now_on_the_ground_touches_down_and_disarms() {
     // A critical battery lands now. The vehicle sits still on the ground,
     // so the command winds down and the touchdown condition then has to
-    // hold for touchdown_s. The low level is set below the critical one so
-    // that the low-battery return (which, at home on the ground, lands and
-    // disarms within two seconds of its own) does not get there first: this
-    // test is about LandNow.
+    // hold for touchdown_s. The low level is set equal to the critical one
+    // (the configuration refuses a critical level above the low one) so that
+    // both latch together and LandNow, not the low-battery return, is in
+    // force: this test is about LandNow.
     let mut c = cfg();
-    c.failsafe.battery_low_v = 3.0;
+    c.failsafe.battery_low_v = c.failsafe.battery_critical_v;
     let mut rig = Rig::external(0).with_cfg(c);
     rig.state = Some(StateSample::default());
     rig.arm();
@@ -1195,11 +1195,11 @@ fn min_motor(rig: &Rig) -> f32 {
 
 /// A Stabilized rig at 5 m with the throttle up (so it does not count as on
 /// the ground) and a critical battery, run until LandNow starts. The low
-/// level is set below the critical one so the return does not get there
-/// first.
+/// level equals the critical one (it may not be lower), so both latch
+/// together and LandNow is in force.
 fn critical_battery_rig() -> Rig {
     let mut c = cfg();
-    c.failsafe.battery_low_v = 3.0;
+    c.failsafe.battery_low_v = c.failsafe.battery_critical_v;
     let mut rig = Rig::external(0).with_cfg(c);
     rig.arm();
     rig.rc.throttle = 0.3;
@@ -1354,7 +1354,7 @@ fn stick_held_down_on_the_ground_in_position_leaves_nothing_wound_up() {
 #[test]
 fn land_now_from_a_centred_position_hold_on_the_ground_disarms() {
     let mut c = cfg();
-    c.failsafe.battery_low_v = 3.0;
+    c.failsafe.battery_low_v = c.failsafe.battery_critical_v;
     let mut rig = Rig::external(1).with_cfg(c);
     rig.state = Some(StateSample::default());
     rig.arm();

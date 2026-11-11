@@ -339,3 +339,280 @@ fn a_future_stamped_sample_is_not_fresh() {
     let out = run(&mut core, 2300, 100, rc(true, false));
     assert!(out.status.armed, "normal frames afterwards still work");
 }
+
+/// One failsafe or battery field changed, and whether the result must
+/// validate.
+fn with(change: impl FnOnce(&mut VehicleConfig<4>)) -> Result<(), ConfigError> {
+    let mut c = cfg();
+    change(&mut c);
+    c.validate()
+}
+
+#[test]
+fn the_default_configuration_validates() {
+    assert_eq!(cfg().validate(), Ok(()));
+    assert_eq!(FailsafeParams::default().validate(), Ok(()));
+}
+
+#[test]
+fn every_float_failsafe_field_refuses_nan_and_infinity() {
+    type Set = fn(&mut FailsafeParams, f32);
+    let fields: [(&str, Set); 23] = [
+        ("rc_valid_min_s", |p, v| p.rc_valid_min_s = v),
+        ("rc_loss_hold_s", |p, v| p.rc_loss_hold_s = v),
+        ("no_link_rtl_s", |p, v| p.no_link_rtl_s = v),
+        ("brain_loss_rtl_s", |p, v| p.brain_loss_rtl_s = v),
+        ("gps_loss_land_s", |p, v| p.gps_loss_land_s = v),
+        ("clear_hysteresis_s", |p, v| p.clear_hysteresis_s = v),
+        ("battery_low_v", |p, v| p.battery_low_v = v),
+        ("battery_critical_v", |p, v| p.battery_critical_v = v),
+        ("battery_debounce_s", |p, v| p.battery_debounce_s = v),
+        ("battery_filter_tau_s", |p, v| p.battery_filter_tau_s = v),
+        ("fence_radius_m", |p, v| p.fence_radius_m = v),
+        ("fence_altitude_m", |p, v| p.fence_altitude_m = v),
+        ("loc_error_rad", |p, v| p.loc_error_rad = v),
+        ("loc_error_s", |p, v| p.loc_error_s = v),
+        ("loc_tilt_rad", |p, v| p.loc_tilt_rad = v),
+        ("loc_tilt_s", |p, v| p.loc_tilt_s = v),
+        ("rtl_altitude_m", |p, v| p.rtl_altitude_m = v),
+        ("rtl_speed_mps", |p, v| p.rtl_speed_mps = v),
+        ("land_speed_mps", |p, v| p.land_speed_mps = v),
+        ("land_blind_thrust", |p, v| p.land_blind_thrust = v),
+        ("touchdown_thrust", |p, v| p.touchdown_thrust = v),
+        ("touchdown_speed_mps", |p, v| p.touchdown_speed_mps = v),
+        ("touchdown_s", |p, v| p.touchdown_s = v),
+    ];
+    for (name, set) in fields {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let r = with(|c| set(&mut c.failsafe, bad));
+            assert_eq!(r, Err(ConfigError::BadFailsafe), "{name} = {bad}");
+        }
+    }
+}
+
+#[test]
+fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
+    type Set = fn(&mut FailsafeParams, f32);
+    let pi = core::f32::consts::PI;
+    // (name, setter, [refused], [accepted])
+    let table: [(&str, Set, &[f32], &[f32]); 22] = [
+        (
+            "rc_valid_min_s",
+            |p, v| p.rc_valid_min_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "rc_loss_hold_s",
+            |p, v| p.rc_loss_hold_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "no_link_rtl_s",
+            |p, v| p.no_link_rtl_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "brain_loss_rtl_s",
+            |p, v| p.brain_loss_rtl_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "gps_loss_land_s",
+            |p, v| p.gps_loss_land_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "clear_hysteresis_s",
+            |p, v| p.clear_hysteresis_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "battery_debounce_s",
+            |p, v| p.battery_debounce_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "battery_filter_tau_s",
+            |p, v| p.battery_filter_tau_s = v,
+            &[0.0, -1.0, 3600.1],
+            &[1e-6, 3600.0],
+        ),
+        (
+            "loc_error_s",
+            |p, v| p.loc_error_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "loc_tilt_s",
+            |p, v| p.loc_tilt_s = v,
+            &[-0.001, 3600.1],
+            &[0.0, 3600.0],
+        ),
+        (
+            "touchdown_s",
+            |p, v| p.touchdown_s = v,
+            &[0.0, -1.0, 3600.1],
+            &[1e-6, 3600.0],
+        ),
+        (
+            "battery_low_v",
+            |p, v| p.battery_low_v = v,
+            &[2.99, 4.21],
+            &[3.3, 3.5, 4.2],
+        ),
+        (
+            "battery_critical_v",
+            |p, v| p.battery_critical_v = v,
+            &[2.99, 3.51],
+            &[3.0, 3.5],
+        ),
+        (
+            "fence_radius_m",
+            |p, v| p.fence_radius_m = v,
+            &[-0.001],
+            &[0.0, 1e6],
+        ),
+        (
+            "fence_altitude_m",
+            |p, v| p.fence_altitude_m = v,
+            &[-0.001],
+            &[0.0, 1e6],
+        ),
+        (
+            "loc_error_rad",
+            |p, v| p.loc_error_rad = v,
+            &[0.0, -0.1, pi + 0.001],
+            &[1e-6, pi],
+        ),
+        (
+            "loc_tilt_rad",
+            |p, v| p.loc_tilt_rad = v,
+            &[0.0, -0.1, pi + 0.001],
+            &[1e-6, pi],
+        ),
+        (
+            "rtl_altitude_m",
+            |p, v| p.rtl_altitude_m = v,
+            &[-0.001],
+            &[0.0, 500.0],
+        ),
+        (
+            "rtl_speed_mps",
+            |p, v| p.rtl_speed_mps = v,
+            &[0.0, 0.0999, -1.0],
+            &[0.1, 10.0],
+        ),
+        (
+            "land_blind_thrust",
+            |p, v| p.land_blind_thrust = v,
+            &[0.0, -0.1, 1.001],
+            &[1e-6, 1.0],
+        ),
+        (
+            "touchdown_thrust",
+            |p, v| p.touchdown_thrust = v,
+            &[0.0, -0.1, 1.0, 1.5],
+            &[1e-6, 0.999],
+        ),
+        (
+            "touchdown_speed_mps",
+            |p, v| p.touchdown_speed_mps = v,
+            &[0.0, -0.1],
+            &[1e-3, 0.35],
+        ),
+    ];
+    for (name, set, refused, accepted) in table {
+        for &v in refused {
+            let r = with(|c| set(&mut c.failsafe, v));
+            assert_eq!(
+                r,
+                Err(ConfigError::BadFailsafe),
+                "{name} = {v} must be refused"
+            );
+        }
+        for &v in accepted {
+            let r = with(|c| set(&mut c.failsafe, v));
+            assert_eq!(r, Ok(()), "{name} = {v} must be accepted");
+        }
+    }
+}
+
+#[test]
+fn failsafe_timeouts_below_50_ms_are_refused() {
+    type Set = fn(&mut FailsafeParams, u32);
+    let fields: [(&str, Set); 4] = [
+        ("rc_timeout_us", |p, v| p.rc_timeout_us = v),
+        ("gcs_timeout_us", |p, v| p.gcs_timeout_us = v),
+        ("brain_timeout_us", |p, v| p.brain_timeout_us = v),
+        ("setpoint_timeout_us", |p, v| p.setpoint_timeout_us = v),
+    ];
+    for (name, set) in fields {
+        for bad in [0, 1, 49_999] {
+            let r = with(|c| set(&mut c.failsafe, bad));
+            assert_eq!(r, Err(ConfigError::BadFailsafe), "{name} = {bad}");
+        }
+        assert_eq!(with(|c| set(&mut c.failsafe, 50_000)), Ok(()), "{name}");
+    }
+}
+
+#[test]
+fn critical_battery_threshold_may_not_exceed_the_low_one() {
+    let r = with(|c| {
+        c.failsafe.battery_low_v = 3.4;
+        c.failsafe.battery_critical_v = 3.41;
+    });
+    assert_eq!(r, Err(ConfigError::BadFailsafe));
+    let r = with(|c| {
+        c.failsafe.battery_low_v = 3.4;
+        c.failsafe.battery_critical_v = 3.4;
+    });
+    assert_eq!(r, Ok(()));
+}
+
+#[test]
+fn land_speed_must_reach_the_contact_descent() {
+    let contact = FailsafeParams::default().contact_descent_mps();
+    assert_eq!(with(|c| c.failsafe.land_speed_mps = contact), Ok(()));
+    assert_eq!(
+        with(|c| c.failsafe.land_speed_mps = contact * 0.99),
+        Err(ConfigError::BadFailsafe)
+    );
+}
+
+#[test]
+fn the_battery_description_is_validated() {
+    assert_eq!(with(|c| c.battery_cells = 0), Err(ConfigError::BadFailsafe));
+    assert_eq!(with(|c| c.battery_cells = 1), Ok(()));
+    for bad in [f32::NAN, f32::INFINITY, -0.001] {
+        assert_eq!(
+            with(|c| c.battery_resistance_ohm = bad),
+            Err(ConfigError::BadFailsafe),
+            "resistance {bad}"
+        );
+    }
+    assert_eq!(with(|c| c.battery_resistance_ohm = 0.0), Ok(()));
+}
+
+#[test]
+fn core_new_refuses_a_bad_failsafe_configuration() {
+    let mut c = cfg();
+    c.failsafe.rtl_speed_mps = 0.0;
+    assert_eq!(
+        Core::new(c, F405_LEAN).err(),
+        Some(ConfigError::BadFailsafe)
+    );
+    let mut c = cfg();
+    c.battery_cells = 0;
+    assert_eq!(
+        Core::new(c, F405_LEAN).err(),
+        Some(ConfigError::BadFailsafe)
+    );
+}

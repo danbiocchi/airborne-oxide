@@ -346,6 +346,97 @@ impl FailsafeParams {
     pub fn contact_descent_mps(&self) -> f32 {
         Self::CONTACT_DESCENT_RATIO * self.touchdown_speed_mps
     }
+
+    /// Shortest accepted timeout, µs: below this a single late frame at
+    /// the slowest supervisor rate would count as a loss.
+    pub const MIN_TIMEOUT_US: u32 = 50_000;
+    /// Longest accepted duration, s.
+    pub const MAX_DURATION_S: f32 = 3600.0;
+    /// Accepted battery thresholds, V per cell. The monitor treats a cell
+    /// voltage outside 3.0 to 4.35 V as implausible and refuses to arm, so a
+    /// threshold below 3.0 could only fire after the pack had passed the
+    /// point where it could be armed. The upper bound leaves room for the
+    /// 0.1 V recovery margin the latch needs to clear on the ground.
+    pub const BATTERY_THRESHOLD_RANGE_V: (f32, f32) = (3.0, 4.2);
+
+    /// Checks every parameter. Returns [`ConfigError::BadFailsafe`] for a
+    /// non-finite or out-of-range value, or for one that would disable a
+    /// protection or make a manoeuvre unable to finish (a zero return
+    /// speed, a landing too slow to tell from standing on the ground).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let finite = |v: f32| v.is_finite();
+        let duration = |v: f32| (0.0..=Self::MAX_DURATION_S).contains(&v);
+        let positive_duration = |v: f32| v > 0.0 && v <= Self::MAX_DURATION_S;
+        let (v_min, v_max) = Self::BATTERY_THRESHOLD_RANGE_V;
+        let floats = [
+            self.rc_valid_min_s,
+            self.rc_loss_hold_s,
+            self.no_link_rtl_s,
+            self.brain_loss_rtl_s,
+            self.gps_loss_land_s,
+            self.clear_hysteresis_s,
+            self.battery_low_v,
+            self.battery_critical_v,
+            self.battery_debounce_s,
+            self.battery_filter_tau_s,
+            self.fence_radius_m,
+            self.fence_altitude_m,
+            self.loc_error_rad,
+            self.loc_error_s,
+            self.loc_tilt_rad,
+            self.loc_tilt_s,
+            self.rtl_altitude_m,
+            self.rtl_speed_mps,
+            self.land_speed_mps,
+            self.land_blind_thrust,
+            self.touchdown_thrust,
+            self.touchdown_speed_mps,
+            self.touchdown_s,
+        ];
+        let timeouts = [
+            self.rc_timeout_us,
+            self.gcs_timeout_us,
+            self.brain_timeout_us,
+            self.setpoint_timeout_us,
+        ];
+        let durations = [
+            self.rc_valid_min_s,
+            self.rc_loss_hold_s,
+            self.no_link_rtl_s,
+            self.brain_loss_rtl_s,
+            self.gps_loss_land_s,
+            self.clear_hysteresis_s,
+            self.battery_debounce_s,
+            self.loc_error_s,
+            self.loc_tilt_s,
+        ];
+        let angle = |v: f32| v > 0.0 && v <= core::f32::consts::PI;
+        let ok = floats.iter().all(|v| finite(*v))
+            && timeouts.iter().all(|t| *t >= Self::MIN_TIMEOUT_US)
+            && durations.iter().all(|v| duration(*v))
+            && positive_duration(self.touchdown_s)
+            && positive_duration(self.battery_filter_tau_s)
+            && (v_min..=v_max).contains(&self.battery_low_v)
+            && (v_min..=v_max).contains(&self.battery_critical_v)
+            && self.battery_critical_v <= self.battery_low_v
+            && self.fence_radius_m >= 0.0
+            && self.fence_altitude_m >= 0.0
+            && angle(self.loc_error_rad)
+            && angle(self.loc_tilt_rad)
+            && self.rtl_altitude_m >= 0.0
+            && self.rtl_speed_mps >= 0.1
+            && self.touchdown_speed_mps > 0.0
+            && self.land_speed_mps >= self.contact_descent_mps()
+            && self.land_blind_thrust > 0.0
+            && self.land_blind_thrust <= 1.0
+            && self.touchdown_thrust > 0.0
+            && self.touchdown_thrust < 1.0;
+        if ok {
+            Ok(())
+        } else {
+            Err(ConfigError::BadFailsafe)
+        }
+    }
 }
 
 /// Everything the core needs to know about the vehicle.
@@ -412,6 +503,13 @@ impl<const N: usize> VehicleConfig<N> {
         }
         if !pos(self.nominal_voltage_v) {
             return Err(ConfigError::BadMassProperties);
+        }
+        self.failsafe.validate()?;
+        if self.battery_cells < 1
+            || !self.battery_resistance_ohm.is_finite()
+            || self.battery_resistance_ohm < 0.0
+        {
+            return Err(ConfigError::BadFailsafe);
         }
         Ok(())
     }
