@@ -661,16 +661,34 @@ pub fn load_path(path: impl AsRef<Path>) -> Result<ScenarioFile> {
     load_str(&text).map_err(|e| e.in_file(&shown))
 }
 
-/// The key a serde error talks about is the first back-quoted word of its
-/// message (unknown field `x`, missing field `y`); the line comes from its
-/// span.
+/// Turns a TOML-layer error into a `ScenarioError`. The span says where the
+/// text went wrong; `key_path_at` maps it back to the dotted key path
+/// (`fault[0].start_s`). An unknown field is named by the field itself (the
+/// first back-quoted word of the message); a missing field is named by the
+/// table the span points at plus the field. Everything else (wrong type,
+/// bad value, unknown variant) is named by the key the span lies in.
 fn from_toml_error(e: &toml::de::Error, text: &str) -> ScenarioError {
     let msg = e.message();
-    let key = msg
-        .split('`')
-        .nth(1)
-        .map(str::to_string)
-        .unwrap_or_default();
+    let quoted = || msg.split('`').nth(1).map(str::to_string);
+    let at = e.span().map(|span| key_path_at(text, span.start));
+    let join = |table: &str, key: &str| {
+        if table.is_empty() {
+            key.to_string()
+        } else {
+            format!("{table}.{key}")
+        }
+    };
+    let key = if msg.starts_with("unknown field") {
+        quoted().unwrap_or_default()
+    } else if msg.starts_with("missing field") {
+        let field = quoted().unwrap_or_default();
+        join(at.as_ref().map_or("", |(table, _)| table), &field)
+    } else {
+        at.map_or_else(String::new, |(table, key)| match key {
+            Some(key) => join(&table, &key),
+            None => table,
+        })
+    };
     let reason = match e.span() {
         Some(span) => {
             let line = text
@@ -681,6 +699,64 @@ fn from_toml_error(e: &toml::de::Error, text: &str) -> ScenarioError {
         None => msg.to_string(),
     };
     ScenarioError::new(key, reason)
+}
+
+/// A `key = value` line's key, unquoted, or `None` for any other line.
+fn assigned_key(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let (k, _) = line.split_once('=')?;
+    let k = k.trim();
+    let ok = !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '"' | '\''));
+    ok.then(|| k.replace(['"', '\''], ""))
+}
+
+/// The dotted key path of the text at byte offset `offset`: the table
+/// header in force (`[[fault]]` counted as `fault[i]`), then the key of the
+/// assignment the offset lies in, returned as `(table, key)`; the key is
+/// `None` when the offset lies on a table header.
+fn key_path_at(text: &str, offset: usize) -> (String, Option<String>) {
+    let offset = offset.min(text.len());
+    let line_end = text
+        .get(offset..)
+        .and_then(|r| r.find('\n'))
+        .map_or(text.len(), |n| offset + n);
+    let lines: Vec<&str> = text.get(..line_end).unwrap_or(text).lines().collect();
+    let last = lines.len().saturating_sub(1);
+    let mut table = String::new();
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut key: Option<String> = None;
+    let mut on_header = false;
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if let Some(h) = line.strip_prefix("[[").and_then(|l| l.split("]]").next()) {
+            let h = h.trim().to_string();
+            let n = match counts.iter_mut().find(|(k, _)| *k == h) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    counts.push((h.clone(), 0));
+                    0
+                }
+            };
+            table = format!("{h}[{n}]");
+            key = None;
+            on_header = i == last;
+        } else if let Some(h) = line.strip_prefix('[').and_then(|l| l.split(']').next()) {
+            if !line.starts_with("[[") && line.ends_with(']') {
+                table = h.trim().to_string();
+                key = None;
+                on_header = i == last;
+            }
+        } else if let Some(k) = assigned_key(line) {
+            key = Some(k);
+            on_header = false;
+        }
+    }
+    (table, key.filter(|_| !on_header))
 }
 
 fn finite(key: &str, v: f64) -> Result<f64> {

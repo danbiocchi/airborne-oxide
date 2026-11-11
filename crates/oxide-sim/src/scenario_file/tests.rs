@@ -317,7 +317,7 @@ fn an_unknown_state_name_is_refused_naming_the_key() {
     let e = refused("[expect.ending]\nkind = \"disarmed\"\nreason = \"boredom\"\n");
     assert_eq!(e.key, "expect.ending.reason", "{e}");
     let e = refused("[expect.ending]\nkind = \"crashed\"\n");
-    assert_eq!(e.key, "crashed", "{e}");
+    assert_eq!(e.key, "expect.ending.kind", "{e}");
     let e = refused("[[pilot.mode]]\nt = 0.0\nswitch = \"acro\"\n");
     assert_eq!(e.key, "pilot.mode[0].switch", "{e}");
     let e = refused("[sim]\nsensors = \"perfect\"\n");
@@ -349,7 +349,7 @@ fn a_missing_required_key_is_refused_naming_it() {
     let e = load_str("name = \"x\"\n").expect_err("no duration");
     assert_eq!(e.key, "duration_s", "{e}");
     let e = refused("[[fault]]\nkind = \"gps-loss\"\n");
-    assert_eq!(e.key, "start_s", "{e}");
+    assert_eq!(e.key, "fault[0].start_s", "{e}");
     let e = refused("[[fault]]\nkind = \"motor-loss\"\nstart_s = 1.0\nrotor = 0\n");
     assert_eq!(e.key, "fault[0].scale", "{e}");
     let e = refused("[[pilot.setpoint]]\nt = 0.0\n");
@@ -425,7 +425,7 @@ fn other_mistakes_are_refused_naming_the_key() {
         "battery.initial_state_of_charge"
     );
     assert_eq!(refused("[run]\nseeds = 0\n").key, "run.seeds");
-    assert_eq!(refused("[wind]\nkind = \"hurricane\"\n").key, "hurricane");
+    assert_eq!(refused("[wind]\nkind = \"hurricane\"\n").key, "wind.kind");
     assert_eq!(
         refused("[wind]\nkind = \"random\"\nsteady_speed_mps = [3.0, 1.0]\nsigma_h_mps = [0.1, 0.2]\ntau_s = 2.0\n").key,
         "wind.steady_speed_mps"
@@ -470,5 +470,47 @@ fn loading_the_same_file_twice_gives_equal_values() {
     assert_eq!(
         load_str(&text).expect("loads"),
         load_str(&text).expect("loads")
+    );
+}
+
+#[test]
+fn type_and_value_errors_from_the_toml_layer_name_the_key() {
+    let wrong = |text: &str, key: &str| {
+        let e = load_str(text).expect_err("must be refused");
+        assert_eq!(e.key, key, "{e}");
+    };
+    wrong("name = \"x\"\nduration_s = \"ten\"\n", "duration_s");
+    wrong(
+        &format!("{MINIMAL}[[fault]]\nkind = \"gps-loss\"\nstart_s = \"a\"\n"),
+        "fault[0].start_s",
+    );
+    wrong(
+        &format!(
+            "{MINIMAL}[[fault]]\nkind = \"gps-loss\"\nstart_s = 1.0\n[[fault]]\nkind = \"gps-loss\"\nstart_s = \"a\"\n"
+        ),
+        "fault[1].start_s",
+    );
+    wrong(
+        &format!("{MINIMAL}[[pilot.sticks]]\nt = 0.0\nroll = \"a\"\n"),
+        "pilot.sticks[0].roll",
+    );
+    wrong(
+        &format!("{MINIMAL}[params]\nFS_GPS_LAND = \"a\"\n"),
+        "params.FS_GPS_LAND",
+    );
+    wrong(
+        &format!("{MINIMAL}[[pilot.setpoint]]\nt = 0.0\nposition = [1.0, 2.0]\n"),
+        "pilot.setpoint[0].position",
+    );
+    // Out-of-range integers and unknown variants.
+    wrong(&format!("{MINIMAL}[run]\nseeds = -1\n"), "run.seeds");
+    wrong(&format!("{MINIMAL}[sim]\nsensors = 3\n"), "sim.sensors");
+    wrong(
+        &format!("{MINIMAL}[sim.links]\nrc_failsafe_delay_us = -5\n"),
+        "sim.links.rc_failsafe_delay_us",
+    );
+    wrong(
+        &format!("{MINIMAL}[sim]\nsensors = \"gale\"\n"),
+        "sim.sensors",
     );
 }
