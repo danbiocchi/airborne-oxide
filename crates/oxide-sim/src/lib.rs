@@ -35,6 +35,8 @@ pub enum SimError {
     TimeBase(u64),
     /// Fault number `index` of the options can never happen as written.
     Fault { index: usize, reason: String },
+    /// A parameter override was refused (ADR-0004).
+    Param { name: String, reason: String },
 }
 
 impl fmt::Display for SimError {
@@ -47,6 +49,7 @@ impl fmt::Display for SimError {
                 "periods must be whole multiples of the {us} µs base tick"
             ),
             SimError::Fault { index, reason } => write!(f, "fault {index}: {reason}"),
+            SimError::Param { name, reason } => write!(f, "parameter {name}: {reason}"),
         }
     }
 }

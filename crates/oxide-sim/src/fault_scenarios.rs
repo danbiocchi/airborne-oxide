@@ -897,6 +897,27 @@ pub fn build_with_wind(
     index: u64,
     adjust: impl FnOnce(WindConfig) -> WindConfig,
 ) -> Result<Simulation<Script, 4>, SimError> {
+    build_full(scenario, profile, index, adjust, &[])
+}
+
+/// Like [`build`], with parameter overrides by name (ADR-0004) applied after
+/// the scenario's own configuration.
+pub fn build_with_params(
+    scenario: &FaultScenario,
+    profile: Profile,
+    index: u64,
+    params: &[(String, f64)],
+) -> Result<Simulation<Script, 4>, SimError> {
+    build_full(scenario, profile, index, |w| w, params)
+}
+
+fn build_full(
+    scenario: &FaultScenario,
+    profile: Profile,
+    index: u64,
+    adjust: impl FnOnce(WindConfig) -> WindConfig,
+    params: &[(String, f64)],
+) -> Result<Simulation<Script, 4>, SimError> {
     let airframe = Airframe::reference_quad()?;
     let seed = run_seed(scenario.name, index);
     let options = SimOptions {
@@ -905,6 +926,7 @@ pub fn build_with_wind(
         links: scenario.links,
         failsafe: scenario.failsafe,
         battery: scenario.battery.clone(),
+        params: params.to_vec(),
         ..SimOptions::realistic(seed)
     };
     Simulation::<_, 4>::with_options(&airframe, profile, scenario.script.clone(), options)

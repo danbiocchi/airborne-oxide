@@ -273,8 +273,19 @@ pub fn fly_gust_hold(
     index: u64,
     c: &HoldCriteria,
 ) -> Result<HoldMetrics, SimError> {
+    fly_gust_hold_with_params(profile, index, c, &[])
+}
+
+/// Like [`fly_gust_hold`], with parameter overrides by name (ADR-0004).
+pub fn fly_gust_hold_with_params(
+    profile: Profile,
+    index: u64,
+    c: &HoldCriteria,
+    params: &[(String, f64)],
+) -> Result<HoldMetrics, SimError> {
     let airframe = Airframe::reference_quad()?;
-    let (pilot, options) = gust_hold(index);
+    let (pilot, mut options) = gust_hold(index);
+    options.params = params.to_vec();
     let duration = Micros((pilot.duration_s * 1e6) as u64);
     let target = pilot.hold.cast::<f64>();
     let mut sim = Simulation::<_, 4>::with_options(&airframe, profile, pilot, options)?;

@@ -21,6 +21,57 @@ pub struct Airframe {
     #[serde(rename = "rotor")]
     pub rotors: Vec<RotorSpec>,
     pub battery: BatterySpec,
+    /// Optional `[params]` table of `NAME = value` (ADR-0004), in file order.
+    /// Applied before any command-line override.
+    #[serde(default, deserialize_with = "ordered_params")]
+    pub params: Vec<(String, f64)>,
+}
+
+/// A `[params]` table as `(name, value)` pairs in the order written, each
+/// value an integer or a float.
+pub fn ordered_params<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<(String, f64)>, D::Error> {
+    use serde::de::{MapAccess, Visitor};
+    struct Num(f64);
+    impl<'de> Deserialize<'de> for Num {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = Num;
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str("a number")
+                }
+                fn visit_f64<E>(self, v: f64) -> Result<Num, E> {
+                    Ok(Num(v))
+                }
+                #[allow(clippy::cast_precision_loss)]
+                fn visit_i64<E>(self, v: i64) -> Result<Num, E> {
+                    Ok(Num(v as f64))
+                }
+                #[allow(clippy::cast_precision_loss)]
+                fn visit_u64<E>(self, v: u64) -> Result<Num, E> {
+                    Ok(Num(v as f64))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+    struct M;
+    impl<'de> Visitor<'de> for M {
+        type Value = Vec<(String, f64)>;
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("a table of NAME = number")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some((k, Num(v))) = m.next_entry::<String, Num>()? {
+                out.push((k, v));
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(M)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

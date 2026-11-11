@@ -8,12 +8,13 @@
 //! 3. integrate physics over `[t, t + base]` with the command valid at `t`.
 
 use oxide_core::Core;
-use oxide_core::config::{EstimatorSource, FailsafeParams};
+use oxide_core::config::{EstimatorSource, FailsafeParams, VehicleConfig};
 use oxide_core::io::{
     BrainHeartbeat, EventList, GcsHeartbeat, Inputs, Outputs, RcSample, Stamped, StateSample,
     Status, TrajectorySetpoint,
 };
 use oxide_core::math::{Quat, Vec3};
+use oxide_core::params::{self, ParamError, ParamKind, ParamValue};
 use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
 
@@ -49,6 +50,10 @@ pub struct SimOptions {
     pub failsafe: Option<FailsafeParams>,
     /// Replaces the airframe's battery (for low-battery scenarios).
     pub battery: Option<BatterySpec>,
+    /// Parameter overrides by name (ADR-0004), applied in order through
+    /// `oxide_core::params::set` after the airframe's own `[params]` table and
+    /// after the `estimator`, `failsafe` and `battery` overrides.
+    pub params: Vec<(String, f64)>,
 }
 
 impl Default for SimOptions {
@@ -63,6 +68,7 @@ impl Default for SimOptions {
             links: LinkConfig::default(),
             failsafe: None,
             battery: None,
+            params: Vec::new(),
         }
     }
 }
@@ -79,8 +85,54 @@ impl SimOptions {
             links: LinkConfig::default(),
             failsafe: None,
             battery: None,
+            params: Vec::new(),
         }
     }
+}
+
+fn describe(e: ParamError) -> String {
+    match e {
+        ParamError::Unknown => "no such parameter (try: oxide-sim params list)".into(),
+        ParamError::WrongType => "wrong type: this parameter needs a whole number".into(),
+        ParamError::NotFinite => "the value is not a finite number".into(),
+        ParamError::OutOfRange => "the value is outside the parameter's range".into(),
+        ParamError::Invalid(c) => format!("the configuration would break a rule: {c:?}"),
+        ParamError::Armed => "cannot be changed while armed".into(),
+    }
+}
+
+/// Sets the parameter `name` on `cfg` through `oxide_core::params::set`. An
+/// `i32` parameter needs a whole number; an `f32` one takes `value as f32`.
+/// A refused change leaves `cfg` untouched.
+#[allow(clippy::cast_possible_truncation)]
+pub fn apply_param<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    name: &str,
+    value: f64,
+) -> Result<(), SimError> {
+    let fail = |e: ParamError| SimError::Param {
+        name: name.to_string(),
+        reason: format!("value {value}: {}", describe(e)),
+    };
+    let id = params::find(name).ok_or_else(|| fail(ParamError::Unknown))?;
+    let def = params::PARAMS
+        .get(id.index())
+        .ok_or_else(|| fail(ParamError::Unknown))?;
+    let v = match def.kind {
+        ParamKind::F32 => ParamValue::F32(value as f32),
+        ParamKind::I32 => {
+            if !value.is_finite()
+                || value.fract() != 0.0
+                || value < f64::from(i32::MIN)
+                || value > f64::from(i32::MAX)
+            {
+                return Err(fail(ParamError::WrongType));
+            }
+            ParamValue::I32(value as i32)
+        }
+    };
+    params::set(cfg, profile, id, v).map_err(fail)
 }
 
 /// What happened in one tick, for logging, viewers and tests.
@@ -157,6 +209,20 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         if let Some(f) = options.failsafe {
             cfg.failsafe = f;
         }
+        for (name, value) in &airframe.params {
+            apply_param(&mut cfg, &profile, name, *value).map_err(|e| match e {
+                SimError::Param { name, reason } => SimError::Param {
+                    name,
+                    reason: format!("{reason} (set in the airframe file {})", airframe.name),
+                },
+                other => other,
+            })?;
+        }
+        for (name, value) in &options.params {
+            apply_param(&mut cfg, &profile, name, *value)?;
+        }
+        // A parameter may have changed the source: the state input follows it.
+        let truth_state = cfg.estimator.source == EstimatorSource::External;
         let core = Core::new(cfg, profile).map_err(SimError::Core)?;
         let base_us = u64::from(profile.base_period_us);
         // One time base: every period must be a whole number of ticks.
@@ -178,7 +244,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             dt: Micros(base_us).as_secs_f64(),
             sensors,
             wind,
-            truth_state: options.estimator == EstimatorSource::External,
+            truth_state,
             active: Outputs::off(Micros::ZERO),
             pending: None,
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
