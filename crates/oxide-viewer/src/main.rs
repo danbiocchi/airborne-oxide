@@ -234,6 +234,13 @@ fn reason_names(r: Reasons) -> String {
     }
 }
 
+/// The name of a parameter, or its number if the table has no such entry.
+fn param_name(id: oxide_core::params::ParamId) -> String {
+    oxide_core::params::PARAMS
+        .get(id.index())
+        .map_or_else(|| format!("parameter #{}", id.0), |d| d.name.to_string())
+}
+
 /// A readable line for an event of the flight core.
 fn describe(kind: EventKind) -> String {
     match kind {
@@ -258,6 +265,10 @@ fn describe(kind: EventKind) -> String {
         EventKind::PilotOverride(r) => format!("Pilot override of {}", reason_names(r)),
         EventKind::Touchdown => "Touchdown".to_string(),
         EventKind::HomeSet => "Home set".to_string(),
+        EventKind::ParamChanged(id) => format!("{} changed", param_name(id)),
+        EventKind::ParamRefused { id, why } => {
+            format!("{} change refused: {why:?}", param_name(id))
+        }
     }
 }
 
