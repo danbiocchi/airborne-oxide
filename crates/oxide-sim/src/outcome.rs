@@ -28,6 +28,13 @@ fn exceeds(value: f64, limit: f64) -> bool {
     value.is_nan() || value > limit
 }
 
+/// The reasons that cause a Hold (ADR-0003); a Hold must not end while one of
+/// them is still set.
+const HOLD_REASONS: Reasons = Reasons::RC_LOST
+    .union(Reasons::BRAIN_LOST)
+    .union(Reasons::SETPOINT_STALE)
+    .union(Reasons::GPS_LOST);
+
 /// What happened in one run, gathered from the step records.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlightOutcome {
@@ -41,7 +48,7 @@ pub struct FlightOutcome {
     /// The highest failsafe action reached.
     pub max_action: Action,
     /// True if, while armed, the action ever dropped to a lower-ranked one
-    /// other than Hold to None, unless it dropped to None within
+    /// other than Hold to None once no Hold reason is left, unless it dropped to None within
     /// `OVERRIDE_WINDOW_S` after a pilot override.
     pub action_decreased: bool,
     pub armed_at_end: bool,
@@ -141,7 +148,11 @@ impl FlightOutcome {
 
         // Escalation only: judged while armed (disarming resets everything).
         if s.armed && self.prev_armed && s.action < self.prev_action {
-            let hold_ended = self.prev_action == Action::Hold && s.action == Action::None;
+            // A Hold may end when none of its reasons is left in this record
+            // (a pilot override is excused by `taken_over` below).
+            let hold_ended = self.prev_action == Action::Hold
+                && s.action == Action::None
+                && !s.reasons.intersects(HOLD_REASONS);
             // The pilot's takeover ends the action (to None); the status
             // follows the event by up to a status period, so a short window
             // after the event excuses that one decrease.
@@ -706,6 +717,42 @@ mod tests {
             ],
             Some(1)
         ));
+    }
+
+    #[test]
+    fn hold_ending_while_its_reason_is_still_set_is_a_decrease() {
+        let run = |reasons_after: Reasons, override_on_second: bool| {
+            let mut o = FlightOutcome::new();
+            o.add(&rec(
+                0.0,
+                up(1.0),
+                status(true, NavState::Hold, Action::Hold, Reasons::RC_LOST),
+            ));
+            let mut r = rec(
+                0.1,
+                up(1.0),
+                status(true, NavState::Offboard, Action::None, reasons_after),
+            );
+            if override_on_second {
+                r = with_event(r, EventKind::PilotOverride(Reasons::RC_LOST));
+            }
+            o.add(&r);
+            o.action_decreased
+        };
+        // Every reason that causes a Hold, still set: the Hold ended early.
+        for reason in [
+            Reasons::RC_LOST,
+            Reasons::BRAIN_LOST,
+            Reasons::SETPOINT_STALE,
+            Reasons::GPS_LOST,
+        ] {
+            assert!(run(reason, false), "{reason:?}");
+            // ... unless the pilot took over on that tick.
+            assert!(!run(reason, true), "{reason:?} with override");
+        }
+        // The reason cleared, or only an unrelated reason is left: legitimate.
+        assert!(!run(Reasons::empty(), false));
+        assert!(!run(Reasons::BATTERY_LOW, false));
     }
 
     #[test]
