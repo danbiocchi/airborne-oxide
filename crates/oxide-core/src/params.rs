@@ -489,7 +489,7 @@ declare_params! {
             "Stick deadband: a stick within this of centre reads as centred, and the rest of the travel is rescaled to the full range.";
     }
     EkfParams {
-        secs EKF_HORIZON = delay_horizon_us: 0.2, MIN_US, 0.5, "s", Estimator, disarmed,
+        secs EKF_HORIZON = delay_horizon_us: 0.2, MIN_US, 0.248, "s", Estimator, disarmed,
             "How far the filter runs behind real time. Must exceed the largest GPS latency and fit the profile's IMU buffer.";
         f32 EKF_GYR_NOISE = gyro_noise: 0.015, TINY, 1.0, "rad/s", Estimator, disarmed,
             "Gyro process noise (1 sigma).";
@@ -890,6 +890,58 @@ mod tests {
     }
 
     #[test]
+    fn the_table_minimum_and_maximum_are_each_accepted_on_a_profile_or_refused_by_a_rule_between_fields()
+     {
+        // Bounds that only a rule between two fields refuses, by name. Any
+        // other refusal of a bound means the table lies about the range.
+        let between_fields = [
+            "LAND_TD_THRUST",
+            "LAND_TD_SPEED",
+            "LIM_MIN_THRUST",
+            "LAND_BLIND_THR",
+            "LAND_SPEED",
+            "BAT_CRIT_V",
+            "BAT_LOW_V",
+        ];
+        let mut refused: Vec<&str> = Vec::new();
+        for (id, d) in ids() {
+            for (what, v) in [("minimum", d.min), ("maximum", d.max)] {
+                let mut accepted = false;
+                for profile in [&F405_LEAN, &H743_FULL] {
+                    let mut c = cfg();
+                    match set(&mut c, profile, id, v) {
+                        Ok(()) => accepted = true,
+                        Err(ParamError::Invalid(_)) => {
+                            assert!(
+                                between_fields.contains(&d.name),
+                                "{} {what} {v:?} is refused by a rule on that field alone",
+                                d.name
+                            );
+                            if !refused.contains(&d.name) {
+                                refused.push(d.name);
+                            }
+                            assert_eq!(c, cfg(), "{}", d.name);
+                        }
+                        Err(e) => panic!("{} {what} {v:?}: {e:?}", d.name),
+                    }
+                }
+                assert!(
+                    accepted || between_fields.contains(&d.name),
+                    "{} {what} {v:?} is accepted on neither profile",
+                    d.name
+                );
+            }
+        }
+        // The list holds exactly the bounds that are refused, no more.
+        for name in between_fields {
+            assert!(
+                refused.contains(&name),
+                "{name} is listed but never refused"
+            );
+        }
+    }
+
+    #[test]
     fn the_defaults_themselves_are_always_accepted() {
         for (id, d) in ids() {
             let mut c = cfg();
@@ -1029,7 +1081,8 @@ mod tests {
 
     #[test]
     fn the_delay_horizon_is_checked_against_the_profile() {
-        // 250 Hz filter on both profiles: 62 deltas of 4 ms fit, 63 do not.
+        // 250 Hz filter on both profiles: 62 deltas of 4 ms fit, 63 do not. The
+        // table maximum is the largest horizon that fits, so the range stops it.
         for profile in [&F405_LEAN, &H743_FULL] {
             let mut c = cfg();
             assert_eq!(
@@ -1050,7 +1103,7 @@ mod tests {
                     ParamId::EKF_HORIZON,
                     ParamValue::F32(0.249)
                 ),
-                Err(ParamError::Invalid(ConfigError::BadEstimator))
+                Err(ParamError::OutOfRange)
             );
             assert_eq!(c, before);
         }

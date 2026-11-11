@@ -68,7 +68,7 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 
 | Name | Type | Default | Min | Max | Unit | Change | Description |
 |---|---|---|---|---|---|---|---|
-| `EKF_HORIZON` | Float | 0.2 | 0.000001 | 0.5 | s | disarmed | How far the filter runs behind real time. Must exceed the largest GPS latency and fit the profile's IMU buffer. |
+| `EKF_HORIZON` | Float | 0.2 | 0.000001 | 0.248 | s | disarmed | How far the filter runs behind real time. Must exceed the largest GPS latency and fit the profile's IMU buffer. |
 | `EKF_GYR_NOISE` | Float | 0.015 | 0.000000000000000000000000000000000000000000001 | 1 | rad/s | disarmed | Gyro process noise (1 sigma). |
 | `EKF_ACC_NOISE` | Float | 0.35 | 0.000000000000000000000000000000000000000000001 | 10 | m/s^2 | disarmed | Accelerometer process noise (1 sigma). |
 | `EKF_GYR_BNOISE` | Float | 0.001 | 0.000000000000000000000000000000000000000000001 | 0.1 | rad/s^2 | disarmed | Gyro bias random walk. |
