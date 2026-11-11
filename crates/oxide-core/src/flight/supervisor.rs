@@ -11,10 +11,48 @@ use crate::math::Quat;
 use crate::monitor::{BatteryMonitor, ControlMonitor, LandDetector, geofence_breached};
 use crate::time::Micros;
 
+/// How many distinct valid frames in a row have shown one switch position.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SwitchRun {
+    /// The position the last examined valid frame showed.
+    position: bool,
+    /// Consecutive examined valid frames that showed it (saturates at
+    /// `KILL_CONFIRMATIONS`).
+    count: u8,
+}
+
+impl SwitchRun {
+    const fn new() -> Self {
+        Self {
+            position: false,
+            count: 0,
+        }
+    }
+
+    fn observe(&mut self, position: bool) {
+        if self.count > 0 && self.position == position {
+            self.count = self.count.saturating_add(1).min(KILL_CONFIRMATIONS);
+        } else {
+            self.position = position;
+            self.count = 1;
+        }
+    }
+
+    /// The switch has shown `position` in `KILL_CONFIRMATIONS` frames in a row.
+    const fn confirmed(&self, position: bool) -> bool {
+        self.count >= KILL_CONFIRMATIONS && self.position == position
+    }
+}
+
 /// The supervisor's memory between runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct SupervisorState {
-    kill_count: u8,
+    /// `t_arrival` of the RC frame examined last (each frame counts once).
+    last_rc_frame: Option<Micros>,
+    kill_run: SwitchRun,
+    arm_run: SwitchRun,
+    /// The arm-switch position confirmed on distinct frames (starts low).
+    arm_confirmed: bool,
     prev_arm_switch: bool,
     /// Since when RC has been valid without a gap.
     pub(super) rc_valid_since: Option<Micros>,
@@ -43,7 +81,10 @@ pub(super) struct SupervisorState {
 impl SupervisorState {
     pub(super) const fn new() -> Self {
         Self {
-            kill_count: 0,
+            last_rc_frame: None,
+            kill_run: SwitchRun::new(),
+            arm_run: SwitchRun::new(),
+            arm_confirmed: false,
             prev_arm_switch: false,
             rc_valid_since: None,
             switch_in_effect: None,
@@ -114,17 +155,31 @@ impl<const N: usize> Core<N> {
             .rc_valid_since
             .is_some_and(|t| now.since(t) >= secs_to_us(p.rc_valid_min_s));
 
-        // 2. Kill switch (valid frames only, three confirmations, latch).
+        // 2. Kill and arm switches. A stored frame is examined once, by its
+        // arrival time; a position takes effect after `KILL_CONFIRMATIONS`
+        // distinct valid frames in a row agree. A flagged frame is no
+        // evidence either way; with no fresh frame at all the runs restart.
+        let latest = Self::fresh(self.rc, now, u64::from(p.rc_timeout_us));
+        match (latest, self.rc.map(|f| f.t_arrival)) {
+            (Some(frame), Some(arrival)) => {
+                if self.sup_state.last_rc_frame != Some(arrival) {
+                    self.sup_state.last_rc_frame = Some(arrival);
+                    if frame.is_valid() {
+                        self.sup_state.kill_run.observe(frame.kill_switch);
+                        self.sup_state.arm_run.observe(frame.arm_switch);
+                        if self.sup_state.arm_run.count >= KILL_CONFIRMATIONS {
+                            self.sup_state.arm_confirmed = self.sup_state.arm_run.position;
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.sup_state.kill_run = SwitchRun::new();
+                self.sup_state.arm_run = SwitchRun::new();
+            }
+        }
         if let Some(rc) = rc {
-            self.sup_state.kill_count = if rc.kill_switch {
-                self.sup_state
-                    .kill_count
-                    .saturating_add(1)
-                    .min(KILL_CONFIRMATIONS)
-            } else {
-                0
-            };
-            if self.sup_state.kill_count >= KILL_CONFIRMATIONS {
+            if self.sup_state.kill_run.confirmed(true) {
                 s.killed = true;
                 self.disarm(now, &mut s, DisarmReason::Kill);
             }
@@ -266,8 +321,9 @@ impl<const N: usize> Core<N> {
 
         // 7. Arm / disarm (valid frames only).
         let fault_count = self.estimator_faults();
-        if let Some(rc) = rc {
-            let rising = rc.arm_switch && !self.sup_state.prev_arm_switch;
+        if rc.is_some() {
+            let arm_switch = self.sup_state.arm_confirmed;
+            let rising = arm_switch && !self.sup_state.prev_arm_switch;
             if rising && !s.armed {
                 if flags.is_empty() {
                     s.armed = true;
@@ -283,10 +339,10 @@ impl<const N: usize> Core<N> {
                 } else {
                     self.emit(now, EventKind::ArmRefused(flags));
                 }
-            } else if s.armed && !rc.arm_switch {
+            } else if s.armed && !arm_switch {
                 self.disarm(now, &mut s, DisarmReason::Switch);
             }
-            self.sup_state.prev_arm_switch = rc.arm_switch;
+            self.sup_state.prev_arm_switch = arm_switch;
         }
         if !s.armed {
             self.sup_state.fault_baseline = fault_count;

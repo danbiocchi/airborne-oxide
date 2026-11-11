@@ -2,7 +2,7 @@ mod flow;
 
 use super::*;
 use crate::config::{EstimatorConfig, FailsafeParams, Gains, Limits, Rotor, Spin};
-use crate::io::{BaroSample, GpsSample, MagSample};
+use crate::io::{BaroSample, DisarmReason, EventKind, GpsSample, MagSample};
 use crate::schedule::F405_LEAN;
 
 fn cfg() -> VehicleConfig<4> {
@@ -615,4 +615,176 @@ fn core_new_refuses_a_bad_failsafe_configuration() {
         Core::new(c, F405_LEAN).err(),
         Some(ConfigError::BadFailsafe)
     );
+}
+
+// ---- switches are confirmed on distinct frames (ADR-0003, DESIGN §4.9) ----
+
+/// Status is published one supervisor run after the run that decided it, so
+/// the tests that look at it add a trailing gap (`None`) after their frames.
+///
+/// Sends one RC frame per supervisor run (every 20th tick), each frame
+/// arriving on the run's own tick, for the samples given. `None` is a gap:
+/// no frame arrives and the stored one stays. Returns the next tick (ms)
+/// and every event seen.
+fn frames(
+    core: &mut Core<4>,
+    start_ms: u64,
+    samples: &[Option<RcSample>],
+) -> (u64, Vec<EventKind>, Outputs<4>) {
+    let mut events = Vec::new();
+    let mut out = Outputs::off(Micros::ZERO);
+    let mut k = start_ms;
+    for sample in samples {
+        for i in 0..20 {
+            let t = Micros(k * 1000);
+            let mut inp = inputs(t, RcSample::default());
+            inp.rc = if i == 0 {
+                sample.map(|s| Stamped::ideal(t, s))
+            } else {
+                None
+            };
+            out = core.tick(t, &inp);
+            events.extend(out.events.iter().map(|e| e.kind));
+            k += 1;
+        }
+    }
+    (k, events, out)
+}
+
+/// A core armed after RC settled; returns the next tick.
+fn armed_core() -> (Core<4>, u64) {
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    run(&mut core, 0, 1100, rc(false, false));
+    let out = run(&mut core, 1100, 100, rc(true, false));
+    assert!(out.status.armed);
+    (core, 1200)
+}
+
+fn kill_frame() -> Option<RcSample> {
+    Some(rc(true, true))
+}
+
+fn ok_frame() -> Option<RcSample> {
+    Some(rc(true, false))
+}
+
+#[test]
+fn one_kill_frame_then_a_gap_does_not_disarm() {
+    let (mut core, k) = armed_core();
+    let (k, ev, out) = frames(&mut core, k, &[kill_frame(), None]);
+    assert!(out.status.armed);
+    // 100 ms with no frames: the stored kill frame is still fresh.
+    let (_, ev2, out) = frames(&mut core, k, &[None; 5]);
+    assert!(out.status.armed && !out.status.killed);
+    assert!(
+        !ev.iter()
+            .chain(&ev2)
+            .any(|e| matches!(e, EventKind::Disarmed(_)))
+    );
+}
+
+#[test]
+fn three_distinct_kill_frames_disarm_with_kill() {
+    let (mut core, k) = armed_core();
+    let (k, _, out) = frames(&mut core, k, &[kill_frame(), kill_frame(), None]);
+    assert!(out.status.armed);
+    let (_, ev, out) = frames(&mut core, k, &[kill_frame(), None]);
+    assert!(!out.status.armed && out.status.killed);
+    assert!(ev.contains(&EventKind::Disarmed(DisarmReason::Kill)));
+}
+
+#[test]
+fn a_valid_non_kill_frame_resets_the_kill_count() {
+    let (mut core, k) = armed_core();
+    let (_, ev, out) = frames(
+        &mut core,
+        k,
+        &[
+            kill_frame(),
+            kill_frame(),
+            ok_frame(),
+            kill_frame(),
+            kill_frame(),
+            None,
+        ],
+    );
+    assert!(out.status.armed && !out.status.killed);
+    assert!(!ev.iter().any(|e| matches!(e, EventKind::Disarmed(_))));
+}
+
+#[test]
+fn a_lost_frame_between_kill_frames_neither_counts_nor_resets() {
+    let (mut core, k) = armed_core();
+    let lost = Some(RcSample {
+        frame_lost: true,
+        ..rc(true, true)
+    });
+    let (_, ev, out) = frames(
+        &mut core,
+        k,
+        &[kill_frame(), kill_frame(), lost, kill_frame(), None],
+    );
+    assert!(!out.status.armed && out.status.killed);
+    assert!(ev.contains(&EventKind::Disarmed(DisarmReason::Kill)));
+}
+
+#[test]
+fn a_kill_count_does_not_survive_an_rc_timeout() {
+    let (mut core, k) = armed_core();
+    let (k, _, _) = frames(&mut core, k, &[kill_frame(), kill_frame()]);
+    // Silence longer than rc_timeout_us (500 ms), then one kill frame.
+    let (k, mut ev, _) = frames(&mut core, k, &[None; 30]);
+    let (_, ev2, out) = frames(&mut core, k, &[kill_frame()]);
+    ev.extend(ev2);
+    assert!(!out.status.killed);
+    assert!(!ev.contains(&EventKind::Disarmed(DisarmReason::Kill)));
+}
+
+#[test]
+fn one_arm_low_frame_in_flight_does_not_disarm() {
+    let (mut core, k) = armed_core();
+    let low = Some(rc(false, false));
+    let (_, ev, out) = frames(
+        &mut core,
+        k,
+        &[low, ok_frame(), ok_frame(), ok_frame(), None],
+    );
+    assert!(out.status.armed);
+    assert!(!ev.iter().any(|e| matches!(e, EventKind::Disarmed(_))));
+}
+
+#[test]
+fn three_arm_low_frames_disarm_with_switch() {
+    let (mut core, k) = armed_core();
+    let low = Some(rc(false, false));
+    let (k, _, out) = frames(&mut core, k, &[low, low, None]);
+    assert!(out.status.armed);
+    let (_, ev, out) = frames(&mut core, k, &[low, None]);
+    assert!(!out.status.armed);
+    assert!(ev.contains(&EventKind::Disarmed(DisarmReason::Switch)));
+}
+
+#[test]
+fn one_arm_high_frame_on_the_bench_does_not_arm() {
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    run(&mut core, 0, 1100, rc(false, false));
+    let low = Some(rc(false, false));
+    let (_, ev, out) = frames(&mut core, 1100, &[ok_frame(), low, low, low, low, None]);
+    assert!(!out.status.armed);
+    assert!(
+        !ev.iter()
+            .any(|e| matches!(e, EventKind::Armed | EventKind::ArmRefused(_))),
+        "events: {ev:?}"
+    );
+}
+
+#[test]
+fn three_arm_high_frames_arm_on_the_confirmed_edge() {
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    run(&mut core, 0, 1100, rc(false, false));
+    let (k, _, out) = frames(&mut core, 1100, &[ok_frame(), ok_frame(), None]);
+    assert!(!out.status.armed);
+    let (_, ev, out) = frames(&mut core, k, &[ok_frame(), None]);
+    assert!(out.status.armed);
+    assert!(ev.contains(&EventKind::Armed));
 }
