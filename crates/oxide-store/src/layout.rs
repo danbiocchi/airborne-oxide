@@ -10,9 +10,17 @@
 //!  12  u32 state: FFFFFFFF writing, A55A3CC3 valid
 //! ```
 //!
-//! A record slot that reads all `0xFF` is free. A record whose CRC fails is
-//! torn: skipped and never reused. A tombstone (a removed key) has value 0
-//! and the *complement* of the CRC.
+//! A record slot that reads all `0xFF` is free. A record whose check word
+//! fails is torn: skipped and never reused.
+//!
+//! The check word of a record (bytes 8..12) is `crc30 | kind << 30`, where
+//! `crc30` is the low 30 bits of the CRC-32 of the key and value, and `kind`
+//! is 0 for a set and 1 for a tombstone (a removed key, stored with value 0).
+//! Bit 31 is always 0, so a check word is never `0xFFFF_FFFF`: a record whose
+//! key and value are written but whose check word is not (it is programmed
+//! last, so its top byte is still `0xFF`) can never read as a valid record of
+//! either kind. A 30-bit check misses a random corruption with probability
+//! 2^-30.
 
 use crate::crc::crc32;
 
@@ -51,19 +59,26 @@ pub fn header_body(sequence: u32) -> [u8; 12] {
     pack(&[WORD0, sequence, crc32(&pack::<8>(&[WORD0, sequence]))])
 }
 
-/// CRC of a record's key and value.
+/// CRC-32 of a record's key and value.
 #[must_use]
 pub fn record_crc(key: u32, value: u32) -> u32 {
     crc32(&pack::<8>(&[key, value]))
+}
+
+/// Check word of a record: 30 CRC bits, the tombstone flag in bit 30, bit 31
+/// clear.
+#[must_use]
+pub fn record_check(key: u32, value: u32, tomb: bool) -> u32 {
+    (record_crc(key, value) & 0x3FFF_FFFF) | (u32::from(tomb) << 30)
 }
 
 /// The 12 bytes of a record; a tombstone (`tomb`) ignores `value`.
 #[must_use]
 pub fn record_bytes(key: u32, value: u32, tomb: bool) -> [u8; RECORD_SIZE] {
     if tomb {
-        pack(&[key, 0, !record_crc(key, 0)])
+        pack(&[key, 0, record_check(key, 0, true)])
     } else {
-        pack(&[key, value, record_crc(key, value)])
+        pack(&[key, value, record_check(key, value, false)])
     }
 }
 
@@ -86,10 +101,9 @@ pub fn decode_slot(key: u32, value: u32, crc: u32) -> Slot {
     if key == u32::MAX && value == u32::MAX && crc == u32::MAX {
         return Slot::Free;
     }
-    let good = record_crc(key, value);
-    if crc == good {
+    if crc == record_check(key, value, false) {
         Slot::Set(key, value)
-    } else if value == 0 && crc == !good {
+    } else if value == 0 && crc == record_check(key, 0, true) {
         Slot::Tomb(key)
     } else {
         Slot::Torn
@@ -145,8 +159,16 @@ mod tests {
     #[test]
     fn an_all_ones_record_is_not_a_real_record() {
         // Otherwise a real record would read as a free slot.
-        assert_ne!(record_crc(u32::MAX, u32::MAX), u32::MAX);
-        assert_ne!(!record_crc(u32::MAX, 0), u32::MAX);
+        assert_ne!(record_check(u32::MAX, u32::MAX, false), u32::MAX);
+        assert_ne!(record_check(u32::MAX, 0, true), u32::MAX);
+    }
+
+    #[test]
+    fn a_check_word_never_reads_as_erased() {
+        for (k, v) in [(0xFFFF_FFFF, 0), (0x101B_2F50, 0), (1, 2)] {
+            assert_eq!(record_check(k, v, false) >> 31, 0);
+            assert_eq!(record_check(k, v, true) >> 31, 0);
+        }
     }
 
     #[test]
@@ -168,7 +190,13 @@ mod tests {
     #[test]
     fn every_proper_prefix_of_a_record_is_torn_or_free() {
         for tomb in [false, true] {
-            for (k, v) in [(1, 2), (0xABCD_1234, 0x0F0F_F0F0), (5, 0)] {
+            for (k, v) in [
+                (1, 2),
+                (0xABCD_1234, 0x0F0F_F0F0),
+                (5, 0),
+                (0xFFFF_FFFF, 0),
+                (0x101B_2F50, 0),
+            ] {
                 let full = record_bytes(k, v, tomb);
                 for cut in 0..RECORD_SIZE {
                     let mut b = [0xFF_u8; RECORD_SIZE];

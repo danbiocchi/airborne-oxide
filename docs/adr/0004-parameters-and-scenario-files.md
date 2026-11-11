@@ -71,7 +71,7 @@ A `[params]` table of `NAME = value` is accepted in three places, applied in thi
 
 `oxide-store` is a small `no_std` crate: a log-structured store over two flash sectors, behind a `Flash` trait with NOR semantics (program clears bits, erase sets a sector).
 
-- **Records** are fixed-size: a 32-bit key (a hash of the parameter name, so reordering the table never changes a meaning), the value's 32 bits, and a CRC. A torn record fails its CRC and is skipped.
+- **Records** are fixed-size: a 32-bit key (a hash of the parameter name, so reordering the table never changes a meaning), the value's 32 bits, and a check word (30 CRC bits plus a tombstone flag, never all ones, so a half-written record cannot read as another record). A torn record fails its check and is skipped.
 - **Compaction** copies the newest value of each key to the other sector, marks it valid, and only then is the old sector erasable. Power loss at any point leaves one valid sector.
 - **Wear** is the erase count, kept in the sector header and reported.
 - **Tested on the host** against a simulated flash that cuts the power after every single byte of every operation: after each cut the store must return, for every key, either the old or the new value, never anything else, and never lose an acknowledged write.
