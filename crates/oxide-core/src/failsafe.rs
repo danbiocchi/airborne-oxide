@@ -140,16 +140,20 @@ impl Failsafe {
             && c.rc_settled
             && c.mode_switch_changed
         {
+            // Only a reason that was already true on an earlier run is
+            // acknowledged: the pilot could not have seen one raised now.
+            let mut acked = Reasons::empty();
             for ((bit, since), ack) in REASONS
                 .iter()
                 .zip(self.since.iter())
                 .zip(self.ack_action.iter_mut())
             {
-                if reasons.contains(*bit) {
+                if reasons.contains(*bit) && since.is_some_and(|t| t < now) {
                     *ack = reason_action_us(*bit, elapsed_us(now, *since), p);
+                    acked.set(*bit, true);
                 }
             }
-            self.acked = reasons;
+            self.acked = acked;
             self.latched = Action::None;
             self.clear_since = None;
             let candidate = self.candidate(now, reasons, p);
@@ -953,6 +957,53 @@ mod tests {
             ..bad
         };
         assert_eq!(run(&mut f, 2.0, &worse).action, Action::Rtl);
+    }
+
+    #[test]
+    fn override_does_not_acknowledge_a_reason_raised_on_the_same_run() {
+        // Hold from RC loss; RC back and settled; on the run where the pilot
+        // flips the mode switch the battery becomes critical.
+        let mut f = Failsafe::new();
+        let lost = Conditions {
+            rc_valid: false,
+            ..healthy()
+        };
+        assert_eq!(run(&mut f, 0.0, &lost).action, Action::Hold);
+        assert_eq!(run(&mut f, 1.0, &rc_back(true, false)).action, Action::Hold);
+        let flip = Conditions {
+            battery_critical: true,
+            ..rc_back(true, true)
+        };
+        let d = run(&mut f, 1.5, &flip);
+        assert!(d.overridden);
+        assert_eq!(d.action, Action::LandNow);
+        assert!(d.reasons.contains(Reasons::BATTERY_CRITICAL));
+        assert!(!d.acknowledged.contains(Reasons::BATTERY_CRITICAL));
+        // It keeps acting on the next run.
+        let still = Conditions {
+            battery_critical: true,
+            ..rc_back(true, false)
+        };
+        assert_eq!(run(&mut f, 2.0, &still).action, Action::LandNow);
+    }
+
+    #[test]
+    fn override_acknowledges_the_older_reason_but_not_the_new_one() {
+        let mut f = Failsafe::new();
+        let low = Conditions {
+            battery_low: true,
+            ..healthy()
+        };
+        assert_eq!(run(&mut f, 0.0, &low).action, Action::Rtl);
+        let flip = Conditions {
+            battery_critical: true,
+            mode_switch_changed: true,
+            ..low
+        };
+        let d = run(&mut f, 1.0, &flip);
+        assert!(d.overridden);
+        assert_eq!(d.action, Action::LandNow);
+        assert_eq!(d.acknowledged, Reasons::BATTERY_LOW);
     }
 
     #[test]
