@@ -70,6 +70,9 @@ pub(super) struct GuidanceState {
     /// The validity flags guidance saw on its previous run, to find the edge
     /// at which a sensor returns.
     prev_valid: Validity,
+    /// This Rtl has been in its `Landing` phase. Cleared on entering the
+    /// state. A phase decided afresh after that never climbs again.
+    rtl_landed: bool,
 }
 
 /// Horizontal hold at a point, in the best form the flags allow.
@@ -159,6 +162,7 @@ impl<const N: usize> Core<N> {
                 contact_s: 0.0,
                 blind_s: 0.0,
                 prev_valid: v,
+                rtl_landed: false,
             };
             self.guidance.pending = AttitudeTarget {
                 attitude: state.attitude,
@@ -176,6 +180,7 @@ impl<const N: usize> Core<N> {
             g.contact_s = 0.0;
             g.blind_s = 0.0;
             g.prev_valid = v;
+            g.rtl_landed = false;
             self.position_ctrl.reset();
             g.last_nav = Some(sup.nav);
         }
@@ -309,6 +314,12 @@ impl<const N: usize> Core<N> {
                         RtlPhase::Pending => {
                             if distance_xy(state.position, home) < RTL_NEAR_HOME_M {
                                 g.rtl = RtlPhase::Landing;
+                            } else if g.rtl_landed {
+                                // The landing was under way and the position
+                                // was lost on the way down: fly home at the
+                                // height we are at, then land. No climb.
+                                g.rtl = RtlPhase::Return;
+                                g.position_sp = state.position;
                             } else {
                                 g.rtl = RtlPhase::Climb;
                                 g.position_sp.x = state.position.x;
@@ -356,6 +367,7 @@ impl<const N: usize> Core<N> {
                         RtlPhase::Landing => {}
                     }
                     if g.rtl == RtlPhase::Landing {
+                        g.rtl_landed = true;
                         g.position_sp.x = home.x;
                         g.position_sp.y = home.y;
                         landing = true;

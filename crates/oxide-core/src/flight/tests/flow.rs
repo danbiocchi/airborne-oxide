@@ -1717,3 +1717,88 @@ fn the_rtl_return_height_survives_a_barometer_outage() {
     let z = core.guide_state.position_sp.z;
     assert!((z + 10.0).abs() < 1e-6, "return height lost: {z}");
 }
+
+#[test]
+fn an_rtl_that_reached_its_landing_does_not_climb_when_the_position_returns() {
+    // Same set-up as the position-loss test above, then the position comes
+    // back 3 m from home (and, after the long gap, as a reset).
+    let mut c = ekf_cfg();
+    c.failsafe.touchdown_s = 8.0;
+    let mut rig = Rig::ekf(1);
+    rig.core = Core::new(c, F405_LEAN).expect("valid config");
+    rig.arm();
+    rig.rc.throttle = 0.5;
+    rig.run(1.0);
+    rig.rc_on = false;
+    assert!(rig.run_until(6.0, |r| r.nav() == NavState::Rtl));
+    rig.run(0.1);
+    assert_eq!(rig.core.guide_state.rtl, RtlPhase::Landing);
+    rig.gps_on = false;
+    assert!(rig.run_until(4.0, |r| !r.out.status.valid.position));
+    rig.run(5.0);
+    assert_eq!(rig.nav(), NavState::Rtl);
+    rig.gps_east = 3.0;
+    rig.gps_on = true;
+    assert!(rig.run_until(3.0, |r| r.out.status.valid.position));
+    let z_back = rig.core.estimate().expect("estimate").position.z;
+    let mut highest = 0.0_f32;
+    let mut phases = Vec::new();
+    rig.run_until(3.0, |r| {
+        highest = highest.min(r.core.guide_state.position_sp.z);
+        if phases.last() != Some(&r.core.guide_state.rtl) {
+            phases.push(r.core.guide_state.rtl);
+        }
+        false
+    });
+    assert!(
+        highest >= z_back - 0.05,
+        "height setpoint {highest} above the height {z_back} at the return"
+    );
+    assert!(!phases.contains(&RtlPhase::Climb), "{phases:?}");
+    assert_eq!(rig.core.guide_state.rtl, RtlPhase::Return);
+}
+
+#[test]
+fn an_rtl_that_reached_its_landing_returns_at_the_current_height_and_lands() {
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    let no_position = Validity {
+        position: false,
+        velocity: false,
+        ..Validity::ALL
+    };
+    let mut core = guidance_core();
+    let mut k = 0;
+    let mut run = |core: &mut Core<4>, v: Validity, p: Vec3<f32>| {
+        guide(core, k, NavState::Rtl, v, p, 0.0, home);
+        k += 1;
+    };
+    // Entered over home: straight to the landing.
+    run(&mut core, Validity::ALL, Vec3::new(0.0, 0.0, -4.0));
+    run(&mut core, Validity::ALL, Vec3::new(0.0, 0.0, -4.0));
+    assert_eq!(core.guide_state.rtl, RtlPhase::Landing);
+    // The position goes, the vehicle drifts and sinks a little.
+    run(&mut core, no_position, Vec3::new(1.0, 0.0, -3.5));
+    run(&mut core, no_position, Vec3::new(2.0, 0.0, -3.0));
+    // It returns 3 m from home, 3 m up: no climb to 10 m.
+    let mut lowest_sp = 0.0_f32;
+    for _ in 0..50 {
+        run(&mut core, Validity::ALL, Vec3::new(3.0, 0.0, -3.0));
+        lowest_sp = lowest_sp.min(core.guide_state.position_sp.z);
+        assert_eq!(core.guide_state.rtl, RtlPhase::Return);
+    }
+    assert!(
+        (lowest_sp + 3.0).abs() < 1e-6,
+        "height setpoint {lowest_sp}"
+    );
+    // Over home and still: the landing, as usual.
+    for _ in 0..3 {
+        run(&mut core, Validity::ALL, Vec3::new(0.0, 0.0, -3.0));
+    }
+    assert_eq!(core.guide_state.rtl, RtlPhase::Return);
+    // The setpoint walks to home at the return speed; wait for it.
+    for _ in 0..400 {
+        run(&mut core, Validity::ALL, Vec3::new(0.0, 0.0, -3.0));
+    }
+    assert_eq!(core.guide_state.rtl, RtlPhase::Landing);
+    assert!((core.guide_state.position_sp.z + 3.0).abs() < 1e-6);
+}
