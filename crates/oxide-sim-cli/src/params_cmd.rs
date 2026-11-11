@@ -16,6 +16,38 @@ pub fn value_text(v: ParamValue) -> String {
     }
 }
 
+/// The smallest positive `f32`: a table minimum meaning "greater than zero".
+const SMALLEST_POSITIVE: f32 = f32::from_bits(1);
+/// The largest `f32` below one: a table maximum meaning "less than one".
+const LARGEST_BELOW_ONE: f32 = f32::from_bits(0x3f7f_ffff);
+
+/// A table minimum for people: the smallest positive `f32` reads `> 0`.
+fn min_text(v: ParamValue) -> String {
+    match v {
+        ParamValue::F32(x) if x == SMALLEST_POSITIVE => "> 0".to_string(),
+        v => value_text(v),
+    }
+}
+
+/// A table maximum for people: the largest `f32` below one reads `< 1`.
+fn max_text(v: ParamValue) -> String {
+    match v {
+        ParamValue::F32(x) if x == LARGEST_BELOW_ONE => "< 1".to_string(),
+        v => value_text(v),
+    }
+}
+
+/// A number in JSON: those two bounds in exponent notation (the plain form of
+/// the first has 45 zeros), everything else as `value_text`.
+fn json_number(v: ParamValue) -> String {
+    match v {
+        ParamValue::F32(x) if x == SMALLEST_POSITIVE || x == LARGEST_BELOW_ONE => {
+            format!("{x:e}")
+        }
+        v => value_text(v),
+    }
+}
+
 fn type_text(d: &ParamDef) -> &'static str {
     match d.default {
         ParamValue::F32(_) => "Float",
@@ -49,8 +81,8 @@ pub fn list() -> Result<String, Box<dyn std::error::Error>> {
             d.name,
             value,
             value_text(d.default),
-            value_text(d.min),
-            value_text(d.max),
+            min_text(d.min),
+            max_text(d.max),
             d.unit,
             change_text(d),
             d.description
@@ -90,9 +122,9 @@ pub fn json() -> String {
             "    {{\"name\": {}, \"type\": {}, \"default\": {}, \"min\": {}, \"max\": {}, \"units\": {}, \"group\": {}, \"shortDesc\": {}, \"rebootRequired\": false}}",
             json_string(d.name),
             json_string(type_text(d)),
-            value_text(d.default),
-            value_text(d.min),
-            value_text(d.max),
+            json_number(d.default),
+            json_number(d.min),
+            json_number(d.max),
             json_string(d.unit),
             json_string(d.group.title()),
             json_string(d.description),
@@ -122,7 +154,8 @@ Set one for a simulated flight with `--param NAME=VALUE` (repeatable), with `--p
 they are applied in that order of increasing priority: airframe file, `--params` file, then the flags. \
 A value outside its range, of the wrong type, or that would break a rule between two parameters is refused \
 and the run does not start. Units are the core's own: radians, metres, seconds, volts. \
-\"live\" parameters take effect in flight; \"disarmed\" ones are accepted only while disarmed.",
+\"live\" parameters take effect in flight; \"disarmed\" ones are accepted only while disarmed. \
+A minimum of `> 0` means any value above zero; a maximum of `< 1` means any value below one.",
         PARAMS.len()
     );
     for group in ParamGroup::ALL {
@@ -136,8 +169,8 @@ and the run does not start. Units are the core's own: radians, metres, seconds, 
                 d.name,
                 type_text(d),
                 value_text(d.default),
-                value_text(d.min),
-                value_text(d.max),
+                min_text(d.min),
+                max_text(d.max),
                 md_cell(d.unit),
                 change_text(d),
                 md_cell(d.description)
@@ -383,6 +416,72 @@ mod tests {
             assert_eq!(field(o, "group"), &J::Str(d.group.title().to_string()));
             assert_eq!(field(o, "shortDesc"), &J::Str(d.description.to_string()));
             assert_eq!(field(o, "rebootRequired"), &J::Bool(false));
+        }
+    }
+
+    /// The names of the parameters whose minimum is the smallest positive
+    /// `f32` and whose maximum is the largest `f32` below one.
+    fn sentinels() -> (Vec<&'static str>, Vec<&'static str>) {
+        let tiny = ParamValue::F32(f32::from_bits(1));
+        let below_one = ParamValue::F32(f32::from_bits(0x3f7f_ffff));
+        let lows = PARAMS.iter().filter(|d| d.min == tiny).map(|d| d.name);
+        let highs = PARAMS.iter().filter(|d| d.max == below_one).map(|d| d.name);
+        (lows.collect(), highs.collect())
+    }
+
+    #[test]
+    fn the_extreme_f32_bounds_print_as_open_bounds_in_list_and_doc() {
+        let (lows, highs) = sentinels();
+        assert!(lows.len() > 5 && highs.len() >= 2, "{lows:?} {highs:?}");
+        let listing = list().expect("list");
+        let text = doc();
+        for name in &lows {
+            let line = listing
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .expect("line");
+            assert!(line.contains("> 0"), "{line}");
+            assert!(!line.contains("0.0000000"), "{line}");
+            let row = text
+                .lines()
+                .find(|l| l.starts_with(&format!("| `{name}` |")))
+                .expect("row");
+            assert!(row.contains("| > 0 |"), "{row}");
+        }
+        for name in &highs {
+            let line = listing
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .expect("line");
+            assert!(line.contains("< 1"), "{line}");
+            assert!(!line.contains("0.9999999"), "{line}");
+            let row = text
+                .lines()
+                .find(|l| l.starts_with(&format!("| `{name}` |")))
+                .expect("row");
+            assert!(row.contains("| < 1 |"), "{row}");
+        }
+        assert!(!text.contains("0.0000000") && !text.contains("0.9999999"));
+    }
+
+    #[test]
+    fn json_prints_the_extreme_f32_bounds_in_exponent_notation() {
+        let text = json();
+        assert!(!text.contains("0.0000000") && !text.contains("0.9999999"));
+        let (lows, highs) = sentinels();
+        for name in lows {
+            let line = text
+                .lines()
+                .find(|l| l.contains(&format!("\"name\": \"{name}\"")))
+                .expect("line");
+            assert!(line.contains("\"min\": 1e-45,"), "{line}");
+        }
+        for name in highs {
+            let line = text
+                .lines()
+                .find(|l| l.contains(&format!("\"name\": \"{name}\"")))
+                .expect("line");
+            assert!(line.contains("\"max\": 9.9999994e-1,"), "{line}");
         }
     }
 
