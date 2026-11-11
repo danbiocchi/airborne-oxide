@@ -37,7 +37,7 @@
 //! capacity_mah = 4000.0
 //! initial_state_of_charge = 0.0614
 //!
-//! [params]                    # parameter overrides by name, applied in file order
+//! [params]                    # parameter overrides by name, applied in name order
 //! FS_GPS_LAND = 10.0
 //!
 //! [[fault]]                   # kind: motor-loss (rotor, scale), gps-loss, imu-loss, baro-loss,
@@ -103,6 +103,8 @@ use crate::sensors::SensorConfig;
 use crate::sim::{SimOptions, Simulation, apply_param};
 use crate::wind::{Gust, WindConfig};
 
+#[cfg(test)]
+mod export;
 #[cfg(test)]
 mod tests;
 
@@ -324,7 +326,8 @@ pub struct ScenarioFile {
     pub links: LinkConfig,
     pub wind: WindSpec,
     pub battery: Option<BatteryOverride>,
-    /// Parameter overrides by name, in file order.
+    /// Parameter overrides by name, in the order they are applied (the TOML
+    /// reader yields a table sorted by key, so: name order).
     pub params: Vec<(String, f64)>,
     pub faults: Vec<Fault>,
     /// What the radio and the brain send. `pilot.duration_s` is

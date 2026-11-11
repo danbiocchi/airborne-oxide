@@ -86,3 +86,132 @@ fn setpoint_heights_are_up_positive() {
     assert_eq!(sp.yaw, 0.5);
     assert_eq!(sp.velocity, Vec3::zero());
 }
+
+// ---- The exporter ------------------------------------------------------------
+
+use super::export;
+use crate::fault_scenarios;
+
+/// The directory of the scenario files in the repository.
+fn scenario_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios")
+}
+
+#[test]
+fn exported_files_load_back_to_the_same_scenario() {
+    let files = export::fault_files();
+    assert_eq!(files.len(), 41);
+    for f in files {
+        let text = export::to_toml(&f);
+        let back = load_str(&text).unwrap_or_else(|e| panic!("{}: {e}\n{text}", f.name));
+        assert_eq!(back, f, "{}", f.name);
+        assert_eq!(export::to_toml(&back), text, "{}", f.name);
+    }
+}
+
+#[test]
+fn a_file_carries_what_the_rust_definition_carries() {
+    for s in fault_scenarios::all()
+        .iter()
+        .chain(fault_scenarios::pairs().iter())
+    {
+        let f = load_str(&export::to_toml(&export::from_fault_scenario(s))).expect("loads");
+        assert_eq!(f.name, s.name);
+        assert_eq!(f.about, s.about);
+        assert_eq!(f.pilot, s.script, "{}", s.name);
+        assert_eq!(f.faults, s.faults, "{}", s.name);
+        assert_eq!(f.links, s.links, "{}", s.name);
+        assert_eq!(f.expect.as_ref(), Some(&s.expect), "{}", s.name);
+        let battery = Airframe::reference_quad().expect("airframe").battery;
+        assert_eq!(
+            f.battery.map(|b| b.apply(&battery)),
+            s.battery.clone(),
+            "{}",
+            s.name
+        );
+    }
+}
+
+#[test]
+fn failsafe_overrides_become_named_parameters() {
+    let s = fault_scenarios::by_name("pair-rc-loss+geofence").expect("pair");
+    let f = export::from_fault_scenario(&s);
+    assert_eq!(
+        f.params,
+        vec![
+            ("FS_FENCE_RAD".to_string(), 10.0),
+            ("FS_GPS_LAND".to_string(), 10.0),
+            ("FS_NOLINK_RTL".to_string(), 5.0),
+        ]
+    );
+    let none =
+        export::from_fault_scenario(&fault_scenarios::by_name("gcs-loss").expect("scenario"));
+    assert!(none.params.is_empty());
+}
+
+#[test]
+fn computed_battery_sizes_are_written_as_literals() {
+    let f = export::from_fault_scenario(
+        &fault_scenarios::by_name("pair-battery-low+battery-critical").expect("pair"),
+    );
+    let text = export::to_toml(&f);
+    // 500 mAh; 0.05 + 0.0048 * (15 - 3 - 3) in f64.
+    assert!(text.contains("capacity_mah = 500.0"), "{text}");
+    let soc = 0.05 + 0.0048 * (15.0 - 3.0 - 3.0);
+    assert!(
+        text.contains(&format!("initial_state_of_charge = {soc:?}")),
+        "{text}"
+    );
+}
+
+/// Rewrites `scenarios/` from the Rust definitions:
+/// `cargo test -p oxide-sim --lib regenerate_scenario_files -- --ignored`.
+#[test]
+#[ignore = "writes the files in scenarios/"]
+fn regenerate_scenario_files() {
+    let dir = scenario_dir();
+    std::fs::create_dir_all(&dir).expect("create scenarios/");
+    for f in export::all_files() {
+        std::fs::write(dir.join(format!("{}.toml", f.name)), export::to_toml(&f)).expect("write");
+    }
+}
+
+#[test]
+fn parameters_are_applied_in_name_order_whatever_the_file_order() {
+    // The TOML reader hands a table over sorted by key, not in file order, so
+    // the order that counts is the name order; the exporter writes it.
+    let s = load_str(
+        "name = \"x\"\nduration_s = 5.0\n[params]\nFS_NOLINK_RTL = 5.0\nFS_GPS_LAND = 10.0\nEKF_HGT_TMO = 2\n",
+    );
+    let s = s.expect_err("EKF_HGT_TMO is not a parameter");
+    assert_eq!(s.key, "params.EKF_HGT_TMO");
+    let s = load_str(
+        "name = \"x\"\nduration_s = 5.0\n[params]\nFS_NOLINK_RTL = 5.0\nFS_GPS_LAND = 10.0\n",
+    )
+    .expect("loads");
+    let names: Vec<&str> = s.params.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["FS_GPS_LAND", "FS_NOLINK_RTL"]);
+}
+
+#[test]
+fn the_files_in_scenarios_are_what_the_exporter_writes() {
+    let dir = scenario_dir();
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .expect("scenarios/ exists")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    let mut expected: Vec<String> = Vec::new();
+    for f in export::all_files() {
+        let name = format!("{}.toml", f.name);
+        let text = std::fs::read_to_string(dir.join(&name))
+            .unwrap_or_else(|e| panic!("{name}: {e} (run the regenerate_scenario_files test)"));
+        assert_eq!(text, export::to_toml(&f), "{name} is out of date");
+        expected.push(name);
+    }
+    expected.sort();
+    assert_eq!(
+        on_disk, expected,
+        "files in scenarios/ and scenarios defined in code differ"
+    );
+}

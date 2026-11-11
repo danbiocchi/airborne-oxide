@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name = "pair-rc-loss+gps-loss"
+about = "Two failures in one flight: it ends on the ground, disarmed, and the action never decreases."
+airframe = "quad-x-5in"
+duration_s = 110.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "random"
+steady_speed_mps = [0.0, 2.0]
+sigma_h_mps = [0.1, 0.4]
+sigma_v_ratio = 0.5
+tau_s = 2.0
+
+[params]
+FS_GPS_LAND = 10.0
+FS_NOLINK_RTL = 5.0
+
+[[fault]]
+kind = "rc-loss"
+start_s = 15.0
+
+[[fault]]
+kind = "gps-loss"
+start_s = 20.0
+
+[pilot]
+arm_at_s = 3.0
+
+[[pilot.mode]]
+t = 0.0
+switch = "offboard"
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, 0.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 4.0
+position = [0.0, 0.0, 5.0]
+yaw = 0.0
+
+[expect]
+reasons = ["NO_HUMAN_LINK", "GPS_LOST"]
+min_action = "land"
+by_s = 105.0
+max_touchdown_mps = 1.5
+max_tilt_deg = 40.0
+min_height_m = 4.0
+
+[expect.ending]
+kind = "down"
+
+[run]
+seeds = 10
+profiles = ["f405", "h743"]
