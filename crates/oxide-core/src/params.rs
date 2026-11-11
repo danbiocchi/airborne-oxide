@@ -692,3 +692,456 @@ pub const fn key(name: &str) -> u32 {
     }
     h
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Rotor, Spin};
+    use crate::math::Vec3;
+    use crate::schedule::{F405_LEAN, H743_FULL};
+
+    fn cfg() -> VehicleConfig<4> {
+        let a = 0.08;
+        let r = |x: f32, y: f32, spin| Rotor {
+            x,
+            y,
+            spin,
+            max_thrust_n: 8.0,
+            torque_coeff_m: 0.016,
+        };
+        VehicleConfig {
+            mass_kg: 0.65,
+            inertia: Vec3::new(1.6e-3, 1.6e-3, 2.8e-3),
+            rotors: [
+                r(a, a, Spin::Ccw),
+                r(-a, -a, Spin::Ccw),
+                r(a, -a, Spin::Cw),
+                r(-a, a, Spin::Cw),
+            ],
+            thrust_expo: 1.0,
+            nominal_voltage_v: 22.2,
+            gains: Gains::default(),
+            limits: Limits::default(),
+            estimator: EstimatorConfig::default(),
+            failsafe: FailsafeParams::default(),
+            battery_cells: 6,
+            battery_resistance_ohm: 0.025,
+        }
+    }
+
+    fn ids() -> impl Iterator<Item = (ParamId, &'static ParamDef)> {
+        PARAMS
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (ParamId(i as u16), d))
+    }
+
+    fn f(v: ParamValue) -> f32 {
+        match v {
+            ParamValue::F32(x) => x,
+            ParamValue::I32(_) => panic!("not a float"),
+        }
+    }
+
+    fn next_up(x: f32) -> f32 {
+        if x == 0.0 {
+            f32::from_bits(1)
+        } else if x > 0.0 {
+            f32::from_bits(x.to_bits() + 1)
+        } else {
+            f32::from_bits(x.to_bits() - 1)
+        }
+    }
+
+    fn next_down(x: f32) -> f32 {
+        -next_up(-x)
+    }
+
+    /// True if the parameter is held as whole microseconds.
+    fn is_us(id: ParamId) -> bool {
+        matches!(
+            Section::load(&FailsafeParams::default(), id)
+                .or_else(|| Section::load(&EkfParams::default(), id)),
+            Some(Stored::Us(_))
+        )
+    }
+
+    /// The value just below `min` that must be refused.
+    fn below(id: ParamId, def: &ParamDef) -> ParamValue {
+        match def.min {
+            ParamValue::I32(v) => ParamValue::I32(v - 1),
+            ParamValue::F32(lo) if is_us(id) => ParamValue::F32(lo - 2.0e-6),
+            ParamValue::F32(lo) => ParamValue::F32(next_down(lo)),
+        }
+    }
+
+    /// The value just above `max` that must be refused.
+    fn above(id: ParamId, def: &ParamDef) -> ParamValue {
+        match def.max {
+            ParamValue::I32(v) => ParamValue::I32(v + 1),
+            ParamValue::F32(hi) if is_us(id) => {
+                let hi_us = secs_to_us(hi).unwrap();
+                let mut v = hi + 2.0e-6;
+                while secs_to_us(v).is_none_or(|u| u <= hi_us) {
+                    v = next_up(v);
+                }
+                ParamValue::F32(v)
+            }
+            ParamValue::F32(hi) => ParamValue::F32(next_up(hi)),
+        }
+    }
+
+    #[test]
+    fn names_are_unique_legal_and_at_most_16_characters() {
+        for (i, d) in PARAMS.iter().enumerate() {
+            assert!(!d.name.is_empty() && d.name.len() <= 16, "{}", d.name);
+            assert!(
+                d.name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "{}",
+                d.name
+            );
+            assert!(
+                d.name.starts_with(d.group.prefix()),
+                "{} is in group {:?}",
+                d.name,
+                d.group
+            );
+            for other in PARAMS.iter().skip(i + 1) {
+                assert_ne!(d.name, other.name);
+            }
+            assert!(!d.description.is_empty(), "{}", d.name);
+        }
+        assert_eq!(PARAMS.len(), COUNT);
+        assert!(COUNT <= usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn keys_are_unique() {
+        for (i, d) in PARAMS.iter().enumerate() {
+            for other in PARAMS.iter().skip(i + 1) {
+                assert_ne!(key(d.name), key(other.name), "{} {}", d.name, other.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_key_is_fnv1a_32() {
+        // Published test vectors of 32-bit FNV-1a.
+        assert_eq!(key(""), 0x811c_9dc5);
+        assert_eq!(key("a"), 0xe40c_292c);
+        assert_eq!(key("foobar"), 0xbf9c_f968);
+    }
+
+    #[test]
+    fn every_default_is_within_its_range_and_of_its_type() {
+        for (id, d) in ids() {
+            assert_eq!(d.default.kind(), d.kind, "{}", d.name);
+            assert_eq!(d.min.kind(), d.kind, "{}", d.name);
+            assert_eq!(d.max.kind(), d.kind, "{}", d.name);
+            let s = match d.default {
+                ParamValue::F32(v) if is_us(id) => Stored::Us(secs_to_us(v).unwrap()),
+                ParamValue::F32(v) => Stored::F(v),
+                ParamValue::I32(v) => Stored::I(v),
+            };
+            assert!(stored_in_range(d, s), "{} default {:?}", d.name, d.default);
+        }
+    }
+
+    #[test]
+    fn the_default_configuration_reads_back_the_table_defaults() {
+        let c = cfg();
+        for (id, d) in ids() {
+            assert_eq!(get(&c, id), Some(d.default), "{}", d.name);
+        }
+    }
+
+    #[test]
+    fn set_to_default_minimum_and_maximum_reads_back() {
+        for profile in [&F405_LEAN, &H743_FULL] {
+            for (id, d) in ids() {
+                for v in [d.default, d.min, d.max] {
+                    let mut c = cfg();
+                    match set(&mut c, profile, id, v) {
+                        Ok(()) => {
+                            let got = get(&c, id).unwrap();
+                            if is_us(id) {
+                                assert_eq!(
+                                    secs_to_us(f(got)),
+                                    secs_to_us(f(v)),
+                                    "{} = {v:?}",
+                                    d.name
+                                );
+                            } else {
+                                assert_eq!(got, v, "{} = {v:?}", d.name);
+                            }
+                        }
+                        // A rule between two fields; nothing else may refuse
+                        // an in-range value.
+                        Err(ParamError::Invalid(_)) => {
+                            assert_eq!(c, cfg(), "{} = {v:?} left a change", d.name);
+                        }
+                        Err(e) => panic!("{} = {v:?}: {e:?}", d.name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_defaults_themselves_are_always_accepted() {
+        for (id, d) in ids() {
+            let mut c = cfg();
+            assert_eq!(set(&mut c, &F405_LEAN, id, d.default), Ok(()), "{}", d.name);
+            assert_eq!(c, cfg(), "{}", d.name);
+        }
+    }
+
+    #[test]
+    fn each_parameter_is_its_own_field() {
+        // Changing one parameter changes that one and no other.
+        let mut moved = 0;
+        for (id, d) in ids() {
+            let before = moved;
+            // The extremes may break a rule between fields (the touchdown
+            // thrust must stay between two other values), so try a value
+            // a little off the default too.
+            let near = match d.default {
+                ParamValue::F32(x) => ParamValue::F32(x * 0.9),
+                ParamValue::I32(x) => ParamValue::I32(x),
+            };
+            for v in [d.max, d.min, near] {
+                let mut c = cfg();
+                if set(&mut c, &F405_LEAN, id, v).is_err() || c == cfg() {
+                    continue;
+                }
+                moved += 1;
+                for (other, od) in ids() {
+                    let want = if other == id {
+                        get(&c, id)
+                    } else {
+                        Some(od.default)
+                    };
+                    assert_eq!(get(&c, other), want, "{} moved {}", d.name, od.name);
+                }
+                break;
+            }
+            assert_eq!(moved, before + 1, "{} never changes a field", d.name);
+        }
+        assert_eq!(moved, COUNT, "every parameter must reach a changed field");
+    }
+
+    #[test]
+    fn values_just_outside_the_range_are_refused_and_change_nothing() {
+        for (id, d) in ids() {
+            for v in [below(id, d), above(id, d)] {
+                let mut c = cfg();
+                assert_eq!(
+                    set(&mut c, &F405_LEAN, id, v),
+                    Err(ParamError::OutOfRange),
+                    "{} = {v:?}",
+                    d.name
+                );
+                assert_eq!(c, cfg(), "{}", d.name);
+                assert_eq!(format!("{c:?}"), format!("{:?}", cfg()), "{}", d.name);
+            }
+        }
+    }
+
+    #[test]
+    fn nan_infinity_and_the_wrong_type_are_refused_and_change_nothing() {
+        for (id, d) in ids() {
+            let mut c = cfg();
+            let wrong = match d.kind {
+                ParamKind::F32 => ParamValue::I32(0),
+                ParamKind::I32 => ParamValue::F32(0.0),
+            };
+            assert_eq!(
+                set(&mut c, &F405_LEAN, id, wrong),
+                Err(ParamError::WrongType),
+                "{}",
+                d.name
+            );
+            if d.kind == ParamKind::F32 {
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    assert_eq!(
+                        set(&mut c, &F405_LEAN, id, ParamValue::F32(bad)),
+                        Err(ParamError::NotFinite),
+                        "{} = {bad}",
+                        d.name
+                    );
+                }
+            }
+            assert_eq!(c, cfg(), "{}", d.name);
+            assert_eq!(format!("{c:?}"), format!("{:?}", cfg()), "{}", d.name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_id_is_refused() {
+        let mut c = cfg();
+        let bad = ParamId(COUNT as u16);
+        assert_eq!(
+            set(&mut c, &F405_LEAN, bad, ParamValue::F32(1.0)),
+            Err(ParamError::Unknown)
+        );
+        assert_eq!(
+            set(&mut c, &F405_LEAN, ParamId(u16::MAX), ParamValue::I32(1)),
+            Err(ParamError::Unknown)
+        );
+        assert_eq!(get(&c, bad), None);
+        assert_eq!(c, cfg());
+    }
+
+    #[test]
+    fn a_change_that_breaks_a_rule_between_fields_is_refused_and_changes_nothing() {
+        let touchdown_speed = FailsafeParams::default().touchdown_speed_mps;
+        let cases: [(&str, f32); 4] = [
+            // Landing slower than twice the touchdown speed.
+            ("LAND_SPEED", 2.0 * touchdown_speed * 0.99),
+            // Critical battery above the low threshold.
+            ("BAT_CRIT_V", 3.6),
+            // Minimum thrust not below the touchdown thrust.
+            ("LIM_MIN_THRUST", 0.3),
+            // Blind landing thrust not above the touchdown thrust.
+            ("LAND_BLIND_THR", 0.3),
+        ];
+        for (name, v) in cases {
+            let mut c = cfg();
+            let id = find(name).unwrap();
+            assert_eq!(
+                set(&mut c, &F405_LEAN, id, ParamValue::F32(v)),
+                Err(ParamError::Invalid(ConfigError::BadFailsafe)),
+                "{name} = {v}"
+            );
+            assert_eq!(c, cfg(), "{name}");
+            assert_eq!(format!("{c:?}"), format!("{:?}", cfg()), "{name}");
+        }
+        // The low threshold below the critical one.
+        let mut c = cfg();
+        assert_eq!(
+            set(&mut c, &F405_LEAN, ParamId::BAT_LOW_V, ParamValue::F32(3.2)),
+            Err(ParamError::Invalid(ConfigError::BadFailsafe))
+        );
+        assert_eq!(c, cfg());
+    }
+
+    #[test]
+    fn the_delay_horizon_is_checked_against_the_profile() {
+        // 250 Hz filter on both profiles: 62 deltas of 4 ms fit, 63 do not.
+        for profile in [&F405_LEAN, &H743_FULL] {
+            let mut c = cfg();
+            assert_eq!(
+                set(
+                    &mut c,
+                    profile,
+                    ParamId::EKF_HORIZON,
+                    ParamValue::F32(0.248)
+                ),
+                Ok(())
+            );
+            assert_eq!(c.estimator.ekf.delay_horizon_us, 248_000);
+            let before = c;
+            assert_eq!(
+                set(
+                    &mut c,
+                    profile,
+                    ParamId::EKF_HORIZON,
+                    ParamValue::F32(0.249)
+                ),
+                Err(ParamError::Invalid(ConfigError::BadEstimator))
+            );
+            assert_eq!(c, before);
+        }
+    }
+
+    #[test]
+    fn microsecond_parameters_round_to_the_microsecond() {
+        let mut c = cfg();
+        let id = ParamId::FS_RC_TIMEOUT;
+        assert_eq!(
+            set(&mut c, &F405_LEAN, id, ParamValue::F32(0.1234567)),
+            Ok(())
+        );
+        assert_eq!(c.failsafe.rc_timeout_us, 123_457);
+        // The bound is exact in microseconds: 49 999 us is refused, 50 000
+        // accepted, whatever the rounding of the f32 seconds.
+        assert_eq!(
+            set(&mut c, &F405_LEAN, id, ParamValue::F32(0.049_999)),
+            Err(ParamError::OutOfRange)
+        );
+        assert_eq!(set(&mut c, &F405_LEAN, id, ParamValue::F32(0.05)), Ok(()));
+        assert_eq!(c.failsafe.rc_timeout_us, 50_000);
+        assert_eq!(set(&mut c, &F405_LEAN, id, ParamValue::F32(3600.0)), Ok(()));
+        assert_eq!(c.failsafe.rc_timeout_us, 3_600_000_000);
+    }
+
+    #[test]
+    fn the_estimator_source_is_an_enum_as_an_integer() {
+        let mut c = cfg();
+        let id = ParamId::EKF_SOURCE;
+        assert_eq!(get(&c, id), Some(ParamValue::I32(0)));
+        assert_eq!(set(&mut c, &F405_LEAN, id, ParamValue::I32(1)), Ok(()));
+        assert_eq!(c.estimator.source, EstimatorSource::Ekf);
+        assert_eq!(get(&c, id), Some(ParamValue::I32(1)));
+        assert_eq!(set(&mut c, &F405_LEAN, id, ParamValue::I32(0)), Ok(()));
+        assert_eq!(c.estimator.source, EstimatorSource::External);
+        assert_eq!(
+            set(&mut c, &F405_LEAN, id, ParamValue::I32(2)),
+            Err(ParamError::OutOfRange)
+        );
+        assert_eq!(
+            set(&mut c, &F405_LEAN, id, ParamValue::I32(-1)),
+            Err(ParamError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn find_finds_every_name_and_nothing_else() {
+        for (id, d) in ids() {
+            assert_eq!(find(d.name), Some(id));
+            assert_eq!(PARAMS.get(id.index()).map(|d| d.name), Some(d.name));
+            // Not found with a change of case, a trailing character or a
+            // dropped one.
+            let lower = d.name.to_ascii_lowercase();
+            assert_eq!(find(&lower), None, "{lower}");
+            let longer = format!("{}X", d.name);
+            assert_eq!(find(&longer), None, "{longer}");
+            let shorter = &d.name[..d.name.len() - 1];
+            if PARAMS.iter().all(|o| o.name != shorter) {
+                assert_eq!(find(shorter), None, "{shorter}");
+            }
+        }
+        assert_eq!(find(""), None);
+        assert_eq!(find("NOT_A_PARAM"), None);
+        assert_eq!(find("RATE_ROLL_P"), Some(ParamId::RATE_ROLL_P));
+        assert_eq!(find("LIM_STICK_DB"), Some(ParamId::LIM_STICK_DB));
+    }
+
+    #[test]
+    fn the_whole_configuration_validates_against_the_table() {
+        assert_eq!(cfg().validate(), Ok(()));
+        let mut c = cfg();
+        c.gains.rate_p.x = -1.0;
+        assert_eq!(c.validate(), Err(ConfigError::BadGains));
+        let mut c = cfg();
+        c.gains.position_p.z = f32::NAN;
+        assert_eq!(c.validate(), Err(ConfigError::BadGains));
+        let mut c = cfg();
+        c.limits.max_tilt_rad = 0.0;
+        assert_eq!(c.validate(), Err(ConfigError::BadLimits));
+        let mut c = cfg();
+        c.limits.idle_command = 1.5;
+        assert_eq!(c.validate(), Err(ConfigError::BadLimits));
+        let mut c = cfg();
+        c.limits.stick_deadband = 0.6;
+        assert_eq!(c.validate(), Err(ConfigError::BadLimits));
+        let mut c = cfg();
+        c.estimator.ekf.gps_gate = 0.0;
+        assert_eq!(c.validate(), Err(ConfigError::BadEstimator));
+        let mut c = cfg();
+        c.failsafe.rtl_speed_mps = 0.0;
+        assert_eq!(c.validate(), Err(ConfigError::BadFailsafe));
+    }
+}
