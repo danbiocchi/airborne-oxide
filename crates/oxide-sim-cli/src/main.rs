@@ -13,7 +13,9 @@
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
-//! the libm paths. `montecarlo` flies gust-hold indices 0..N (default 200) on
+//! the libm paths, then one line per fault scenario in `HASHED_FAULT_SCENARIOS`
+//! (run 0, `<profile> <name>#0 <hash>`), so that it also covers ground contact,
+//! landings, failsafes and a crash. `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
 //! with 1 if any run fails. `scenario` flies a fault scenario (ADR-0003),
 //! prints its event timeline, a summary and every violated expectation, and
@@ -378,6 +380,32 @@ fn execute<P: Pilot>(
     })
 }
 
+/// Fault scenarios whose trace hash `hash` prints (run 0): an Rtl and a
+/// landing on the ground model, a blind landing, and a termination and crash.
+const HASHED_FAULT_SCENARIOS: [&str; 3] =
+    ["rc-loss-position", "pair-gps-loss+baro-loss", "motor-loss"];
+
+/// `<profile> <name>#0 <hash>` for each of `HASHED_FAULT_SCENARIOS`.
+fn fault_hash_lines(profile: Profile) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut lines = Vec::new();
+    for name in HASHED_FAULT_SCENARIOS {
+        let scenario = fault_scenarios::by_name(name)
+            .ok_or_else(|| format!("hashed fault scenario {name} does not exist"))?;
+        let mut sim = fault_scenarios::build(&scenario, profile, 0)?;
+        sim.run_until(
+            Micros((scenario.script.duration_s * 1e6).round() as u64),
+            |_| {},
+        );
+        lines.push(format!(
+            "{} {}#0 {:016x}",
+            profile.name,
+            name,
+            sim.trace_hash()
+        ));
+    }
+    Ok(lines)
+}
+
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let airframe = load_airframe(args.airframe.as_deref())?;
     let profile = args.profile;
@@ -396,6 +424,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         for &kind in kinds {
             let o = run_one(kind, args.csv.as_deref())?;
             println!("{} {} {:016x}", profile.name, o.label, o.hash);
+        }
+        if args.scenario.is_none() {
+            for line in fault_hash_lines(profile)? {
+                println!("{line}");
+            }
         }
         return Ok(());
     }
@@ -695,6 +728,26 @@ mod tests {
         assert!(scenario_command(args(&["gcs-loss", "--bogus"]).into_iter()).is_err());
         assert!(scenario_command(args(&["gcs-loss", "--seed", "x"]).into_iter()).is_err());
         assert!(scenario_command(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn hash_covers_landings_and_faults_on_both_profiles() {
+        for profile in [F405_LEAN, H743_FULL] {
+            let lines = fault_hash_lines(profile).expect("fault hashes");
+            assert_eq!(lines.len(), 3);
+            for (line, name) in lines.iter().zip(HASHED_FAULT_SCENARIOS) {
+                let parts: Vec<&str> = line.split(' ').collect();
+                assert_eq!(parts.len(), 3, "{line}");
+                assert_eq!(parts[0], profile.name);
+                assert_eq!(parts[1], format!("{name}#0"));
+                assert_eq!(parts[2].len(), 16, "{line}");
+                assert!(u64::from_str_radix(parts[2], 16).is_ok(), "{line}");
+            }
+            // Deterministic, and the three flights differ.
+            assert_eq!(lines, fault_hash_lines(profile).expect("again"));
+            assert_ne!(lines[0], lines[1]);
+            assert_ne!(lines[1], lines[2]);
+        }
     }
 
     #[test]
