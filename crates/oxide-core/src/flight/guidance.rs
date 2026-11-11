@@ -19,17 +19,21 @@ const RTL_ARRIVE_SPEED_MPS: f32 = 0.5;
 /// The moving Rtl setpoint stays within this distance of the vehicle, m.
 const RTL_LEASH_M: f32 = 3.0;
 
-/// A descent command of at least this, m/s, counts as a command to move.
+/// A descent command of at least `FailsafeParams::contact_descent_mps()`
+/// (twice `touchdown_speed_mps`, 0.5 m/s by default) counts as a command to
+/// move.
 ///
-/// A velocity loop told to descend at 0.5 m/s or more demands at least
-/// 1 m/s² downwards, and a vehicle in the air would pass 0.25 m/s
-/// (`touchdown_speed_mps`) within a quarter of a second. So when the
-/// estimated vertical speed stays below that for `LAND_CONTACT_S` while the
-/// command stands, something is holding the vehicle up: it is on the ground.
+/// A velocity loop told to descend at twice the touchdown speed demands at
+/// least 1 m/s² downwards (with the default loop), and a vehicle in the air
+/// would pass the touchdown speed within a quarter of a second. So when the
+/// estimated vertical speed stays below the touchdown speed for
+/// `LAND_CONTACT_S` while the command stands, something is holding the vehicle
+/// up: it is on the ground. The ratio, not a fixed speed, keeps that true for
+/// any configured speeds (configuration validation refuses a landing speed
+/// below it).
 /// Thrust is no part of the test: on the ground the position loop keeps
 /// demanding tilt and with it thrust, and the vertical loop's integral limit
 /// stops the thrust at about 40 %, so thrust says nothing about contact.
-const CONTACT_DESCENT_MPS: f32 = 0.5;
 /// How long the descent command must stand without motion, s.
 const LAND_CONTACT_S: f32 = 0.5;
 /// A landing with neither height nor vertical speed first descends on the
@@ -437,13 +441,13 @@ impl<const N: usize> Core<N> {
             // a constant descent rate takes about hover thrust.)
             target.thrust_n = target.thrust_n.min(hover);
         }
-        // Ground contact (ADR-0003 §2; see `CONTACT_DESCENT_MPS`): a descent
+        // Ground contact (ADR-0003 §2; see `FailsafeParams::contact_descent_mps`): a descent
         // is commanded and the vehicle is not moving. A vertical speed is
         // available from the altitude or velocity flags, or, in the first
         // `BLIND_INERTIAL_S` of a blind landing, from the inertial estimate.
         let inertial_blind = landing_now && !speed_known(v) && g.blind_s < BLIND_INERTIAL_S;
         let speed_available = speed_known(v) || inertial_blind;
-        if descent_cmd >= CONTACT_DESCENT_MPS
+        if descent_cmd >= fs.contact_descent_mps()
             && speed_available
             && Real::abs(state.velocity.z) < fs.touchdown_speed_mps
         {

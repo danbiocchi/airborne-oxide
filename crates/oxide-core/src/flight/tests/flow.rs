@@ -1802,3 +1802,44 @@ fn an_rtl_that_reached_its_landing_returns_at_the_current_height_and_lands() {
     assert_eq!(core.guide_state.rtl, RtlPhase::Landing);
     assert!((core.guide_state.position_sp.z + 3.0).abs() < 1e-6);
 }
+
+/// Low battery in a landing with the given speeds, from a motionless state
+/// at 5 m (the ground, as far as the descent command can tell).
+fn land_now_rig(touchdown_speed_mps: f32, land_speed_mps: f32) -> Rig {
+    let mut c = cfg();
+    c.failsafe.battery_low_v = c.failsafe.battery_critical_v;
+    c.failsafe.touchdown_speed_mps = touchdown_speed_mps;
+    c.failsafe.land_speed_mps = land_speed_mps;
+    let mut rig = Rig::external(0).with_cfg(c);
+    rig.state = Some(StateSample::default());
+    rig.arm();
+    rig.rc.throttle = 0.3;
+    rig.battery = Some(BatterySample {
+        voltage_v: 19.0,
+        current_a: 0.0,
+    });
+    rig
+}
+
+#[test]
+fn a_slow_landing_on_the_ground_still_disarms() {
+    let mut rig = land_now_rig(0.15, 0.4);
+    assert!(
+        rig.core.config().failsafe.land_speed_mps
+            >= rig.core.config().failsafe.contact_descent_mps()
+    );
+    assert!(rig.run_until(10.0, |r| r.nav() == NavState::LandNow));
+    assert!(
+        rig.run_until(60.0, |r| !r.out.status.armed),
+        "still armed, motors {:?}",
+        rig.out.motors
+    );
+    assert!(rig.saw(EventKind::Disarmed(DisarmReason::Touchdown)));
+}
+
+#[test]
+fn a_landing_with_the_default_speeds_still_disarms_on_the_ground() {
+    let mut rig = land_now_rig(0.25, 0.7);
+    assert!(rig.run_until(10.0, |r| r.nav() == NavState::LandNow));
+    assert!(rig.run_until(60.0, |r| !r.out.status.armed));
+}
