@@ -23,6 +23,8 @@
     )
 )]
 
+pub mod crc;
 pub mod flash;
+pub mod layout;
 
 pub use flash::{Flash, FlashError};
