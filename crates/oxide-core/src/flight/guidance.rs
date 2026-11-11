@@ -74,6 +74,8 @@ pub(super) struct GuidanceState {
     /// The validity flags guidance saw on its previous run, to find the edge
     /// at which a sensor returns.
     prev_valid: Validity,
+    /// The estimator's reset count guidance saw on its previous run.
+    prev_resets: u32,
     /// This Rtl has been in its `Landing` phase. Cleared on entering the
     /// state. A phase decided afresh after that never climbs again.
     rtl_landed: bool,
@@ -166,6 +168,7 @@ impl<const N: usize> Core<N> {
                 contact_s: 0.0,
                 blind_s: 0.0,
                 prev_valid: v,
+                prev_resets: est.resets,
                 rtl_landed: false,
             };
             self.guidance.pending = AttitudeTarget {
@@ -184,11 +187,13 @@ impl<const N: usize> Core<N> {
             g.contact_s = 0.0;
             g.blind_s = 0.0;
             g.prev_valid = v;
+            g.prev_resets = est.resets;
             g.rtl_landed = false;
             self.position_ctrl.reset();
             g.last_nav = Some(sup.nav);
         }
-        Self::follow_returning_sensors(&mut g, &state.position, yaw_now, v, sup.nav);
+        let reset = est.resets != g.prev_resets;
+        Self::follow_returning_sensors(&mut g, &state.position, yaw_now, v, reset, sup.nav);
 
         let l = self.cfg.limits;
         let fs = self.cfg.failsafe;
@@ -482,6 +487,7 @@ impl<const N: usize> Core<N> {
             }
         }
         g.prev_valid = v;
+        g.prev_resets = est.resets;
         self.guide_state = g;
         self.guidance.pending = target;
     }
@@ -490,22 +496,26 @@ impl<const N: usize> Core<N> {
     ///
     /// The estimator resets position and yaw to the sensor when the sensor
     /// returns after its timeout, and the matching flag turns valid on the
-    /// same estimate. Every reset happens only while the flag is false (the
-    /// timeouts exceed the validity windows), so the edge from invalid to
-    /// valid marks it. A setpoint kept from before the gap is then off by the
-    /// drift that built up, and the vehicle would fly or turn to it. So on the
-    /// edge the setpoint becomes the estimate; while the flag is false the
-    /// yaw setpoint follows the yaw. In `Rtl` climb and return the vertical
-    /// setpoint is the return height, a target that stays meaningful.
+    /// same estimate. A setpoint kept from before the gap is then off by the
+    /// drift that built up, and the vehicle would fly or turn to it. So on
+    /// the edge from invalid to valid the setpoint becomes the estimate;
+    /// while the flag is false the yaw setpoint follows the yaw. The edge
+    /// alone can be missed: a sensor that returns within one guidance run
+    /// of its timeout resets the estimate without guidance ever seeing the
+    /// flag false. `reset` (the estimator's reset count changed) covers
+    /// that; it re-bases the horizontal point and the yaw, the two things
+    /// a reset can move. In `Rtl` climb and return the vertical setpoint is
+    /// the return height, a target that stays meaningful.
     fn follow_returning_sensors(
         g: &mut GuidanceState,
         position: &Vec3<f32>,
         yaw_now: f32,
         v: Validity,
+        reset: bool,
         nav: NavState,
     ) {
         let was = g.prev_valid;
-        if v.position && !was.position {
+        if v.position && (!was.position || reset) {
             g.position_sp.x = position.x;
             g.position_sp.y = position.y;
         }
@@ -513,7 +523,7 @@ impl<const N: usize> Core<N> {
         // or without a heading, and its setpoint accumulates the pilot's
         // stick: there only the reset at the edge re-bases it. Pinning it to
         // the yaw on every run would take the yaw stick away.
-        let returned = v.heading && !was.heading;
+        let returned = v.heading && (!was.heading || reset);
         if returned || (!v.heading && nav != NavState::Stabilized) {
             g.yaw_sp = yaw_now;
         }

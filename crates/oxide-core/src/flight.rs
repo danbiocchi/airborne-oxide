@@ -65,6 +65,9 @@ impl<T: Copy> Let<T> {
 struct Estimate {
     state: Option<StateSample>,
     valid: Validity,
+    /// The estimator's state resets so far (zero for the external source).
+    /// A change means the estimate jumped rather than moved.
+    resets: u32,
 }
 
 /// Supervisor decisions.
@@ -347,7 +350,11 @@ impl<const N: usize> Core<N> {
             } else {
                 Validity::NONE
             };
-            self.estimate.pending = Estimate { state, valid };
+            self.estimate.pending = Estimate {
+                state,
+                valid,
+                resets: self.estimator.status().resets,
+            };
             return;
         }
         // External: the estimate is the `state` input (simulator ground
@@ -365,6 +372,7 @@ impl<const N: usize> Core<N> {
             } else {
                 Validity::NONE
             },
+            resets: 0,
         };
     }
 

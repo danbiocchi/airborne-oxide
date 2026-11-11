@@ -1525,6 +1525,8 @@ fn guide(
             ..StateSample::default()
         }),
         valid,
+        // A test sets the estimator's reset count on the core beforehand.
+        resets: core.estimate.visible.resets,
     };
     core.run_guidance(Micros(k * 4000), 0.004);
 }
@@ -1892,4 +1894,42 @@ fn the_yaw_stick_still_turns_a_stabilized_vehicle_without_a_heading() {
         "yaw_sp {}",
         core.guide_state.yaw_sp
     );
+}
+
+#[test]
+fn an_estimator_reset_re_bases_the_setpoints_even_if_the_flags_never_dropped() {
+    // A sensor can return so soon after its timeout that guidance never saw
+    // the flag false: the estimator still reset, and the estimate jumped.
+    // The reset count published with the estimate marks it.
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    for nav in [NavState::Hold, NavState::Land, NavState::LandNow] {
+        let mut core = guidance_core();
+        let p = Vec3::new(0.0, 0.0, -5.0);
+        guide(&mut core, 0, nav, Validity::ALL, p, 0.0, home);
+        guide(&mut core, 1, nav, Validity::ALL, p, 0.0, home);
+        // The estimate jumps 6 m and 1.4 rad with a reset, flags valid throughout.
+        let jumped = Vec3::new(0.0, 6.0, -5.0);
+        core.estimate.visible.resets += 1;
+        guide(&mut core, 2, nav, Validity::ALL, jumped, 1.4, home);
+        let g = core.guide_state;
+        assert!(
+            (g.yaw_sp - 1.4).abs() < 1e-6,
+            "{nav:?}: yaw_sp {}",
+            g.yaw_sp
+        );
+        assert!(
+            (g.position_sp.y - 6.0).abs() < 1e-6,
+            "{nav:?}: point {:?}",
+            g.position_sp
+        );
+        // Without a reset a change in the estimate is motion, not a jump.
+        guide(&mut core, 3, nav, Validity::ALL, p, 0.0, home);
+        let g = core.guide_state;
+        assert!(
+            (g.yaw_sp - 1.4).abs() < 1e-6,
+            "{nav:?}: yaw_sp {}",
+            g.yaw_sp
+        );
+        assert!((g.position_sp.y - 6.0).abs() < 1e-6, "{nav:?}");
+    }
 }

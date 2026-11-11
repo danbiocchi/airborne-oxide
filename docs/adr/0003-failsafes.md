@@ -48,6 +48,7 @@ What the vehicle is doing is one `NavState`:
 
 **When a sensor returns.** After a long gap the estimator resets its position, or its yaw, to the sensor, and the estimate jumps by the drift that built up. A setpoint kept from before the gap is then off by that drift, and the vehicle would fly, or turn, to it. So setpoints follow the estimate across the gap:
 - **Position:** while `position` is not valid the held point follows the vehicle, and on the run where it is valid again the held point is the new estimate.
+- **Resets:** the estimate carries the estimator's reset count. A change in it re-bases the held point and the yaw setpoint as well, because a sensor that returns within one guidance run of its timeout resets the estimate without guidance ever seeing the flag drop.
 - **Yaw:** the yaw setpoint does the same for `heading`. `Stabilized` is the exception while the heading is away: it flies on the gyro-integrated yaw, which is smooth without a magnetometer, so the pilot keeps the yaw stick and the setpoint is re-based only at the return.
 - **Height:** the height setpoint does the same for `altitude`, except the Rtl return height, which is a target that stays meaningful.
 
@@ -124,10 +125,11 @@ Arming needs a rising edge of the arm switch with no pre-arm check failing. Each
 
 **Configuration.** The core refuses to start with an invalid configuration (`Core::new` returns the error), so `CONFIG` cannot be seen failing on a running core; the bit is reserved for parameters changed at run time (part two). Validation covers every failsafe parameter, because a bad one silently disables a protection or makes a landing that never ends:
 - every value finite;
-- link timeouts at least 50 ms, and delays at most an hour;
-- battery thresholds within 3.0 to 4.2 V per cell (the range in which the monitor can act and its latch can clear), with critical not above low;
+- link timeouts between 50 ms and an hour, and delays at most an hour;
+- battery thresholds within 3.0 to 4.0 V per cell (the range in which the monitor can act and its latch can clear on a full pack), with critical not above low;
 - loss-of-control angles within (0, π], fence limits not negative (0 turns the fence off);
 - return speed at least 0.1 m/s, landing speed at least twice the touchdown speed;
+- the minimum thrust below the touchdown thrust, or a vehicle on the ground could never read as landed; the blind-landing thrust above it, or a blind landing would read as landed in the air;
 - thrust fractions within their range, at least one battery cell, resistance not negative.
 
 A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. A vehicle armed without a position (Stabilized or Altitude, GPS not yet locked) gets its home at the first run where `position` becomes valid while armed; until then `Rtl` behaves as `Hold`. Home is never overwritten in flight and is cleared on disarm. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
@@ -150,6 +152,5 @@ The core reports discrete events through its outputs: armed, disarmed and why, a
 - In-flight restart after a core reset (DESIGN §4.16), with the firmware.
 - The energy-to-home check for Rtl.
 - IMU and estimator lanes on the H743.
-- Reset counters from the estimator. Guidance finds an estimator reset by the validity flag returning, which holds because every reset timeout is longer than its validity window. One sliver remains: a magnetometer outage that ends within one filter step (4 ms) of the 30 s timeout can reset the yaw while guidance still saw the flag valid, and the vehicle then turns through the drift of those 30 s. Reset counters in the estimate close it, and the log wants them anyway (part three).
 - Switch confirmation on every link frame. The supervisor samples the newest frame at 50 Hz, so on a faster link the frames between two runs are not examined. Counting in the input path would examine all of them.
 - Ranges for the gains and limits, which arrive with the parameter system (part two).
