@@ -169,7 +169,7 @@ Brain commands come in tiers. Every tier exists in the protocol, and a configura
 ### 4.9 Command priority, kill switch and pilot override (Q10)
 
 1. **Kill switch.** It has a dedicated RC channel and stops the motors, on the ground and in flight.
-   - **Valid frames only:** it acts only on frames that carry no failsafe or frame-lost flag, and only after the kill position has been seen in 3 consecutive frames. RC loss is never read as kill, or as un-kill.
+   - **Valid frames only:** it acts only on frames that carry no failsafe or frame-lost flag, and only after the kill position has been seen in 3 consecutive frames. RC loss is never read as kill, or as un-kill. The arm switch is confirmed the same way, so one corrupted frame can neither arm nor disarm (ADR-0003 §6).
    - **Latching:** it latches. Motors stay off until the switch is released and the vehicle is re-armed through the normal checks (§4.11).
 2. **Pilot (sticks and mode switch).** Outranks everything below, including a failsafe in progress, under these rules:
    - **(a) A valid link first.** RC must have delivered valid frames (no failsafe or frame-lost flag) for at least 1 s (a parameter) before pilot input counts. RC coming back does not, on its own, end a failsafe.

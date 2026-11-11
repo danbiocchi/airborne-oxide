@@ -46,13 +46,18 @@ What the vehicle is doing is one `NavState`:
 - **Vertical:** height control needs `altitude`. Without it, climb-rate control still works while `velocity` is valid, because GPS keeps correcting vertical speed. Without either, a landing descends on the estimator's inertial vertical speed for 30 s: the barometer calibrated the accelerometer's vertical bias before it failed, so the speed drifts slowly and is far better than open-loop thrust for a short descent. Thrust is capped at hover in that phase, so a wrong speed can stall the descent but never climb. After 30 s the landing flies a fixed 90 % of hover thrust, and after 60 s minimum thrust. Outside landing states, with neither valid, the vehicle holds hover thrust.
 - **Yaw:** holding a heading needs `heading`; otherwise zero yaw rate.
 
+**When a sensor returns.** After a long gap the estimator resets its position, or its yaw, to the sensor, and the estimate jumps by the drift that built up. A setpoint kept from before the gap is then off by that drift, and the vehicle would fly, or turn, to it. So setpoints follow the estimate across the gap:
+- **Position:** while `position` is not valid the held point follows the vehicle, and on the run where it is valid again the held point is the new estimate.
+- **Yaw:** the yaw setpoint does the same for `heading`. `Stabilized` is the exception while the heading is away: it flies on the gyro-integrated yaw, which is smooth without a magnetometer, so the pilot keeps the yaw stick and the setpoint is re-based only at the return.
+- **Height:** the height setpoint does the same for `altitude`, except the Rtl return height, which is a target that stays meaningful.
+
 **Pilot modes** degrade the same way (DESIGN §4.9 rule c): a requested `Position` or `Offboard` without `position` becomes `Altitude`; without `altitude` it becomes `Stabilized`. The change is logged as an event.
 
-**Rtl** needs home (set at arming) and `position`. Without them it behaves as `Hold`. Within 1 m of home it skips the climb and lands.
+**Rtl** needs home (set at arming) and `position`. Without them it behaves as `Hold`. Within 1 m of home it skips the climb and lands. An Rtl that has begun its landing never climbs again: if the position is lost on the way down it holds its height, and when the position returns it lands if it is within 1 m of home, and otherwise flies home at the height it is at and then lands.
 
-**Touchdown.** The vehicle is landed when, for 1 s, the commanded thrust is below 30 % of hover thrust and the estimated vertical speed is below 0.25 m/s. In `Rtl`, `Land` and `LandNow`, touchdown disarms the vehicle.
+**Touchdown.** The vehicle is landed when, for 1 s, the commanded thrust is below 30 % of hover thrust and the estimated vertical speed is below 0.25 m/s. In `Rtl`, `Land` and `LandNow`, touchdown disarms the vehicle. The vertical speed is known while `altitude` or `velocity` is valid. When it is not known, low thrust alone counts only in `Rtl`, `Land` and `LandNow`, where the controller lowers the thrust only on ground contact or at the end of a blind landing. Where the pilot commands the thrust (`Stabilized`, `Altitude`, `Position`), an unknown speed means not landed: a throttle chop in the air must never read as a landing.
 
-**Ground contact.** A controller pushing against the ground does not wind its thrust down far enough for touchdown to be detected: the vertical loop's integral limit stops at about 40 % of hover, and the horizontal loop keeps demanding tilt, and with it thrust, to reach a point it cannot get to. Ground contact is therefore judged by motion, not thrust. When a descent of at least 0.5 m/s is commanded and the vehicle has not moved vertically (below 0.25 m/s) for 0.5 s, something is holding it up: in the air that command would have it moving within a quarter of a second. In contact, guidance commands minimum thrust and a level attitude, resets the position controller so nothing winds up, and moves the held point to where the vehicle is. Contact ends as soon as the vehicle moves. This applies in the landing states and when the pilot holds the throttle down in `Altitude` or `Position`.
+**Ground contact.** A controller pushing against the ground does not wind its thrust down far enough for touchdown to be detected: the vertical loop's integral limit stops at about 40 % of hover, and the horizontal loop keeps demanding tilt, and with it thrust, to reach a point it cannot get to. Ground contact is therefore judged by motion, not thrust. When a descent of at least twice the touchdown speed is commanded (0.5 m/s with the default 0.25 m/s) and the vehicle has not moved vertically (below the touchdown speed) for 0.5 s, something is holding it up: in the air that command would have it moving within a quarter of a second. The landing speed must reach that threshold too, and a configuration with a slower landing is refused (§6). In contact, guidance commands minimum thrust and a level attitude, resets the position controller so nothing winds up, and moves the held point to where the vehicle is. Contact ends as soon as the vehicle moves. This applies in the landing states and when the pilot holds the throttle down in `Altitude` or `Position`.
 
 **On the ground.** A failsafe action that begins while the vehicle is landed disarms it at once. An armed vehicle sitting on the ground that loses its radio link must not take off to "return". For this rule alone "landed" is wider than touchdown: a pilot state with thrust below half of hover and no vertical speed for 0.2 s also counts. A vehicle in the air at half thrust is accelerating downwards, so it cannot meet that test.
 
@@ -91,11 +96,11 @@ A *reason* is a condition that is currently true. Each maps to an action, someti
 
 ### 5. Pilot override (DESIGN §4.9)
 
-- **Kill switch** works at all times, as before.
+- **Kill switch** works at all times. Its position takes effect after three valid frames in a row show it (§6).
 - **A valid link first.** RC must have been valid for `rc_valid_min_s` (1 s) without a gap.
 - **An explicit act.** The override is a *change* of the mode switch while a failsafe action is active. Moving sticks does nothing. RC returning does nothing on its own.
 - **The switch position in effect** only updates while RC is settled. A switch moved while the link was down therefore counts as a change once the link has been back for `rc_valid_min_s`.
-- **Effect.** The failsafe action ends and the vehicle enters the mode now selected, subject to degradation (§2). The reasons that were active are *acknowledged*: they do not act again until they clear and recur. A new reason, or an acknowledged one that escalates to a higher action, acts as normal.
+- **Effect.** The failsafe action ends and the vehicle enters the mode now selected, subject to degradation (§2). The reasons that were active are *acknowledged*: they do not act again until they clear and recur. Only reasons that were already active before the run of the switch change are acknowledged; one raised on that very run is new. A new reason, or an acknowledged one that escalates to a higher action, acts as normal.
 - **Restricted.** While `BATTERY_CRITICAL`, `ESTIMATOR_UNHEALTHY` or `IMU_FAILURE` is active the pilot can only take over into `Stabilized` or `Altitude`.
 - `Terminated` cannot be overridden.
 
@@ -114,6 +119,16 @@ Arming needs a rising edge of the arm switch with no pre-arm check failing. Each
 | `LINK` | The selected mode is Offboard and the brain heartbeat or the tier-2 setpoints are not live |
 | `BATTERY` | No fresh battery reading, cell voltage outside 3.0–4.35 V, or `BATTERY_LOW` latched |
 | `CONFIG` | The configuration failed validation |
+
+**Switch confirmation.** The kill switch and the arm switch take effect only after three distinct valid frames in a row show the new position. The supervisor examines each frame once, by its arrival time; it runs at 50 Hz and sees the newest frame of each run. A valid frame showing the other position starts the count again. A frame flagged failsafe or frame-lost is no evidence either way. With no fresh frame at all the counts start again. So one corrupted frame can neither stop the motors in flight, nor disarm, nor arm on the bench, at a cost of about 40 to 60 ms. Arming is the rising edge of the confirmed arm position, and the switch disarms when the confirmed position goes low. Releasing the kill latch or the termination latch needs only one valid frame with both switches off: that can only make arming possible again, and arming still needs its own confirmed edge.
+
+**Configuration.** The core refuses to start with an invalid configuration (`Core::new` returns the error), so `CONFIG` cannot be seen failing on a running core; the bit is reserved for parameters changed at run time (part two). Validation covers every failsafe parameter, because a bad one silently disables a protection or makes a landing that never ends:
+- every value finite;
+- link timeouts at least 50 ms, and delays at most an hour;
+- battery thresholds within 3.0 to 4.2 V per cell (the range in which the monitor can act and its latch can clear), with critical not above low;
+- loss-of-control angles within (0, π], fence limits not negative (0 turns the fence off);
+- return speed at least 0.1 m/s, landing speed at least twice the touchdown speed;
+- thrust fractions within their range, at least one battery cell, resistance not negative.
 
 A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. A vehicle armed without a position (Stabilized or Altitude, GPS not yet locked) gets its home at the first run where `position` becomes valid while armed; until then `Rtl` behaves as `Hold`. Home is never overwritten in flight and is cleared on disarm. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
 
@@ -135,3 +150,6 @@ The core reports discrete events through its outputs: armed, disarmed and why, a
 - In-flight restart after a core reset (DESIGN §4.16), with the firmware.
 - The energy-to-home check for Rtl.
 - IMU and estimator lanes on the H743.
+- Reset counters from the estimator. Guidance finds an estimator reset by the validity flag returning, which holds because every reset timeout is longer than its validity window. One sliver remains: a magnetometer outage that ends within one filter step (4 ms) of the 30 s timeout can reset the yaw while guidance still saw the flag valid, and the vehicle then turns through the drift of those 30 s. Reset counters in the estimate close it, and the log wants them anyway (part three).
+- Switch confirmation on every link frame. The supervisor samples the newest frame at 50 Hz, so on a faster link the frames between two runs are not examined. Counting in the input path would examine all of them.
+- Ranges for the gains and limits, which arrive with the parameter system (part two).
