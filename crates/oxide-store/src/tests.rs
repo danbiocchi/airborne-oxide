@@ -360,7 +360,7 @@ const FOLLOW_UP: [Op; 9] = [
     Op::Set(3, 301),
 ];
 
-const UNIVERSE: [u32; 6] = [1, 2, 3, 4, 5, u32::MAX];
+const UNIVERSE: [u32; 7] = [1, 2, 3, 4, 5, u32::MAX, KEY_CRC_ZERO];
 
 /// Records what each flash event was, to know where erases are.
 struct Recorder<'a> {
@@ -717,4 +717,44 @@ fn random_sequences_with_random_cuts_match_a_model() {
         t.elapsed()
     );
     assert!(cuts > 100 && comp > 50, "cuts {cuts} compactions {comp}");
+}
+
+// -------------------------------------------- keys whose CRC aliases an erased field
+
+/// `crc32(key, 0) == 0xFFFF_FFFF`: a half-written remove has an erased CRC field.
+const KEY_CRC_ONES: u32 = 0xFFFF_FFFF;
+/// `crc32(key, 0) == 0`: a half-written set of value 0 has an erased CRC field.
+const KEY_CRC_ZERO: u32 = 0x101B_2F50;
+
+#[test]
+fn keys_whose_crc_aliases_an_erased_field_are_safe_at_every_cut() {
+    let script = [
+        Op::Set(KEY_CRC_ONES, 5),
+        Op::Set(KEY_CRC_ZERO, 7),
+        Op::Remove(KEY_CRC_ONES),
+        Op::Set(KEY_CRC_ZERO, 0),
+        Op::Set(KEY_CRC_ONES, 0),
+        Op::Remove(KEY_CRC_ZERO),
+        Op::Set(KEY_CRC_ZERO, 0),
+    ];
+    let mut base = fresh();
+    let _ = Store::mount(&mut base).unwrap();
+    let kinds = event_kinds(&base, &script);
+    let expected = models(&Model::new(), &script);
+    for (k, _) in kinds.iter().enumerate() {
+        let ctx = format!("cut at event {k}");
+        let mut flash = base.clone();
+        let j = run_with_cut(&mut flash, &script, Some((k as u64, 0))).expect(&ctx);
+        flash.restore_power();
+        let (s, report) = Store::mount(&mut flash).unwrap();
+        assert_ne!(report, MountReport::Corrupt, "{ctx}");
+        assert_old_or_new(&s, &expected[j], &expected[j + 1], &ctx);
+    }
+}
+
+#[test]
+fn the_aliasing_keys_really_alias() {
+    use crate::layout::record_crc;
+    assert_eq!(record_crc(KEY_CRC_ZERO, 0), 0);
+    assert_eq!(record_crc(KEY_CRC_ONES, 0), u32::MAX);
 }
