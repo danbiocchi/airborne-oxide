@@ -465,8 +465,8 @@ fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
         (
             "battery_low_v",
             |p, v| p.battery_low_v = v,
-            &[2.99, 4.21],
-            &[3.3, 3.5, 4.2],
+            &[2.99, 4.01],
+            &[3.3, 3.5, 4.0],
         ),
         (
             "battery_critical_v",
@@ -513,14 +513,18 @@ fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
         (
             "land_blind_thrust",
             |p, v| p.land_blind_thrust = v,
-            &[0.0, -0.1, 1.001],
-            &[1e-6, 1.0],
+            // At or below the touchdown thrust (0.3) a blind landing's fixed
+            // thrust would read as landed in the air.
+            &[0.0, -0.1, 1.001, 0.3],
+            &[0.31, 1.0],
         ),
         (
             "touchdown_thrust",
             |p, v| p.touchdown_thrust = v,
-            &[0.0, -0.1, 1.0, 1.5],
-            &[1e-6, 0.999],
+            // Above the minimum thrust (0.1), or contact could never read as
+            // landed; below the blind landing thrust (0.9).
+            &[0.0, -0.1, 1.0, 1.5, 0.1, 0.9],
+            &[0.11, 0.89],
         ),
         (
             "touchdown_speed_mps",
@@ -560,6 +564,48 @@ fn failsafe_timeouts_below_50_ms_are_refused() {
             assert_eq!(r, Err(ConfigError::BadFailsafe), "{name} = {bad}");
         }
         assert_eq!(with(|c| set(&mut c.failsafe, 50_000)), Ok(()), "{name}");
+    }
+}
+
+#[test]
+fn failsafe_timeouts_above_an_hour_are_refused() {
+    // A timeout that never runs out is a loss that is never detected.
+    type Set = fn(&mut FailsafeParams, u32);
+    let fields: [(&str, Set); 4] = [
+        ("rc_timeout_us", |p, v| p.rc_timeout_us = v),
+        ("gcs_timeout_us", |p, v| p.gcs_timeout_us = v),
+        ("brain_timeout_us", |p, v| p.brain_timeout_us = v),
+        ("setpoint_timeout_us", |p, v| p.setpoint_timeout_us = v),
+    ];
+    for (name, set) in fields {
+        for bad in [3_600_000_001, u32::MAX] {
+            let r = with(|c| set(&mut c.failsafe, bad));
+            assert_eq!(r, Err(ConfigError::BadFailsafe), "{name} = {bad}");
+        }
+        let r = with(|c| set(&mut c.failsafe, 3_600_000_000));
+        assert_eq!(r, Ok(()), "{name}");
+    }
+}
+
+#[test]
+fn the_minimum_thrust_must_stay_below_the_touchdown_thrust() {
+    // On ground contact guidance commands the minimum thrust, and touchdown
+    // needs the thrust below `touchdown_thrust`: at or above it a landed
+    // vehicle would never disarm.
+    let touchdown = FailsafeParams::default().touchdown_thrust;
+    for bad in [touchdown, touchdown + 0.05, -0.01, f32::NAN, f32::INFINITY] {
+        assert_eq!(
+            with(|c| c.limits.min_thrust_fraction_of_hover = bad),
+            Err(ConfigError::BadFailsafe),
+            "minimum thrust {bad}"
+        );
+    }
+    for ok in [0.0, 0.1, touchdown - 0.01] {
+        assert_eq!(
+            with(|c| c.limits.min_thrust_fraction_of_hover = ok),
+            Ok(()),
+            "minimum thrust {ok}"
+        );
     }
 }
 

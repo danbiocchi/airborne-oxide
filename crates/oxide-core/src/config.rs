@@ -350,14 +350,18 @@ impl FailsafeParams {
     /// Shortest accepted timeout, µs: below this a single late frame at
     /// the slowest supervisor rate would count as a loss.
     pub const MIN_TIMEOUT_US: u32 = 50_000;
+    /// Longest accepted timeout, µs (an hour, like the durations): a
+    /// timeout that never runs out is a loss that is never detected.
+    pub const MAX_TIMEOUT_US: u32 = 3_600_000_000;
     /// Longest accepted duration, s.
     pub const MAX_DURATION_S: f32 = 3600.0;
     /// Accepted battery thresholds, V per cell. The monitor treats a cell
     /// voltage outside 3.0 to 4.35 V as implausible and refuses to arm, so a
     /// threshold below 3.0 could only fire after the pack had passed the
-    /// point where it could be armed. The upper bound leaves room for the
-    /// 0.1 V recovery margin the latch needs to clear on the ground.
-    pub const BATTERY_THRESHOLD_RANGE_V: (f32, f32) = (3.0, 4.2);
+    /// point where it could be armed. A latch clears on the ground only
+    /// above the threshold plus 0.1 V, and a full cell reads 4.2 V, so a
+    /// threshold above 4.0 V could latch a fresh pack for good.
+    pub const BATTERY_THRESHOLD_RANGE_V: (f32, f32) = (3.0, 4.0);
 
     /// Checks every parameter. Returns [`ConfigError::BadFailsafe`] for a
     /// non-finite or out-of-range value, or for one that would disable a
@@ -412,7 +416,9 @@ impl FailsafeParams {
         ];
         let angle = |v: f32| v > 0.0 && v <= core::f32::consts::PI;
         let ok = floats.iter().all(|v| finite(*v))
-            && timeouts.iter().all(|t| *t >= Self::MIN_TIMEOUT_US)
+            && timeouts
+                .iter()
+                .all(|t| (Self::MIN_TIMEOUT_US..=Self::MAX_TIMEOUT_US).contains(t))
             && durations.iter().all(|v| duration(*v))
             && positive_duration(self.touchdown_s)
             && positive_duration(self.battery_filter_tau_s)
@@ -427,10 +433,13 @@ impl FailsafeParams {
             && self.rtl_speed_mps >= 0.1
             && self.touchdown_speed_mps > 0.0
             && self.land_speed_mps >= self.contact_descent_mps()
-            && self.land_blind_thrust > 0.0
-            && self.land_blind_thrust <= 1.0
             && self.touchdown_thrust > 0.0
-            && self.touchdown_thrust < 1.0;
+            && self.touchdown_thrust < 1.0
+            // A blind landing flies this fixed thrust with no vertical speed
+            // known, where low thrust alone reads as landed: it must stay
+            // above the touchdown thrust or the motors would stop in the air.
+            && self.land_blind_thrust > self.touchdown_thrust
+            && self.land_blind_thrust <= 1.0;
         if ok {
             Ok(())
         } else {
@@ -476,7 +485,8 @@ pub enum ConfigError {
     /// An estimator parameter is out of range, or the delay horizon does not
     /// fit the profile's filter rate and buffer sizes.
     BadEstimator,
-    /// A failsafe parameter or the battery description is out of range.
+    /// A failsafe parameter or the battery description is out of range, or
+    /// the minimum thrust is not below the touchdown thrust.
     BadFailsafe,
 }
 
@@ -505,6 +515,14 @@ impl<const N: usize> VehicleConfig<N> {
             return Err(ConfigError::BadMassProperties);
         }
         self.failsafe.validate()?;
+        // On ground contact guidance commands the minimum thrust, and
+        // touchdown needs the thrust below `touchdown_thrust`: at or above
+        // it a landed vehicle would never disarm.
+        if !(0.0..self.failsafe.touchdown_thrust)
+            .contains(&self.limits.min_thrust_fraction_of_hover)
+        {
+            return Err(ConfigError::BadFailsafe);
+        }
         if self.battery_cells < 1
             || !self.battery_resistance_ohm.is_finite()
             || self.battery_resistance_ohm < 0.0
