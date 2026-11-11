@@ -480,6 +480,22 @@ fn a_motor_loss_on_a_rotor_the_airframe_lacks_is_refused() {
 }
 
 #[test]
+fn a_motor_loss_scale_that_is_not_a_fraction_is_refused() {
+    for scale in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+        let bad = FaultKind::MotorLoss { rotor: 0, scale };
+        let e = setup_error(with_faults(vec![fault(bad, 5.0, None)])).expect("refused");
+        assert!(
+            matches!(e, SimError::Fault { index: 0, .. }),
+            "{scale}: {e:?}"
+        );
+    }
+    for scale in [0.0, 0.5, 1.0] {
+        let ok = FaultKind::MotorLoss { rotor: 0, scale };
+        assert_eq!(setup_error(with_faults(vec![fault(ok, 5.0, None)])), None);
+    }
+}
+
+#[test]
 fn a_fault_window_that_ends_before_it_starts_is_refused() {
     for (start, end) in [(5.0, 4.0), (5.0, 5.0), (5.0, f64::NAN)] {
         let e = setup_error(with_faults(vec![

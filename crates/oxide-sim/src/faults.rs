@@ -124,7 +124,8 @@ impl LinkConfig {
 
 /// Refuses faults that could never act: a window that is not finite or ends
 /// at or before its start (`end_s: None` is a permanent fault), a motor loss on
-/// a rotor beyond the airframe's `rotors`, and a ground-station or brain fault
+/// a rotor beyond the airframe's `rotors` or with a scale outside 0 to 1, and a
+/// ground-station or brain fault
 /// when `links` has no such link. Such a fault would silently fly undisturbed.
 pub fn validate_faults(
     faults: &[Fault],
@@ -148,6 +149,11 @@ pub fn validate_faults(
             FaultKind::MotorLoss { rotor, .. } if rotor >= rotors => {
                 return refuse(format!(
                     "motor loss on rotor {rotor}, but the airframe has {rotors} rotors"
+                ));
+            }
+            FaultKind::MotorLoss { scale, .. } if !(0.0..=1.0).contains(&scale) => {
+                return refuse(format!(
+                    "motor loss scale {scale} is not a fraction between 0 and 1"
                 ));
             }
             FaultKind::GcsLoss if !links.gcs => {
