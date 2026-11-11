@@ -498,7 +498,8 @@ struct RawLinks {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum RawWind {
-    Calm,
+    // A struct variant, so that deny_unknown_fields applies to it.
+    Calm {},
     Fixed {
         steady_ned: Option<[f64; 3]>,
         turbulence_sigma: Option<[f64; 3]>,
@@ -614,9 +615,9 @@ enum RawEnding {
     Flying { point: [f64; 3], tolerance_m: f64 },
     FlyingAtHeight { height_m: f64, tolerance_m: f64 },
     Landed { within_m_of_home: Option<f64> },
-    Terminated,
+    Terminated {},
     Disarmed { reason: String },
-    Down,
+    Down {},
 }
 
 #[derive(Deserialize)]
@@ -857,7 +858,7 @@ fn vec3(key: &str, v: [f64; 3]) -> Result<Vec3<f64>> {
 
 fn convert_wind(raw: RawWind) -> Result<WindSpec> {
     Ok(match raw {
-        RawWind::Calm => WindSpec::Calm,
+        RawWind::Calm {} => WindSpec::Calm,
         RawWind::Fixed {
             steady_ned,
             turbulence_sigma,
@@ -1163,14 +1164,14 @@ fn convert_expect(raw: RawExpect) -> Result<(Option<Expect>, Option<HoldCriteria
         Some(RawEnding::Landed { within_m_of_home }) => Ending::Landed {
             within_m_of_home: opt("expect.ending.within_m_of_home", within_m_of_home)?,
         },
-        Some(RawEnding::Terminated) => Ending::Terminated,
+        Some(RawEnding::Terminated {}) => Ending::Terminated,
         Some(RawEnding::Disarmed { reason }) => Ending::Disarmed(lookup(
             &DISARM_REASON_NAMES,
             "disarm reason",
             "expect.ending.reason",
             &reason,
         )?),
-        Some(RawEnding::Down) => Ending::Down,
+        Some(RawEnding::Down {}) => Ending::Down,
     };
     let expect = Expect {
         nav_contains: names(

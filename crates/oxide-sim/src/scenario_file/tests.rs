@@ -275,3 +275,200 @@ fn gust_hold_as_a_script_flies_the_same_flight() {
         }
     }
 }
+
+// ---- Refusals -----------------------------------------------------------------
+
+/// The error of loading `MINIMAL` followed by `extra`.
+fn refused(extra: &str) -> ScenarioError {
+    load_str(&format!("{MINIMAL}{extra}")).expect_err("the file must be refused")
+}
+
+#[test]
+fn an_unknown_key_is_refused_naming_it() {
+    let e = refused("colour = \"red\"\n");
+    assert_eq!(e.key, "colour", "{e}");
+    assert!(e.reason.contains("unknown field"), "{e}");
+    // In a nested table too, with its line.
+    let e = refused("[sim]\nsensor = \"ideal\"\n");
+    assert_eq!(e.key, "sensor", "{e}");
+    assert!(e.reason.contains("line 4"), "{e}");
+    let e = refused("[expect.ending]\nkind = \"down\"\ntolerance_m = 1.0\n");
+    assert_eq!(e.key, "tolerance_m", "{e}");
+    let e = refused("[expect.ending]\nkind = \"terminated\"\nby = 1.0\n");
+    assert_eq!(e.key, "by", "{e}");
+    let e = refused("[wind]\nkind = \"calm\"\nsteady_ned = [1.0, 0.0, 0.0]\n");
+    assert_eq!(e.key, "steady_ned", "{e}");
+}
+
+#[test]
+fn an_unknown_state_name_is_refused_naming_the_key() {
+    let e = refused("[expect]\nnav_contains = [\"hold\", \"Lunch\"]\n");
+    assert_eq!(e.key, "expect.nav_contains[1]", "{e}");
+    assert!(
+        e.reason.contains("`Lunch`") && e.reason.contains("land-now"),
+        "{e}"
+    );
+    let e = refused("[expect]\nreasons = [\"RC_LOST\", \"BORED\"]\n");
+    assert_eq!(e.key, "expect.reasons[1]", "{e}");
+    let e = refused("[expect]\nmin_action = \"panic\"\n");
+    assert_eq!(e.key, "expect.min_action", "{e}");
+    let e = refused("[expect]\nevents = [\"armed\", \"landed\"]\n");
+    assert_eq!(e.key, "expect.events[1]", "{e}");
+    let e = refused("[expect.ending]\nkind = \"disarmed\"\nreason = \"boredom\"\n");
+    assert_eq!(e.key, "expect.ending.reason", "{e}");
+    let e = refused("[expect.ending]\nkind = \"crashed\"\n");
+    assert_eq!(e.key, "crashed", "{e}");
+    let e = refused("[[pilot.mode]]\nt = 0.0\nswitch = \"acro\"\n");
+    assert_eq!(e.key, "pilot.mode[0].switch", "{e}");
+    let e = refused("[sim]\nsensors = \"perfect\"\n");
+    assert_eq!(e.key, "sim.sensors", "{e}");
+    let e = refused("[run]\nprofiles = [\"f405\", \"f777\"]\n");
+    assert_eq!(e.key, "run.profiles[1]", "{e}");
+}
+
+#[test]
+fn an_unsorted_timeline_is_refused_naming_the_entry() {
+    let e = refused(
+        "[[pilot.setpoint]]\nt = 4.0\nposition = [0.0, 0.0, 1.0]\n[[pilot.setpoint]]\nt = 2.0\nsilent = true\n",
+    );
+    assert_eq!(e.key, "pilot.setpoint[1].t", "{e}");
+    assert!(e.reason.contains("increasing"), "{e}");
+    let e = refused(
+        "[[pilot.mode]]\nt = 1.0\nswitch = \"position\"\n[[pilot.mode]]\nt = 1.0\nswitch = \"offboard\"\n",
+    );
+    assert_eq!(e.key, "pilot.mode[1].t", "{e}");
+    let e = refused("[[pilot.sticks]]\nt = 3.0\n[[pilot.sticks]]\nt = 1.0\n");
+    assert_eq!(e.key, "pilot.sticks[1].t", "{e}");
+}
+
+#[test]
+fn a_missing_required_key_is_refused_naming_it() {
+    let e = load_str("duration_s = 5.0\n").expect_err("no name");
+    assert_eq!(e.key, "name", "{e}");
+    assert!(e.reason.contains("missing"), "{e}");
+    let e = load_str("name = \"x\"\n").expect_err("no duration");
+    assert_eq!(e.key, "duration_s", "{e}");
+    let e = refused("[[fault]]\nkind = \"gps-loss\"\n");
+    assert_eq!(e.key, "start_s", "{e}");
+    let e = refused("[[fault]]\nkind = \"motor-loss\"\nstart_s = 1.0\nrotor = 0\n");
+    assert_eq!(e.key, "fault[0].scale", "{e}");
+    let e = refused("[[pilot.setpoint]]\nt = 0.0\n");
+    assert_eq!(e.key, "pilot.setpoint[0].position", "{e}");
+}
+
+#[test]
+fn a_bad_parameter_is_refused_naming_it() {
+    let e = refused("[params]\nFS_NO_SUCH = 1.0\n");
+    assert_eq!(e.key, "params.FS_NO_SUCH", "{e}");
+    assert!(e.reason.contains("no such parameter"), "{e}");
+    // A value out of range, a wrong type, and one that is too large for i32.
+    let e = refused("[params]\nFS_GPS_LAND = -1.0\n");
+    assert_eq!(e.key, "params.FS_GPS_LAND", "{e}");
+    assert!(e.reason.contains("range"), "{e}");
+    let int = oxide_core::params::PARAMS
+        .iter()
+        .find(|d| d.kind == oxide_core::params::ParamKind::I32)
+        .map(|d| d.name);
+    if let Some(name) = int {
+        let e = refused(&format!("[params]\n{name} = 1.5\n"));
+        assert_eq!(e.key, format!("params.{name}"), "{e}");
+        assert!(e.reason.contains("whole number"), "{e}");
+        let e = refused(&format!("[params]\n{name} = 99999999999\n"));
+        assert!(e.reason.contains("range"), "{e}");
+    }
+}
+
+#[test]
+fn faults_the_simulator_would_refuse_are_refused_at_load() {
+    // A rotor the airframe does not have.
+    let e = refused("[[fault]]\nkind = \"motor-loss\"\nstart_s = 1.0\nrotor = 4\nscale = 0.0\n");
+    assert_eq!(e.key, "fault[0]", "{e}");
+    // A scale outside 0..=1.
+    let e = refused("[[fault]]\nkind = \"motor-loss\"\nstart_s = 1.0\nrotor = 0\nscale = 2.0\n");
+    assert_eq!(e.key, "fault[0]", "{e}");
+    // A ground-station fault without a ground station.
+    let e = refused("[[fault]]\nkind = \"gcs-loss\"\nstart_s = 1.0\n");
+    assert_eq!(e.key, "fault[0]", "{e}");
+    assert!(
+        load_str(&format!(
+            "{MINIMAL}[sim.links]\ngcs = true\n[[fault]]\nkind = \"gcs-loss\"\nstart_s = 1.0\n"
+        ))
+        .is_ok()
+    );
+    // A window that ends before it starts.
+    let e = refused("[[fault]]\nkind = \"gps-loss\"\nstart_s = 5.0\nend_s = 4.0\n");
+    assert_eq!(e.key, "fault[0]", "{e}");
+    // An unknown kind, and a field of another kind.
+    let e = refused("[[fault]]\nkind = \"gremlins\"\nstart_s = 1.0\n");
+    assert_eq!(e.key, "fault[0].kind", "{e}");
+    let e = refused("[[fault]]\nkind = \"gps-loss\"\nstart_s = 1.0\nrotor = 0\n");
+    assert_eq!(e.key, "fault[0].rotor", "{e}");
+}
+
+#[test]
+fn other_mistakes_are_refused_naming_the_key() {
+    assert_eq!(
+        load_str("name = \"a b\"\nduration_s = 1.0\n")
+            .expect_err("name")
+            .key,
+        "name"
+    );
+    assert_eq!(
+        load_str("name = \"x\"\nduration_s = 0.0\n")
+            .expect_err("duration")
+            .key,
+        "duration_s"
+    );
+    assert_eq!(refused("airframe = \"my-quad\"\n").key, "airframe");
+    assert_eq!(
+        refused("[battery]\ninitial_state_of_charge = 1.5\n").key,
+        "battery.initial_state_of_charge"
+    );
+    assert_eq!(refused("[run]\nseeds = 0\n").key, "run.seeds");
+    assert_eq!(refused("[wind]\nkind = \"hurricane\"\n").key, "hurricane");
+    assert_eq!(
+        refused("[wind]\nkind = \"random\"\nsteady_speed_mps = [3.0, 1.0]\nsigma_h_mps = [0.1, 0.2]\ntau_s = 2.0\n").key,
+        "wind.steady_speed_mps"
+    );
+    // A silent setpoint with a position says two things at once.
+    assert_eq!(
+        refused("[[pilot.setpoint]]\nt = 0.0\nsilent = true\nposition = [0.0, 0.0, 1.0]\n").key,
+        "pilot.setpoint[0].silent"
+    );
+    assert_eq!(
+        refused("[[pilot.sticks]]\nt = 0.0\nthrottle = 1.5\n").key,
+        "pilot.sticks[0].throttle"
+    );
+    assert_eq!(refused("[pilot]\narm_at_s = -1.0\n").key, "pilot.arm_at_s");
+}
+
+#[test]
+fn an_error_from_a_file_names_the_file() {
+    let dir = std::env::temp_dir().join(format!("oxide-scenario-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("bad.toml");
+    std::fs::write(&path, format!("{MINIMAL}colour = 1\n")).expect("write");
+    let e = load_path(&path).expect_err("refused");
+    let shown = path.display().to_string();
+    assert_eq!(e.file.as_deref(), Some(shown.as_str()));
+    assert!(e.to_string().starts_with(&shown), "{e}");
+    assert!(e.to_string().contains("`colour`"), "{e}");
+    let e = load_path(dir.join("missing.toml")).expect_err("no such file");
+    assert!(e.file.is_some() && e.reason.contains("cannot read"), "{e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn loading_the_same_file_twice_gives_equal_values() {
+    for entry in std::fs::read_dir(scenario_dir()).expect("scenarios/") {
+        let path = entry.expect("entry").path();
+        let a = load_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let b = load_path(&path).expect("loads again");
+        assert_eq!(a, b, "{}", path.display());
+    }
+    let text = documented_example();
+    assert_eq!(
+        load_str(&text).expect("loads"),
+        load_str(&text).expect("loads")
+    );
+}
