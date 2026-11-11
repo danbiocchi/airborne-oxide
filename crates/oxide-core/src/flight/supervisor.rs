@@ -218,7 +218,8 @@ impl<const N: usize> Core<N> {
             &p,
             dt,
         );
-        let vertical_speed = if valid.altitude {
+        // The estimate's vertical velocity is valid under either flag.
+        let vertical_speed = if valid.altitude || valid.velocity {
             state.map(|e| -e.velocity.z)
         } else {
             None
@@ -229,6 +230,10 @@ impl<const N: usize> Core<N> {
             self.guidance.visible.thrust_n,
             self.cfg.weight_n(),
             vertical_speed,
+            // Where the pilot commands the thrust, low thrust alone is not
+            // evidence of ground contact; in a landing state the controller
+            // lowers it only on contact or after the blind-landing timeout.
+            matches!(s.nav, NavState::Rtl | NavState::Land | NavState::LandNow),
             &p,
         );
         // A pilot state at low thrust and standing still is the vehicle on

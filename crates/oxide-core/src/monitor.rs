@@ -167,12 +167,17 @@ impl LandDetector {
     }
 
     /// `thrust_n`: commanded collective thrust; `vertical_speed`: estimated,
-    /// m/s, None when height is invalid.
+    /// m/s, None when it is not known (neither height nor velocity valid);
+    /// `unknown_speed_counts`: whether low thrust alone may count as landed
+    /// when the speed is not known. It is true only where the controller, not
+    /// the pilot, commands the thrust (a landing state lowers it on ground
+    /// contact or after the blind-landing timeout).
     ///
     /// Not armed → landed. Armed: landed once thrust < `touchdown_thrust` ×
-    /// hover thrust and (speed unknown or |speed| < `touchdown_speed_mps`)
-    /// has held for `touchdown_s`. Any violation clears it. A NaN thrust or
-    /// speed counts as a violation.
+    /// hover thrust and (|speed| < `touchdown_speed_mps`, or the speed is
+    /// unknown and `unknown_speed_counts`) has held for `touchdown_s`. Any
+    /// violation clears it. A NaN thrust or speed counts as a violation.
+    #[allow(clippy::too_many_arguments)] // Fixed by the supervisor's inputs.
     pub fn update(
         &mut self,
         now: Micros,
@@ -180,6 +185,7 @@ impl LandDetector {
         thrust_n: f32,
         hover_thrust_n: f32,
         vertical_speed: Option<f32>,
+        unknown_speed_counts: bool,
         p: &FailsafeParams,
     ) -> bool {
         if !armed {
@@ -188,7 +194,10 @@ impl LandDetector {
             return true;
         }
         let thrust_ok = thrust_n < p.touchdown_thrust * hover_thrust_n;
-        let speed_ok = vertical_speed.is_none_or(|s| s.abs() < p.touchdown_speed_mps);
+        let speed_ok = match vertical_speed {
+            Some(s) => s.abs() < p.touchdown_speed_mps,
+            None => unknown_speed_counts,
+        };
         self.landed = held_for(&mut self.since, thrust_ok && speed_ok, now, p.touchdown_s);
         self.landed
     }
@@ -493,20 +502,20 @@ mod tests {
     fn land_disarmed_is_landed() {
         let p = params();
         let mut d = LandDetector::new();
-        assert!(d.update(t(0), false, 5.0, 1.0, Some(3.0), &p));
+        assert!(d.update(t(0), false, 5.0, 1.0, Some(3.0), true, &p));
         assert!(d.landed());
         // Arming with high thrust: not landed, and the disarmed time does not count.
-        assert!(!d.update(t(10), true, 5.0, 1.0, Some(0.0), &p));
+        assert!(!d.update(t(10), true, 5.0, 1.0, Some(0.0), true, &p));
     }
 
     #[test]
     fn land_needs_the_full_time() {
         let p = params(); // touchdown 1 s, thrust < 30 % of hover, speed < 0.25 m/s
         let mut d = LandDetector::new();
-        assert!(!d.update(t(0), true, 0.1, 1.0, None, &p));
-        assert!(!d.update(t(500), true, 0.1, 1.0, None, &p));
-        assert!(!d.update(t(999), true, 0.1, 1.0, None, &p));
-        assert!(d.update(t(1000), true, 0.1, 1.0, None, &p));
+        assert!(!d.update(t(0), true, 0.1, 1.0, None, true, &p));
+        assert!(!d.update(t(500), true, 0.1, 1.0, None, true, &p));
+        assert!(!d.update(t(999), true, 0.1, 1.0, None, true, &p));
+        assert!(d.update(t(1000), true, 0.1, 1.0, None, true, &p));
         assert!(d.landed());
     }
 
@@ -514,11 +523,11 @@ mod tests {
     fn land_interruption_restarts_the_timer() {
         let p = params();
         let mut d = LandDetector::new();
-        assert!(!d.update(t(0), true, 0.1, 1.0, Some(0.0), &p));
-        assert!(!d.update(t(600), true, 0.5, 1.0, Some(0.0), &p)); // thrust too high
-        assert!(!d.update(t(700), true, 0.1, 1.0, Some(0.0), &p));
-        assert!(!d.update(t(1600), true, 0.1, 1.0, Some(0.0), &p));
-        assert!(d.update(t(1700), true, 0.1, 1.0, Some(0.0), &p));
+        assert!(!d.update(t(0), true, 0.1, 1.0, Some(0.0), true, &p));
+        assert!(!d.update(t(600), true, 0.5, 1.0, Some(0.0), true, &p)); // thrust too high
+        assert!(!d.update(t(700), true, 0.1, 1.0, Some(0.0), true, &p));
+        assert!(!d.update(t(1600), true, 0.1, 1.0, Some(0.0), true, &p));
+        assert!(d.update(t(1700), true, 0.1, 1.0, Some(0.0), true, &p));
     }
 
     #[test]
@@ -526,7 +535,36 @@ mod tests {
         let p = params();
         let mut d = LandDetector::new();
         for ms in (0..=5000).step_by(100) {
-            assert!(!d.update(t(ms), true, 0.1, 1.0, Some(-0.5), &p));
+            assert!(!d.update(t(ms), true, 0.1, 1.0, Some(-0.5), true, &p));
+        }
+    }
+
+    #[test]
+    fn land_unknown_speed_is_not_landed_when_the_pilot_commands_the_thrust() {
+        let p = params();
+        let mut d = LandDetector::new();
+        for ms in (0..=5000).step_by(100) {
+            assert!(!d.update(t(ms), true, 0.0, 1.0, None, false, &p), "{ms} ms");
+        }
+        // Allowed again: the condition starts to hold now, not retroactively.
+        assert!(!d.update(t(5100), true, 0.0, 1.0, None, true, &p));
+        assert!(!d.update(t(6099), true, 0.0, 1.0, None, true, &p));
+        assert!(d.update(t(6100), true, 0.0, 1.0, None, true, &p));
+        // And revoked again: not landed at once.
+        assert!(!d.update(t(6200), true, 0.0, 1.0, None, false, &p));
+    }
+
+    #[test]
+    fn land_a_known_speed_does_not_depend_on_the_flag() {
+        let p = params();
+        for flag in [false, true] {
+            let mut d = LandDetector::new();
+            assert!(!d.update(t(0), true, 0.1, 1.0, Some(0.0), flag, &p));
+            assert!(d.update(t(1000), true, 0.1, 1.0, Some(0.0), flag, &p));
+            let mut d = LandDetector::new();
+            for ms in (0..=3000).step_by(100) {
+                assert!(!d.update(t(ms), true, 0.1, 1.0, Some(-0.5), flag, &p));
+            }
         }
     }
 
@@ -534,8 +572,8 @@ mod tests {
     fn land_unknown_speed_uses_thrust_only() {
         let p = params();
         let mut d = LandDetector::new();
-        assert!(!d.update(t(0), true, 0.0, 1.0, None, &p));
-        assert!(d.update(t(1000), true, 0.0, 1.0, None, &p));
+        assert!(!d.update(t(0), true, 0.0, 1.0, None, true, &p));
+        assert!(d.update(t(1000), true, 0.0, 1.0, None, true, &p));
     }
 
     #[test]
@@ -543,25 +581,25 @@ mod tests {
         let p = params();
         let mut d = LandDetector::new();
         // Strictly below 30 % of hover thrust is required.
-        assert!(!d.update(t(0), true, 0.3, 1.0, Some(0.0), &p));
-        assert!(!d.update(t(2000), true, 0.3, 1.0, Some(0.0), &p));
+        assert!(!d.update(t(0), true, 0.3, 1.0, Some(0.0), true, &p));
+        assert!(!d.update(t(2000), true, 0.3, 1.0, Some(0.0), true, &p));
     }
 
     #[test]
     fn land_nan_inputs_count_as_violation() {
         let p = params();
         let mut d = LandDetector::new();
-        assert!(!d.update(t(0), true, f32::NAN, 1.0, Some(0.0), &p));
-        assert!(!d.update(t(2000), true, 0.1, 1.0, Some(f32::NAN), &p));
+        assert!(!d.update(t(0), true, f32::NAN, 1.0, Some(0.0), true, &p));
+        assert!(!d.update(t(2000), true, 0.1, 1.0, Some(f32::NAN), true, &p));
     }
 
     #[test]
     fn land_violation_clears_landed() {
         let p = params();
         let mut d = LandDetector::new();
-        assert!(!d.update(t(0), true, 0.1, 1.0, Some(0.0), &p));
-        assert!(d.update(t(1000), true, 0.1, 1.0, Some(0.0), &p));
-        assert!(!d.update(t(2000), true, 0.1, 1.0, Some(1.0), &p));
+        assert!(!d.update(t(0), true, 0.1, 1.0, Some(0.0), true, &p));
+        assert!(d.update(t(1000), true, 0.1, 1.0, Some(0.0), true, &p));
+        assert!(!d.update(t(2000), true, 0.1, 1.0, Some(1.0), true, &p));
         assert!(!d.landed());
     }
 

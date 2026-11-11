@@ -1383,3 +1383,54 @@ fn contact_is_not_declared_on_a_vehicle_rising() {
     }
     assert!(min_seen > CUT, "thrust cut on a rising vehicle: {min_seen}");
 }
+
+#[test]
+fn zero_throttle_with_no_height_or_speed_is_not_landed_when_a_failsafe_starts() {
+    // Stabilized and descending with the throttle at zero, the barometer and
+    // GPS gone (height and speed invalid). The pilot overrides the estimator
+    // failsafe, so the pilot's state flies; the thrust is the pilot's, and
+    // low thrust says nothing about the ground. When the battery then turns
+    // critical, LandNow must start in the air, not disarm as "landed".
+    let mut rig = Rig::ekf(0);
+    rig.arm();
+    rig.rc.throttle = 0.5;
+    rig.run(1.0);
+    rig.world = true;
+    rig.baro_on = false;
+    rig.gps_on = false;
+    rig.rc.throttle = 0.0;
+    assert!(rig.run_until(15.0, |r| r.nav() == NavState::LandNow));
+    assert!(!rig.out.status.valid.altitude && !rig.out.status.valid.velocity);
+    // The pilot takes over (flips the mode switch) and keeps the throttle off.
+    rig.rc.mode_switch = 1;
+    assert!(
+        rig.run_until(5.0, |r| r.nav() == NavState::Stabilized),
+        "the override flies the pilot's state"
+    );
+    assert!(
+        rig.events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PilotOverride(_)))
+    );
+    rig.run(3.0);
+    assert!(rig.out.status.armed && rig.nav() == NavState::Stabilized);
+    // A new failsafe starts.
+    rig.battery = Some(BatterySample {
+        voltage_v: 19.0,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(15.0, |r| r.nav() == NavState::LandNow
+        || !r.out.status.armed));
+    assert!(
+        rig.out.status.armed,
+        "disarmed in the air: {:?}",
+        rig.events
+    );
+    rig.run(0.3);
+    assert!(
+        rig.out.status.armed,
+        "disarmed in the air: {:?}",
+        rig.events
+    );
+    assert!(!rig.saw(EventKind::Disarmed(DisarmReason::Touchdown)));
+}
