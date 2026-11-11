@@ -4,6 +4,7 @@
 //! ADR-0001).
 
 use crate::math::{Quat, Vec3};
+use crate::params::{ParamError, ParamId, ParamValue};
 use crate::time::Micros;
 
 /// A sample with when it was measured and when the core received it.
@@ -140,6 +141,13 @@ pub struct TrajectorySetpoint {
     pub yaw: f32,
 }
 
+/// A request to change one parameter (ADR-0004 §4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamSet {
+    pub id: ParamId,
+    pub value: ParamValue,
+}
+
 /// Everything that arrived since the previous tick. `None` means no new
 /// sample; the core keeps the last one and judges staleness itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -154,6 +162,9 @@ pub struct Inputs {
     pub mag: Option<Stamped<MagSample>>,
     pub gcs_heartbeat: Option<Stamped<GcsHeartbeat>>,
     pub brain_heartbeat: Option<Stamped<BrainHeartbeat>>,
+    /// A parameter change, applied on the tick it arrives; at most one per
+    /// tick (ADR-0004 §4).
+    pub param_set: Option<ParamSet>,
 }
 
 /// Flight mode.
@@ -381,6 +392,13 @@ pub enum EventKind {
     PilotOverride(Reasons),
     Touchdown,
     HomeSet,
+    /// A parameter was changed (`Core::param` has the new value).
+    ParamChanged(ParamId),
+    /// A parameter change was refused; nothing changed.
+    ParamRefused {
+        id: ParamId,
+        why: ParamError,
+    },
 }
 
 /// An event with the tick time it happened at.
@@ -466,6 +484,9 @@ pub struct Status {
     pub prearm: PrearmFlags,
     /// Home was set at arming.
     pub home_set: bool,
+    /// A parameter has changed since the store last had the values
+    /// (`Core::clear_unsaved`).
+    pub params_unsaved: bool,
 }
 
 /// Actuator commands and status. `motors` are normalised commands in

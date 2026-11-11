@@ -274,6 +274,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             setpoint: setpoint.map(|s| Stamped::ideal(t, s)),
             gcs_heartbeat,
             brain_heartbeat,
+            param_set: None,
         };
         self.last_inputs = inputs;
 

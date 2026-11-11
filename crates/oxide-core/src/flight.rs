@@ -19,10 +19,11 @@ use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
 use crate::io::{
     Action, BatterySample, BrainHeartbeat, EVENTS_PER_TICK, EstimatorStatus, Event, EventKind,
-    EventList, FlightMode, GcsHeartbeat, ImuSample, Inputs, NavState, Outputs, PrearmFlags,
-    RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
+    EventList, FlightMode, GcsHeartbeat, ImuSample, Inputs, NavState, Outputs, ParamSet,
+    PrearmFlags, RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
 };
 use crate::math::{Real, Vec3};
+use crate::params::{self, ParamError, ParamId, ParamValue};
 use crate::schedule::{Profile, TaskId};
 use crate::time::Micros;
 
@@ -129,6 +130,8 @@ pub struct Core<const N: usize> {
 
     events: Ring<Option<Event>, EVENT_QUEUE>,
     events_dropped: u32,
+    /// A parameter changed and the store has not been told it is saved.
+    params_unsaved: bool,
 }
 
 impl<const N: usize> Core<N> {
@@ -180,6 +183,7 @@ impl<const N: usize> Core<N> {
             rate_ctrl: RateController::default(),
             events: Ring::new(),
             events_dropped: 0,
+            params_unsaved: false,
         })
     }
 
@@ -211,6 +215,30 @@ impl<const N: usize> Core<N> {
         self.supervision.visible.home
     }
 
+    /// The current value of a parameter; `None` for an unknown id.
+    pub fn param(&self, id: ParamId) -> Option<ParamValue> {
+        params::get(&self.cfg, id)
+    }
+
+    /// Whether a parameter changed since the store last had the values.
+    pub fn params_unsaved(&self) -> bool {
+        self.params_unsaved
+    }
+
+    /// Tells the core the current parameter values are stored. Does nothing
+    /// while armed: the store is never written in flight (ADR-0004 §6), so
+    /// nothing can have been saved.
+    pub fn clear_unsaved(&mut self) {
+        if !self.is_armed() {
+            self.params_unsaved = false;
+        }
+    }
+
+    /// Armed now or as of the supervisor's latest decision.
+    fn is_armed(&self) -> bool {
+        self.supervision.visible.armed || self.supervision.pending.armed
+    }
+
     /// Events dropped because the queue (32 events) overflowed.
     pub fn events_dropped(&self) -> u32 {
         self.events_dropped
@@ -223,6 +251,9 @@ impl<const N: usize> Core<N> {
             && now.since(last) != base_us
         {
             self.timing_faults = self.timing_faults.saturating_add(1);
+        }
+        if let Some(req) = inputs.param_set {
+            self.apply_param(now, req);
         }
         self.absorb(inputs);
 
@@ -269,6 +300,70 @@ impl<const N: usize> Core<N> {
         self.ticks = self.ticks.saturating_add(1);
         self.last_now = Some(now);
         out
+    }
+
+    /// Applies a parameter change (ADR-0004 §4) and reports the outcome.
+    fn apply_param(&mut self, now: Micros, req: ParamSet) {
+        let ParamSet { id, value } = req;
+        let Some(def) = params::PARAMS.get(id.index()) else {
+            self.emit(
+                now,
+                EventKind::ParamRefused {
+                    id,
+                    why: ParamError::Unknown,
+                },
+            );
+            return;
+        };
+        if !def.live && self.is_armed() {
+            self.emit(
+                now,
+                EventKind::ParamRefused {
+                    id,
+                    why: ParamError::Armed,
+                },
+            );
+            return;
+        }
+        let mut next = self.cfg;
+        if let Err(why) = params::set(&mut next, &self.profile, id, value) {
+            self.emit(now, EventKind::ParamRefused { id, why });
+            return;
+        }
+        // The estimator is rebuilt first: `set` has already checked it
+        // against the profile, so this cannot fail; if it somehow does,
+        // nothing is changed.
+        let restart = def.group == params::ParamGroup::Estimator;
+        let estimator = if restart {
+            match Estimator::new(&next.estimator.ekf, &self.profile) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    self.emit(
+                        now,
+                        EventKind::ParamRefused {
+                            id,
+                            why: ParamError::Invalid(e),
+                        },
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let new_cutoff = next.gains.gyro_cutoff_hz;
+        let cutoff_changed = new_cutoff.to_bits() != self.cfg.gains.gyro_cutoff_hz.to_bits();
+        self.cfg = next;
+        if let Some(e) = estimator {
+            self.estimator = e;
+            // The published estimate is gone until the new one aligns.
+            self.estimate = Let::default();
+        }
+        if cutoff_changed {
+            self.gyro_lpf = LowPass2::new(1.0 / self.profile.base_dt(), new_cutoff);
+        }
+        self.params_unsaved = true;
+        self.emit(now, EventKind::ParamChanged(id));
     }
 
     /// Keeps the newest sample of each kind.
@@ -442,6 +537,7 @@ impl<const N: usize> Core<N> {
             action: sup.action,
             prearm: sup.prearm,
             home_set: sup.home.is_some(),
+            params_unsaved: self.params_unsaved,
         };
         let mut events = EventList::new();
         for _ in 0..EVENTS_PER_TICK {
