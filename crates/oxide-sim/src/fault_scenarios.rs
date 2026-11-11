@@ -371,4 +371,100 @@ mod tests {
             assert!(w.gusts.is_empty());
         }
     }
+
+    // ---- Coverage of the pairings (ADR-0004 §7) ---------------------------------
+
+    /// The seven common failures (ADR-0003, Consequences), in the order the
+    /// pairing names use.
+    const FAILURES: [&str; 7] = [
+        "rc-loss",
+        "gps-loss",
+        "battery-low",
+        "battery-critical",
+        "brain-crash",
+        "geofence",
+        "baro-loss",
+    ];
+
+    /// Which of the seven failures a scenario flies: the mechanism that
+    /// causes each one is in the file, and the reason it raises is required.
+    fn failures_in(s: &ScenarioFile) -> BTreeSet<&'static str> {
+        use crate::faults::FaultKind;
+        let e = expect_of(s);
+        let fault = |k: FaultKind| s.faults.iter().any(|f| f.kind == k);
+        let mut found = BTreeSet::new();
+        let mut add = |name: &'static str, present: bool, reason: Reasons| {
+            if present && e.reasons.contains(reason) {
+                found.insert(name);
+            }
+        };
+        add("rc-loss", fault(FaultKind::RcLoss), Reasons::NO_HUMAN_LINK);
+        add("gps-loss", fault(FaultKind::GpsLoss), Reasons::GPS_LOST);
+        add(
+            "brain-crash",
+            fault(FaultKind::BrainCrash),
+            Reasons::BRAIN_LOST,
+        );
+        add(
+            "baro-loss",
+            fault(FaultKind::BaroLoss),
+            Reasons::ESTIMATOR_UNHEALTHY,
+        );
+        // A battery failure needs a battery that runs down to its level; a
+        // fence failure needs a fence and a setpoint outside it.
+        add("battery-low", s.battery.is_some(), Reasons::BATTERY_LOW);
+        add(
+            "battery-critical",
+            s.battery.is_some(),
+            Reasons::BATTERY_CRITICAL,
+        );
+        let fence = s.params.iter().find(|(n, _)| n == "FS_FENCE_RAD");
+        let outside = fence.is_some_and(|(_, radius)| {
+            s.pilot.setpoints.iter().any(|(_, sp)| {
+                sp.is_some_and(|sp| {
+                    let (n, east) = (f64::from(sp.position.x), f64::from(sp.position.y));
+                    n * n + east * east > radius * radius
+                })
+            })
+        });
+        add("geofence", outside, Reasons::GEOFENCE);
+        found
+    }
+
+    #[test]
+    fn the_failure_detector_sees_one_failure_in_the_single_failure_files() {
+        // A control for the coverage test below: it is not vacuous.
+        for (file, failure) in [
+            ("no-human-link", "rc-loss"),
+            ("gps-loss", "gps-loss"),
+            ("battery-low", "battery-low"),
+            ("battery-critical", "battery-critical"),
+            ("brain-crash", "brain-crash"),
+            ("geofence", "geofence"),
+            ("baro-loss", "baro-loss"),
+        ] {
+            let s = by_name(file).expect("scenario");
+            assert_eq!(failures_in(&s), BTreeSet::from([failure]), "{file}");
+        }
+    }
+
+    #[test]
+    fn every_pair_of_the_seven_failures_has_a_file_that_flies_both() {
+        let mut n = 0;
+        for (i, a) in FAILURES.iter().enumerate() {
+            for b in FAILURES.iter().skip(i + 1) {
+                let name = format!("pair-{a}+{b}");
+                let s = by_name(&name).unwrap_or_else(|| panic!("no file {name}.toml"));
+                assert_eq!(
+                    failures_in(&s),
+                    BTreeSet::from([*a, *b]),
+                    "{name} does not fly exactly {a} and {b}"
+                );
+                n += 1;
+            }
+        }
+        assert_eq!(n, 21);
+        // No file named like a pairing is outside the 21.
+        assert_eq!(pairs().len(), 21);
+    }
 }
