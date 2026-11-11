@@ -4,23 +4,60 @@
 
 use oxide_core::io::NavState;
 use oxide_core::math::Vec3;
-use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
+use oxide_core::schedule::{F405_LEAN, Profile};
 use oxide_core::time::Micros;
-use oxide_sim::fault_scenarios::{FaultScenario, all, build_with_wind, by_name, fly, pairs};
+use oxide_sim::fault_scenarios::by_name;
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::outcome::{FlightOutcome, event_line};
+use oxide_sim::scenario_file::{ScenarioFile, load_path};
 use oxide_sim::wind::Gust;
 
-const PROFILES: [Profile; 2] = [F405_LEAN, H743_FULL];
+/// The fault scenarios: every file in `scenarios/` that states `[expect]`,
+/// sorted by name. The tests iterate over the directory, so a new file is
+/// flown without a change here.
+fn files() -> Vec<ScenarioFile> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("scenarios/")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|p| load_path(p).unwrap_or_else(|e| panic!("{e}")))
+        .filter(|f| f.expect.is_some())
+        .collect()
+}
+
+/// The named failures, then the pairings.
+fn named() -> Vec<ScenarioFile> {
+    files()
+        .into_iter()
+        .filter(|f| !f.name.starts_with("pair-"))
+        .collect()
+}
+
+fn pairings() -> Vec<ScenarioFile> {
+    files()
+        .into_iter()
+        .filter(|f| f.name.starts_with("pair-"))
+        .collect()
+}
+
+fn profile_of(p: oxide_sim::scenario_file::RunProfile) -> Profile {
+    p.profile()
+}
 
 /// The scenario's violations on one run, or a description of the setup error.
-fn violations(s: &FaultScenario, profile: Profile, index: u64) -> (Vec<String>, FlightOutcome) {
-    let o = fly(s, profile, index).expect("simulation setup");
-    (s.expect.check(&o), o)
+fn violations(s: &ScenarioFile, profile: Profile, index: u64) -> (Vec<String>, FlightOutcome) {
+    let o = s.fly(profile, index).expect("simulation setup");
+    let expect = s.expect.as_ref().expect("a fault scenario has [expect]");
+    (expect.check(&o), o)
 }
 
 /// What to print for a failed run.
-fn report(s: &FaultScenario, profile: Profile, index: u64, v: &[String], o: &FlightOutcome) {
+fn report(s: &ScenarioFile, profile: Profile, index: u64, v: &[String], o: &FlightOutcome) {
     eprintln!(
         "FAIL {} (index {index}, profile {})\n  about: {}",
         s.name, profile.name, s.about
@@ -36,7 +73,7 @@ fn report(s: &FaultScenario, profile: Profile, index: u64, v: &[String], o: &Fli
 
 /// Runs index 0 of each scenario on the lean profile; collects every
 /// failure before asserting, so one failing scenario does not hide others.
-fn run_quick(scenarios: &[FaultScenario]) {
+fn run_quick(scenarios: &[ScenarioFile]) {
     let results = run_indexed(scenarios.len(), 0, |i| {
         let s = &scenarios[i];
         let (v, o) = violations(s, F405_LEAN, 0);
@@ -46,7 +83,7 @@ fn run_quick(scenarios: &[FaultScenario]) {
     for (s, (v, o)) in scenarios.iter().zip(&results) {
         if !v.is_empty() {
             report(s, F405_LEAN, 0, v, o);
-            failed.push(s.name);
+            failed.push(s.name.as_str());
         }
     }
     assert!(
@@ -60,26 +97,29 @@ fn run_quick(scenarios: &[FaultScenario]) {
 
 #[test]
 fn fault_scenarios_quick() {
-    run_quick(&all());
+    run_quick(&named());
 }
 
 #[test]
 fn fault_pairs_quick() {
-    run_quick(&pairs());
+    run_quick(&pairings());
 }
 
 #[test]
-#[ignore = "10 runs x 2 profiles of every scenario and pairing; run with --release"]
+#[ignore = "every file's [run] seeds x profiles; run with --release"]
 fn fault_scenarios_full() {
-    const RUNS: usize = 10;
-    let scenarios: Vec<FaultScenario> = all().into_iter().chain(pairs()).collect();
+    let scenarios = files();
+    assert_eq!(scenarios.len(), 41);
     let mut failed = 0_usize;
     let mut failed_scenarios = Vec::new();
     for s in &scenarios {
         let mut passed = 0_usize;
         let mut total = 0_usize;
-        for &profile in &PROFILES {
-            let runs = run_indexed(RUNS, 0, |i| violations(s, profile, i as u64));
+        for &p in &s.run.profiles {
+            let profile = profile_of(p);
+            let runs = run_indexed(s.run.seeds as usize, 0, |i| {
+                violations(s, profile, i as u64)
+            });
             for (i, (v, o)) in runs.iter().enumerate() {
                 total += 1;
                 if v.is_empty() {
@@ -92,7 +132,7 @@ fn fault_scenarios_full() {
         println!("{:<40} passed {passed}/{total}", s.name);
         if passed != total {
             failed += total - passed;
-            failed_scenarios.push(s.name);
+            failed_scenarios.push(s.name.as_str());
         }
     }
     assert_eq!(
@@ -106,11 +146,11 @@ fn fault_scenarios_full() {
 #[test]
 fn fault_scenario_is_deterministic() {
     let s = by_name("brain-crash").expect("scenario");
-    let a = fly(&s, F405_LEAN, 2).expect("run");
-    let b = fly(&s, F405_LEAN, 2).expect("run");
+    let a = s.fly(F405_LEAN, 2).expect("run");
+    let b = s.fly(F405_LEAN, 2).expect("run");
     assert_eq!(a, b);
     // A different run index is a different flight (different wind).
-    let c = fly(&s, F405_LEAN, 3).expect("run");
+    let c = s.fly(F405_LEAN, 3).expect("run");
     assert_ne!(a.position_at_end, c.position_at_end);
 }
 
@@ -130,20 +170,21 @@ fn landing_thrust_is_not_cut_in_the_air_in_wind() {
         for air in ["still", "up-wind", "up-gust-wind"] {
             let s = by_name(name).expect("scenario");
             for index in 0..10_u64 {
-                let mut sim = build_with_wind(&s, F405_LEAN, index, |mut w| {
-                    match air {
-                        "up-wind" => w.steady_ned.z = -3.0,
-                        "up-gust-wind" => w.gusts.push(Gust {
-                            start_s: 20.0,
-                            duration_s: 15.0,
-                            peak_ned: Vec3::new(0.0, 0.0, -6.0),
-                        }),
-                        _ => {}
-                    }
-                    w
-                })
-                .expect("simulation setup");
-                let end = Micros((s.script.duration_s * 1e6).round() as u64);
+                let mut sim = s
+                    .build_with_wind(F405_LEAN, index, |mut w| {
+                        match air {
+                            "up-wind" => w.steady_ned.z = -3.0,
+                            "up-gust-wind" => w.gusts.push(Gust {
+                                start_s: 20.0,
+                                duration_s: 15.0,
+                                peak_ned: Vec3::new(0.0, 0.0, -6.0),
+                            }),
+                            _ => {}
+                        }
+                        w
+                    })
+                    .expect("simulation setup");
+                let end = Micros((s.duration_s * 1e6).round() as u64);
                 let mut landing_seen = false;
                 sim.run_until(end, |r| {
                     let landing = matches!(

@@ -104,8 +104,6 @@ use crate::sim::{SimOptions, Simulation, apply_param};
 use crate::wind::{Gust, WindConfig};
 
 #[cfg(test)]
-mod export;
-#[cfg(test)]
 mod tests;
 
 /// The airframe every scenario flies until files can name another.
@@ -348,7 +346,21 @@ impl ScenarioFile {
 
     /// The simulation options of run `index`, for `airframe`.
     pub fn options(&self, airframe: &Airframe, index: u64) -> SimOptions {
+        self.options_with(airframe, index, &[])
+    }
+
+    /// Like [`options`](Self::options), with `extra` parameter overrides
+    /// applied after the file's own `[params]` (the command line, ADR-0004
+    /// §5).
+    pub fn options_with(
+        &self,
+        airframe: &Airframe,
+        index: u64,
+        extra: &[(String, f64)],
+    ) -> SimOptions {
         let seed = self.seed(index);
+        let mut params = self.params.clone();
+        params.extend_from_slice(extra);
         SimOptions {
             seed,
             sensors: self.sensors.config(),
@@ -358,7 +370,7 @@ impl ScenarioFile {
             links: self.links,
             failsafe: None,
             battery: self.battery.map(|b| b.apply(&airframe.battery)),
-            params: self.params.clone(),
+            params,
         }
     }
 
@@ -368,8 +380,41 @@ impl ScenarioFile {
         profile: Profile,
         index: u64,
     ) -> core::result::Result<Simulation<Script, ROTORS>, SimError> {
+        self.build_with(profile, index, |w| w, &[])
+    }
+
+    /// Like [`build`](Self::build), with `adjust` applied to the run's wind
+    /// (for example to add an updraft).
+    pub fn build_with_wind(
+        &self,
+        profile: Profile,
+        index: u64,
+        adjust: impl FnOnce(WindConfig) -> WindConfig,
+    ) -> core::result::Result<Simulation<Script, ROTORS>, SimError> {
+        self.build_with(profile, index, adjust, &[])
+    }
+
+    /// Like [`build`](Self::build), with parameter overrides by name
+    /// (ADR-0004) applied after the file's own.
+    pub fn build_with_params(
+        &self,
+        profile: Profile,
+        index: u64,
+        params: &[(String, f64)],
+    ) -> core::result::Result<Simulation<Script, ROTORS>, SimError> {
+        self.build_with(profile, index, |w| w, params)
+    }
+
+    fn build_with(
+        &self,
+        profile: Profile,
+        index: u64,
+        adjust: impl FnOnce(WindConfig) -> WindConfig,
+        params: &[(String, f64)],
+    ) -> core::result::Result<Simulation<Script, ROTORS>, SimError> {
         let airframe = Airframe::reference_quad()?;
-        let options = self.options(&airframe, index);
+        let mut options = self.options_with(&airframe, index, params);
+        options.wind = adjust(options.wind);
         Simulation::<_, ROTORS>::with_options(&airframe, profile, self.pilot.clone(), options)
     }
 

@@ -87,10 +87,11 @@ fn setpoint_heights_are_up_positive() {
     assert_eq!(sp.velocity, Vec3::zero());
 }
 
-// ---- The exporter ------------------------------------------------------------
+// ---- The files in scenarios/ -----------------------------------------------------
 
-use super::export;
 use crate::fault_scenarios;
+use crate::scenario::{GustHold, HoverStep, gust_hold};
+use oxide_core::schedule::{F405_LEAN, H743_FULL};
 
 /// The directory of the scenario files in the repository.
 fn scenario_dir() -> std::path::PathBuf {
@@ -98,44 +99,23 @@ fn scenario_dir() -> std::path::PathBuf {
 }
 
 #[test]
-fn exported_files_load_back_to_the_same_scenario() {
-    let files = export::all_files();
-    assert_eq!(files.len(), 43);
-    for f in files {
-        let text = export::to_toml(&f);
-        let back = load_str(&text).unwrap_or_else(|e| panic!("{}: {e}\n{text}", f.name));
-        assert_eq!(back, f, "{}", f.name);
-        assert_eq!(export::to_toml(&back), text, "{}", f.name);
-    }
-}
-
-#[test]
-fn a_file_carries_what_the_rust_definition_carries() {
-    for s in fault_scenarios::all()
-        .iter()
-        .chain(fault_scenarios::pairs().iter())
-    {
-        let f = load_str(&export::to_toml(&export::from_fault_scenario(s))).expect("loads");
-        assert_eq!(f.name, s.name);
-        assert_eq!(f.about, s.about);
-        assert_eq!(f.pilot, s.script, "{}", s.name);
-        assert_eq!(f.faults, s.faults, "{}", s.name);
-        assert_eq!(f.links, s.links, "{}", s.name);
-        assert_eq!(f.expect.as_ref(), Some(&s.expect), "{}", s.name);
-        let battery = Airframe::reference_quad().expect("airframe").battery;
+fn every_file_in_scenarios_loads_and_is_named_after_its_file() {
+    let mut n = 0;
+    for entry in std::fs::read_dir(scenario_dir()).expect("scenarios/") {
+        let path = entry.expect("entry").path();
+        let f = load_path(&path).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            f.battery.map(|b| b.apply(&battery)),
-            s.battery.clone(),
-            "{}",
-            s.name
+            path.file_stem().and_then(|s| s.to_str()),
+            Some(f.name.as_str())
         );
+        n += 1;
     }
+    assert_eq!(n, 43);
 }
 
 #[test]
-fn failsafe_overrides_become_named_parameters() {
-    let s = fault_scenarios::by_name("pair-rc-loss+geofence").expect("pair");
-    let f = export::from_fault_scenario(&s);
+fn failsafe_overrides_are_named_parameters_in_the_file() {
+    let f = fault_scenarios::by_name("pair-rc-loss+geofence").expect("pair");
     assert_eq!(
         f.params,
         vec![
@@ -144,42 +124,26 @@ fn failsafe_overrides_become_named_parameters() {
             ("FS_NOLINK_RTL".to_string(), 5.0),
         ]
     );
-    let none =
-        export::from_fault_scenario(&fault_scenarios::by_name("gcs-loss").expect("scenario"));
+    let none = fault_scenarios::by_name("gcs-loss").expect("scenario");
     assert!(none.params.is_empty());
 }
 
 #[test]
 fn computed_battery_sizes_are_written_as_literals() {
-    let f = export::from_fault_scenario(
-        &fault_scenarios::by_name("pair-battery-low+battery-critical").expect("pair"),
-    );
-    let text = export::to_toml(&f);
+    let f = fault_scenarios::by_name("pair-battery-low+battery-critical").expect("pair");
+    let b = f.battery.expect("a battery override");
     // 500 mAh; 0.05 + 0.0048 * (15 - 3 - 3) in f64.
-    assert!(text.contains("capacity_mah = 500.0"), "{text}");
-    let soc = 0.05 + 0.0048 * (15.0 - 3.0 - 3.0);
-    assert!(
-        text.contains(&format!("initial_state_of_charge = {soc:?}")),
-        "{text}"
+    assert_eq!(b.capacity_mah, Some(500.0));
+    assert_eq!(
+        b.initial_state_of_charge,
+        Some(0.05 + 0.0048 * (15.0 - 3.0 - 3.0))
     );
-}
-
-/// Rewrites `scenarios/` from the Rust definitions:
-/// `cargo test -p oxide-sim --lib regenerate_scenario_files -- --ignored`.
-#[test]
-#[ignore = "writes the files in scenarios/"]
-fn regenerate_scenario_files() {
-    let dir = scenario_dir();
-    std::fs::create_dir_all(&dir).expect("create scenarios/");
-    for f in export::all_files() {
-        std::fs::write(dir.join(format!("{}.toml", f.name)), export::to_toml(&f)).expect("write");
-    }
 }
 
 #[test]
 fn parameters_are_applied_in_name_order_whatever_the_file_order() {
     // The TOML reader hands a table over sorted by key, not in file order, so
-    // the order that counts is the name order; the exporter writes it.
+    // the order that counts is the name order.
     let s = load_str(
         "name = \"x\"\nduration_s = 5.0\n[params]\nFS_NOLINK_RTL = 5.0\nFS_GPS_LAND = 10.0\nEKF_HGT_TMO = 2\n",
     );
@@ -193,33 +157,7 @@ fn parameters_are_applied_in_name_order_whatever_the_file_order() {
     assert_eq!(names, ["FS_GPS_LAND", "FS_NOLINK_RTL"]);
 }
 
-#[test]
-fn the_files_in_scenarios_are_what_the_exporter_writes() {
-    let dir = scenario_dir();
-    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-        .expect("scenarios/ exists")
-        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .collect();
-    on_disk.sort();
-    let mut expected: Vec<String> = Vec::new();
-    for f in export::all_files() {
-        let name = format!("{}.toml", f.name);
-        let text = std::fs::read_to_string(dir.join(&name))
-            .unwrap_or_else(|e| panic!("{name}: {e} (run the regenerate_scenario_files test)"));
-        assert_eq!(text, export::to_toml(&f), "{name} is out of date");
-        expected.push(name);
-    }
-    expected.sort();
-    assert_eq!(
-        on_disk, expected,
-        "files in scenarios/ and scenarios defined in code differ"
-    );
-}
-
 // ---- hover-step and gust-hold ---------------------------------------------------
-
-use crate::scenario::{GustHold, HoverStep, gust_hold};
-use oxide_core::schedule::{F405_LEAN, H743_FULL};
 
 /// Hash of the Rust `HoverStep` flight (seed 0, ideal sensors, true state).
 fn hover_step_hash(profile: Profile) -> u64 {
@@ -238,7 +176,8 @@ fn file_hash(f: &ScenarioFile, profile: Profile, index: u64) -> u64 {
 
 #[test]
 fn hover_step_as_a_script_flies_the_same_flight() {
-    let f = export::from_hover_step(&HoverStep::default());
+    let f = fault_scenarios::by_name("hover-step").expect("hover-step");
+    assert_eq!(f.duration_s, HoverStep::default().duration_s);
     // The hashes `oxide-sim hash` prints.
     assert_eq!(hover_step_hash(F405_LEAN), 0x3de1_6d7a_9847_deaf);
     assert_eq!(hover_step_hash(H743_FULL), 0x9ff0_2684_5c34_2fbd);
@@ -258,7 +197,8 @@ fn hover_step_as_a_script_flies_the_same_flight() {
 
 #[test]
 fn gust_hold_as_a_script_flies_the_same_flight() {
-    let f = export::from_gust_hold(&GustHold::default());
+    let f = fault_scenarios::by_name("gust-hold").expect("gust-hold");
+    assert_eq!(f.duration_s, GustHold::default().duration_s);
     let airframe = Airframe::reference_quad().expect("airframe");
     for profile in [F405_LEAN, H743_FULL] {
         for index in 0..2 {

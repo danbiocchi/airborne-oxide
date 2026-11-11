@@ -1,150 +1,150 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The scenario files in `scenarios/` against the Rust definitions they were
-//! exported from (ADR-0004 §7): same flight, bit for bit.
+//! The scenario files in `scenarios/` are the only definition of the 43
+//! scenarios (ADR-0004 §7). Task S1 proved that each file flies the same
+//! flight as the Rust definition it was exported from; the definitions are
+//! gone, so the trace hashes of those flights are pinned in
+//! `tests/data/scenario_hashes.txt` and every file must still produce them.
+//! A change that moves a hash moves a flight: it is a decision, not a
+//! side effect. Regenerate the table only for such a decision:
+//! `cargo test --release -p oxide-sim --test scenario_files -- --ignored
+//! regenerate_scenario_hashes`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
-use oxide_sim::fault_scenarios::{self, FaultScenario};
-use oxide_sim::metrics::HoldCriteria;
 use oxide_sim::montecarlo::run_indexed;
-use oxide_sim::scenario::{GUST_HOLD_ID, HoverStep, gust_hold};
 use oxide_sim::scenario_file::{self, ScenarioFile};
-use oxide_sim::{Airframe, Simulation};
 
-fn load(name: &str) -> ScenarioFile {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scenarios")
-        .join(format!("{name}.toml"));
-    let f = scenario_file::load_path(&path).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(f.name, name, "the file name and the name key differ");
-    f
+const TABLE: &str = "tests/data/scenario_hashes.txt";
+
+/// The flights pinned for every file: profile and run index.
+fn cases() -> [(Profile, u64); 3] {
+    [(F405_LEAN, 0), (F405_LEAN, 1), (H743_FULL, 0)]
 }
 
-/// What the Rust definition of a scenario says.
-enum Definition {
-    Fault(Box<FaultScenario>),
-    HoverStep,
-    GustHold,
+fn dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios")
 }
 
-fn definitions() -> Vec<(String, Definition)> {
-    let mut out = vec![
-        ("hover-step".to_string(), Definition::HoverStep),
-        (GUST_HOLD_ID.to_string(), Definition::GustHold),
-    ];
-    for s in fault_scenarios::all()
-        .into_iter()
-        .chain(fault_scenarios::pairs())
-    {
-        out.push((s.name.to_string(), Definition::Fault(Box::new(s))));
-    }
-    out
+/// Every file in `scenarios/`, sorted by name.
+fn files() -> Vec<ScenarioFile> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir())
+        .expect("scenarios/")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|p| scenario_file::load_path(p).unwrap_or_else(|e| panic!("{e}")))
+        .collect()
 }
 
-/// The trace hash of the flight built from the Rust definition.
-fn definition_hash(d: &Definition, profile: Profile, index: u64) -> u64 {
-    let airframe = Airframe::reference_quad().expect("airframe");
-    match d {
-        Definition::Fault(s) => {
-            let mut sim = fault_scenarios::build(s, profile, index).expect("builds");
-            sim.run_until(Micros((s.script.duration_s * 1e6).round() as u64), |_| {});
-            sim.trace_hash()
-        }
-        Definition::HoverStep => {
-            let pilot = HoverStep::default();
-            let end = Micros((pilot.duration_s * 1e6).round() as u64);
-            let mut sim = Simulation::<_, 4>::new(&airframe, profile, pilot).expect("builds");
-            sim.run_until(end, |_| {});
-            sim.trace_hash()
-        }
-        Definition::GustHold => {
-            let (pilot, options) = gust_hold(index);
-            let end = Micros((pilot.duration_s * 1e6).round() as u64);
-            let mut sim = Simulation::<_, 4>::with_options(&airframe, profile, pilot, options)
-                .expect("builds");
-            sim.run_until(end, |_| {});
-            sim.trace_hash()
-        }
-    }
-}
-
-fn file_hash(f: &ScenarioFile, profile: Profile, index: u64) -> u64 {
+fn flight_hash(f: &ScenarioFile, profile: Profile, index: u64) -> u64 {
     let mut sim = f.build(profile, index).expect("builds");
     sim.run_until(Micros((f.duration_s * 1e6).round() as u64), |_| {});
     sim.trace_hash()
 }
 
-/// What the file says must equal what the definition says.
-fn check_data(name: &str, f: &ScenarioFile, d: &Definition) {
-    match d {
-        Definition::Fault(s) => {
-            assert_eq!(f.expect.as_ref(), Some(&s.expect), "{name}: expect");
-            assert_eq!(f.hold, None, "{name}: hold");
-            assert_eq!(f.pilot, s.script, "{name}: pilot");
-            assert_eq!(f.faults, s.faults, "{name}: faults");
-            assert_eq!(f.links, s.links, "{name}: links");
-            assert_eq!(f.about, s.about, "{name}: about");
-        }
-        Definition::HoverStep => {
-            assert_eq!(f.expect, None, "{name}: expect");
-            assert_eq!(f.hold, None, "{name}: hold");
-        }
-        Definition::GustHold => {
-            assert_eq!(f.expect, None, "{name}: expect");
-            assert_eq!(f.hold, Some(HoldCriteria::default()), "{name}: hold");
-        }
-    }
+/// `name profile index hash` for each file and case, in file order.
+fn pinned() -> Vec<(String, String, u64, u64)> {
+    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(TABLE))
+        .expect("the pinned hashes");
+    text.lines()
+        .map(|l| {
+            let w: Vec<&str> = l.split(' ').collect();
+            assert_eq!(w.len(), 4, "bad line {l:?}");
+            (
+                w[0].to_string(),
+                w[1].to_string(),
+                w[2].parse().expect("index"),
+                u64::from_str_radix(w[3], 16).expect("hash"),
+            )
+        })
+        .collect()
 }
 
-/// Flies every scenario on each `(profile, index)` of `cases` from the file
-/// and from the definition and collects the differences.
-fn compare(cases: &[(Profile, u64)]) {
-    let defs = definitions();
-    assert_eq!(defs.len(), 43);
-    let jobs: Vec<(usize, Profile, u64)> = (0..defs.len())
-        .flat_map(|i| cases.iter().map(move |&(p, k)| (i, p, k)))
+/// Flies `pinned` entries selected by `keep` and compares.
+fn check(keep: impl Fn(&str, u64) -> bool + Sync) {
+    let files = files();
+    assert_eq!(files.len(), 43);
+    let jobs: Vec<_> = pinned()
+        .into_iter()
+        .filter(|(_, p, i, _)| keep(p, *i))
         .collect();
     let results = run_indexed(jobs.len(), 0, |j| {
-        let (i, profile, index) = jobs[j];
-        let (name, def) = &defs[i];
-        let f = load(name);
-        check_data(name, &f, def);
-        (
-            file_hash(&f, profile, index),
-            definition_hash(def, profile, index),
-        )
+        let (name, profile, index, _) = &jobs[j];
+        let f = files.iter().find(|f| &f.name == name).expect("file");
+        let profile = cases()
+            .iter()
+            .map(|c| c.0)
+            .find(|p| p.name == profile)
+            .expect("profile");
+        flight_hash(f, profile, *index)
     });
-    let mut bad = Vec::new();
-    for ((i, profile, index), (from_file, from_code)) in jobs.iter().zip(results) {
-        if from_file != from_code {
-            bad.push(format!(
-                "{} on {} index {index}: file {from_file:016x}, definition {from_code:016x}",
-                defs[*i].0, profile.name
-            ));
-        }
-    }
+    let bad: Vec<String> = jobs
+        .iter()
+        .zip(results)
+        .filter(|((_, _, _, want), got)| want != got)
+        .map(|((n, p, i, want), got)| {
+            format!("{n} on {p} index {i}: pinned {want:016x}, flown {got:016x}")
+        })
+        .collect();
     assert!(
         bad.is_empty(),
-        "{} flights differ:\n{}",
+        "{} flights moved:\n{}",
         bad.len(),
         bad.join("\n")
     );
 }
 
-/// The quick form of the proof: every file on the lean profile, index 0. The
-/// full form below adds index 1 and the H743 profile.
 #[test]
-fn every_scenario_file_flies_the_same_flight_as_its_definition() {
-    compare(&[(F405_LEAN, 0)]);
+fn the_pinned_table_covers_every_file_and_case() {
+    let files = files();
+    let table = pinned();
+    assert_eq!(table.len(), files.len() * cases().len());
+    for f in &files {
+        for (p, i) in cases() {
+            assert!(
+                table
+                    .iter()
+                    .any(|(n, tp, ti, _)| *n == f.name && tp == p.name && *ti == i),
+                "{} {} {i} is not pinned",
+                f.name,
+                p.name
+            );
+        }
+    }
 }
 
-/// The proof: f405 index 0 and 1, h743 index 0, all 43 scenarios. About a
-/// minute in the test profile: `cargo test --release -p oxide-sim --test
-/// scenario_files -- --ignored`.
+/// Quick form: every file on the lean profile, index 0.
 #[test]
-#[ignore = "the full sweep takes about a minute"]
-fn every_scenario_file_flies_the_same_flight_as_its_definition_full() {
-    compare(&[(F405_LEAN, 0), (F405_LEAN, 1), (H743_FULL, 0)]);
+fn every_scenario_file_still_flies_its_pinned_flight() {
+    check(|p, i| p == F405_LEAN.name && i == 0);
+}
+
+/// Full form: f405 index 0 and 1, h743 index 0.
+#[test]
+#[ignore = "the full sweep takes about a minute in release"]
+fn every_scenario_file_still_flies_its_pinned_flight_full() {
+    check(|_, _| true);
+}
+
+#[test]
+#[ignore = "rewrites the pinned table: only for a decided change of a flight"]
+fn regenerate_scenario_hashes() {
+    let files = files();
+    let jobs: Vec<(usize, Profile, u64)> = (0..files.len())
+        .flat_map(|i| cases().into_iter().map(move |(p, k)| (i, p, k)))
+        .collect();
+    let hashes = run_indexed(jobs.len(), 0, |j| {
+        let (i, p, k) = jobs[j];
+        flight_hash(&files[i], p, k)
+    });
+    let mut out = String::new();
+    for ((i, p, k), h) in jobs.iter().zip(hashes) {
+        out.push_str(&format!("{} {} {k} {h:016x}\n", files[*i].name, p.name));
+    }
+    std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join(TABLE), out).expect("write");
 }

@@ -444,11 +444,8 @@ fn fault_hash_lines_with(
     for name in HASHED_FAULT_SCENARIOS {
         let scenario = fault_scenarios::by_name(name)
             .ok_or_else(|| format!("hashed fault scenario {name} does not exist"))?;
-        let mut sim = fault_scenarios::build_with_params(&scenario, profile, 0, params)?;
-        sim.run_until(
-            Micros((scenario.script.duration_s * 1e6).round() as u64),
-            |_| {},
-        );
+        let mut sim = scenario.build_with_params(profile, 0, params)?;
+        sim.run_until(Micros((scenario.duration_s * 1e6).round() as u64), |_| {});
         lines.push(format!(
             "{} {}#0 {:016x}",
             profile.name,
@@ -636,7 +633,7 @@ fn scenario_command(
         }
     }
     let params = collect_params(params_file.as_deref(), param_flags)?;
-    let mut sim = fault_scenarios::build_with_params(&scenario, profile, index, &params)?;
+    let mut sim = scenario.build_with_params(profile, index, &params)?;
     let mut csv = match &csv_path {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
@@ -647,7 +644,7 @@ fn scenario_command(
     };
     let mut outcome = FlightOutcome::new();
     let mut io_error = None;
-    let end = Micros((scenario.script.duration_s * 1e6).round() as u64);
+    let end = Micros((scenario.duration_s * 1e6).round() as u64);
     sim.run_until(end, |r| {
         outcome.add(r);
         if let Some(f) = csv.as_mut()
@@ -701,7 +698,10 @@ fn scenario_command(
             .map_or("-".into(), |t| format!("{t:.2} s"))
     );
     println!("trace hash {:016x}", sim.trace_hash());
-    let violations = scenario.expect.check(&outcome);
+    let violations = scenario
+        .expect
+        .as_ref()
+        .map_or_else(Vec::new, |e| e.check(&outcome));
     if violations.is_empty() {
         println!("result     PASS");
     } else {
