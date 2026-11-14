@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::flash::{Flash, FlashError};
 use crate::sim::{BitCut, SimFlash};
-use crate::store::{Error, MountReport, Store};
+use crate::store::{Error, MountReport, Replaced, Store};
 
 /// Six record slots per sector: (88 - 16) / 12.
 const SMALL: usize = 16 + 12 * 6;
@@ -1058,6 +1058,330 @@ fn power_cut_during_format_leaves_a_mountable_flash_and_a_second_format_finishes
         assert_eq!(s.get(9).unwrap(), Some(9));
     }
     eprintln!("format: {} cut points", cuts.len());
+}
+
+// ------------------------------------------------------------- replace_all
+
+fn pairs(m: &[(u32, u32)]) -> impl Iterator<Item = (u32, u32)> + Clone + '_ {
+    m.iter().copied()
+}
+
+#[test]
+fn replace_all_with_nothing_to_change_writes_nothing() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    assert_eq!(s.replace_all(pairs(&[])), Ok(Replaced::Unchanged));
+    s.set(1, 10).unwrap();
+    s.set(2, 20).unwrap();
+    s.set(1, 11).unwrap();
+    let events = s.flash_mut().events();
+    assert_eq!(
+        s.replace_all(pairs(&[(2, 20), (1, 11)])),
+        Ok(Replaced::Unchanged)
+    );
+    assert_eq!(s.flash_mut().events(), events, "nothing was written");
+    assert_eq!(contents(&s), Model::from([(1, 11), (2, 20)]));
+}
+
+#[test]
+fn replace_all_with_one_difference_appends_one_record() {
+    for (wanted, want) in [
+        // A changed value, a new key, a removed key.
+        (vec![(1, 99), (2, 20)], Model::from([(1, 99), (2, 20)])),
+        (
+            vec![(1, 11), (2, 20), (3, 30)],
+            Model::from([(1, 11), (2, 20), (3, 30)]),
+        ),
+        (vec![(1, 11)], Model::from([(1, 11)])),
+        // A value that is 0, and the same key and value as a removed one.
+        (vec![(1, 11), (2, 0)], Model::from([(1, 11), (2, 0)])),
+    ] {
+        let mut f = fresh();
+        let (mut s, _) = Store::mount(&mut f).unwrap();
+        s.set(1, 11).unwrap();
+        s.set(2, 20).unwrap();
+        let events = s.flash_mut().events();
+        let erases = s.erase_count();
+        assert_eq!(
+            s.replace_all(pairs(&wanted)),
+            Ok(Replaced::Appended),
+            "{wanted:?}"
+        );
+        assert_eq!(
+            s.flash_mut().events(),
+            events + 12,
+            "{wanted:?}: one record"
+        );
+        assert_eq!(s.erase_count(), erases, "{wanted:?}");
+        assert_matches(&s, &want, &format!("{wanted:?}"));
+        let (s, r) = Store::mount(&mut f).unwrap();
+        assert_eq!(r, MountReport::Clean);
+        assert_matches(&s, &want, &format!("{wanted:?} remounted"));
+    }
+}
+
+#[test]
+fn replace_all_with_a_single_change_on_a_full_sector_compacts_as_an_append_may() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    for k in 1..=6 {
+        s.set(k, k).unwrap();
+    }
+    assert_eq!(s.erase_count(), 0);
+    let wanted = [(1, 1), (2, 2), (3, 3), (4, 44), (5, 5), (6, 6)];
+    assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Appended));
+    assert_eq!(s.erase_count(), 1, "the append compacted");
+    assert_eq!(contents(&s), wanted.iter().copied().collect::<Model>());
+}
+
+#[test]
+fn replace_all_with_several_differences_writes_a_fresh_sector() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    s.set(1, 10).unwrap();
+    s.set(2, 20).unwrap();
+    s.set(1, 11).unwrap();
+    s.set(9, 90).unwrap(); // a key the caller does not know
+    let wanted = [(1, 12), (2, 20), (3, 30)];
+    assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Rewritten));
+    assert_eq!(s.erase_count(), 1);
+    assert_eq!(s.get(9), Ok(None), "an unknown key is removed");
+    assert_eq!(contents(&s), wanted.iter().copied().collect::<Model>());
+    assert_eq!(s.flash_mut().total_erases(), 1);
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Clean);
+    assert_eq!(contents(&s), wanted.iter().copied().collect::<Model>());
+    // The superseded sector was retired, so only one sector is live.
+    assert_eq!(s.erase_count(), 1);
+}
+
+#[test]
+fn erase_count_rises_by_one_per_rewrite() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    for i in 0..5_u32 {
+        let wanted = [(1, i), (2, i + 100), (3, 3)];
+        assert_eq!(
+            s.replace_all(pairs(&wanted)),
+            Ok(Replaced::Rewritten),
+            "{i}"
+        );
+        assert_eq!(s.erase_count(), i + 1);
+        assert_eq!(s.flash_mut().total_erases(), i + 1);
+    }
+}
+
+#[test]
+fn removing_two_unknown_keys_is_a_rewrite_and_removing_one_is_a_tombstone() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    for k in [1, 2, 3, 98, 99] {
+        s.set(k, k).unwrap();
+    }
+    let wanted = [(1, 1), (2, 2), (3, 3), (98, 98)];
+    assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Appended));
+    assert_eq!(s.get(99), Ok(None));
+    let wanted = [(1, 1), (2, 2)];
+    assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Rewritten));
+    assert_eq!(contents(&s), wanted.iter().copied().collect::<Model>());
+    assert_eq!(s.replace_all(pairs(&[])), Ok(Replaced::Rewritten));
+    assert_eq!(contents(&s), Model::new());
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!((r, contents(&s)), (MountReport::Clean, Model::new()));
+}
+
+#[test]
+fn more_pairs_than_slots_is_full_before_anything_is_erased() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    s.set(1, 1).unwrap();
+    let events = s.flash_mut().events();
+    let wanted: Vec<(u32, u32)> = (1..=7).map(|k| (k, k)).collect();
+    assert_eq!(s.replace_all(pairs(&wanted)), Err(Error::Full));
+    assert_eq!(s.flash_mut().events(), events, "nothing written or erased");
+    assert_eq!(contents(&s), Model::from([(1, 1)]));
+    // Not a failure of the flash: the store is still usable.
+    s.set(2, 2).unwrap();
+    let wanted: Vec<(u32, u32)> = (1..=6).map(|k| (k, k + 1)).collect();
+    assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Rewritten));
+    assert_eq!(contents(&s), wanted.iter().copied().collect::<Model>());
+}
+
+#[test]
+fn replace_all_on_a_corrupt_store_is_refused_until_format() {
+    let mut f = fresh();
+    f.bytes_mut(0).unwrap()[60] = 0;
+    let (mut s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Corrupt);
+    assert_eq!(s.replace_all(pairs(&[(1, 1)])), Err(Error::Corrupt));
+    assert_eq!(s.replace_all(pairs(&[])), Err(Error::Corrupt));
+    s.format().unwrap();
+    assert_eq!(s.replace_all(pairs(&[(1, 1)])), Ok(Replaced::Appended));
+}
+
+/// The values a script of `replace_all` calls leaves behind, in order. Each
+/// changes several keys, except the fifth, which changes one key of a full
+/// sector (and so compacts).
+const REPLACE_SCRIPT: [&[(u32, u32)]; 7] = [
+    &[(1, 10), (2, 20), (3, 30)],
+    &[(1, 11), (2, 20), (4, 40)],
+    &[(1, 11), (2, 20), (4, 40), (5, 50)],
+    &[(1, 12), (2, 21), (4, 40), (5, 50), (6, 60), (u32::MAX, 0)],
+    &[(1, 12), (2, 21), (4, 41), (5, 50), (6, 60), (u32::MAX, 0)],
+    &[(1, 12), (2, 21), (4, 41), (5, 50), (6, 60), (7, 7)],
+    &[],
+];
+
+fn model_of(p: &[(u32, u32)]) -> Model {
+    p.iter().copied().collect()
+}
+
+/// Runs the script with `cut`; returns the call that was interrupted.
+fn run_replace_with_cut(flash: &mut Small, cut: Option<Cut>) -> Option<usize> {
+    let (mut s, _) = Store::mount(&mut *flash).unwrap();
+    if let Some(cut) = cut {
+        cut.arm(s.flash_mut());
+    }
+    for (i, w) in REPLACE_SCRIPT.iter().enumerate() {
+        match s.replace_all(pairs(w)) {
+            Ok(_) => {}
+            Err(Error::Flash(FlashError::PowerLoss)) => return Some(i),
+            Err(e) => panic!("unexpected {e:?} at call {i}"),
+        }
+    }
+    None
+}
+
+#[test]
+fn replace_all_outcomes_of_the_script_are_as_designed() {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    let got: Vec<_> = REPLACE_SCRIPT
+        .iter()
+        .map(|w| s.replace_all(pairs(w)).unwrap())
+        .collect();
+    use Replaced::{Appended, Rewritten};
+    assert_eq!(
+        got,
+        [
+            Rewritten, Rewritten, Appended, Rewritten, Appended, Rewritten, Rewritten
+        ]
+    );
+    assert_eq!(contents(&s), Model::new());
+}
+
+#[test]
+fn power_cut_at_every_point_of_a_script_of_replace_all_leaves_the_old_or_the_new_set() {
+    let t = Instant::now();
+    let mut base = fresh();
+    let _ = Store::mount(&mut base).unwrap();
+    let plan = plan_of(&base, |s| {
+        for w in REPLACE_SCRIPT {
+            s.replace_all(pairs(w)).unwrap();
+        }
+    });
+    assert!(plan.erases() >= 4);
+    let mut cuts = plan.byte_cuts(ERASE_SEEDS);
+    cuts.extend(plan.bit_cuts(CALL_SEEDS));
+    let sets: Vec<Model> = std::iter::once(Model::new())
+        .chain(REPLACE_SCRIPT.iter().map(|w| model_of(w)))
+        .collect();
+    let (mut old_seen, mut new_seen) = (0_u64, 0_u64);
+    for &cut in &cuts {
+        let ctx = format!("{cut:?}");
+        let mut flash = base.clone();
+        let j = run_replace_with_cut(&mut flash, Some(cut)).unwrap_or_else(|| panic!("{ctx}"));
+        assert!(flash.is_dead(), "{ctx}");
+        flash.restore_power();
+        let (mut s, r) = Store::mount(&mut flash).unwrap_or_else(|e| panic!("mount {e} ({ctx})"));
+        assert_ne!(r, MountReport::Corrupt, "{ctx}");
+        let (before, after) = (&sets[j], &sets[j + 1]);
+        // The whole content: the set before the call or the set after it.
+        let seen = contents(&s);
+        assert!(
+            &seen == before || &seen == after,
+            "{ctx}: call {j}: {seen:?} is neither {before:?} nor {after:?}"
+        );
+        if &seen == before {
+            old_seen += 1;
+        } else {
+            new_seen += 1;
+        }
+        assert_matches(&s, &seen, &ctx);
+        // A following replace_all works, to the set the call was after and to
+        // another one.
+        s.replace_all(pairs(REPLACE_SCRIPT[j]))
+            .unwrap_or_else(|e| panic!("replace after cut: {e} ({ctx})"));
+        assert_matches(&s, after, &ctx);
+        let other = [(1, 77), (8, 8), (u32::MAX, 5)];
+        s.replace_all(pairs(&other))
+            .unwrap_or_else(|e| panic!("second replace after cut: {e} ({ctx})"));
+        assert_matches(&s, &model_of(&other), &ctx);
+        let (s, r) = Store::mount(&mut flash).unwrap();
+        assert_ne!(r, MountReport::Corrupt, "{ctx}");
+        assert_eq!(contents(&s), model_of(&other), "{ctx}");
+    }
+    eprintln!(
+        "replace_all script: {} events in {} program calls, {} erases; {} cut points ({} byte-prefix); \
+         old set seen {old_seen}, new set seen {new_seen}; {:?}",
+        plan.is_erase.len(),
+        plan.call_bits.len(),
+        plan.erases(),
+        cuts.len(),
+        plan.byte_cuts(ERASE_SEEDS).len(),
+        t.elapsed()
+    );
+    assert!(old_seen > 0 && new_seen > 0);
+}
+
+#[test]
+fn a_second_cut_during_the_recovery_of_a_cut_replace_all_is_survived_too() {
+    // The first cut leaves the store with the old or the new set; cutting the
+    // next replace_all anywhere (byte-prefix and seeded subsets) leaves the
+    // old or the new set of *that* call.
+    let mut base = fresh();
+    let _ = Store::mount(&mut base).unwrap();
+    let plan = plan_of(&base, |s| {
+        for w in REPLACE_SCRIPT {
+            s.replace_all(pairs(w)).unwrap();
+        }
+    });
+    let mut first = plan.byte_cuts(2);
+    first.extend(plan.seeded_cuts(2));
+    let target = [(1, 5), (2, 6), (3, 7), (4, 8)];
+    for (n, &cut) in first.iter().enumerate() {
+        let mut flash = base.clone();
+        run_replace_with_cut(&mut flash, Some(cut)).unwrap();
+        flash.restore_power();
+        let seen = {
+            let (s, _) = Store::mount(&mut flash).unwrap();
+            contents(&s)
+        };
+        let plan2 = plan_of(&flash, |s| {
+            s.replace_all(pairs(&target)).unwrap();
+        });
+        let mut second = plan2.byte_cuts(2);
+        second.extend(plan2.seeded_cuts(2));
+        for (i, &cut2) in second.iter().enumerate() {
+            if (i + n) % 3 != 0 {
+                continue;
+            }
+            let mut f2 = flash.clone();
+            {
+                let (mut s, _) = Store::mount(&mut f2).unwrap();
+                cut2.arm(s.flash_mut());
+                assert!(s.replace_all(pairs(&target)).is_err(), "{cut:?} {cut2:?}");
+            }
+            f2.restore_power();
+            let (s, r) = Store::mount(&mut f2).unwrap();
+            assert_ne!(r, MountReport::Corrupt, "{cut:?} {cut2:?}");
+            let got = contents(&s);
+            assert!(
+                got == seen || got == model_of(&target),
+                "{cut:?} then {cut2:?}: {got:?}"
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------ random testing

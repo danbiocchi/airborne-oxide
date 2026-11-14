@@ -56,6 +56,17 @@ impl core::fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
+/// What [`Store::replace_all`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replaced {
+    /// The store already held exactly the wanted pairs; nothing was written.
+    Unchanged,
+    /// One record (a set or a tombstone) was appended.
+    Appended,
+    /// A fresh sector holding exactly the wanted pairs was written (one erase).
+    Rewritten,
+}
+
 /// What [`Store::mount`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountReport {
@@ -271,7 +282,7 @@ impl<F: Flash> Store<F> {
     }
 
     /// Marks the store unreliable after a flash error.
-    fn note(&mut self, r: Result<(), Error>) -> Result<(), Error> {
+    fn note<T>(&mut self, r: Result<T, Error>) -> Result<T, Error> {
         if matches!(r, Err(Error::Flash(_))) {
             self.faulted = true;
         }
@@ -438,8 +449,7 @@ impl<F: Flash> Store<F> {
             return Err(Error::Full);
         }
         let sequence = self.sequence.wrapping_add(1);
-        self.flash.erase(new)?;
-        self.flash.program(new, 0, &header_body(sequence))?;
+        self.begin_sector(new, sequence)?;
         let mut out = 0;
         for slot in 0..self.used {
             if let Slot::Set(k, v) = self.read_slot(old, slot)?
@@ -454,16 +464,115 @@ impl<F: Flash> Store<F> {
             self.program_record(new, out, key, Some(v))?;
             out += 1;
         }
+        self.finish_sector(old, new, sequence, out)?;
+        Ok(())
+    }
+
+    /// Erases `new` and programs the body of its header (not yet valid).
+    fn begin_sector(&mut self, new: usize, sequence: u32) -> Result<(), FlashError> {
+        self.flash.erase(new)?;
+        self.flash.program(new, 0, &header_body(sequence))
+    }
+
+    /// Makes `new` (with `out` records) the live sector by programming its state
+    /// word, then retires `old` so that it can never be mistaken for the live
+    /// one if `new` is damaged later.
+    fn finish_sector(
+        &mut self,
+        old: usize,
+        new: usize,
+        sequence: u32,
+        out: usize,
+    ) -> Result<(), FlashError> {
         self.flash
             .program(new, STATE_OFFSET, &pack::<4>(&[STATE_VALID]))?;
         self.active = Some(new);
         self.sequence = sequence;
         self.used = out;
-        // The change is visible from here on. Retire the old sector so that it
-        // can never be mistaken for the live one if the new one is damaged.
         self.flash
-            .program(old, STATE_OFFSET, &pack::<4>(&[STATE_RETIRED]))?;
-        Ok(())
+            .program(old, STATE_OFFSET, &pack::<4>(&[STATE_RETIRED]))
+    }
+
+    /// Makes the store hold exactly `wanted` (distinct keys): every pair in it
+    /// reads back, every other key is gone. All or nothing under power loss.
+    ///
+    /// The differences are counted: pairs of `wanted` that are absent or hold
+    /// another value, plus live keys not in `wanted`. With none nothing is
+    /// written ([`Replaced::Unchanged`]); with exactly one a single record is
+    /// appended, a set or a tombstone, compacting if the sector is full as
+    /// any append may ([`Replaced::Appended`]); with two or more a fresh sector
+    /// holding exactly `wanted` is written, in the way a compaction writes one
+    /// (erase the other sector, header body with the next sequence, the
+    /// records, the state word valid, then retire the old sector), so the
+    /// change becomes visible in one program call ([`Replaced::Rewritten`]).
+    ///
+    /// The result of repeating a key in `wanted` is unspecified (but nothing
+    /// panics and the store stays consistent).
+    ///
+    /// # Errors
+    /// [`Error::Full`] when `wanted` has more pairs than a sector has slots
+    /// (before anything is erased); [`Error::Corrupt`] on a store mounted
+    /// [`MountReport::Corrupt`] (format it first); flash errors.
+    pub fn replace_all(
+        &mut self,
+        wanted: impl Iterator<Item = (u32, u32)> + Clone,
+    ) -> Result<Replaced, Error> {
+        self.ready()?;
+        let r = self.replace_all_inner(wanted);
+        self.note(r)
+    }
+
+    fn replace_all_inner(
+        &mut self,
+        wanted: impl Iterator<Item = (u32, u32)> + Clone,
+    ) -> Result<Replaced, Error> {
+        if wanted.clone().count() > Self::SLOTS {
+            return Err(Error::Full);
+        }
+        // The first difference, and whether there is a second.
+        let mut first: Option<(u32, Option<u32>)> = None;
+        let mut several = false;
+        for (k, v) in wanted.clone() {
+            if self.lookup(k)? != Some(v) {
+                several = first.is_some();
+                first.get_or_insert((k, Some(v)));
+                if several {
+                    break;
+                }
+            }
+        }
+        if !several {
+            for item in self.iter() {
+                let (k, _) = item?;
+                if !wanted.clone().any(|(w, _)| w == k) {
+                    several = first.is_some();
+                    first.get_or_insert((k, None));
+                    if several {
+                        break;
+                    }
+                }
+            }
+        }
+        match (first, several) {
+            (None, _) => Ok(Replaced::Unchanged),
+            (Some((key, value)), false) => {
+                self.write(key, value)?;
+                Ok(Replaced::Appended)
+            }
+            (Some(_), true) => {
+                let old = self.sector()?;
+                let new = old ^ 1;
+                let sequence = self.sequence.wrapping_add(1);
+                self.begin_sector(new, sequence)?;
+                let mut out = 0;
+                for (k, v) in wanted {
+                    self.program_record(new, out, k, Some(v))?;
+                    out += 1;
+                }
+                self.finish_sector(old, new, sequence, out)?;
+                Ok(Replaced::Rewritten)
+            }
+        }
     }
 }
 

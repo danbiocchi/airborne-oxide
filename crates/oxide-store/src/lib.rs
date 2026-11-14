@@ -31,7 +31,7 @@ pub mod sim;
 pub mod store;
 
 pub use flash::{Flash, FlashError};
-pub use store::{Error, Iter, MountReport, Store};
+pub use store::{Error, Iter, MountReport, Replaced, Store};
 
 #[cfg(test)]
 mod tests;
