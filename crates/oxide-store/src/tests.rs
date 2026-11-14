@@ -620,10 +620,84 @@ const FOLLOW_UP: [Op; 9] = [
 
 const UNIVERSE: [u32; 7] = [1, 2, 3, 4, 5, u32::MAX, KEY_CRC_ZERO];
 
-/// Records what each flash event was, to know where erases are.
+/// One way to cut the power during a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// After this many flash events (programmed bytes and erases) from the
+    /// start of the run; the seed shapes an interrupted erase.
+    Byte(u64, u64),
+    /// Inside the program call with this number (from the start of the run),
+    /// leaving this subset of the bits the call clears.
+    Bits(u64, BitCut),
+}
+
+impl Cut {
+    fn arm<const N: usize>(self, f: &mut SimFlash<N>) {
+        match self {
+            Self::Byte(k, seed) => f.cut_power_after(k, seed),
+            Self::Bits(call, how) => f.cut_program_call(call, how),
+        }
+    }
+
+    fn is_bits(self) -> bool {
+        matches!(self, Self::Bits(..))
+    }
+}
+
+/// What a run does to the flash: whether each event is an erase, and how many
+/// bits each program call clears.
+struct Plan {
+    is_erase: Vec<bool>,
+    call_bits: Vec<usize>,
+}
+
+impl Plan {
+    fn programmed_bytes(&self) -> usize {
+        self.is_erase.iter().filter(|e| !**e).count()
+    }
+
+    fn erases(&self) -> usize {
+        self.is_erase.len() - self.programmed_bytes()
+    }
+
+    /// Byte-prefix cuts: at every event (an erase with `erase_seeds` seeds).
+    fn byte_cuts(&self, erase_seeds: u64) -> Vec<Cut> {
+        let mut v = Vec::new();
+        for (k, &erase) in self.is_erase.iter().enumerate() {
+            for seed in 0..(if erase { erase_seeds } else { 1 }) {
+                v.push(Cut::Byte(k as u64, seed));
+            }
+        }
+        v
+    }
+
+    /// Cuts inside every program call: `seeds` seeded subsets, all but bit
+    /// `k` and only bit `k`, for every bit `k` the call clears.
+    fn bit_cuts(&self, seeds: u64) -> Vec<Cut> {
+        let mut v = Vec::new();
+        for (call, &bits) in self.call_bits.iter().enumerate() {
+            let call = call as u64;
+            v.extend((0..seeds).map(|s| Cut::Bits(call, BitCut::Seeded(s))));
+            v.extend((0..bits).map(|k| Cut::Bits(call, BitCut::AllBut(k))));
+            v.extend((0..bits).map(|k| Cut::Bits(call, BitCut::Only(k))));
+        }
+        v
+    }
+
+    /// Only the seeded subsets of every program call.
+    fn seeded_cuts(&self, seeds: u64) -> Vec<Cut> {
+        let mut v = Vec::new();
+        for call in 0..self.call_bits.len() as u64 {
+            v.extend((0..seeds).map(|s| Cut::Bits(call, BitCut::Seeded(s))));
+        }
+        v
+    }
+}
+
+/// Records what each flash event and program call was.
 struct Recorder<'a> {
     flash: &'a mut Small,
-    log: Vec<bool>,
+    plan: Plan,
 }
 
 impl Flash for Recorder<'_> {
@@ -632,37 +706,50 @@ impl Flash for Recorder<'_> {
         self.flash.read(s, o, b)
     }
     fn program(&mut self, s: usize, o: usize, d: &[u8]) -> Result<(), FlashError> {
+        let bits = self.flash.bits_cleared_by(s, o, d).unwrap_or(0);
         self.flash.program(s, o, d)?;
-        self.log.extend(d.iter().map(|_| false));
+        self.plan.call_bits.push(bits);
+        self.plan.is_erase.extend(d.iter().map(|_| false));
         Ok(())
     }
     fn erase(&mut self, s: usize) -> Result<(), FlashError> {
         self.flash.erase(s)?;
-        self.log.push(true);
+        self.plan.is_erase.push(true);
         Ok(())
     }
 }
 
-/// Events of `ops` run on a copy of `flash`, in order: `true` for an erase.
-fn event_kinds(flash: &Small, ops: &[Op]) -> Vec<bool> {
+/// The plan of what `run` does to a copy of `flash` after mounting it.
+fn plan_of(flash: &Small, run: impl FnOnce(&mut Store<&mut Recorder<'_>>)) -> Plan {
     let mut copy = flash.clone();
     let mut rec = Recorder {
         flash: &mut copy,
-        log: Vec::new(),
+        plan: Plan {
+            is_erase: Vec::new(),
+            call_bits: Vec::new(),
+        },
     };
     let (mut s, _) = Store::mount(&mut rec).unwrap();
-    for op in ops {
-        op.run(&mut s).unwrap();
-    }
-    rec.log
+    run(&mut s);
+    rec.plan
 }
 
-/// Runs `ops` against a store on `flash` with the power cut at event `k` of
-/// the run. Returns the index of the interrupted operation, if any.
-fn run_with_cut(flash: &mut Small, ops: &[Op], cut: Option<(u64, u64)>) -> Option<usize> {
+/// The plan of `ops` run on a copy of `flash`.
+fn plan_ops(flash: &Small, ops: &[Op]) -> Plan {
+    plan_of(flash, |s| {
+        for op in ops {
+            op.run(s).unwrap();
+        }
+    })
+}
+
+/// Runs `ops` against a store on `flash` with the power cut as given, counted
+/// from the start of the run. Returns the index of the interrupted operation,
+/// if any.
+fn run_with_cut(flash: &mut Small, ops: &[Op], cut: Option<Cut>) -> Option<usize> {
     let (mut s, _) = Store::mount(&mut *flash).unwrap();
-    if let Some((k, seed)) = cut {
-        s.flash_mut().cut_power_after(k, seed);
+    if let Some(cut) = cut {
+        cut.arm(s.flash_mut());
     }
     for (i, op) in ops.iter().enumerate() {
         match op.run(&mut s) {
@@ -712,6 +799,14 @@ fn assert_old_or_new(s: &Store<&mut Small>, before: &Model, after: &Model, ctx: 
 
 const ERASE_SEEDS: u64 = 16;
 const FOLLOW_UP_ERASE_SEEDS: u64 = 4;
+/// Seeded subsets per program call, first cut.
+const CALL_SEEDS: u64 = 8;
+/// Seeded subsets per program call, second cut.
+const FOLLOW_UP_CALL_SEEDS: u64 = 2;
+/// Second cuts after a first cut inside a call: every this-many-th of them,
+/// shifted by the first cut's number, so that the positions of all of them are
+/// covered across the first cuts without multiplying the run time.
+const SECOND_STRIDE: usize = 4;
 
 #[test]
 fn power_cut_at_every_point_of_every_operation() {
@@ -719,84 +814,102 @@ fn power_cut_at_every_point_of_every_operation() {
     // Dry run of the script on a formatted flash.
     let mut base = fresh();
     let _ = Store::mount(&mut base).unwrap();
-    let kinds = event_kinds(&base, &SCRIPT);
-    let programmed = kinds.iter().filter(|e| !**e).count();
-    let erases = kinds.len() - programmed;
+    let plan = plan_ops(&base, &SCRIPT);
+    let (programmed, erases) = (plan.programmed_bytes(), plan.erases());
     assert_eq!(erases, 2, "script must force exactly two compactions");
     let expected = models(&Model::new(), &SCRIPT);
 
-    let (mut first_cuts, mut second_cuts) = (0_u64, 0_u64);
+    let byte_cuts = plan.byte_cuts(ERASE_SEEDS);
+    let bit_cuts = plan.bit_cuts(CALL_SEEDS);
+    let first: Vec<Cut> = byte_cuts.iter().chain(&bit_cuts).copied().collect();
+    let (mut second_byte, mut second_bits) = (0_u64, 0_u64);
     let (mut recovered, mut clean) = (0_u64, 0_u64);
-    for (k, &is_erase) in kinds.iter().enumerate() {
-        for seed in 0..(if is_erase { ERASE_SEEDS } else { 1 }) {
-            first_cuts += 1;
-            let ctx = format!("first cut at event {k} seed {seed}");
-            let mut flash = base.clone();
-            let j = run_with_cut(&mut flash, &SCRIPT, Some((k as u64, seed)))
-                .unwrap_or_else(|| panic!("no cut happened: {ctx}"));
-            assert!(flash.is_dead(), "{ctx}");
-            flash.restore_power();
+    for (n, &cut) in first.iter().enumerate() {
+        let ctx = format!("first cut {cut:?}");
+        let mut flash = base.clone();
+        let j = run_with_cut(&mut flash, &SCRIPT, Some(cut))
+            .unwrap_or_else(|| panic!("no cut happened: {ctx}"));
+        assert!(flash.is_dead(), "{ctx}");
+        flash.restore_power();
 
-            let (s, report) =
-                Store::mount(&mut flash).unwrap_or_else(|e| panic!("mount: {e} ({ctx})"));
-            assert_ne!(report, MountReport::Corrupt, "{ctx}");
-            if report == MountReport::Recovered {
-                recovered += 1
-            } else {
-                clean += 1
-            }
-            let (before, after) = (expected.get(j).unwrap(), expected.get(j + 1).unwrap());
-            assert_old_or_new(&s, before, after, &ctx);
-            let seen: Model = contents(&s);
-
-            // The store carries on, and survives a second cut anywhere in the
-            // follow-up.
-            let kinds2 = event_kinds(&flash, &FOLLOW_UP);
-            let expected2 = models(&seen, &FOLLOW_UP);
-            for (k2, &is_erase2) in kinds2.iter().enumerate() {
-                for seed2 in 0..(if is_erase2 { FOLLOW_UP_ERASE_SEEDS } else { 1 }) {
-                    second_cuts += 1;
-                    let ctx2 = format!("{ctx}; second cut at event {k2} seed {seed2}");
-                    let mut f2 = flash.clone();
-                    let j2 = run_with_cut(&mut f2, &FOLLOW_UP, Some((k2 as u64, seed2)))
-                        .unwrap_or_else(|| panic!("no second cut: {ctx2}"));
-                    f2.restore_power();
-                    let (mut s2, r2) =
-                        Store::mount(&mut f2).unwrap_or_else(|e| panic!("mount: {e} ({ctx2})"));
-                    assert_ne!(r2, MountReport::Corrupt, "{ctx2}");
-                    assert_old_or_new(
-                        &s2,
-                        expected2.get(j2).unwrap(),
-                        expected2.get(j2 + 1).unwrap(),
-                        &ctx2,
-                    );
-                    // Still writable.
-                    let seen2 = contents(&s2);
-                    let k = seen2.keys().next().copied().unwrap_or(1);
-                    s2.set(k, 4242)
-                        .unwrap_or_else(|e| panic!("set after second cut: {e} ({ctx2})"));
-                    assert_eq!(s2.get(k).unwrap(), Some(4242), "{ctx2}");
-                    for (&other, &v) in seen2.iter().filter(|(o, _)| **o != k) {
-                        assert_eq!(s2.get(other).unwrap(), Some(v), "{ctx2}");
-                    }
-                }
-            }
-            // Finish the follow-up uncut: everything lands.
-            let (mut s, _) = Store::mount(&mut flash).unwrap();
-            for op in FOLLOW_UP {
-                op.run(&mut s)
-                    .unwrap_or_else(|e| panic!("follow-up: {e} ({ctx})"));
-            }
-            assert_matches(&s, expected2.last().unwrap(), &ctx);
+        let (s, report) = Store::mount(&mut flash).unwrap_or_else(|e| panic!("mount: {e} ({ctx})"));
+        assert_ne!(report, MountReport::Corrupt, "{ctx}");
+        if report == MountReport::Recovered {
+            recovered += 1
+        } else {
+            clean += 1
         }
+        let (before, after) = (expected.get(j).unwrap(), expected.get(j + 1).unwrap());
+        assert_old_or_new(&s, before, after, &ctx);
+        let seen: Model = contents(&s);
+
+        // The store carries on, and survives a second cut anywhere in the
+        // follow-up.
+        let plan2 = plan_ops(&flash, &FOLLOW_UP);
+        let expected2 = models(&seen, &FOLLOW_UP);
+        let mut second: Vec<Cut> = plan2.byte_cuts(FOLLOW_UP_ERASE_SEEDS);
+        second.extend(plan2.seeded_cuts(FOLLOW_UP_CALL_SEEDS));
+        for (i, &cut2) in second.iter().enumerate() {
+            if cut.is_bits() && (i + n) % SECOND_STRIDE != 0 {
+                continue;
+            }
+            if cut2.is_bits() {
+                second_bits += 1;
+            } else {
+                second_byte += 1;
+            }
+            let ctx2 = format!("{ctx}; second cut {cut2:?}");
+            let mut f2 = flash.clone();
+            let j2 = run_with_cut(&mut f2, &FOLLOW_UP, Some(cut2))
+                .unwrap_or_else(|| panic!("no second cut: {ctx2}"));
+            f2.restore_power();
+            let (mut s2, r2) =
+                Store::mount(&mut f2).unwrap_or_else(|e| panic!("mount: {e} ({ctx2})"));
+            assert_ne!(r2, MountReport::Corrupt, "{ctx2}");
+            assert_old_or_new(
+                &s2,
+                expected2.get(j2).unwrap(),
+                expected2.get(j2 + 1).unwrap(),
+                &ctx2,
+            );
+            // Still writable.
+            let seen2 = contents(&s2);
+            let k = seen2.keys().next().copied().unwrap_or(1);
+            s2.set(k, 4242)
+                .unwrap_or_else(|e| panic!("set after second cut: {e} ({ctx2})"));
+            assert_eq!(s2.get(k).unwrap(), Some(4242), "{ctx2}");
+            for (&other, &v) in seen2.iter().filter(|(o, _)| **o != k) {
+                assert_eq!(s2.get(other).unwrap(), Some(v), "{ctx2}");
+            }
+        }
+        // Finish the follow-up uncut: everything lands.
+        let (mut s, _) = Store::mount(&mut flash).unwrap();
+        for op in FOLLOW_UP {
+            op.run(&mut s)
+                .unwrap_or_else(|e| panic!("follow-up: {e} ({ctx})"));
+        }
+        assert_matches(&s, expected2.last().unwrap(), &ctx);
     }
     eprintln!(
-        "script: {} events ({programmed} programmed bytes + {erases} erases); first cuts {first_cuts} \
-         ({ERASE_SEEDS} seeds per erase), second cuts {second_cuts}; mounts clean {clean} recovered {recovered}; {:?}",
-        kinds.len(),
+        "script: {} events ({programmed} programmed bytes + {erases} erases) in {} program calls ({} bits); \
+         first cuts {} ({} byte-prefix incl. {ERASE_SEEDS} seeds per erase, {} inside a call: {CALL_SEEDS} seeded + all-but-bit + only-bit); \
+         second cuts {} byte-prefix + {} inside a call; mounts clean {clean} recovered {recovered}; {:?}",
+        plan.is_erase.len(),
+        plan.call_bits.len(),
+        plan.call_bits.iter().sum::<usize>(),
+        first.len(),
+        byte_cuts.len(),
+        bit_cuts.len(),
+        second_byte,
+        second_bits,
         t.elapsed()
     );
-    assert!(first_cuts >= programmed as u64 + 2 * ERASE_SEEDS);
+    assert!(byte_cuts.len() >= programmed + 2 * ERASE_SEEDS as usize);
+    assert!(
+        bit_cuts.len()
+            >= plan.call_bits.len() * (CALL_SEEDS as usize)
+                + 2 * plan.call_bits.iter().sum::<usize>()
+    );
     assert!(
         recovered > 0,
         "some cuts must leave something to recover from"
@@ -904,42 +1017,47 @@ fn power_cut_during_format_leaves_a_mountable_flash_and_a_second_format_finishes
             op.run(&mut s).unwrap();
         }
     }
-    let span = {
+    let plan = plan_of(&base, |s| s.format().unwrap());
+    assert!(plan.erases() >= 1 && plan.programmed_bytes() > 0);
+    let mut cuts = plan.byte_cuts(4);
+    cuts.extend(plan.bit_cuts(CALL_SEEDS));
+    for cut in &cuts {
         let mut f = base.clone();
-        let start = f.events();
-        let (mut s, _) = Store::mount(&mut f).unwrap();
-        s.format().unwrap();
-        f.events() - start
-    };
-    assert!(span > 0);
-    for k in 0..span {
-        for seed in 0..4 {
-            let mut f = base.clone();
-            {
-                let (mut s, _) = Store::mount(&mut f).unwrap();
-                s.flash_mut().cut_power_after(k, seed);
-                assert!(s.format().is_err());
-            }
-            f.restore_power();
-            let (mut s, r) = Store::mount(&mut f).unwrap();
-            assert!(
-                matches!(
-                    r,
-                    MountReport::Fresh
-                        | MountReport::Clean
-                        | MountReport::Corrupt
-                        | MountReport::Recovered
-                ),
-                "cut {k} seed {seed}: {r:?}"
-            );
-            s.format().unwrap();
-            assert_eq!(contents(&s), Model::new());
-            s.set(9, 9).unwrap();
-            let (s, r) = Store::mount(&mut f).unwrap();
-            assert_eq!(r, MountReport::Clean, "cut {k} seed {seed}");
-            assert_eq!(s.get(9).unwrap(), Some(9));
+        {
+            let (mut s, _) = Store::mount(&mut f).unwrap();
+            cut.arm(s.flash_mut());
+            assert!(s.format().is_err(), "{cut:?}");
         }
+        f.restore_power();
+        // Whatever is left is mountable (nothing in it may be trusted to be
+        // the old content), and a second format finishes the job.
+        let (mut s, r) = Store::mount(&mut f).unwrap();
+        assert!(
+            matches!(
+                r,
+                MountReport::Fresh
+                    | MountReport::Clean
+                    | MountReport::Corrupt
+                    | MountReport::Recovered
+            ),
+            "{cut:?}: {r:?}"
+        );
+        // An interrupted format of a populated store leaves an empty store,
+        // the old one (if the cut came before the erase of its sector), or
+        // wreckage that mount calls corrupt: it never invents values.
+        let listed = contents(&s);
+        assert!(
+            listed.is_empty() || listed == models(&Model::new(), &SCRIPT).last().cloned().unwrap(),
+            "{cut:?}: {listed:?}"
+        );
+        s.format().unwrap();
+        assert_eq!(contents(&s), Model::new());
+        s.set(9, 9).unwrap();
+        let (s, r) = Store::mount(&mut f).unwrap();
+        assert_eq!(r, MountReport::Clean, "{cut:?}");
+        assert_eq!(s.get(9).unwrap(), Some(9));
     }
+    eprintln!("format: {} cut points", cuts.len());
 }
 
 // ------------------------------------------------------------ random testing
@@ -961,12 +1079,12 @@ impl Rng {
     }
 }
 
-fn random_sequence(seed: u64, ops: usize) -> (u64, u64) {
+fn random_sequence(seed: u64, ops: usize) -> (u64, u64, u64) {
     const RANDOM_SIZE: usize = 16 + 12 * 12;
     let mut flash = SimFlash::<RANDOM_SIZE>::new();
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut model = Model::new();
-    let (mut cuts, mut compactions_seen) = (0_u64, 0_u64);
+    let (mut byte_cuts, mut bit_cuts, mut compactions_seen) = (0_u64, 0_u64, 0_u64);
     let mut last_erase_count = 0;
     let _ = Store::mount(&mut flash).unwrap();
     for n in 0..ops {
@@ -976,12 +1094,30 @@ fn random_sequence(seed: u64, ops: usize) -> (u64, u64) {
         } else {
             Op::Set(key, rng.next() as u32)
         };
-        let cut = rng.below(6) == 0;
+        let cut = (rng.below(6) == 0).then(|| {
+            if rng.below(2) == 0 {
+                Cut::Byte(rng.below(110), rng.next())
+            } else {
+                // Mostly an early call (an append is two), sometimes deep into a
+                // compaction; any subset of its bits.
+                let call = if rng.below(4) == 0 {
+                    rng.below(40)
+                } else {
+                    rng.below(4)
+                };
+                let how = match rng.below(3) {
+                    0 => BitCut::Seeded(rng.next()),
+                    1 => BitCut::AllBut(rng.below(70) as usize),
+                    _ => BitCut::Only(rng.below(70) as usize),
+                };
+                Cut::Bits(call, how)
+            }
+        });
         let (mut s, _) = Store::mount(&mut flash).unwrap();
-        if cut {
-            s.flash_mut().cut_power_after(rng.below(110), rng.next());
+        if let Some(c) = cut {
+            c.arm(s.flash_mut());
         }
-        let ctx = format!("seed {seed} op {n} {op:?} cut {cut}");
+        let ctx = format!("seed {seed} op {n} {op:?} cut {cut:?}");
         match op.run(&mut s) {
             Ok(()) => {
                 op.apply(&mut model);
@@ -993,7 +1129,11 @@ fn random_sequence(seed: u64, ops: usize) -> (u64, u64) {
                 flash.restore_power();
             }
             Err(Error::Flash(FlashError::PowerLoss)) => {
-                cuts += 1;
+                if cut.is_some_and(Cut::is_bits) {
+                    bit_cuts += 1;
+                } else {
+                    byte_cuts += 1;
+                }
                 flash.restore_power();
                 let (s, report) = Store::mount(&mut flash).unwrap();
                 assert_ne!(report, MountReport::Corrupt, "{ctx}");
@@ -1021,24 +1161,29 @@ fn random_sequence(seed: u64, ops: usize) -> (u64, u64) {
     }
     let (s, _) = Store::mount(&mut flash).unwrap();
     assert_matches(&s, &model, "end");
-    (cuts, compactions_seen)
+    (byte_cuts, bit_cuts, compactions_seen)
 }
 
 #[test]
 fn random_sequences_with_random_cuts_match_a_model() {
     let t = Instant::now();
-    let (mut ops, mut cuts, mut comp) = (0, 0, 0);
-    for seed in 1..=4 {
-        let (c, k) = random_sequence(seed, 1500);
+    let (mut ops, mut byte_cuts, mut bit_cuts, mut comp) = (0, 0, 0, 0);
+    for seed in 1..=8 {
+        let (b, c, k) = random_sequence(seed, 1500);
         ops += 1500;
-        cuts += c;
+        byte_cuts += b;
+        bit_cuts += c;
         comp += k;
     }
     eprintln!(
-        "random: {ops} operations, {cuts} power cuts, {comp} compactions observed uncut; {:?}",
+        "random: {ops} operations, {byte_cuts} byte-prefix and {bit_cuts} inside-a-call power cuts, \
+         {comp} compactions observed uncut; {:?}",
         t.elapsed()
     );
-    assert!(cuts > 100 && comp > 50, "cuts {cuts} compactions {comp}");
+    assert!(
+        byte_cuts > 100 && bit_cuts > 100 && comp > 50,
+        "{byte_cuts} {bit_cuts} {comp}"
+    );
 }
 
 // -------------------------------------------- keys whose CRC aliases an erased field
@@ -1062,12 +1207,14 @@ fn keys_whose_crc_aliases_an_erased_field_are_safe_at_every_cut() {
     ];
     let mut base = fresh();
     let _ = Store::mount(&mut base).unwrap();
-    let kinds = event_kinds(&base, &script);
+    let plan = plan_ops(&base, &script);
     let expected = models(&Model::new(), &script);
-    for (k, _) in kinds.iter().enumerate() {
-        let ctx = format!("cut at event {k}");
+    let mut cuts = plan.byte_cuts(1);
+    cuts.extend(plan.bit_cuts(CALL_SEEDS));
+    for cut in &cuts {
+        let ctx = format!("{cut:?}");
         let mut flash = base.clone();
-        let j = run_with_cut(&mut flash, &script, Some((k as u64, 0))).expect(&ctx);
+        let j = run_with_cut(&mut flash, &script, Some(*cut)).expect(&ctx);
         flash.restore_power();
         let (s, report) = Store::mount(&mut flash).unwrap();
         assert_ne!(report, MountReport::Corrupt, "{ctx}");
