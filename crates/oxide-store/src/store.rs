@@ -29,6 +29,7 @@
 //! |---|---|---|---|
 //! | `Valid` + `Blank` or `Retired` | normal | the valid one | `Clean` (`Recovered` if it holds torn records) |
 //! | `Valid` + `Valid` | cut between steps 4 and 5 | higher sequence (wrapping compare) | `Recovered` |
+//! | `Valid` + `Valid`, equal sequences | not a power cut: damage | none | `Corrupt` |
 //! | `Valid` + `Writing` or `Bad` | cut during an erase or the copy | the valid one | `Recovered` |
 //! | no `Valid`, and no byte outside the two 16-byte headers differs from `0xFF` | a first initialisation or a format was cut; nothing was ever stored | erase what is not blank, write a header on sector 0 | `Fresh` |
 //! | anything else | damage | none | `Corrupt` |
@@ -173,6 +174,10 @@ impl<F: Flash> Store<F> {
         };
         let h = [s.read_header(0)?, s.read_header(1)?];
         let best = match (h[0], h[1]) {
+            // Equal sequences cannot come from a power cut (each compaction
+            // adds one): it is damage or tampering, and which sector is right
+            // is unknowable.
+            (Header::Valid(a), Header::Valid(b)) if a == b => return Ok((s, MountReport::Corrupt)),
             (Header::Valid(a), Header::Valid(b)) => Some(usize::from(b.wrapping_sub(a) as i32 > 0)),
             (Header::Valid(_), _) => Some(0),
             (_, Header::Valid(_)) => Some(1),
