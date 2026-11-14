@@ -6,8 +6,8 @@
 //! `tests/data/scenario_hashes.txt` and every file must still produce them.
 //! A change that moves a hash moves a flight: it is a decision, not a
 //! side effect. Regenerate the table only for such a decision:
-//! `cargo test --release -p oxide-sim --test scenario_files -- --ignored
-//! regenerate_scenario_hashes`.
+//! `OXIDE_REGENERATE=1 cargo test --release -p oxide-sim --test scenario_files
+//! -- --ignored regenerate_scenario_hashes`.
 
 use std::path::{Path, PathBuf};
 
@@ -131,9 +131,15 @@ fn every_scenario_file_still_flies_its_pinned_flight_full() {
     check(|_, _| true);
 }
 
+/// Rewrites the table, and only when `OXIDE_REGENERATE=1` is set: running
+/// every ignored test of this file must never move a pin by accident.
 #[test]
 #[ignore = "rewrites the pinned table: only for a decided change of a flight"]
 fn regenerate_scenario_hashes() {
+    if std::env::var("OXIDE_REGENERATE").as_deref() != Ok("1") {
+        eprintln!("regenerate_scenario_hashes: skipped, set OXIDE_REGENERATE=1 to rewrite");
+        return;
+    }
     let files = files();
     let jobs: Vec<(usize, Profile, u64)> = (0..files.len())
         .flat_map(|i| cases().into_iter().map(move |(p, k)| (i, p, k)))
