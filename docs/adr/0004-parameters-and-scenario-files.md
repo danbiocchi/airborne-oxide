@@ -59,27 +59,46 @@ A change arrives through the core's inputs, like every other command: `Inputs.pa
 
 ### 5. Parameters in files
 
-A `[params]` table of `NAME = value` is accepted in three places, applied in this order, each through the same checked `set`:
+A `[params]` table of `NAME = value` is accepted in three places:
 
 1. the airframe file (tuning that belongs to the airframe);
 2. the scenario file;
 3. the command line (`--param NAME=VALUE`, `--params FILE.toml`).
 
-`oxide-sim params list` prints the table, `params json` writes the metadata file QGroundControl reads, and `params doc` writes `docs/PARAMETERS.md`. CI regenerates the last and fails if it differs from the file in the repository.
+The three are gathered in that order and applied **as one change**. A later source overrides an earlier one. Each value is checked against its own range, and the rules between fields are checked once, on the result. A file can therefore state any valid combination, whatever order its lines are in.
+
+`oxide-sim params list` prints the table, `params json` writes the metadata file QGroundControl reads, and `params doc` writes `docs/PARAMETERS.md`. A test regenerates the last and fails if it differs from the file in the repository.
 
 ### 6. Storage
 
-`oxide-store` is a small `no_std` crate: a log-structured store over two flash sectors, behind a `Flash` trait with NOR semantics (program clears bits, erase sets a sector).
+`oxide-store` is a small `no_std` crate: a log-structured store over two flash sectors, behind a `Flash` trait with NOR semantics (a program clears bits, an erase sets a whole sector).
 
-- **Records** are fixed-size: a 32-bit key (a hash of the parameter name, so reordering the table never changes a meaning), the value's 32 bits, and a check word (30 CRC bits plus a tombstone flag, never all ones, so a half-written record cannot read as another record). A torn record fails its check and is skipped.
-- **Compaction** copies the newest value of each key to the other sector, marks it valid, and only then is the old sector erasable. Power loss at any point leaves one valid sector.
+**What a power cut may do.** This is the contract the flash driver must meet, and what the tests simulate:
+
+- A program call that returned is complete.
+- An interrupted program call may have cleared any subset of its bits.
+- An interrupted erase leaves each byte anywhere between its old value and erased.
+
+**On flash**
+
+- **Records** are 12 bytes: a 32-bit key (a hash of the parameter name, so reordering the table never changes a meaning), the value's 32 bits, and a check word. The check word is written last, in its own program call. It holds 30 CRC bits and a two-bit kind that is one-hot: set or removed.
+- **A half-written record cannot read as a valid record.** That follows from the layout, not from CRC luck: until the check word is complete its kind is neither of the two valid ones, or its CRC bits are wrong. A torn record is skipped and its slot is never reused.
+- **Compaction** copies the newest value of each key to the other sector, marks that sector valid, then marks the old one retired. A power cut at any point leaves exactly one sector to mount.
+- **No silent rollback.** Because the old sector is retired, damage to the live sector's header is reported as a corrupt store. The store never falls back to older values without saying so.
+- **Saving several values is all or nothing.** `replace_all` makes the store hold exactly a given set. No difference writes nothing; one difference appends one record; more than one writes a fresh sector that becomes valid in a single step. Two parameters that are valid only together can therefore never be loaded half-saved.
 - **Wear** is the erase count, kept in the sector header and reported. Sequence numbers are compared as a signed wrapping difference, so mount stays correct across the 2^32 wrap.
-- **Tested on the host** against a simulated flash that cuts the power after every single byte of every operation: after each cut the store must return, for every key, either the old or the new value, never anything else, and never lose an acknowledged write.
-- **Never while armed.** The core hands out unsaved changes only while disarmed. The firmware writes them then.
-- **A corrupt or unreadable store** loads defaults, sets the `CONFIG` pre-arm bit, and arming stays refused until an operator acknowledges it (`Inputs.param_ack`).
-- A value on flash that is out of range for the running firmware is dropped for its default and reported the same way.
+- An interrupted first initialisation, with nothing ever stored, mounts as a fresh store and not as a corrupt one.
 
-The simulator keeps parameters in TOML files; `oxide-store` is exercised by its own tests and wired to real flash at F405 bring-up.
+**Policy** (`ParamStore`, the part the firmware reuses)
+
+- **What is stored:** only the parameters that differ from the firmware's own values (the table defaults plus the airframe's). A parameter set back to that value leaves the store. So a firmware update that changes a default changes it for everyone who never touched it.
+- **Never while armed.** A save happens only while disarmed.
+- **A load that was not fully understood sets a parameter fault.** The causes: the store cannot be read; it holds a key this firmware does not know; a value is out of this firmware's range (it is dropped for the firmware's value); or the values together break a rule (none is taken). While the fault is held the `CONFIG` pre-arm bit refuses arming, and the store is not modified.
+- **An operator's acknowledgement** (`Inputs.param_ack`) clears the fault and rewrites the store from the values in use.
+
+**Tests.** The store is tested on the host against a simulated flash that cuts the power at every byte of every operation, inside every program call (seeded subsets of its bits, all bits but one, one bit only) and part-way through every erase. After each cut the store must mount, return for every key the old or the new value and nothing else, and never lose an acknowledged write. The policy is tested with a real flight core on that flash, and end to end in the simulator: a parameter changed in flight is saved after the disarm and is there after a reboot.
+
+The simulator itself keeps parameters in TOML files. `oxide-store` meets real flash at F405 bring-up.
 
 ### 7. Scenario files
 
@@ -93,7 +112,7 @@ One TOML file per scenario in `scenarios/`. A file holds:
 | `[battery]` | capacity and starting charge, when the scenario overrides the airframe |
 | `[params]` | parameter overrides by name |
 | `[[fault]]` | kind, start, end |
-| `[pilot]` | arming time, and timelines of mode switch, sticks, kill switch and setpoints |
+| `[pilot]` | arming, disarming and kill times, and timelines of mode switch, sticks and setpoints |
 | `[expect]` | states and reasons that must or must never appear, the ending, limits |
 | `[run]` | seeds and profiles for the Monte-Carlo job |
 
@@ -103,9 +122,9 @@ One TOML file per scenario in `scenarios/`. A file holds:
 - **Concrete numbers only.** The 21 pairings become 21 files. Battery sizes that were computed from a target time are written out. A test checks that every pairing of the seven failure kinds has a file, so coverage cannot quietly shrink.
 - **Rotor count:** four, until another airframe exists.
 
-**The files replace the Rust definitions, and the proof is the hashes.** First every scenario is exported from Rust to TOML and loaded back; the trace hash from the file must equal the hash from the Rust definition, for every scenario, on index 0 and one other. Then the Rust definitions are deleted.
+**The files replaced the Rust definitions, and the proof was the hashes.** Every scenario was exported from Rust to TOML and loaded back, and the trace hash from the file equalled the hash from the Rust definition for all 43 scenarios, on two run indices of one chip profile and one of the other. Then the Rust definitions were deleted, and the hashes of those 129 flights were pinned in `crates/oxide-sim/tests/data/scenario_hashes.txt`. A change that moves one of them changes a flight: it is a decision, and the table is regenerated only on request (`OXIDE_REGENERATE=1`).
 
-`oxide-sim scenario` takes a name or a path. `oxide-sim scenarios DIR --seeds N` flies every file on both profiles and prints one line each; CI's Monte-Carlo job runs that.
+`oxide-sim scenario` takes a name or a path: an argument that ends in `.toml` or contains a path separator is a path, anything else is the name of a scenario in `scenarios/`. `oxide-sim scenarios DIR` flies every file on the seeds and profiles its `[run]` table names and prints one line each; CI's Monte-Carlo job runs that.
 
 `hover-step` keeps its M1a requirements as Rust tests (they check positions at set times, which `[expect]` does not express); the file carries its flight.
 
@@ -120,7 +139,14 @@ One TOML file per scenario in `scenarios/`. A file holds:
 
 - The MAVLink parameter protocol itself (with communications).
 - Vehicle description as parameters (with the airframe lab).
-- Parameter groups that must change together in one step (a transaction). Until then, change them in an order that keeps the configuration valid. A `[params]` table in an airframe or scenario file is applied in name order (a TOML table is unordered, and the parser sorts it by key), so a file cannot choose the order; a joint change that is valid in only one order needs the transaction.
+- Several parameters changed together **at run time** (a transaction over the link). Files and saves are already one change. Until then, change run-time parameters in an order that keeps the configuration valid.
 - Per-parameter access levels for the brain (with the command gateway, M3).
-- The flash driver and the erase stall on the F405 (bring-up).
+- The flash driver, and at F405 bring-up: the erase stall, the size of a program word, whether a cell can read unstable after an interrupted program or erase, and the measured time of a compaction (about 1.9 million key reads for a full 16 KB sector).
+- When the firmware calls the store's service routine, and what it shows the operator for a parameter fault.
 - Terrain and missions in scenario files (they do not exist yet).
+
+## Notes
+
+- `EKF_SOURCE` defaults to the external state (0), which is what the simulator's ideal-sensor scenarios use. The firmware's own values will select the estimator.
+- The 0.01 minimum on the tilt, rate and speed limits is deliberate: a limit of zero would freeze an axis.
+- A parameter held in the core as whole microseconds is a parameter in seconds; the stored value is the parameter's, so the conversion happens in one place.

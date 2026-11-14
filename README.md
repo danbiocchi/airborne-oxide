@@ -8,7 +8,7 @@ Airborne Oxide is flight software for drones, written in Rust. It has three part
 2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that flies multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
 3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and will move onto smaller drones as AI hardware shrinks.
 
-> **Status: milestone M1c, part one.** The flight core flies a simulated 5" quad on its own state estimate and now handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. Each is a scenario flown across random seeds on both chip profiles, as is every pairing of the common ones. Parameters, scenario files, logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
+> **Status: milestone M1c, part two.** The flight core flies a simulated 5" quad on its own state estimate and handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. Every tunable value is now a named parameter with a range, changeable in flight, and kept on flash by a store that survives a power cut at any moment. The scenarios are data files, flown across random seeds on both chip profiles. Logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
 
 ## Try it
 
@@ -133,6 +133,7 @@ Putting a file in `scenarios/` adds it to the Monte-Carlo run. To embed it in th
 | Path | What it is |
 |---|---|
 | `crates/oxide-core` | Flight core library (`no_std`, no heap). Builds for `thumbv7em-none-eabihf`. |
+| `crates/oxide-store` | Parameter storage on flash (`no_std`): a two-sector log that survives power loss at any point |
 | `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, fault injection, scenario-file loader, Monte-Carlo runner, lockstep loop |
 | `scenarios/` | The scenario files: the 20 failures, the 21 pairings, `hover-step` and `gust-hold` |
 | `crates/oxide-sim-cli` | `oxide-sim` command-line runner |
