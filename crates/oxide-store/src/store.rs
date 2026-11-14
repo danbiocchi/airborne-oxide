@@ -19,8 +19,8 @@
 
 use crate::flash::{Flash, FlashError};
 use crate::layout::{
-    HEADER_SIZE, Header, RECORD_SIZE, RECORDS_OFFSET, STATE_OFFSET, STATE_VALID, Slot,
-    decode_header, decode_slot, header_body, pack, record_bytes,
+    CHECK_OFFSET, HEADER_SIZE, Header, RECORD_SIZE, RECORDS_OFFSET, STATE_OFFSET, STATE_VALID,
+    Slot, decode_header, decode_slot, header_body, pack, record_parts,
 };
 
 /// Why a store operation failed.
@@ -365,13 +365,27 @@ impl<F: Flash> Store<F> {
         Ok(None)
     }
 
+    /// Programs a record in two calls: key and value, then the check word. A
+    /// power cut inside either can never leave something that reads as a
+    /// record (see [`crate::layout`]).
+    fn program_record(
+        &mut self,
+        sector: usize,
+        slot: usize,
+        key: u32,
+        value: Option<u32>,
+    ) -> Result<(), FlashError> {
+        let (kv, check) = record_parts(key, value.unwrap_or(0), value.is_none());
+        let at = Self::slot_offset(slot);
+        self.flash.program(sector, at, &kv)?;
+        self.flash.program(sector, at + CHECK_OFFSET, &check)
+    }
+
     /// Appends a set (`Some`) or a tombstone (`None`), compacting if full.
     fn write(&mut self, key: u32, value: Option<u32>) -> Result<(), Error> {
         if self.used < Self::SLOTS {
             let sector = self.sector()?;
-            let bytes = record_bytes(key, value.unwrap_or(0), value.is_none());
-            self.flash
-                .program(sector, Self::slot_offset(self.used), &bytes)?;
+            self.program_record(sector, self.used, key, value)?;
             self.used += 1;
             Ok(())
         } else {
@@ -406,14 +420,12 @@ impl<F: Flash> Store<F> {
                 && k != key
                 && !self.superseded(old, slot, k)?
             {
-                self.flash
-                    .program(new, Self::slot_offset(out), &record_bytes(k, v, false))?;
+                self.program_record(new, out, k, Some(v))?;
                 out += 1;
             }
         }
         if let Some(v) = value {
-            self.flash
-                .program(new, Self::slot_offset(out), &record_bytes(key, v, false))?;
+            self.program_record(new, out, key, Some(v))?;
             out += 1;
         }
         self.flash

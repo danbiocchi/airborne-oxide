@@ -721,7 +721,8 @@ fn random_sequences_with_random_cuts_match_a_model() {
 
 // -------------------------------------------- keys whose CRC aliases an erased field
 
-/// `crc32(key, 0) == 0xFFFF_FFFF`: a half-written remove has an erased CRC field.
+/// `crc32(key, 0) == 0xFFFF_FFFF`: before the one-hot kind, a half-written
+/// remove of this key had an erased CRC field. Kept: the CRC still aliases.
 const KEY_CRC_ONES: u32 = 0xFFFF_FFFF;
 /// `crc32(key, 0) == 0`: a half-written set of value 0 has an erased CRC field.
 const KEY_CRC_ZERO: u32 = 0x101B_2F50;
@@ -757,6 +758,14 @@ fn the_aliasing_keys_really_alias() {
     use crate::layout::record_crc;
     assert_eq!(record_crc(KEY_CRC_ZERO, 0), 0);
     assert_eq!(record_crc(KEY_CRC_ONES, 0), u32::MAX);
+    // With the one-hot kind in the top two bits the check words of these keys
+    // are still not an erased word, and a set and a tombstone differ in both
+    // kind bits.
+    use crate::layout::record_check;
+    assert_eq!(record_check(KEY_CRC_ONES, 0, false), 0x7FFF_FFFF);
+    assert_eq!(record_check(KEY_CRC_ONES, 0, true), 0xBFFF_FFFF);
+    assert_eq!(record_check(KEY_CRC_ZERO, 0, false), 0x4000_0000);
+    assert_eq!(record_check(KEY_CRC_ZERO, 0, true), 0x8000_0000);
 }
 
 #[test]
