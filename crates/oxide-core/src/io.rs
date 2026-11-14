@@ -4,7 +4,7 @@
 //! ADR-0001).
 
 use crate::math::{Quat, Vec3};
-use crate::params::{ParamError, ParamId, ParamValue};
+use crate::params::{LoadReport, ParamError, ParamId, ParamValue};
 use crate::time::Micros;
 
 /// A sample with when it was measured and when the core received it.
@@ -165,6 +165,10 @@ pub struct Inputs {
     /// A parameter change, applied on the tick it arrives; at most one per
     /// tick (ADR-0004 §4).
     pub param_set: Option<ParamSet>,
+    /// An operator acknowledges a parameter fault (`Core::params_fault`). It
+    /// counts only on a tick where the fault is held and the vehicle is
+    /// disarmed (ADR-0004 §6).
+    pub param_ack: bool,
 }
 
 /// Flight mode.
@@ -344,7 +348,9 @@ bitset! {
         POSITION = 5;
         /// No battery reading, an implausible voltage, or battery low.
         BATTERY = 6;
-        /// The configuration failed validation.
+        /// A parameter fault is held: what the store held was not fully
+        /// understood or could not be read, until an operator acknowledges
+        /// it (`Inputs::param_ack`).
         CONFIG = 7;
         /// Offboard is selected and the brain or its setpoints are not live.
         LINK = 8;
@@ -399,6 +405,13 @@ pub enum EventKind {
         id: ParamId,
         why: ParamError,
     },
+    /// Loading the stored parameters was not clean (`Core::report_param_load`):
+    /// the report. Emitted once, on the first tick; arming is refused until
+    /// an operator acknowledges.
+    ParamLoadFault(LoadReport),
+    /// An operator acknowledged the parameter fault; the store must now be
+    /// rewritten from the values in use (`Status::params_unsaved`).
+    ParamFaultAcked,
 }
 
 /// An event with the tick time it happened at.

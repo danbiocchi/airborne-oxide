@@ -4,7 +4,7 @@
 use super::*;
 use crate::config::ConfigError;
 use crate::io::ParamSet;
-use crate::params::{ParamError, ParamId, ParamValue};
+use crate::params::{LoadReport, ParamError, ParamId, ParamValue};
 
 fn set(id: ParamId, v: f32) -> ParamSet {
     ParamSet {
@@ -380,4 +380,236 @@ fn unsaved_flag_rises_survives_arming_and_clears_only_when_disarmed() {
     core.clear_unsaved();
     let out = step(&mut core, 1403, rc(false, false), None);
     assert!(!out.status.params_unsaved);
+}
+
+// ---- a bad load, and its acknowledgement (ADR-0004 §6) ----
+
+fn unclean_reports() -> [(&'static str, LoadReport); 4] {
+    let r = LoadReport::default;
+    [
+        (
+            "unknown",
+            LoadReport {
+                unknown: 1,
+                applied: 3,
+                ..r()
+            },
+        ),
+        ("dropped", LoadReport { dropped: 2, ..r() }),
+        (
+            "invalid",
+            LoadReport {
+                invalid: true,
+                ..r()
+            },
+        ),
+        (
+            "unreadable",
+            LoadReport {
+                unreadable: true,
+                ..r()
+            },
+        ),
+    ]
+}
+
+/// One tick of the external-source rig with an acknowledgement.
+fn step_ack(core: &mut Core<4>, k: u64, rc_sample: RcSample, ack: bool) -> Outputs<4> {
+    let t = Micros(k * 1000);
+    let mut i = inputs(t, rc_sample);
+    i.param_ack = ack;
+    core.tick(t, &i)
+}
+
+/// Runs `n` ticks from `k`, collecting every event; returns the next tick.
+fn run_events(
+    core: &mut Core<4>,
+    k: u64,
+    n: u64,
+    rc_sample: RcSample,
+    all: &mut Vec<(u64, EventKind)>,
+) -> (u64, Outputs<4>) {
+    let mut out = Outputs::off(Micros::ZERO);
+    for j in k..k + n {
+        out = step_ack(core, j, rc_sample, false);
+        all.extend(out.events.iter().map(|e| (j, e.kind)));
+    }
+    (k + n, out)
+}
+
+#[test]
+fn a_clean_report_arms_and_an_unclean_one_leaves_only_config_between_it_and_arming() {
+    for (what, report) in unclean_reports() {
+        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+        core.report_param_load(report);
+        assert!(core.params_fault(), "{what}");
+        let mut all = Vec::new();
+        let (k, _) = run_events(&mut core, 0, 1100, rc(false, false), &mut all);
+        let (_, out) = run_events(&mut core, k, 100, rc(true, false), &mut all);
+        assert!(!out.status.armed, "{what}: armed with a parameter fault");
+        assert_eq!(out.status.prearm, PrearmFlags::CONFIG, "{what}");
+        assert!(!core.is_armed());
+        // The refusal names exactly that flag.
+        let refusals: Vec<PrearmFlags> = all
+            .iter()
+            .filter_map(|(_, e)| match e {
+                EventKind::ArmRefused(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refusals, vec![PrearmFlags::CONFIG], "{what}");
+        assert_eq!(out.status.timing_faults, 0, "{what}");
+    }
+    // The same rig with a clean report arms; so does one that applied values.
+    for report in [
+        LoadReport::default(),
+        LoadReport {
+            applied: 12,
+            ..LoadReport::default()
+        },
+    ] {
+        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+        core.report_param_load(report);
+        assert!(!core.params_fault());
+        let mut all = Vec::new();
+        let (k, _) = run_events(&mut core, 0, 1100, rc(false, false), &mut all);
+        let (_, out) = run_events(&mut core, k, 100, rc(true, false), &mut all);
+        assert!(out.status.armed && core.is_armed());
+        assert!(out.status.prearm.is_empty());
+        assert!(
+            all.iter()
+                .all(|(_, e)| !matches!(e, EventKind::ParamLoadFault(_))),
+            "no event for a clean load"
+        );
+        assert_eq!(out.status.timing_faults, 0);
+    }
+}
+
+#[test]
+fn the_fault_event_comes_once_on_the_first_tick() {
+    for (what, report) in unclean_reports() {
+        let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+        core.report_param_load(report);
+        let mut all = Vec::new();
+        run_events(&mut core, 0, 3000, rc(true, false), &mut all);
+        let faults: Vec<_> = all
+            .iter()
+            .filter(|(_, e)| matches!(e, EventKind::ParamLoadFault(_)))
+            .collect();
+        assert_eq!(
+            faults,
+            vec![&(0, EventKind::ParamLoadFault(report))],
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn an_acknowledgement_clears_the_fault_sets_unsaved_and_the_vehicle_then_arms() {
+    let report = LoadReport {
+        unknown: 1,
+        ..LoadReport::default()
+    };
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(report);
+    let mut all = Vec::new();
+    let (mut k, _) = run_events(&mut core, 0, 1100, rc(false, false), &mut all);
+    let (k2, out) = run_events(&mut core, k, 100, rc(true, false), &mut all);
+    k = k2;
+    assert!(!out.status.armed && !out.status.params_unsaved && !core.params_unsaved());
+
+    let out = step_ack(&mut core, k, rc(true, false), true);
+    k += 1;
+    assert!(!core.params_fault());
+    assert!(core.params_unsaved() && out.status.params_unsaved);
+    assert_eq!(
+        events(&out),
+        vec![EventKind::ParamFaultAcked],
+        "exactly the acknowledgement"
+    );
+    // A second acknowledgement does nothing more.
+    let out = step_ack(&mut core, k, rc(true, false), true);
+    k += 1;
+    assert!(events(&out).is_empty());
+
+    // The flag clears on the next supervisor run; a fresh rising edge arms.
+    let mut all = Vec::new();
+    let (k2, out) = run_events(&mut core, k, 100, rc(false, false), &mut all);
+    k = k2;
+    assert!(!out.status.armed);
+    assert!(out.status.prearm.is_empty(), "{:?}", out.status.prearm);
+    let (_, out) = run_events(&mut core, k, 100, rc(true, false), &mut all);
+    assert!(out.status.armed && core.is_armed());
+    assert!(out.status.params_unsaved, "unsaved survives arming");
+    assert_eq!(out.status.timing_faults, 0);
+}
+
+#[test]
+fn an_acknowledgement_with_no_fault_held_emits_nothing_and_does_not_set_unsaved() {
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(LoadReport {
+        applied: 4,
+        ..LoadReport::default()
+    });
+    let mut out = Outputs::off(Micros::ZERO);
+    for k in 0..50 {
+        out = step_ack(&mut core, k, rc(false, false), true);
+        assert!(events(&out).is_empty(), "tick {k}");
+    }
+    assert!(!core.params_unsaved() && !out.status.params_unsaved);
+    assert_eq!(out.status.timing_faults, 0);
+    // The same on a core never told anything.
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    let out = step_ack(&mut core, 0, rc(false, false), true);
+    assert!(events(&out).is_empty() && !out.status.params_unsaved);
+}
+
+#[test]
+fn an_acknowledgement_while_armed_is_ignored_until_the_vehicle_is_disarmed() {
+    let (mut core, mut k) = armed_core(cfg());
+    // A fault reported late, on a vehicle that is already flying.
+    core.report_param_load(LoadReport {
+        dropped: 1,
+        ..LoadReport::default()
+    });
+    assert!(core.is_armed() && core.params_fault());
+    let out = step_ack(&mut core, k, stick(0.0), true);
+    k += 1;
+    assert!(core.params_fault() && !core.params_unsaved());
+    assert_eq!(
+        events(&out)
+            .into_iter()
+            .filter(|e| matches!(e, EventKind::ParamFaultAcked))
+            .count(),
+        0
+    );
+    // Disarm (switch low for long enough), then it works.
+    let mut all = Vec::new();
+    let (k2, _) = run_events(&mut core, k, 200, rc(false, false), &mut all);
+    k = k2;
+    assert!(!core.is_armed());
+    let out = step_ack(&mut core, k, rc(false, false), true);
+    assert!(!core.params_fault() && core.params_unsaved());
+    assert!(events(&out).contains(&EventKind::ParamFaultAcked));
+    assert_eq!(out.status.timing_faults, 0);
+}
+
+#[test]
+fn a_parameter_set_while_the_fault_is_held_is_applied_and_stays_unsaved() {
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(LoadReport {
+        unreadable: true,
+        ..LoadReport::default()
+    });
+    let out = step(
+        &mut core,
+        0,
+        rc(false, false),
+        Some(set(ParamId::LIM_TILT, 0.5)),
+    );
+    assert!(events(&out).contains(&EventKind::ParamChanged(ParamId::LIM_TILT)));
+    assert_eq!(core.config().limits.max_tilt_rad, 0.5);
+    assert!(core.params_fault(), "a change does not acknowledge");
+    assert!(core.params_unsaved() && out.status.params_unsaved);
+    assert_eq!(out.status.timing_faults, 0);
 }

@@ -321,8 +321,11 @@ impl<const N: usize> Core<N> {
                 && self.sup_state.battery.plausible()
                 && !self.sup_state.battery.low()),
         );
-        // CONFIG never fails here: `Core::new` refuses an invalid
-        // configuration, so a running core has a valid one.
+        // `Core::new` refuses an invalid configuration, so a running core
+        // has a valid one. CONFIG fails while a parameter fault is held: what
+        // the store held was not fully understood, until an operator
+        // acknowledges it (ADR-0004 §6).
+        flags.set(PrearmFlags::CONFIG, self.param_fault.is_some());
 
         // 7. Arm / disarm (valid frames only).
         let fault_count = self.estimator_faults();

@@ -273,6 +273,14 @@ fn describe(kind: EventKind) -> String {
         EventKind::ParamRefused { id, why } => {
             format!("{} change refused: {why:?}", param_name(id))
         }
+        EventKind::ParamLoadFault(r) => format!(
+            "Stored parameters not fully loaded ({} unknown, {} dropped{}{})",
+            r.unknown,
+            r.dropped,
+            if r.invalid { ", broke a rule" } else { "" },
+            if r.unreadable { ", unreadable" } else { "" },
+        ),
+        EventKind::ParamFaultAcked => "Parameter fault acknowledged".to_string(),
     }
 }
 

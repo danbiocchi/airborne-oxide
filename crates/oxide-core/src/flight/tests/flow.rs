@@ -347,9 +347,10 @@ fn each_prearm_bit_alone_blocks_arming_and_is_reported() {
 }
 
 #[test]
-fn the_config_prearm_bit_is_never_set_on_a_running_core() {
-    // `Core::new` refuses an invalid configuration, so CONFIG cannot be
-    // observed failing; it must not be set spuriously either.
+fn the_config_prearm_bit_is_not_set_on_a_running_core_with_no_parameter_fault() {
+    // `Core::new` refuses an invalid configuration, so the configuration
+    // cannot make CONFIG fail; only a parameter fault does (tests/params.rs).
+    // With none held it must not be set spuriously.
     let mut rig = Rig::external(1);
     rig.arm();
     assert!(!rig.out.status.prearm.contains(PrearmFlags::CONFIG));

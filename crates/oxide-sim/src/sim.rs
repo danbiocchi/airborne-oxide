@@ -406,6 +406,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             gcs_heartbeat,
             brain_heartbeat,
             param_set: None,
+            param_ack: false,
         };
         self.last_inputs = inputs;
 

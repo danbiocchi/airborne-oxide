@@ -23,7 +23,7 @@ use crate::io::{
     PrearmFlags, RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
 };
 use crate::math::{Real, Vec3};
-use crate::params::{self, ParamError, ParamId, ParamValue};
+use crate::params::{self, LoadReport, ParamError, ParamId, ParamValue};
 use crate::schedule::{Profile, TaskId};
 use crate::time::Micros;
 
@@ -132,6 +132,11 @@ pub struct Core<const N: usize> {
     events_dropped: u32,
     /// A parameter changed and the store has not been told it is saved.
     params_unsaved: bool,
+    /// What the store held was not fully understood (`report_param_load`),
+    /// and nobody has acknowledged it yet.
+    param_fault: Option<LoadReport>,
+    /// The `ParamLoadFault` event has not been emitted yet.
+    param_fault_event_due: bool,
 }
 
 impl<const N: usize> Core<N> {
@@ -184,6 +189,8 @@ impl<const N: usize> Core<N> {
             events: Ring::new(),
             events_dropped: 0,
             params_unsaved: false,
+            param_fault: None,
+            param_fault_event_due: false,
         })
     }
 
@@ -234,8 +241,29 @@ impl<const N: usize> Core<N> {
         }
     }
 
+    /// Tells the core what loading the stored parameters did. Call once after
+    /// [`Core::new`], with the report of `params::load` (and `unreadable` set if
+    /// the store could not be read). A report that is not clean puts the core
+    /// in a parameter fault: arming is refused (pre-arm flag `CONFIG`), one
+    /// `ParamLoadFault` event is emitted on the next tick, and the fault
+    /// stays until an operator acknowledges it (`Inputs::param_ack`). A clean
+    /// report changes nothing.
+    pub fn report_param_load(&mut self, report: LoadReport) {
+        if !report.clean() {
+            self.param_fault = Some(report);
+            self.param_fault_event_due = true;
+        }
+    }
+
+    /// A parameter fault is held: the stored values were not fully
+    /// understood, and no operator has acknowledged it. The store must not be
+    /// written while it is held.
+    pub fn params_fault(&self) -> bool {
+        self.param_fault.is_some()
+    }
+
     /// Armed now or as of the supervisor's latest decision.
-    fn is_armed(&self) -> bool {
+    pub fn is_armed(&self) -> bool {
         self.supervision.visible.armed || self.supervision.pending.armed
     }
 
@@ -251,6 +279,17 @@ impl<const N: usize> Core<N> {
             && now.since(last) != base_us
         {
             self.timing_faults = self.timing_faults.saturating_add(1);
+        }
+        if let Some(report) = self.param_fault
+            && self.param_fault_event_due
+        {
+            self.param_fault_event_due = false;
+            self.emit(now, EventKind::ParamLoadFault(report));
+        }
+        if inputs.param_ack && self.param_fault.is_some() && !self.is_armed() {
+            self.param_fault = None;
+            self.params_unsaved = true;
+            self.emit(now, EventKind::ParamFaultAcked);
         }
         if let Some(req) = inputs.param_set {
             self.apply_param(now, req);
