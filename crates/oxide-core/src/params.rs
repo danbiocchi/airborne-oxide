@@ -363,6 +363,10 @@ macro_rules! declare_params {
             )* )*
         ];
 
+        /// The storage key of every parameter, in table order: `KEYS[id]` is
+        /// `key(PARAMS[id].name)`, computed at compile time.
+        pub const KEYS: [u32; COUNT] = [$( $( key(stringify!($name)), )* )*];
+
         $(
             impl Section for $sec {
                 fn load(s: &Self, id: ParamId) -> Option<Stored> {
@@ -671,6 +675,34 @@ pub fn set<const N: usize>(
     Ok(())
 }
 
+// Two names with one key would make a stored value ambiguous: refuse to build.
+const _: () = {
+    let mut i = 0;
+    while i < COUNT {
+        let mut j = i + 1;
+        while j < COUNT {
+            #[allow(clippy::indexing_slicing)]
+            let same = KEYS[i] == KEYS[j];
+            assert!(!same, "two parameters share a storage key");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+/// The storage key of a parameter; `None` for an unknown id.
+pub fn key_of(id: ParamId) -> Option<u32> {
+    KEYS.get(id.index()).copied()
+}
+
+/// The parameter stored under `key`; `None` if this firmware has none.
+pub fn find_key(key: u32) -> Option<ParamId> {
+    KEYS.iter()
+        .position(|k| *k == key)
+        .and_then(|i| u16::try_from(i).ok())
+        .map(ParamId)
+}
+
 /// The parameter called `name`.
 pub fn find(name: &str) -> Option<ParamId> {
     PARAMS
@@ -824,6 +856,27 @@ mod tests {
                 assert_ne!(key(d.name), key(other.name), "{} {}", d.name, other.name);
             }
         }
+    }
+
+    #[test]
+    fn the_key_table_has_one_distinct_key_per_parameter_and_find_key_inverts_it() {
+        assert_eq!(KEYS.len(), COUNT);
+        for (id, d) in ids() {
+            let k = KEYS[id.index()];
+            assert_eq!(k, key(d.name), "{}", d.name);
+            assert_eq!(key_of(id), Some(k));
+            assert_eq!(find_key(k), Some(id), "{}", d.name);
+        }
+        for (i, a) in KEYS.iter().enumerate() {
+            for b in KEYS.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(key_of(ParamId(COUNT as u16)), None);
+        // A key no parameter has.
+        let unused = (0u32..).find(|k| !KEYS.contains(k)).unwrap();
+        assert_eq!(find_key(unused), None);
+        assert_eq!(find_key(u32::MAX).is_some(), KEYS.contains(&u32::MAX));
     }
 
     #[test]
