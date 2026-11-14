@@ -716,6 +716,110 @@ pub fn set_all<const N: usize>(
     Ok(())
 }
 
+// ---- stored values ----
+
+/// What loading stored values did (ADR-0004 §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct LoadReport {
+    /// Values taken.
+    pub applied: u16,
+    /// Keys this firmware does not know.
+    pub unknown: u16,
+    /// Values not finite or out of this firmware's range; the default stays.
+    pub dropped: u16,
+    /// The values together broke a rule; none was taken.
+    pub invalid: bool,
+    /// The store itself could not be read. Set by the caller, never by
+    /// [`load`].
+    pub unreadable: bool,
+}
+
+impl LoadReport {
+    /// Everything stored was understood and taken: nothing unknown, dropped,
+    /// invalid or unreadable (`applied` does not matter).
+    pub const fn clean(&self) -> bool {
+        self.unknown == 0 && self.dropped == 0 && !self.invalid && !self.unreadable
+    }
+}
+
+/// The 32 bits a stored value is kept as: `to_bits` of an `f32` (seconds for
+/// the fields held as microseconds), an `i32` as `u32`.
+fn stored_bits(s: Stored) -> u32 {
+    match s {
+        Stored::F(v) => v.to_bits(),
+        Stored::Us(us) => us_to_secs(us).to_bits(),
+        Stored::I(v) => v as u32,
+    }
+}
+
+/// Decodes stored bits by the parameter's own kind, so there is no wrong type.
+fn value_from_bits(kind: ParamKind, bits: u32) -> ParamValue {
+    match kind {
+        ParamKind::F32 => ParamValue::F32(f32::from_bits(bits)),
+        ParamKind::I32 => ParamValue::I32(bits as i32),
+    }
+}
+
+/// Applies stored `(key, bits)` pairs onto `cfg`, which holds the firmware's
+/// own values (the baseline). Never fails and never leaves `cfg` invalid.
+///
+/// A key no parameter has is counted as unknown. A value that is not finite or
+/// is out of range on its own is dropped and counted: the baseline value
+/// stays. The rest are applied; then the rules between fields are checked once
+/// on the result, and if they fail `cfg` is left exactly as it was given,
+/// nothing counts as applied and `invalid` is set. A key that appears twice
+/// takes its later value.
+pub fn load<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    records: impl IntoIterator<Item = (u32, u32)>,
+) -> LoadReport {
+    let mut report = LoadReport::default();
+    let mut next = *cfg;
+    for (key, bits) in records {
+        let Some(id) = find_key(key) else {
+            report.unknown = report.unknown.saturating_add(1);
+            continue;
+        };
+        let Some(def) = PARAMS.get(id.index()) else {
+            report.unknown = report.unknown.saturating_add(1);
+            continue;
+        };
+        // `put` writes before it checks the range: try on a copy.
+        let mut trial = next;
+        if put(&mut trial, id, value_from_bits(def.kind, bits)).is_ok() {
+            next = trial;
+            report.applied = report.applied.saturating_add(1);
+        } else {
+            report.dropped = report.dropped.saturating_add(1);
+        }
+    }
+    if report.applied > 0 {
+        if check_together(&next, profile).is_ok() {
+            *cfg = next;
+        } else {
+            report.applied = 0;
+            report.invalid = true;
+        }
+    }
+    report
+}
+
+/// The parameters whose value differs between `cfg` and `baseline`, as
+/// `(key, bits)` in table order: what a store must hold so that [`load`] onto
+/// `baseline` gives `cfg` again. Values are compared bit for bit.
+pub fn changed<'a, const N: usize>(
+    cfg: &'a VehicleConfig<N>,
+    baseline: &'a VehicleConfig<N>,
+) -> impl Iterator<Item = (u32, u32)> + Clone + 'a {
+    KEYS.iter().enumerate().filter_map(move |(i, key)| {
+        let id = ParamId(u16::try_from(i).ok()?);
+        let now = stored_bits(load_cfg(cfg, id)?);
+        let before = stored_bits(load_cfg(baseline, id)?);
+        (now != before).then_some((*key, now))
+    })
+}
+
 // Two names with one key would make a stored value ambiguous: refuse to build.
 const _: () = {
     let mut i = 0;
@@ -1273,6 +1377,258 @@ mod tests {
         let mut c = cfg();
         let list = [pair("EKF_HORIZON", 0.248), pair("LIM_TILT", 0.5)];
         assert_eq!(set_all(&mut c, &F405_LEAN, list), Ok(()));
+    }
+
+    /// The bits a value is stored as: `to_bits` of an `f32`, an `i32` as `u32`.
+    fn bits_of(v: ParamValue) -> u32 {
+        match v {
+            ParamValue::F32(x) => x.to_bits(),
+            ParamValue::I32(x) => x as u32,
+        }
+    }
+
+    fn rec(name: &str, v: ParamValue) -> (u32, u32) {
+        (key(name), bits_of(v))
+    }
+
+    /// Every parameter's value, as bits, in table order.
+    fn all_bits(c: &VehicleConfig<4>) -> Vec<u32> {
+        ids().map(|(id, _)| bits_of(get(c, id).unwrap())).collect()
+    }
+
+    #[test]
+    fn changed_then_load_reproduces_every_parameter_at_its_bounds_default_and_between() {
+        for profile in [&F405_LEAN, &H743_FULL] {
+            let base = cfg();
+            let mut tried = 0;
+            for (id, d) in ids() {
+                let mid = match (d.min, d.max) {
+                    (ParamValue::F32(lo), ParamValue::F32(hi)) => {
+                        ParamValue::F32(lo + (hi - lo) * 0.5)
+                    }
+                    (ParamValue::I32(lo), ParamValue::I32(hi)) => {
+                        ParamValue::I32(lo + (hi - lo) / 2)
+                    }
+                    _ => unreachable!(),
+                };
+                for v in [d.min, d.max, d.default, mid] {
+                    let mut c = base;
+                    match set(&mut c, profile, id, v) {
+                        Ok(()) => {}
+                        // A bound a rule between fields refuses, as in the
+                        // bound test above.
+                        Err(ParamError::Invalid(_)) => continue,
+                        Err(e) => panic!("{} = {v:?}: {e:?}", d.name),
+                    }
+                    tried += 1;
+                    let records: Vec<(u32, u32)> = changed(&c, &base).collect();
+                    assert!(records.len() <= 1, "{} = {v:?}: {records:?}", d.name);
+                    let mut loaded = base;
+                    let r = load(&mut loaded, profile, records.iter().copied());
+                    assert!(r.clean(), "{} = {v:?}: {r:?}", d.name);
+                    assert_eq!(usize::from(r.applied), records.len());
+                    assert_eq!(loaded, c, "{} = {v:?}", d.name);
+                    assert_eq!(all_bits(&loaded), all_bits(&c), "{} = {v:?}", d.name);
+                    // Loading what was just loaded changes nothing.
+                    let mut twice = loaded;
+                    let r2 = load(&mut twice, profile, records.iter().copied());
+                    assert_eq!(r2, r);
+                    assert_eq!(twice, loaded);
+                }
+            }
+            assert!(tried > 4 * COUNT - 30, "only {tried} cases ran");
+        }
+    }
+
+    #[test]
+    fn changed_of_a_configuration_against_itself_is_empty_and_lists_only_differences() {
+        let c = cfg();
+        assert_eq!(changed(&c, &c).count(), 0);
+        let mut d = c;
+        set(&mut d, &F405_LEAN, ParamId::LIM_TILT, ParamValue::F32(0.5)).unwrap();
+        set(&mut d, &F405_LEAN, ParamId::EKF_SOURCE, ParamValue::I32(1)).unwrap();
+        set(
+            &mut d,
+            &F405_LEAN,
+            ParamId::FS_RC_TIMEOUT,
+            ParamValue::F32(0.75),
+        )
+        .unwrap();
+        let got: Vec<(u32, u32)> = changed(&d, &c).collect();
+        // In table order.
+        assert_eq!(
+            got,
+            vec![
+                rec("LIM_TILT", ParamValue::F32(0.5)),
+                rec("EKF_SOURCE", ParamValue::I32(1)),
+                // A parameter held as microseconds is stored in seconds.
+                rec("FS_RC_TIMEOUT", ParamValue::F32(0.75)),
+            ]
+        );
+        // The iterator can be walked more than once.
+        let it = changed(&d, &c);
+        assert_eq!(it.clone().count(), it.count());
+        // The other way round, the values are the baseline's.
+        let back: Vec<(u32, u32)> = changed(&c, &d).collect();
+        assert_eq!(
+            back,
+            vec![
+                rec("LIM_TILT", ParamValue::F32(Limits::default().max_tilt_rad)),
+                rec("EKF_SOURCE", ParamValue::I32(0)),
+                rec("FS_RC_TIMEOUT", ParamValue::F32(0.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_counts_unknown_keys_and_changes_nothing_else() {
+        let mut unknown = 0u32;
+        while KEYS.contains(&unknown) {
+            unknown += 1;
+        }
+        let mut c = cfg();
+        let r = load(
+            &mut c,
+            &F405_LEAN,
+            [(unknown, 0x3f80_0000), (unknown + 7, 1)],
+        );
+        assert_eq!(
+            r,
+            LoadReport {
+                unknown: 2,
+                ..LoadReport::default()
+            }
+        );
+        assert!(!r.clean());
+        assert_eq!(c, cfg());
+        // A clean load is clean whatever it applied.
+        let mut c = cfg();
+        let r = load(&mut c, &F405_LEAN, [rec("LIM_TILT", ParamValue::F32(0.5))]);
+        assert!(r.clean() && r.applied == 1, "{r:?}");
+        assert_eq!(c.limits.max_tilt_rad, 0.5);
+        let mut c = cfg();
+        let r = load(&mut c, &F405_LEAN, []);
+        assert_eq!(r, LoadReport::default());
+        assert!(r.clean());
+        assert_eq!(c, cfg());
+    }
+
+    #[test]
+    fn load_drops_what_is_not_finite_or_out_of_range_and_applies_the_rest() {
+        let mut c = cfg();
+        let records = [
+            rec("LIM_TILT", ParamValue::F32(f32::NAN)),
+            rec("LIM_SPEED_XY", ParamValue::F32(f32::INFINITY)),
+            rec("LIM_SPEED_UP", ParamValue::F32(f32::NEG_INFINITY)),
+            rec("POS_X_P", ParamValue::F32(1.0e9)),
+            rec("POS_Y_P", ParamValue::F32(-1.0)),
+            rec("EKF_SOURCE", ParamValue::I32(2)),
+            rec("EKF_HORIZON", ParamValue::F32(0.3)),
+            rec("RTL_ALT", ParamValue::F32(12.0)),
+        ];
+        let r = load(&mut c, &F405_LEAN, records);
+        assert_eq!(
+            r,
+            LoadReport {
+                applied: 1,
+                dropped: 7,
+                ..LoadReport::default()
+            }
+        );
+        assert!(!r.clean());
+        let mut want = cfg();
+        want.failsafe.rtl_altitude_m = 12.0;
+        assert_eq!(c, want);
+        // A dropped value leaves the default, not the last stored one.
+        assert_eq!(c.limits.max_tilt_rad, Limits::default().max_tilt_rad);
+    }
+
+    #[test]
+    fn load_leaves_the_baseline_alone_when_the_values_break_a_rule_together() {
+        // Critical above low, with something valid in the same load.
+        let mut c = cfg();
+        let r = load(
+            &mut c,
+            &F405_LEAN,
+            [
+                rec("RTL_ALT", ParamValue::F32(12.0)),
+                rec("BAT_CRIT_V", ParamValue::F32(3.9)),
+            ],
+        );
+        assert_eq!(
+            r,
+            LoadReport {
+                invalid: true,
+                ..LoadReport::default()
+            }
+        );
+        assert!(!r.clean());
+        assert_eq!(c, cfg());
+        assert_eq!(format!("{c:?}"), format!("{:?}", cfg()));
+        // The same pair that is valid only together loads in either order.
+        for pair in [
+            [
+                rec("BAT_CRIT_V", ParamValue::F32(3.6)),
+                rec("BAT_LOW_V", ParamValue::F32(3.8)),
+            ],
+            [
+                rec("BAT_LOW_V", ParamValue::F32(3.8)),
+                rec("BAT_CRIT_V", ParamValue::F32(3.6)),
+            ],
+        ] {
+            let mut c = cfg();
+            let r = load(&mut c, &F405_LEAN, pair);
+            assert!(r.clean() && r.applied == 2, "{r:?}");
+            assert_eq!(c.failsafe.battery_critical_v, 3.6);
+            assert_eq!(c.failsafe.battery_low_v, 3.8);
+        }
+        // Unknown and dropped records are still counted next to a broken rule.
+        let mut c = cfg();
+        let r = load(
+            &mut c,
+            &F405_LEAN,
+            [
+                rec("BAT_CRIT_V", ParamValue::F32(3.9)),
+                rec("LIM_TILT", ParamValue::F32(f32::NAN)),
+            ],
+        );
+        assert_eq!((r.invalid, r.dropped, r.applied), (true, 1, 0));
+        assert_eq!(c, cfg());
+    }
+
+    #[test]
+    fn a_microsecond_value_an_f32_cannot_hold_does_not_round_trip_exactly() {
+        // Parameters in seconds are `f32`, which holds whole microseconds
+        // exactly only up to 2^24 (16.7 s); `set` can only produce values
+        // that survive, a field written directly may not.
+        let base = cfg();
+        let mut c = base;
+        c.failsafe.rc_timeout_us = 3_600_000_001;
+        let mut loaded = base;
+        let r = load(&mut loaded, &F405_LEAN, changed(&c, &base));
+        assert!(r.clean());
+        assert_eq!(loaded.failsafe.rc_timeout_us, 3_600_000_000);
+        // Every value `set` can make survives, up to the table's maximum.
+        for x in [
+            0.05_f32,
+            0.123_456_7,
+            16.777_217,
+            100.000_01,
+            3599.999,
+            3600.0,
+        ] {
+            let mut c = base;
+            set(
+                &mut c,
+                &F405_LEAN,
+                ParamId::FS_RC_TIMEOUT,
+                ParamValue::F32(x),
+            )
+            .unwrap();
+            let mut loaded = base;
+            load(&mut loaded, &F405_LEAN, changed(&c, &base));
+            assert_eq!(loaded, c, "{x}");
+        }
     }
 
     #[test]
