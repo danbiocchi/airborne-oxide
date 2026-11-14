@@ -37,7 +37,7 @@
 //! capacity_mah = 4000.0
 //! initial_state_of_charge = 0.0614
 //!
-//! [params]                    # parameter overrides by name, applied in name order
+//! [params]                    # parameter overrides by name, applied as one change
 //! FS_GPS_LAND = 10.0
 //!
 //! [[fault]]                   # kind: motor-loss (rotor, scale), gps-loss, imu-loss, baro-loss,
@@ -100,7 +100,7 @@ use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, REASON_NAMES};
 use crate::rng::{Rng, Stream, run_seed};
 use crate::scenario::Script;
 use crate::sensors::SensorConfig;
-use crate::sim::{SimOptions, Simulation, StepRecord, apply_param};
+use crate::sim::{SimOptions, Simulation, StepRecord, apply_params_at};
 use crate::wind::{Gust, WindConfig};
 
 #[cfg(test)]
@@ -390,8 +390,9 @@ pub struct ScenarioFile {
     pub links: LinkConfig,
     pub wind: WindSpec,
     pub battery: Option<BatteryOverride>,
-    /// Parameter overrides by name, in the order they are applied (the TOML
-    /// reader yields a table sorted by key, so: name order).
+    /// Parameter overrides by name. They are applied together with the
+    /// airframe's and the command line's as one change, so the order here
+    /// (the TOML reader yields a table sorted by key) does not matter.
     pub params: Vec<(String, f64)>,
     pub faults: Vec<Fault>,
     /// What the radio and the brain send. `pilot.duration_s` is
@@ -1122,29 +1123,36 @@ fn convert_wind(raw: RawWind) -> Result<WindSpec> {
     })
 }
 
-/// Every override must be a real parameter and an acceptable value: tried in
-/// order on a scratch configuration of the reference airframe.
+/// Every override must be a real parameter and an acceptable value, and the
+/// airframe's table and these together a valid configuration: applied as one
+/// change, as the simulator does, on a scratch configuration of the reference
+/// airframe.
 fn check_params(params: &[(String, f64)]) -> Result<()> {
     if params.is_empty() {
         return Ok(());
     }
-    let key = |name: &str| format!("params.{name}");
     let airframe =
         Airframe::reference_quad().map_err(|e| ScenarioError::new("airframe", e.to_string()))?;
     let mut cfg = airframe
         .core_config::<ROTORS>()
         .map_err(|e| ScenarioError::new("airframe", e.to_string()))?;
-    for (name, value) in &airframe.params {
-        apply_param(&mut cfg, &F405_LEAN, name, *value)
-            .map_err(|e| ScenarioError::new("airframe", e.to_string()))?;
-    }
-    for (name, value) in params {
-        apply_param(&mut cfg, &F405_LEAN, name, *value).map_err(|e| match e {
-            SimError::Param { reason, .. } => ScenarioError::new(key(name), reason),
-            other => ScenarioError::new(key(name), other.to_string()),
-        })?;
-    }
-    Ok(())
+    let from_airframe = airframe.params.len();
+    let mut list = airframe.params.clone();
+    list.extend_from_slice(params);
+    apply_params_at(&mut cfg, &F405_LEAN, &list).map_err(|(at, e)| {
+        let reason = match &e {
+            SimError::Param { reason, .. } => reason.clone(),
+            other => other.to_string(),
+        };
+        match at {
+            Some(i) if i < from_airframe => ScenarioError::new("airframe", e.to_string()),
+            Some(i) => ScenarioError::new(
+                format!("params.{}", list.get(i).map_or("", |(n, _)| n.as_str())),
+                reason,
+            ),
+            None => ScenarioError::new("params", reason),
+        }
+    })
 }
 
 /// Fault kinds by file name.

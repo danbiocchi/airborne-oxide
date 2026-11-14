@@ -21,15 +21,16 @@ pub struct Airframe {
     #[serde(rename = "rotor")]
     pub rotors: Vec<RotorSpec>,
     pub battery: BatterySpec,
-    /// Optional `[params]` table of `NAME = value` (ADR-0004), applied in name
-    /// order (the TOML table is sorted by key).
-    /// Applied before any command-line override.
+    /// Optional `[params]` table of `NAME = value` (ADR-0004). It comes first
+    /// in the list of parameters: the scenario's and the command line's follow
+    /// it and override it. The whole list is applied as one change, so the
+    /// order of the entries does not matter (the TOML table is sorted by key).
     #[serde(default, deserialize_with = "ordered_params")]
     pub params: Vec<(String, f64)>,
 }
 
-/// A `[params]` table as `(name, value)` pairs in key (name) order, each
-/// value an integer or a float.
+/// A `[params]` table as `(name, value)` pairs in the reader's order (sorted
+/// by key), each value an integer or a float.
 pub fn ordered_params<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Vec<(String, f64)>, D::Error> {
@@ -131,7 +132,7 @@ struct ParamsFile {
 }
 
 /// Parses a parameter file (`--params FILE.toml`) into `(name, value)` pairs
-/// in file order.
+/// (sorted by name: the order within a file carries no meaning).
 pub fn parse_params_file(text: &str) -> Result<Vec<(String, f64)>, SimError> {
     toml::from_str::<ParamsFile>(text)
         .map(|f| f.params)

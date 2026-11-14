@@ -92,14 +92,69 @@ fn each_error_names_the_parameter_the_value_and_the_reason() {
     assert!(e.contains("BAT_CRIT_V") && e.contains("rule"), "{e}");
 }
 
+fn config_with(airframe: &Airframe, params: &[(&str, f64)]) -> Result<(f32, f32), SimError> {
+    let options = SimOptions {
+        params: params.iter().map(|(n, v)| ((*n).to_string(), *v)).collect(),
+        ..SimOptions::default()
+    };
+    let sim = Simulation::<_, 4>::with_options(airframe, F405_LEAN, HoverStep::default(), options)?;
+    let f = sim.core().config().failsafe;
+    Ok((f.battery_critical_v, f.battery_low_v))
+}
+
 #[test]
-fn overrides_apply_in_order() {
-    // Raising the low level first and then the critical one is valid at each
-    // step; the reverse order breaks the rule (critical above low) at the
-    // first step and is refused.
+fn a_pair_valid_only_together_is_accepted_in_either_order() {
+    // Critical 3.6 above the default low 3.5 breaks the rule on its own; with
+    // low 3.8 the pair is fine. The result does not depend on the order.
     let a = reference();
-    assert!(hash_with(&a, &[("BAT_LOW_V", 3.8), ("BAT_CRIT_V", 3.6)]).is_ok());
-    assert!(hash_with(&a, &[("BAT_CRIT_V", 3.6), ("BAT_LOW_V", 3.8)]).is_err());
+    for list in [
+        [("BAT_LOW_V", 3.8), ("BAT_CRIT_V", 3.6)],
+        [("BAT_CRIT_V", 3.6), ("BAT_LOW_V", 3.8)],
+    ] {
+        assert_eq!(config_with(&a, &list).expect("accepted"), (3.6, 3.8));
+    }
+    // A later entry for the same parameter overrides an earlier one, and only
+    // the final configuration has to be valid.
+    let list = [("BAT_LOW_V", 3.0), ("BAT_LOW_V", 3.8), ("BAT_CRIT_V", 3.6)];
+    assert_eq!(config_with(&a, &list).expect("accepted"), (3.6, 3.8));
+}
+
+#[test]
+fn the_airframe_table_and_the_options_form_one_change() {
+    // Half of the pair in the airframe file, the other half as an option, in
+    // both directions: valid together, so accepted.
+    let low = format!("{REFERENCE_QUAD_TOML}\n[params]\nBAT_LOW_V = 3.8\n");
+    let a = Airframe::from_toml(&low).expect("parses");
+    assert_eq!(
+        config_with(&a, &[("BAT_CRIT_V", 3.6)]).expect("accepted"),
+        (3.6, 3.8)
+    );
+    let crit = format!("{REFERENCE_QUAD_TOML}\n[params]\nBAT_CRIT_V = 3.6\n");
+    let a = Airframe::from_toml(&crit).expect("parses");
+    assert_eq!(
+        config_with(&a, &[("BAT_LOW_V", 3.8)]).expect("accepted"),
+        (3.6, 3.8)
+    );
+    // Both in the airframe table.
+    let both = format!("{REFERENCE_QUAD_TOML}\n[params]\nBAT_CRIT_V = 3.6\nBAT_LOW_V = 3.8\n");
+    let a = Airframe::from_toml(&both).expect("parses");
+    assert_eq!(config_with(&a, &[]).expect("accepted"), (3.6, 3.8));
+}
+
+#[test]
+fn a_list_that_breaks_a_rule_together_is_refused_naming_the_rule_and_the_parameters() {
+    let e = refused(&[("BAT_CRIT_V", 3.9), ("BAT_LOW_V", 3.8)]);
+    assert!(
+        e.contains("BAT_CRIT_V") && e.contains("BAT_LOW_V") && e.contains("together"),
+        "{e}"
+    );
+    assert!(e.contains("BAT_CRIT_V must not exceed BAT_LOW_V"), "{e}");
+    // A bad value is named on its own, whatever else is in the list.
+    let e = refused(&[("BAT_LOW_V", 3.8), ("POS_X_P", 1.0e9), ("BAT_CRIT_V", 3.6)]);
+    assert!(
+        e.contains("POS_X_P") && e.contains("range") && !e.contains("together"),
+        "{e}"
+    );
 }
 
 #[test]

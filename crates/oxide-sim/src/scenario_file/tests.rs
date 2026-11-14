@@ -141,20 +141,20 @@ fn computed_battery_sizes_are_written_as_literals() {
 }
 
 #[test]
-fn parameters_are_applied_in_name_order_whatever_the_file_order() {
-    // The TOML reader hands a table over sorted by key, not in file order, so
-    // the order that counts is the name order.
-    let s = load_str(
-        "name = \"x\"\nduration_s = 5.0\n[params]\nFS_NOLINK_RTL = 5.0\nFS_GPS_LAND = 10.0\nEKF_HGT_TMO = 2\n",
-    );
-    let s = s.expect_err("EKF_HGT_TMO is not a parameter");
-    assert_eq!(s.key, "params.EKF_HGT_TMO");
-    let s = load_str(
-        "name = \"x\"\nduration_s = 5.0\n[params]\nFS_NOLINK_RTL = 5.0\nFS_GPS_LAND = 10.0\n",
-    )
-    .expect("loads");
-    let names: Vec<&str> = s.params.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["FS_GPS_LAND", "FS_NOLINK_RTL"]);
+fn a_combination_valid_only_together_loads_from_a_scenario_file() {
+    // The critical battery level above the default low level breaks a rule on
+    // its own, and the table is read sorted by name, critical first. The
+    // values are applied as one change, so the file loads.
+    let s =
+        load_str("name = \"x\"\nduration_s = 5.0\n[params]\nBAT_LOW_V = 3.8\nBAT_CRIT_V = 3.6\n")
+            .expect("loads");
+    assert_eq!(s.params.len(), 2);
+    // Together they still have to hold: this pair does not.
+    let e = refused("[params]\nBAT_CRIT_V = 3.9\nBAT_LOW_V = 3.8\n");
+    assert!(e.reason.contains("together"), "{e}");
+    // An unknown name is still named.
+    let e = refused("[params]\nFS_NOLINK_RTL = 5.0\nEKF_HGT_TMO = 2\n");
+    assert_eq!(e.key, "params.EKF_HGT_TMO");
 }
 
 // ---- hover-step and gust-hold ---------------------------------------------------

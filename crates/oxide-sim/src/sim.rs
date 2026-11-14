@@ -50,9 +50,11 @@ pub struct SimOptions {
     pub failsafe: Option<FailsafeParams>,
     /// Replaces the airframe's battery (for low-battery scenarios).
     pub battery: Option<BatterySpec>,
-    /// Parameter overrides by name (ADR-0004), applied in order through
-    /// `oxide_core::params::set` after the airframe's own `[params]` table and
-    /// after the `estimator`, `failsafe` and `battery` overrides.
+    /// Parameter overrides by name (ADR-0004: the scenario's `[params]`, then
+    /// the command line's). They follow the airframe's own `[params]` table
+    /// and the `estimator`, `failsafe` and `battery` overrides, and are applied
+    /// together with the airframe's as one change (`apply_params`): a later
+    /// entry for a name wins, and only the final configuration must be valid.
     pub params: Vec<(String, f64)>,
 }
 
@@ -101,39 +103,100 @@ fn describe(e: ParamError) -> String {
     }
 }
 
-/// Sets the parameter `name` on `cfg` through `oxide_core::params::set`. An
-/// `i32` parameter needs a whole number (one too large for an `i32` is out
-/// of range); an `f32` one takes `value as f32`.
-/// A refused change leaves `cfg` untouched.
+/// The rule a joint failure names, in words.
+fn describe_rule(c: oxide_core::config::ConfigError) -> String {
+    use oxide_core::config::ConfigError;
+    match c {
+        ConfigError::BadFailsafe => "a failsafe, battery or landing rule (BAT_CRIT_V must not \
+             exceed BAT_LOW_V; LAND_SPEED must be at least twice LAND_TD_SPEED; LIM_MIN_THRUST \
+             must stay below LAND_TD_THRUST, which must stay below LAND_BLIND_THR)"
+            .into(),
+        ConfigError::BadEstimator => {
+            "an estimator rule (the delay horizon must fit the profile's buffers)".into()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// One `(name, value)` as the core's parameter and value. An `i32` parameter
+/// needs a whole number (one too large for an `i32` is out of range); an
+/// `f32` one takes `value as f32`.
 #[allow(clippy::cast_possible_truncation)]
-pub fn apply_param<const N: usize>(
-    cfg: &mut VehicleConfig<N>,
-    profile: &Profile,
-    name: &str,
-    value: f64,
-) -> Result<(), SimError> {
-    let fail = |e: ParamError| SimError::Param {
-        name: name.to_string(),
-        reason: format!("value {value}: {}", describe(e)),
-    };
-    let id = params::find(name).ok_or_else(|| fail(ParamError::Unknown))?;
-    let def = params::PARAMS
-        .get(id.index())
-        .ok_or_else(|| fail(ParamError::Unknown))?;
+fn to_change(name: &str, value: f64) -> Result<(params::ParamId, ParamValue), ParamError> {
+    let id = params::find(name).ok_or(ParamError::Unknown)?;
+    let def = params::PARAMS.get(id.index()).ok_or(ParamError::Unknown)?;
     let v = match def.kind {
         ParamKind::F32 => ParamValue::F32(value as f32),
         ParamKind::I32 => {
             if !value.is_finite() || value.fract() != 0.0 {
-                return Err(fail(ParamError::WrongType));
+                return Err(ParamError::WrongType);
             }
             // A whole number, but one an i32 cannot hold.
             if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
-                return Err(fail(ParamError::OutOfRange));
+                return Err(ParamError::OutOfRange);
             }
             ParamValue::I32(value as i32)
         }
     };
-    params::set(cfg, profile, id, v).map_err(fail)
+    Ok((id, v))
+}
+
+/// Applies the parameters `list` to `cfg` as one change through
+/// `oxide_core::params::set_all`: each value is checked on its own, a later
+/// entry for a name overrides an earlier one, and the rules between fields are
+/// checked once, on the result. So any valid combination can be stated in any
+/// order. All or nothing: a refused list leaves `cfg` untouched.
+///
+/// On an error, the index of the entry at fault comes with it (`None` when the
+/// values are each fine but together break a rule).
+pub fn apply_params_at<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    list: &[(String, f64)],
+) -> Result<(), (Option<usize>, SimError)> {
+    let fail = |name: &str, value: f64, e: ParamError| SimError::Param {
+        name: name.to_string(),
+        reason: format!("value {value}: {}", describe(e)),
+    };
+    let mut changes = Vec::with_capacity(list.len());
+    for (i, (name, value)) in list.iter().enumerate() {
+        let change = to_change(name, *value).map_err(|e| (Some(i), fail(name, *value, e)))?;
+        // On its own (type, finite, range). A rule between fields may need
+        // the other entries, so only a failure of this value counts here.
+        let mut scratch = *cfg;
+        if let Err((Some(_), e)) = params::set_all(&mut scratch, profile, [change]) {
+            return Err((Some(i), fail(name, *value, e)));
+        }
+        changes.push(change);
+    }
+    params::set_all(cfg, profile, changes).map_err(|(_, e)| {
+        let rule = match e {
+            ParamError::Invalid(c) => describe_rule(c),
+            other => describe(other),
+        };
+        let mut names: Vec<&str> = Vec::new();
+        for (name, _) in list {
+            if !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        (
+            None,
+            SimError::Param {
+                name: names.join(", "),
+                reason: format!("these values together break a rule: {rule}"),
+            },
+        )
+    })
+}
+
+/// [`apply_params_at`] without the index of the entry at fault.
+pub fn apply_params<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    list: &[(String, f64)],
+) -> Result<(), SimError> {
+    apply_params_at(cfg, profile, list).map_err(|(_, e)| e)
 }
 
 /// What happened in one tick, for logging, viewers and tests.
@@ -210,18 +273,19 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         if let Some(f) = options.failsafe {
             cfg.failsafe = f;
         }
-        for (name, value) in &airframe.params {
-            apply_param(&mut cfg, &profile, name, *value).map_err(|e| match e {
-                SimError::Param { name, reason } => SimError::Param {
-                    name,
-                    reason: format!("{reason} (set in the airframe file {})", airframe.name),
-                },
-                other => other,
-            })?;
-        }
-        for (name, value) in &options.params {
-            apply_param(&mut cfg, &profile, name, *value)?;
-        }
+        // The airframe's `[params]`, then the options' (the scenario's, then
+        // the command line's), as one change: later entries override earlier
+        // ones and only the final configuration has to be valid.
+        let from_airframe = airframe.params.len();
+        let mut list = airframe.params.clone();
+        list.extend_from_slice(&options.params);
+        apply_params_at(&mut cfg, &profile, &list).map_err(|(at, e)| match (at, e) {
+            (Some(i), SimError::Param { name, reason }) if i < from_airframe => SimError::Param {
+                name,
+                reason: format!("{reason} (set in the airframe file {})", airframe.name),
+            },
+            (_, other) => other,
+        })?;
         // A parameter may have changed the source: the state input follows it.
         let truth_state = cfg.estimator.source == EstimatorSource::External;
         let core = Core::new(cfg, profile).map_err(SimError::Core)?;

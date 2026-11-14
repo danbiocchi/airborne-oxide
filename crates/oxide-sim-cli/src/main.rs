@@ -931,6 +931,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pair_valid_only_together_is_accepted_from_flags_in_either_order() {
+        let crit_first = hover_hash(&["--param", "BAT_CRIT_V=3.6", "--param", "BAT_LOW_V=3.8"])
+            .expect("critical first");
+        let low_first = hover_hash(&["--param", "BAT_LOW_V=3.8", "--param", "BAT_CRIT_V=3.6"])
+            .expect("low first");
+        // A hover-step never reaches either threshold, so the flight is the
+        // default one: what matters is that the run starts.
+        assert_eq!(crit_first, low_first);
+        assert_eq!(crit_first, hover_hash(&[]).expect("base"));
+        // A file and a flag form one change as well.
+        let file = temp_file("pair.toml", "[params]\nBAT_CRIT_V = 3.6\n");
+        assert!(hover_hash(&["--params", &file, "--param", "BAT_LOW_V=3.8"]).is_ok());
+        let _ = std::fs::remove_file(&file);
+        // Together they must still hold.
+        let e = hover_hash(&["--param", "BAT_LOW_V=3.8", "--param", "BAT_CRIT_V=3.9"])
+            .expect_err("critical above low");
+        assert!(e.contains("BAT_CRIT_V") && e.contains("together"), "{e}");
+    }
+
+    #[test]
     fn each_error_case_prints_its_message() {
         for (flag, name, why) in [
             ("NOPE=1", "NOPE", "no such parameter"),
