@@ -173,10 +173,13 @@ impl<F: Flash> Store<F> {
         self.sequence
     }
 
-    /// The newest value for `key`. A flash read failure reads as `None`.
-    #[must_use]
-    pub fn get(&self, key: u32) -> Option<u32> {
-        self.lookup(key).ok().flatten()
+    /// The newest value for `key`: `Ok(None)` when the key is absent (or was
+    /// removed, or the store is [`MountReport::Corrupt`] and so empty).
+    ///
+    /// # Errors
+    /// A flash read failure. It is never reported as "absent".
+    pub fn get(&self, key: u32) -> Result<Option<u32>, Error> {
+        self.lookup(key).map_err(Error::from)
     }
 
     /// Sets `key` to `value`, compacting first when the sector is full.
@@ -204,11 +207,13 @@ impl<F: Flash> Store<F> {
     }
 
     /// The live keys and values, in the order their newest record was written.
+    /// A flash read failure is yielded as an `Err` item and ends the iteration.
     #[must_use]
     pub fn iter(&self) -> Iter<'_, F> {
         Iter {
             store: self,
             next: 0,
+            done: false,
         }
     }
 
@@ -466,20 +471,35 @@ impl<F: Flash> Store<F> {
 pub struct Iter<'a, F: Flash> {
     store: &'a Store<F>,
     next: usize,
+    /// Set after an error has been yielded.
+    done: bool,
+}
+
+impl<F: Flash> Iter<'_, F> {
+    /// Whether the record in `slot` is a set that nothing later replaces.
+    fn live(&self, sector: usize, slot: usize) -> Result<Option<(u32, u32)>, FlashError> {
+        let Slot::Set(k, v) = self.store.read_slot(sector, slot)? else {
+            return Ok(None);
+        };
+        Ok((!self.store.superseded(sector, slot, k)?).then_some((k, v)))
+    }
 }
 
 impl<F: Flash> Iterator for Iter<'_, F> {
-    type Item = (u32, u32);
+    type Item = Result<(u32, u32), Error>;
 
-    fn next(&mut self) -> Option<(u32, u32)> {
+    fn next(&mut self) -> Option<Self::Item> {
         let sector = self.store.active?;
-        while self.next < self.store.used {
+        while !self.done && self.next < self.store.used {
             let slot = self.next;
             self.next += 1;
-            if let Ok(Slot::Set(k, v)) = self.store.read_slot(sector, slot)
-                && self.store.superseded(sector, slot, k) == Ok(false)
-            {
-                return Some((k, v));
+            match self.live(sector, slot) {
+                Ok(Some(kv)) => return Some(Ok(kv)),
+                Ok(None) => {}
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
             }
         }
         None

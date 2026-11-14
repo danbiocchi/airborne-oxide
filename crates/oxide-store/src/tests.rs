@@ -40,14 +40,14 @@ impl Op {
 }
 
 fn contents<F: Flash>(s: &Store<F>) -> Model {
-    s.iter().collect()
+    s.iter().map(|r| r.unwrap()).collect()
 }
 
 /// `get` and `iter` agree with each other and with `model`.
 fn assert_matches<F: Flash>(s: &Store<F>, model: &Model, ctx: &str) {
     assert_eq!(&contents(s), model, "iter differs: {ctx}");
     for (&k, &v) in model {
-        assert_eq!(s.get(k), Some(v), "get({k}): {ctx}");
+        assert_eq!(s.get(k).unwrap(), Some(v), "get({k}): {ctx}");
     }
 }
 
@@ -60,16 +60,16 @@ fn a_set_then_a_remount_reads_back() {
     let mut f = fresh();
     let (mut s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Fresh);
-    assert_eq!(s.get(1), None);
+    assert_eq!(s.get(1).unwrap(), None);
     s.set(1, 10).unwrap();
     s.set(2, 20).unwrap();
     s.set(u32::MAX, u32::MAX).unwrap();
     let (s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Clean);
-    assert_eq!(s.get(1), Some(10));
-    assert_eq!(s.get(2), Some(20));
-    assert_eq!(s.get(u32::MAX), Some(u32::MAX));
-    assert_eq!(s.get(3), None);
+    assert_eq!(s.get(1).unwrap(), Some(10));
+    assert_eq!(s.get(2).unwrap(), Some(20));
+    assert_eq!(s.get(u32::MAX).unwrap(), Some(u32::MAX));
+    assert_eq!(s.get(3).unwrap(), None);
 }
 
 #[test]
@@ -79,10 +79,10 @@ fn the_newest_value_wins() {
     s.set(1, 1).unwrap();
     s.set(1, 2).unwrap();
     s.set(1, 3).unwrap();
-    assert_eq!(s.get(1), Some(3));
+    assert_eq!(s.get(1).unwrap(), Some(3));
     assert_eq!(contents(&s), Model::from([(1, 3)]));
     let (s, _) = Store::mount(&mut f).unwrap();
-    assert_eq!(s.get(1), Some(3));
+    assert_eq!(s.get(1).unwrap(), Some(3));
 }
 
 #[test]
@@ -92,13 +92,13 @@ fn remove_hides_the_key_and_a_later_set_revives_it() {
     s.set(1, 5).unwrap();
     s.set(2, 6).unwrap();
     s.remove(1).unwrap();
-    assert_eq!(s.get(1), None);
+    assert_eq!(s.get(1).unwrap(), None);
     assert_eq!(contents(&s), Model::from([(2, 6)]));
     let (mut s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Clean);
-    assert_eq!(s.get(1), None);
+    assert_eq!(s.get(1).unwrap(), None);
     s.set(1, 0).unwrap();
-    assert_eq!(s.get(1), Some(0));
+    assert_eq!(s.get(1).unwrap(), Some(0));
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn erase_count_rises_by_one_per_compaction() {
     assert_eq!(f.total_erases(), 6);
     let (s, _) = Store::mount(&mut f).unwrap();
     assert_eq!(s.erase_count(), 6);
-    assert_eq!(s.get(7), Some(39));
+    assert_eq!(s.get(7).unwrap(), Some(39));
 }
 
 #[test]
@@ -164,8 +164,8 @@ fn more_live_keys_than_slots_is_full_and_changes_nothing() {
     assert_eq!(s.set(7, 7), Err(Error::Full));
     // Replacing an existing key of a full sector still works, via compaction.
     s.set(3, 33).unwrap();
-    assert_eq!(s.get(3), Some(33));
-    assert_eq!(s.get(7), None);
+    assert_eq!(s.get(3).unwrap(), Some(33));
+    assert_eq!(s.get(7).unwrap(), None);
     s.remove(6).unwrap();
     s.set(7, 7).unwrap();
     assert_eq!(
@@ -200,13 +200,13 @@ fn a_torn_record_is_skipped_and_never_reused() {
     let (mut s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Recovered);
     assert_eq!(s.torn_records(), 1);
-    assert_eq!(s.get(2), None);
+    assert_eq!(s.get(2).unwrap(), None);
     s.set(3, 3).unwrap();
     assert_eq!(contents(&s), Model::from([(1, 1), (3, 3)]));
     // The torn slot is still there and still counted; the new record is after it.
     let (s, r) = Store::mount(&mut f).unwrap();
     assert_eq!((r, s.torn_records()), (MountReport::Recovered, 1));
-    assert_eq!(s.get(3), Some(3));
+    assert_eq!(s.get(3).unwrap(), Some(3));
 }
 
 #[test]
@@ -226,18 +226,18 @@ fn both_sectors_damaged_is_corrupt_and_format_recovers() {
     }
     let (mut s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Corrupt);
-    assert_eq!(s.get(1), None);
+    assert_eq!(s.get(1).unwrap(), None);
     assert_eq!(contents(&s), Model::new());
     assert_eq!(s.set(1, 1), Err(Error::Corrupt));
     assert_eq!(s.remove(1), Err(Error::Corrupt));
     s.format().unwrap();
     s.set(1, 42).unwrap();
-    assert_eq!(s.get(1), Some(42));
+    assert_eq!(s.get(1).unwrap(), Some(42));
     let before = s.erase_count();
     assert!(before >= 1, "format accounts for the erases it made");
     let (s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Clean);
-    assert_eq!(s.get(1), Some(42));
+    assert_eq!(s.get(1).unwrap(), Some(42));
     assert_eq!(s.erase_count(), before);
 }
 
@@ -262,7 +262,7 @@ fn a_damaged_active_header_is_corrupt_and_never_a_silent_rollback_to_old_values(
     f.bytes_mut(active).unwrap()[4] &= !1;
     let (s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Corrupt);
-    assert_eq!(s.get(1), None);
+    assert_eq!(s.get(1).unwrap(), None);
     assert_eq!(contents(&s), Model::new());
 }
 
@@ -300,7 +300,7 @@ fn both_sectors_valid_mounts_the_higher_sequence_and_reports_recovered() {
         }
         let (s, r) = Store::mount(&mut f).unwrap();
         assert_eq!(r, MountReport::Recovered, "{seq0} {seq1}");
-        assert_eq!(s.get(1), Some(100 + want), "{seq0} {seq1}");
+        assert_eq!(s.get(1).unwrap(), Some(100 + want), "{seq0} {seq1}");
         assert_eq!(f.total_erases(), 0, "mount erases nothing here");
     }
 }
@@ -343,7 +343,7 @@ fn a_valid_sector_beside_a_writing_or_damaged_one_is_recovered_and_beside_a_blan
         other(&mut f, how);
         let (s, r) = Store::mount(&mut f).unwrap();
         assert_eq!(r, want, "{how}");
-        assert_eq!(s.get(1), Some(9), "{how}");
+        assert_eq!(s.get(1).unwrap(), Some(9), "{how}");
         assert_eq!(f.total_erases(), 0, "{how}: mount writes nothing");
         assert_eq!(f.events(), 0, "{how}: mount writes nothing");
     }
@@ -362,7 +362,7 @@ fn no_valid_sector_and_nothing_stored_is_fresh_whatever_the_headers_hold() {
     s.set(1, 1).unwrap();
     assert_eq!(f.total_erases(), 2, "both dirty sectors were erased");
     let (s, r) = Store::mount(&mut f).unwrap();
-    assert_eq!((r, s.get(1)), (MountReport::Clean, Some(1)));
+    assert_eq!((r, s.get(1).unwrap()), (MountReport::Clean, Some(1)));
     // One byte of record area written: anything else is damage.
     let mut f = fresh();
     f.bytes_mut(0).unwrap()[..12].copy_from_slice(&header_body(5));
@@ -419,6 +419,133 @@ fn a_flash_read_error_is_an_error_not_a_panic() {
     ));
 }
 
+/// A flash that fails reads on demand: every read from the `n`-th on (counting
+/// from when `fail_from` is set) returns a device error.
+struct FlakyReads<F: Flash> {
+    inner: F,
+    reads: std::cell::Cell<u64>,
+    fail_from: std::cell::Cell<Option<u64>>,
+}
+
+impl<F: Flash> FlakyReads<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner,
+            reads: std::cell::Cell::new(0),
+            fail_from: std::cell::Cell::new(None),
+        }
+    }
+
+    fn fail_after(&self, n: u64) {
+        self.fail_from.set(Some(self.reads.get() + n));
+    }
+
+    fn heal(&self) {
+        self.fail_from.set(None);
+    }
+}
+
+impl<F: Flash> Flash for FlakyReads<F> {
+    const SECTOR_SIZE: usize = F::SECTOR_SIZE;
+    fn read(&self, s: usize, o: usize, b: &mut [u8]) -> Result<(), FlashError> {
+        let n = self.reads.get();
+        self.reads.set(n + 1);
+        match self.fail_from.get() {
+            Some(from) if n >= from => Err(FlashError::Device),
+            _ => self.inner.read(s, o, b),
+        }
+    }
+    fn program(&mut self, s: usize, o: usize, d: &[u8]) -> Result<(), FlashError> {
+        self.inner.program(s, o, d)
+    }
+    fn erase(&mut self, s: usize) -> Result<(), FlashError> {
+        self.inner.erase(s)
+    }
+}
+
+#[test]
+fn a_flash_read_error_is_never_reported_as_an_absent_key() {
+    let mut f = FlakyReads::new(fresh());
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    s.set(1, 10).unwrap();
+    s.set(2, 20).unwrap();
+    s.set(1, 11).unwrap();
+    assert_eq!(s.get(1), Ok(Some(11)));
+    assert_eq!(s.get(9), Ok(None));
+    // From the first read on, every read fails.
+    s.flash_mut().fail_after(0);
+    let dev = Err(Error::Flash(FlashError::Device));
+    assert_eq!(s.get(1), dev);
+    assert_eq!(
+        s.get(9),
+        dev,
+        "an absent key is not told apart from a failure"
+    );
+    // A failure part-way through the search is a failure too.
+    s.flash_mut().heal();
+    // Looking up key 2 makes 5 reads: the newest key, the older key, then the
+    // three words of the record.
+    for n in 0..5 {
+        s.flash_mut().fail_after(n);
+        assert_eq!(s.get(2), dev, "fails at read {n}");
+        s.flash_mut().heal();
+        assert_eq!(s.get(2), Ok(Some(20)));
+    }
+}
+
+#[test]
+fn iter_yields_the_read_error_and_then_ends() {
+    let mut f = FlakyReads::new(fresh());
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    s.set(1, 10).unwrap();
+    s.set(2, 20).unwrap();
+    s.set(3, 30).unwrap();
+    let all: Vec<_> = s.iter().collect();
+    assert_eq!(all, vec![Ok((1, 10)), Ok((2, 20)), Ok((3, 30))]);
+    for n in 0..40 {
+        s.flash_mut().fail_after(n);
+        let got: Vec<_> = s.iter().collect();
+        s.flash_mut().heal();
+        // Some prefix of the good items, then at most one error, then nothing.
+        let errors = got.iter().filter(|r| r.is_err()).count();
+        assert!(errors <= 1, "read {n}: {got:?}");
+        if errors == 1 {
+            assert_eq!(
+                got.last(),
+                Some(&Err(Error::Flash(FlashError::Device))),
+                "{got:?}"
+            );
+            assert!(got.len() <= 4, "{got:?}");
+            let items = got.len() - 1;
+            assert_eq!(&got[..items], &all[..items], "read {n}: {got:?}");
+        } else {
+            assert_eq!(got, all, "read {n}");
+        }
+        // Once an iterator has yielded an error it stays finished.
+        s.flash_mut().fail_after(n);
+        {
+            let mut it = s.iter();
+            let mut saw_error = false;
+            for _ in 0..10 {
+                match it.next() {
+                    Some(Err(_)) => saw_error = true,
+                    Some(Ok(_)) => assert!(!saw_error, "an item after an error"),
+                    None => break,
+                }
+            }
+            if saw_error {
+                // The reads still fail, so a live iterator would yield another
+                // error.
+                assert_eq!(it.next(), None, "ends after the error");
+            }
+        }
+        s.flash_mut().heal();
+    }
+    // At least some read position must have produced an error mid-iteration.
+    s.flash_mut().fail_after(3);
+    assert!(s.iter().any(|r| r.is_err()));
+}
+
 #[test]
 fn the_real_sector_size_holds_1364_records() {
     type Big = SimFlash<16384>;
@@ -432,8 +559,8 @@ fn the_real_sector_size_holds_1364_records() {
     assert_eq!(s.set(5000, 1), Err(Error::Full));
     s.set(1000, 7).unwrap(); // full sector of live keys: compacts
     assert_eq!(s.erase_count(), 1);
-    assert_eq!(s.get(1000), Some(7));
-    assert_eq!(s.get(1363), Some(!1363));
+    assert_eq!(s.get(1000).unwrap(), Some(7));
+    assert_eq!(s.get(1363).unwrap(), Some(!1363));
     assert_eq!(s.iter().count(), 1364);
 }
 
@@ -562,7 +689,7 @@ fn models(start: &Model, ops: &[Op]) -> Vec<Model> {
 /// every other key is untouched, and `iter` agrees with `get`.
 fn assert_old_or_new(s: &Store<&mut Small>, before: &Model, after: &Model, ctx: &str) {
     for &k in &UNIVERSE {
-        let got = s.get(k);
+        let got = s.get(k).unwrap();
         let (b, a) = (before.get(&k).copied(), after.get(&k).copied());
         assert!(
             got == b || got == a,
@@ -573,7 +700,7 @@ fn assert_old_or_new(s: &Store<&mut Small>, before: &Model, after: &Model, ctx: 
     for &k in &UNIVERSE {
         assert_eq!(
             listed.get(&k).copied(),
-            s.get(k),
+            s.get(k).unwrap(),
             "iter vs get for {k}: {ctx}"
         );
     }
@@ -648,9 +775,9 @@ fn power_cut_at_every_point_of_every_operation() {
                     let k = seen2.keys().next().copied().unwrap_or(1);
                     s2.set(k, 4242)
                         .unwrap_or_else(|e| panic!("set after second cut: {e} ({ctx2})"));
-                    assert_eq!(s2.get(k), Some(4242), "{ctx2}");
+                    assert_eq!(s2.get(k).unwrap(), Some(4242), "{ctx2}");
                     for (&other, &v) in seen2.iter().filter(|(o, _)| **o != k) {
-                        assert_eq!(s2.get(other), Some(v), "{ctx2}");
+                        assert_eq!(s2.get(other).unwrap(), Some(v), "{ctx2}");
                     }
                 }
             }
@@ -708,7 +835,7 @@ fn power_cut_while_initialising_a_blank_flash() {
         );
         assert_eq!(contents(&s), Model::new(), "{ctx}");
         s.set(1, 1).unwrap();
-        assert_eq!(s.get(1), Some(1), "{ctx}");
+        assert_eq!(s.get(1).unwrap(), Some(1), "{ctx}");
     };
     for k in 0..events {
         let mut f = fresh();
@@ -810,7 +937,7 @@ fn power_cut_during_format_leaves_a_mountable_flash_and_a_second_format_finishes
             s.set(9, 9).unwrap();
             let (s, r) = Store::mount(&mut f).unwrap();
             assert_eq!(r, MountReport::Clean, "cut {k} seed {seed}");
-            assert_eq!(s.get(9), Some(9));
+            assert_eq!(s.get(9).unwrap(), Some(9));
         }
     }
 }
@@ -873,7 +1000,7 @@ fn random_sequence(seed: u64, ops: usize) -> (u64, u64) {
                 let mut after = model.clone();
                 op.apply(&mut after);
                 // The interrupted key is old or new; everything else is as it was.
-                let got = s.get(key);
+                let got = s.get(key).unwrap();
                 assert!(
                     got == model.get(&key).copied() || got == after.get(&key).copied(),
                     "{ctx}: {got:?}"
@@ -974,6 +1101,6 @@ fn mount_picks_the_newer_sector_across_a_sequence_wrap() {
         b[16..28].copy_from_slice(&record_bytes(1, value, false));
     }
     let (s, _) = Store::mount(&mut f).unwrap();
-    assert_eq!(s.get(1), Some(200));
+    assert_eq!(s.get(1).unwrap(), Some(200));
     assert_eq!(s.erase_count(), 0);
 }
