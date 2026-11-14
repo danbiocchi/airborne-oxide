@@ -639,15 +639,9 @@ pub fn get<const N: usize>(cfg: &VehicleConfig<N>, id: ParamId) -> Option<ParamV
     load_cfg(cfg, id).map(to_value)
 }
 
-/// Changes one parameter. The value must be of the parameter's type, finite
-/// and within `[min, max]`, and the configuration with the change must pass
-/// [`VehicleConfig::validate`] and the estimator's checks against `profile`
-/// (rules that involve more than one field). A refused change leaves `cfg`
-/// untouched. Whether the vehicle is armed is the caller's business: see
-/// [`ParamDef::live`].
-pub fn set<const N: usize>(
-    cfg: &mut VehicleConfig<N>,
-    profile: &Profile,
+/// Checks one value on its own (type, finite, range) and writes it to `next`.
+fn put<const N: usize>(
+    next: &mut VehicleConfig<N>,
     id: ParamId,
     value: ParamValue,
 ) -> Result<(), ParamError> {
@@ -660,17 +654,64 @@ pub fn set<const N: usize>(
     {
         return Err(ParamError::NotFinite);
     }
-    let mut next = *cfg;
-    store_cfg(&mut next, id, value)?;
-    let stored = load_cfg(&next, id).ok_or(ParamError::Unknown)?;
+    store_cfg(next, id, value)?;
+    let stored = load_cfg(next, id).ok_or(ParamError::Unknown)?;
     if !stored_in_range(def, stored) {
         return Err(ParamError::OutOfRange);
     }
+    Ok(())
+}
+
+/// The rules between fields: the configuration's own and the estimator's
+/// against `profile`.
+fn check_together<const N: usize>(
+    next: &VehicleConfig<N>,
+    profile: &Profile,
+) -> Result<(), ParamError> {
     next.validate().map_err(ParamError::Invalid)?;
     next.estimator
         .ekf
         .validate(profile)
-        .map_err(ParamError::Invalid)?;
+        .map_err(ParamError::Invalid)
+}
+
+/// Changes one parameter. The value must be of the parameter's type, finite
+/// and within `[min, max]`, and the configuration with the change must pass
+/// [`VehicleConfig::validate`] and the estimator's checks against `profile`
+/// (rules that involve more than one field). A refused change leaves `cfg`
+/// untouched. Whether the vehicle is armed is the caller's business: see
+/// [`ParamDef::live`].
+pub fn set<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    id: ParamId,
+    value: ParamValue,
+) -> Result<(), ParamError> {
+    let mut next = *cfg;
+    put(&mut next, id, value)?;
+    check_together(&next, profile)?;
+    *cfg = next;
+    Ok(())
+}
+
+/// Applies several changes as one. Each value is checked on its own (type,
+/// finite, range); a later entry for the same parameter overrides an earlier
+/// one; the rules between fields are checked once, on the result. All or
+/// nothing: on an error `cfg` is untouched.
+///
+/// The error carries the parameter when one value failed, and `None` (with
+/// [`ParamError::Invalid`]) when the values are each fine but together break
+/// a rule.
+pub fn set_all<const N: usize>(
+    cfg: &mut VehicleConfig<N>,
+    profile: &Profile,
+    changes: impl IntoIterator<Item = (ParamId, ParamValue)>,
+) -> Result<(), (Option<ParamId>, ParamError)> {
+    let mut next = *cfg;
+    for (id, value) in changes {
+        put(&mut next, id, value).map_err(|e| (Some(id), e))?;
+    }
+    check_together(&next, profile).map_err(|e| (None, e))?;
     *cfg = next;
     Ok(())
 }
@@ -1130,6 +1171,108 @@ mod tests {
             Err(ParamError::Invalid(ConfigError::BadFailsafe))
         );
         assert_eq!(c, cfg());
+    }
+
+    fn pair(name: &str, v: f32) -> (ParamId, ParamValue) {
+        (find(name).unwrap(), ParamValue::F32(v))
+    }
+
+    #[test]
+    fn set_all_accepts_a_pair_that_is_valid_only_together_in_either_order() {
+        let crit = pair("BAT_CRIT_V", 3.6);
+        let low = pair("BAT_LOW_V", 3.8);
+        // One at a time, the critical threshold first is refused today.
+        let mut one_by_one = cfg();
+        assert_eq!(
+            set(&mut one_by_one, &F405_LEAN, crit.0, crit.1),
+            Err(ParamError::Invalid(ConfigError::BadFailsafe))
+        );
+        for order in [[crit, low], [low, crit]] {
+            for profile in [&F405_LEAN, &H743_FULL] {
+                let mut c = cfg();
+                assert_eq!(set_all(&mut c, profile, order), Ok(()));
+                assert_eq!(c.failsafe.battery_critical_v, 3.6);
+                assert_eq!(c.failsafe.battery_low_v, 3.8);
+            }
+        }
+    }
+
+    #[test]
+    fn set_all_is_all_or_nothing_and_names_the_bad_value() {
+        let good = [pair("LIM_TILT", 0.5), pair("RATE_ROLL_P", 30.0)];
+        let bad: [(ParamId, ParamValue, ParamError); 4] = [
+            (
+                find("LIM_TILT").unwrap(),
+                ParamValue::F32(5.0),
+                ParamError::OutOfRange,
+            ),
+            (
+                find("LIM_TILT").unwrap(),
+                ParamValue::F32(f32::NAN),
+                ParamError::NotFinite,
+            ),
+            (
+                find("LIM_TILT").unwrap(),
+                ParamValue::I32(1),
+                ParamError::WrongType,
+            ),
+            (ParamId(u16::MAX), ParamValue::F32(1.0), ParamError::Unknown),
+        ];
+        for (id, v, why) in bad {
+            // Bad value first, in the middle and last.
+            for at in 0..3 {
+                let mut list = good.to_vec();
+                list.insert(at, (id, v));
+                let mut c = cfg();
+                assert_eq!(
+                    set_all(&mut c, &F405_LEAN, list),
+                    Err((Some(id), why)),
+                    "{why:?} at {at}"
+                );
+                assert_eq!(c, cfg());
+                assert_eq!(format!("{c:?}"), format!("{:?}", cfg()));
+            }
+        }
+    }
+
+    #[test]
+    fn set_all_with_nothing_changes_nothing_and_a_later_entry_overrides() {
+        let mut c = cfg();
+        assert_eq!(set_all(&mut c, &F405_LEAN, []), Ok(()));
+        assert_eq!(c, cfg());
+        // The first entry alone would break a rule; the second replaces it.
+        let mut c = cfg();
+        let list = [
+            pair("BAT_LOW_V", 3.0),
+            pair("BAT_LOW_V", 3.8),
+            pair("BAT_CRIT_V", 3.6),
+        ];
+        assert_eq!(set_all(&mut c, &F405_LEAN, list), Ok(()));
+        assert_eq!(c.failsafe.battery_low_v, 3.8);
+        assert_eq!(c.failsafe.battery_critical_v, 3.6);
+        // And the other way: the last entry is the one that must be valid.
+        let mut c = cfg();
+        let list = [pair("BAT_LOW_V", 3.8), pair("BAT_LOW_V", 3.0)];
+        assert_eq!(
+            set_all(&mut c, &F405_LEAN, list),
+            Err((None, ParamError::Invalid(ConfigError::BadFailsafe)))
+        );
+        assert_eq!(c, cfg());
+    }
+
+    #[test]
+    fn set_all_refuses_a_list_that_breaks_a_rule_together_with_none() {
+        let mut c = cfg();
+        let list = [pair("BAT_CRIT_V", 3.9), pair("BAT_LOW_V", 3.8)];
+        assert_eq!(
+            set_all(&mut c, &F405_LEAN, list),
+            Err((None, ParamError::Invalid(ConfigError::BadFailsafe)))
+        );
+        assert_eq!(c, cfg());
+        // The estimator's rule against the profile is part of "together".
+        let mut c = cfg();
+        let list = [pair("EKF_HORIZON", 0.248), pair("LIM_TILT", 0.5)];
+        assert_eq!(set_all(&mut c, &F405_LEAN, list), Ok(()));
     }
 
     #[test]
