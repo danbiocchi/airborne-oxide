@@ -2,6 +2,42 @@
 //! The store: an append-only log of records in one sector at a time, compacted
 //! into the other sector when full.
 //!
+//! # Sectors and what a power cut can do
+//!
+//! Exactly one sector is live: its header is `Valid` (see [`crate::layout`]
+//! for the header, the record format and why an interrupted write never reads
+//! as a record; [`crate::flash::Flash`] for the contract the flash must keep).
+//! New records are appended to it. When it is full, or for
+//! [`Store::replace_all`], a fresh sector is built in the other one:
+//!
+//! 1. erase it;
+//! 2. program the header body (magic, version, sequence + 1, CRC);
+//! 3. program the records, each in two calls;
+//! 4. program its state word to *valid*: from this call on the change exists
+//!    (a cut inside the call leaves a state word that is not `A55A3CC3`, which
+//!    reads as retired, so the old sector is still the live one);
+//! 5. program the old sector's state word to `0` (*retired*).
+//!
+//! Step 5 matters: without it a stale sector keeps a valid header, and if the
+//! newer sector's header were ever damaged the store would silently roll back
+//! to old values. Now a damaged header of the live sector leaves no valid
+//! sector, and the store says [`MountReport::Corrupt`].
+//!
+//! # Mount
+//!
+//! | Sectors | Meaning | Active | Report |
+//! |---|---|---|---|
+//! | `Valid` + `Blank` or `Retired` | normal | the valid one | `Clean` (`Recovered` if it holds torn records) |
+//! | `Valid` + `Valid` | cut between steps 4 and 5 | higher sequence (wrapping compare) | `Recovered` |
+//! | `Valid` + `Writing` or `Bad` | cut during an erase or the copy | the valid one | `Recovered` |
+//! | no `Valid`, and no byte outside the two 16-byte headers differs from `0xFF` | a first initialisation or a format was cut; nothing was ever stored | erase what is not blank, write a header on sector 0 | `Fresh` |
+//! | anything else | damage | none | `Corrupt` |
+//!
+//! Mount writes to flash only in the `Fresh` row. A valid sector beside a
+//! `Retired` one is reported `Clean` even when the retired sector is really a
+//! half-written new one whose state word was cut short (the two look alike and
+//! are treated alike: not used, erased by the next compaction).
+//!
 //! # Cost
 //!
 //! With `S` = `SECTOR_SIZE` the sector holds `n = (S - 16) / 12` records
@@ -10,12 +46,23 @@
 //! each record, whether a later one has the same key: at most `n(n-1)/2` four
 //! byte key reads (about 0.93 million for 16 KB; a CRC is computed only for a
 //! later record with the same key). A compaction does that once to count and
-//! once to copy, plus one sector erase and at most `n` record programs. No
+//! once to copy, plus one sector erase and at most `n` records, each now two
+//! program calls (8 and 4 bytes, the same bytes as before), plus the state
+//! word and the retiring of the old sector (two more 4-byte calls). No
 //! allocation; the stack use is a few dozen bytes.
+//!
+//! [`Store::replace_all`] with `w` wanted pairs and `u` records in use costs
+//! up to `w` lookups (each at most `u` key reads) to find a first and a second
+//! difference, and, if there is no second, one pass over the live records
+//! (`u(u-1)/2` key reads, as `iter`) with `w` comparisons per live key. It
+//! stops at the second difference. A rewrite then does one erase and `w`
+//! records, with no scan of the old sector at all: it is cheaper than a
+//! compaction, which has to find the live records.
 //!
 //! Every `set` of a full sector compacts, so a sector full of distinct live
 //! keys erases on every write; the caller keeps the live key count well below
-//! `n` (a parameter table has about 100).
+//! `n` (a parameter table has about 100). Writing a changed table with
+//! `replace_all` costs at most one erase however many keys changed.
 
 use crate::flash::{Flash, FlashError};
 use crate::layout::{
@@ -67,18 +114,25 @@ pub enum Replaced {
     Rewritten,
 }
 
-/// What [`Store::mount`] found.
+/// What [`Store::mount`] found (the table is in the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountReport {
-    /// A valid sector and nothing to ignore.
+    /// A valid sector, beside a blank or retired one, and no torn records.
     Clean,
-    /// Both sectors were erased; the store was initialised empty.
+    /// No valid sector and nothing but (perhaps cut-short) headers on the
+    /// flash: it was blank, or a first initialisation or a `format` was
+    /// interrupted. Nothing was ever stored, so nothing is lost. The store was
+    /// initialised empty (the only case in which mount writes).
     Fresh,
-    /// A valid sector, but a half-written or damaged sector or torn records
-    /// were ignored. No acknowledged write was lost.
+    /// A valid sector, but torn records, a second valid sector (a compaction
+    /// was cut before it retired the old one; the newer was taken), or a
+    /// half-written or damaged sector were found. No acknowledged write was
+    /// lost.
     Recovered,
-    /// No valid sector, but the flash is not blank. The store is empty and
-    /// refuses writes until [`Store::format`].
+    /// No valid sector, and something other than headers is on the flash: the
+    /// store holds nothing it can trust and refuses writes until
+    /// [`Store::format`]. In particular a damaged header of the live sector
+    /// lands here, however intact the retired sector beside it is.
     Corrupt,
 }
 
@@ -102,8 +156,9 @@ impl<F: Flash> Store<F> {
         (F::SECTOR_SIZE - HEADER_SIZE) / RECORD_SIZE
     };
 
-    /// Opens the store, repairing nothing on flash except initialising a blank
-    /// device. See [`MountReport`].
+    /// Opens the store. Writes only to initialise a flash that holds nothing
+    /// but headers (`MountReport::Fresh`). See [`MountReport`] and the table in
+    /// the module docs.
     ///
     /// # Errors
     /// A flash read or program failure.
@@ -230,7 +285,8 @@ impl<F: Flash> Store<F> {
 
     /// Erases whatever is on the flash and starts an empty store. Destructive;
     /// the way out of [`MountReport::Corrupt`]. Unlike `set`, an interruption
-    /// is not all-or-nothing: mount again and format again.
+    /// is not all-or-nothing: mount again (it reports `Fresh`, `Clean` or
+    /// `Corrupt`) and format again.
     ///
     /// # Errors
     /// Flash errors.
