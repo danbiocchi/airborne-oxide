@@ -1575,3 +1575,184 @@ fn mount_picks_the_newer_sector_across_a_sequence_wrap() {
     assert_eq!(s.get(1).unwrap(), Some(200));
     assert_eq!(s.erase_count(), 0);
 }
+
+// ------------------------------------------------- structure of record writes
+
+/// One program call as the store made it.
+type Call = (usize, usize, Vec<u8>);
+
+/// Logs every program call (sector, offset, bytes) and passes it on.
+struct CallLog<'a> {
+    flash: &'a mut Small,
+    calls: Vec<Call>,
+}
+
+impl Flash for CallLog<'_> {
+    const SECTOR_SIZE: usize = SMALL;
+    fn read(&self, s: usize, o: usize, b: &mut [u8]) -> Result<(), FlashError> {
+        self.flash.read(s, o, b)
+    }
+    fn program(&mut self, s: usize, o: usize, d: &[u8]) -> Result<(), FlashError> {
+        self.calls.push((s, o, d.to_vec()));
+        self.flash.program(s, o, d)
+    }
+    fn erase(&mut self, s: usize) -> Result<(), FlashError> {
+        self.flash.erase(s)
+    }
+}
+
+/// Every program call in the record area of `calls` is part of a record
+/// written as exactly two calls: key and value (8 bytes) at the slot start,
+/// then the check word (4 bytes) at +8 of the same slot, immediately after.
+/// Returns the records seen, as (key, value, tomb).
+fn assert_two_call_records(calls: &[Call]) -> Vec<(u32, u32, bool)> {
+    use crate::layout::{CHECK_OFFSET, RECORD_SIZE, RECORDS_OFFSET, record_check};
+    let mut seen = Vec::new();
+    let mut i = 0;
+    while i < calls.len() {
+        let (sector, offset, data) = &calls[i];
+        if *offset < RECORDS_OFFSET {
+            i += 1;
+            continue;
+        }
+        assert_eq!(
+            (offset - RECORDS_OFFSET) % RECORD_SIZE,
+            0,
+            "call {i}: not at a slot start"
+        );
+        assert_eq!(
+            data.len(),
+            CHECK_OFFSET,
+            "call {i}: key and value are one 8-byte call"
+        );
+        let (s2, o2, check) = calls.get(i + 1).expect("a check word call follows");
+        assert_eq!(
+            (*s2, *o2, check.len()),
+            (*sector, offset + CHECK_OFFSET, 4),
+            "call {i}: the check word is its own 4-byte call at +8, right after"
+        );
+        let key = u32::from_le_bytes(data[..4].try_into().unwrap());
+        let value = u32::from_le_bytes(data[4..].try_into().unwrap());
+        let word = u32::from_le_bytes(check[..].try_into().unwrap());
+        let tomb = word >> 30 == 0b10;
+        assert_eq!(
+            word,
+            record_check(key, value, tomb),
+            "call {i}: wrong check word"
+        );
+        seen.push((key, value, tomb));
+        i += 2;
+    }
+    seen
+}
+
+#[test]
+fn a_record_is_two_program_calls_key_and_value_first_then_the_check_word() {
+    let log = |f: &mut Small, run: &dyn Fn(&mut Store<&mut CallLog<'_>>)| {
+        let mut l = CallLog {
+            flash: f,
+            calls: Vec::new(),
+        };
+        let (mut s, _) = Store::mount(&mut l).unwrap();
+        run(&mut s);
+        drop(s);
+        l.calls
+    };
+    // An append (a set and a tombstone).
+    let mut f = fresh();
+    let calls = log(&mut f, &|s| {
+        s.set(1, 10).unwrap();
+        s.set(2, 20).unwrap();
+        s.remove(1).unwrap();
+    });
+    assert_eq!(
+        assert_two_call_records(&calls),
+        vec![(1, 10, false), (2, 20, false), (1, 0, true)]
+    );
+    // A compaction copy (the sector is full: the seventh record compacts).
+    let mut f = fresh();
+    let calls = log(&mut f, &|s| {
+        for i in 0..6 {
+            s.set(1, i).unwrap();
+        }
+        s.set(2, 2).unwrap();
+    });
+    let seen = assert_two_call_records(&calls);
+    assert_eq!(
+        seen.len(),
+        6 + 2,
+        "six appends, then the copy of key 1 and the new key 2"
+    );
+    assert_eq!(&seen[6..], &[(1, 5, false), (2, 2, false)]);
+    // A replace_all rewrite.
+    let mut f = fresh();
+    {
+        let (mut s, _) = Store::mount(&mut f).unwrap();
+        s.set(9, 9).unwrap();
+    }
+    let calls = log(&mut f, &|s| {
+        let wanted = [(1, 1), (2, 2), (3, 3)];
+        assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Rewritten));
+    });
+    assert_eq!(
+        assert_two_call_records(&calls),
+        vec![(1, 1, false), (2, 2, false), (3, 3, false)]
+    );
+}
+
+// ------------------------------------------- the Fresh row needs both sectors
+
+#[test]
+fn records_beyond_the_header_in_either_sector_alone_make_it_corrupt_not_fresh() {
+    // Records in sector 1 only (it is the live one, but its header is damaged
+    // and sector 0 is blank or damaged); and the mirror, records in sector 0.
+    for records_in in [1_usize, 0] {
+        for other in ["blank", "damaged header"] {
+            let (mut f, active) = after_one_compaction();
+            assert_eq!(active, 1);
+            let (rec, oth) = (records_in, records_in ^ 1);
+            if rec == 0 {
+                // Move the live records to sector 0: copy, then blank sector 1.
+                let b = *f.bytes(1).unwrap();
+                f.bytes_mut(0).unwrap().copy_from_slice(&b);
+            }
+            f.bytes_mut(rec).unwrap()[4] &= !1; // damage the header body
+            match other {
+                "blank" => f.bytes_mut(oth).unwrap().fill(0xFF),
+                _ => {
+                    f.bytes_mut(oth).unwrap().fill(0xFF);
+                    f.bytes_mut(oth).unwrap()[0] = 0x00;
+                }
+            }
+            let before = [*f.bytes(0).unwrap(), *f.bytes(1).unwrap()];
+            let erases = f.total_erases();
+            let (_, r) = Store::mount(&mut f).unwrap();
+            let ctx = format!("records in {rec}, other {other}");
+            assert_eq!(r, MountReport::Corrupt, "{ctx}");
+            assert_eq!(f.total_erases(), erases, "{ctx}: nothing erased");
+            assert_eq!(
+                [*f.bytes(0).unwrap(), *f.bytes(1).unwrap()],
+                before,
+                "{ctx}: flash unchanged"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_valid_sectors_with_the_same_sequence_are_corrupt_not_an_arbitrary_pick() {
+    use crate::layout::{STATE_VALID, header_body, record_bytes};
+    let mut f = fresh();
+    for (sector, v) in [(0, 100), (1, 101)] {
+        let b = f.bytes_mut(sector).unwrap();
+        b[..12].copy_from_slice(&header_body(4));
+        b[12..16].copy_from_slice(&STATE_VALID.to_le_bytes());
+        b[16..28].copy_from_slice(&record_bytes(1, v, false));
+    }
+    let before = [*f.bytes(0).unwrap(), *f.bytes(1).unwrap()];
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Corrupt);
+    assert_eq!(s.get(1).unwrap(), None);
+    drop(s);
+    assert_eq!([*f.bytes(0).unwrap(), *f.bytes(1).unwrap()], before);
+}
