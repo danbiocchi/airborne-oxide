@@ -1655,7 +1655,6 @@ fn a_record_is_two_program_calls_key_and_value_first_then_the_check_word() {
         };
         let (mut s, _) = Store::mount(&mut l).unwrap();
         run(&mut s);
-        drop(s);
         l.calls
     };
     // An append (a set and a tombstone).
@@ -1753,6 +1752,5 @@ fn two_valid_sectors_with_the_same_sequence_are_corrupt_not_an_arbitrary_pick() 
     let (s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Corrupt);
     assert_eq!(s.get(1).unwrap(), None);
-    drop(s);
     assert_eq!([*f.bytes(0).unwrap(), *f.bytes(1).unwrap()], before);
 }
