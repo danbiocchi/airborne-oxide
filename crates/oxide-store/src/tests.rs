@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::flash::{Flash, FlashError};
-use crate::sim::SimFlash;
+use crate::sim::{BitCut, SimFlash};
 use crate::store::{Error, MountReport, Store};
 
 /// Six record slots per sector: (88 - 16) / 12.
@@ -239,6 +239,137 @@ fn both_sectors_damaged_is_corrupt_and_format_recovers() {
     assert_eq!(r, MountReport::Clean);
     assert_eq!(s.get(1), Some(42));
     assert_eq!(s.erase_count(), before);
+}
+
+/// A store that has compacted once: contents {1: 7, 2: 2}, the active sector is
+/// the one with sequence 1, the other holds the previous generation.
+fn after_one_compaction() -> (Small, usize) {
+    let mut f = fresh();
+    let (mut s, _) = Store::mount(&mut f).unwrap();
+    for i in 0..6 {
+        s.set(1, i).unwrap();
+    }
+    s.set(2, 2).unwrap(); // compacts
+    s.set(1, 7).unwrap();
+    assert_eq!(s.erase_count(), 1);
+    (f, 1)
+}
+
+#[test]
+fn a_damaged_active_header_is_corrupt_and_never_a_silent_rollback_to_old_values() {
+    let (mut f, active) = after_one_compaction();
+    // Clear a bit of the active sector's header body (its sequence number).
+    f.bytes_mut(active).unwrap()[4] &= !1;
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Corrupt);
+    assert_eq!(s.get(1), None);
+    assert_eq!(contents(&s), Model::new());
+}
+
+#[test]
+fn after_a_compaction_the_old_sector_is_retired_and_a_remount_is_clean() {
+    use crate::layout::{Header, STATE_RETIRED, decode_header};
+    let (mut f, active) = after_one_compaction();
+    let header = |f: &Small, sector: usize| {
+        let b = f.bytes(sector).unwrap();
+        let w = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        decode_header([w(0), w(4), w(8), w(12)])
+    };
+    assert_eq!(header(&f, active), Header::Valid(1));
+    assert_eq!(header(&f, active ^ 1), Header::Retired(0));
+    assert_eq!(
+        &f.bytes(active ^ 1).unwrap()[12..16],
+        &STATE_RETIRED.to_le_bytes()
+    );
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Clean);
+    assert_eq!(contents(&s), Model::from([(1, 7), (2, 2)]));
+    assert_eq!(s.erase_count(), 1);
+}
+
+#[test]
+fn both_sectors_valid_mounts_the_higher_sequence_and_reports_recovered() {
+    use crate::layout::{STATE_VALID, header_body, record_bytes};
+    for (seq0, seq1, want) in [(5, 6, 1), (6, 5, 0), (u32::MAX, 0, 1)] {
+        let mut f = fresh();
+        for (sector, seq) in [(0, seq0), (1, seq1)] {
+            let b = f.bytes_mut(sector).unwrap();
+            b[..12].copy_from_slice(&header_body(seq));
+            b[12..16].copy_from_slice(&STATE_VALID.to_le_bytes());
+            b[16..28].copy_from_slice(&record_bytes(1, 100 + sector as u32, false));
+        }
+        let (s, r) = Store::mount(&mut f).unwrap();
+        assert_eq!(r, MountReport::Recovered, "{seq0} {seq1}");
+        assert_eq!(s.get(1), Some(100 + want), "{seq0} {seq1}");
+        assert_eq!(f.total_erases(), 0, "mount erases nothing here");
+    }
+}
+
+#[test]
+fn a_valid_sector_beside_a_writing_or_damaged_one_is_recovered_and_beside_a_blank_or_retired_one_clean()
+ {
+    use crate::layout::{STATE_RETIRED, STATE_VALID, header_body, record_bytes};
+    let valid = |f: &mut Small, sector: usize| {
+        let b = f.bytes_mut(sector).unwrap();
+        b[..12].copy_from_slice(&header_body(3));
+        b[12..16].copy_from_slice(&STATE_VALID.to_le_bytes());
+        b[16..28].copy_from_slice(&record_bytes(1, 9, false));
+    };
+    let other = |f: &mut Small, how: &str| {
+        let b = f.bytes_mut(1).unwrap();
+        match how {
+            "blank" => {}
+            "retired" => {
+                b[..12].copy_from_slice(&header_body(2));
+                b[12..16].copy_from_slice(&STATE_RETIRED.to_le_bytes());
+                b[16..28].copy_from_slice(&record_bytes(1, 8, false));
+            }
+            "writing" => {
+                b[..12].copy_from_slice(&header_body(4));
+                b[16..28].copy_from_slice(&record_bytes(1, 7, false));
+            }
+            "bad" => b[..16].fill(0x12 & 0xF0),
+            _ => unreachable!(),
+        }
+    };
+    for (how, want) in [
+        ("blank", MountReport::Clean),
+        ("retired", MountReport::Clean),
+        ("writing", MountReport::Recovered),
+        ("bad", MountReport::Recovered),
+    ] {
+        let mut f = fresh();
+        valid(&mut f, 0);
+        other(&mut f, how);
+        let (s, r) = Store::mount(&mut f).unwrap();
+        assert_eq!(r, want, "{how}");
+        assert_eq!(s.get(1), Some(9), "{how}");
+        assert_eq!(f.total_erases(), 0, "{how}: mount writes nothing");
+        assert_eq!(f.events(), 0, "{how}: mount writes nothing");
+    }
+}
+
+#[test]
+fn no_valid_sector_and_nothing_stored_is_fresh_whatever_the_headers_hold() {
+    use crate::layout::{header_body, record_bytes};
+    // Header bodies in any state, in either sector, but no record bytes.
+    let mut f = fresh();
+    f.bytes_mut(0).unwrap()[..12].copy_from_slice(&header_body(5));
+    f.bytes_mut(1).unwrap()[..16].fill(0x0F);
+    let (mut s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Fresh);
+    assert_eq!(contents(&s), Model::new());
+    s.set(1, 1).unwrap();
+    assert_eq!(f.total_erases(), 2, "both dirty sectors were erased");
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!((r, s.get(1)), (MountReport::Clean, Some(1)));
+    // One byte of record area written: anything else is damage.
+    let mut f = fresh();
+    f.bytes_mut(0).unwrap()[..12].copy_from_slice(&header_body(5));
+    f.bytes_mut(0).unwrap()[16..28].copy_from_slice(&record_bytes(1, 2, false));
+    let (_, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Corrupt);
+    assert_eq!(f.events(), 0);
 }
 
 #[test]
@@ -564,22 +695,76 @@ fn power_cut_while_initialising_a_blank_flash() {
     let _ = Store::mount(&mut f).unwrap();
     let events = f.events();
     assert_eq!(events, 16);
+    let calls = f.program_calls();
+    assert_eq!(calls, 2);
+    let check = |mut f: Small, ctx: &str| {
+        f.restore_power();
+        let (mut s, r) = Store::mount(&mut f).unwrap();
+        // Nothing was ever stored, so starting empty loses nothing; and a
+        // flash that holds only a cut-short header is never "corrupt".
+        assert!(
+            matches!(r, MountReport::Fresh | MountReport::Clean),
+            "{ctx}: {r:?}"
+        );
+        assert_eq!(contents(&s), Model::new(), "{ctx}");
+        s.set(1, 1).unwrap();
+        assert_eq!(s.get(1), Some(1), "{ctx}");
+    };
     for k in 0..events {
         let mut f = fresh();
         f.cut_power_after(k, 0);
         assert!(Store::mount(&mut f).is_err());
-        f.restore_power();
-        let (mut s, r) = Store::mount(&mut f).unwrap();
-        // Nothing was ever acknowledged, so either outcome loses nothing.
-        assert!(
-            matches!(r, MountReport::Fresh | MountReport::Corrupt),
-            "cut {k}: {r:?}"
-        );
-        if r == MountReport::Corrupt {
-            s.format().unwrap();
+        check(f, &format!("byte cut {k}"));
+    }
+    for call in 0..calls {
+        // Bits of this call: the header body (call 0), then the state word.
+        let mut probe = fresh();
+        let body = crate::layout::header_body(0);
+        let bits = if call == 0 {
+            probe.bits_cleared_by(0, 0, &body).unwrap()
+        } else {
+            probe.program(0, 0, &body).unwrap();
+            let state = crate::layout::STATE_VALID.to_le_bytes();
+            probe.bits_cleared_by(0, 12, &state).unwrap()
+        };
+        let mut cuts = vec![];
+        cuts.extend((0..8).map(BitCut::Seeded));
+        cuts.extend((0..bits).map(BitCut::AllBut));
+        cuts.extend((0..bits).map(BitCut::Only));
+        for how in cuts {
+            let mut f = fresh();
+            f.cut_program_call(call, how);
+            assert!(Store::mount(&mut f).is_err());
+            check(f, &format!("call {call} {how:?}"));
         }
-        s.set(1, 1).unwrap();
-        assert_eq!(s.get(1), Some(1));
+    }
+}
+
+/// After a failed mount of a fresh flash, a second mount that is itself cut
+/// anywhere still ends in a mountable store.
+#[test]
+fn a_cut_during_the_recovery_of_an_interrupted_initialisation_is_recovered_too() {
+    for k in 0..16 {
+        let mut f = fresh();
+        f.cut_power_after(k, 0);
+        assert!(Store::mount(&mut f).is_err());
+        f.restore_power();
+        // The recovery of a header left half written erases sector 0.
+        let mut g = f.clone();
+        let _ = Store::mount(&mut g).unwrap();
+        for k2 in 0..(g.events() - f.events()) {
+            for seed in 0..4 {
+                let mut h = f.clone();
+                h.cut_power_after(k2, seed);
+                let _ = Store::mount(&mut h);
+                h.restore_power();
+                let (_, r) = Store::mount(&mut h).unwrap();
+                assert!(
+                    matches!(r, MountReport::Fresh | MountReport::Clean),
+                    "cut {k} then {k2} seed {seed}: {r:?}"
+                );
+            }
+        }
     }
 }
 
@@ -609,7 +794,17 @@ fn power_cut_during_format_leaves_a_mountable_flash_and_a_second_format_finishes
                 assert!(s.format().is_err());
             }
             f.restore_power();
-            let (mut s, _) = Store::mount(&mut f).unwrap();
+            let (mut s, r) = Store::mount(&mut f).unwrap();
+            assert!(
+                matches!(
+                    r,
+                    MountReport::Fresh
+                        | MountReport::Clean
+                        | MountReport::Corrupt
+                        | MountReport::Recovered
+                ),
+                "cut {k} seed {seed}: {r:?}"
+            );
             s.format().unwrap();
             assert_eq!(contents(&s), Model::new());
             s.set(9, 9).unwrap();

@@ -10,6 +10,12 @@
 //!  12  u32 state: FFFFFFFF writing, A55A3CC3 valid, 00000000 retired
 //! ```
 //!
+//! A header is *intact* when its first 12 bytes are the magic and version, a
+//! sequence number and the CRC-32 of those 8 bytes. An intact header is
+//! `Valid` with state `A55A3CC3`, `Writing` with state `FFFFFFFF`, and
+//! `Retired` with any other state; a header that is all `0xFF` is `Blank`;
+//! anything else is `Bad`.
+//!
 //! A record slot that reads all `0xFF` is free. A record whose check word
 //! fails is torn: skipped and never reused.
 //!
@@ -70,6 +76,11 @@ pub const WORD0: u32 = (1 << 16) | 0x534F;
 pub const STATE_VALID: u32 = 0xA55A_3CC3;
 /// State word of a sector still being written (erased flash).
 pub const STATE_WRITING: u32 = 0xFFFF_FFFF;
+/// State word of a sector whose contents have been superseded: programmed over
+/// [`STATE_VALID`] once the sector that replaces it is valid. Any other state
+/// word of a sector with an intact header body also reads as retired (it is a
+/// retirement or a valid-marking that was cut short; the sector is not used).
+pub const STATE_RETIRED: u32 = 0x0000_0000;
 
 /// Packs little-endian words into bytes.
 #[must_use]
@@ -164,7 +175,11 @@ pub enum Header {
     Writing(u32),
     /// Intact and finished, with its sequence number.
     Valid(u32),
-    /// Anything else.
+    /// Intact, but its state word is neither erased nor valid: the sector has
+    /// been replaced (see [`STATE_RETIRED`]), or the program of its valid
+    /// state word was cut short. Its sequence number.
+    Retired(u32),
+    /// Body damaged, or not a header of this format.
     Bad,
 }
 
@@ -181,7 +196,7 @@ pub fn decode_header(words: [u32; 4]) -> Header {
     match state {
         STATE_WRITING => Header::Writing(seq),
         STATE_VALID => Header::Valid(seq),
-        _ => Header::Bad,
+        _ => Header::Retired(seq),
     }
 }
 
@@ -288,7 +303,23 @@ mod tests {
             decode_header([w[0], w[1], w[2], STATE_VALID]),
             Header::Valid(7)
         );
-        assert_eq!(decode_header([w[0], w[1], w[2], 0xFFFF_00FF]), Header::Bad);
+        assert_eq!(
+            decode_header([w[0], w[1], w[2], STATE_RETIRED]),
+            Header::Retired(7)
+        );
+        // A state word cut short on its way to valid, or on its way to retired.
+        assert_eq!(
+            decode_header([w[0], w[1], w[2], 0xFFFF_00FF]),
+            Header::Retired(7)
+        );
+        assert_eq!(
+            decode_header([w[0], w[1], w[2], STATE_VALID & !1]),
+            Header::Retired(7)
+        );
+        assert_eq!(
+            decode_header([w[0] ^ 1, w[1], w[2], STATE_RETIRED]),
+            Header::Bad
+        );
         assert_eq!(
             decode_header([w[0], w[1] ^ 1, w[2], STATE_VALID]),
             Header::Bad

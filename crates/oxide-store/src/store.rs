@@ -19,8 +19,8 @@
 
 use crate::flash::{Flash, FlashError};
 use crate::layout::{
-    CHECK_OFFSET, HEADER_SIZE, Header, RECORD_SIZE, RECORDS_OFFSET, STATE_OFFSET, STATE_VALID,
-    Slot, decode_header, decode_slot, header_body, pack, record_parts,
+    CHECK_OFFSET, HEADER_SIZE, Header, RECORD_SIZE, RECORDS_OFFSET, STATE_OFFSET, STATE_RETIRED,
+    STATE_VALID, Slot, decode_header, decode_slot, header_body, pack, record_parts,
 };
 
 /// Why a store operation failed.
@@ -120,7 +120,13 @@ impl<F: Flash> Store<F> {
             s.active = Some(a);
             s.sequence = seq;
             s.scan_active()?;
-            let other_ignored = matches!(h.get(a ^ 1), Some(Header::Writing(_) | Header::Bad));
+            // Both valid: a compaction was cut between marking the new sector
+            // valid and retiring the old one. A sector being written or
+            // damaged: a compaction or an erase was cut.
+            let other_ignored = matches!(
+                h.get(a ^ 1),
+                Some(Header::Valid(_) | Header::Writing(_) | Header::Bad)
+            );
             let report = if s.torn > 0 || other_ignored {
                 MountReport::Recovered
             } else {
@@ -128,7 +134,15 @@ impl<F: Flash> Store<F> {
             };
             return Ok((s, report));
         }
-        if s.is_blank(0)? && s.is_blank(1)? {
+        // No valid sector. If nothing but (perhaps damaged) headers was ever
+        // written, no value was ever stored: a first initialisation or a
+        // format was interrupted, and starting empty loses nothing.
+        if s.is_blank_from(0, HEADER_SIZE)? && s.is_blank_from(1, HEADER_SIZE)? {
+            for sector in 0..2 {
+                if !s.is_blank_from(sector, 0)? {
+                    s.flash.erase(sector)?;
+                }
+            }
             s.write_header(0, 0)?;
             s.active = Some(0);
             return Ok((s, MountReport::Fresh));
@@ -215,7 +229,9 @@ impl<F: Flash> Store<F> {
     fn format_inner(&mut self) -> Result<(), FlashError> {
         let mut highest: Option<u32> = None;
         for sector in 0..2 {
-            if let Header::Valid(q) | Header::Writing(q) = self.read_header(sector)? {
+            if let Header::Valid(q) | Header::Writing(q) | Header::Retired(q) =
+                self.read_header(sector)?
+            {
                 highest =
                     Some(highest.map_or(q, |h| if q.wrapping_sub(h) as i32 > 0 { q } else { h }));
             }
@@ -284,8 +300,13 @@ impl<F: Flash> Store<F> {
     }
 
     fn is_blank(&self, sector: usize) -> Result<bool, FlashError> {
+        self.is_blank_from(sector, 0)
+    }
+
+    /// Whether every byte of `sector` from `start` on is erased.
+    fn is_blank_from(&self, sector: usize, start: usize) -> Result<bool, FlashError> {
         let mut buf = [0_u8; 16];
-        let mut offset = 0;
+        let mut offset = start;
         while offset < F::SECTOR_SIZE {
             let n = buf.len().min(F::SECTOR_SIZE - offset);
             let part = buf.get_mut(..n).ok_or(FlashError::OutOfBounds)?;
@@ -433,6 +454,10 @@ impl<F: Flash> Store<F> {
         self.active = Some(new);
         self.sequence = sequence;
         self.used = out;
+        // The change is visible from here on. Retire the old sector so that it
+        // can never be mistaken for the live one if the new one is damaged.
+        self.flash
+            .program(old, STATE_OFFSET, &pack::<4>(&[STATE_RETIRED]))?;
         Ok(())
     }
 }
