@@ -19,9 +19,24 @@ pub enum FlashError {
 /// Two sectors of NOR flash, each [`Flash::SECTOR_SIZE`] bytes.
 ///
 /// Erased bytes read `0xFF`. `program` can only clear bits: the stored byte
-/// becomes `old & new`. `erase` sets every byte of a sector to `0xFF`. After
-/// an interrupted `program` or `erase` the contents are unspecified beyond
-/// that: bits may only have moved in the direction of the operation.
+/// becomes `old & new`. `erase` sets every byte of a sector to `0xFF`.
+///
+/// # The contract the store relies on
+///
+/// * A `program` call that returned `Ok` is complete.
+/// * A `program` call interrupted by power loss may have cleared **any subset**
+///   of the bits it was asked to clear, in any byte of that call, and **none
+///   outside it**. (Not only a prefix of the bytes: a real part programs a
+///   word at a time and can stop inside one.)
+/// * An interrupted `erase` leaves each byte of the sector unchanged, `0xFF`,
+///   or anything between (bits are only ever set, never cleared).
+/// * Calls take effect in the order the store makes them: the store never
+///   starts a call before the previous one has returned `Ok`.
+/// * A read returns what is stored, or an error; it never changes the flash.
+///
+/// The store is written so that nothing else is needed (see
+/// [`crate::layout`] for why an interrupted write can never read as a valid
+/// record, and [`crate::store`] for the mount rules).
 pub trait Flash {
     /// Bytes per sector. At least 28 (a header and one record).
     const SECTOR_SIZE: usize;
