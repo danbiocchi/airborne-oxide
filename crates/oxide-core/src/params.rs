@@ -464,9 +464,9 @@ declare_params! {
     }
     Limits {
         f32 LIM_TILT = max_tilt_rad: 35.0_f32.to_radians(), 0.01, 1.39, "rad", Limits, live,
-            "Maximum tilt in the position and offboard modes.";
+            "Maximum tilt in the position and offboard modes. FS_LOC_TILT must be at least 0.175 rad above it.";
         f32 LIM_TILT_STAB = max_tilt_stabilized_rad: 45.0_f32.to_radians(), 0.01, 1.39, "rad", Limits, live,
-            "Maximum tilt in the stabilized mode, at full stick.";
+            "Maximum tilt in the stabilized mode, at full stick. FS_LOC_TILT must be at least 0.175 rad above it.";
         f32 LIM_RATE_ROLL = max_rate.x: 3.8, 0.01, 35.0, "rad/s", Limits, live,
             "Maximum body rate, roll axis.";
         f32 LIM_RATE_PITCH = max_rate.y: 3.8, 0.01, 35.0, "rad/s", Limits, live,
@@ -581,14 +581,14 @@ declare_params! {
             "Geofence radius around home. Zero disables it.";
         f32 FS_FENCE_ALT = fence_altitude_m: 0.0, 0.0, 1000000.0, "m", Failsafe, live,
             "Geofence height above home. Zero disables it.";
-        f32 FS_LOC_ERR = loc_error_rad: 45.0_f32.to_radians(), TINY, PI, "rad", Failsafe, live,
-            "Loss of control: attitude error above this for FS_LOC_ERR_T.";
-        f32 FS_LOC_ERR_T = loc_error_s: 0.5, 0.0, DUR, "s", Failsafe, live,
-            "Loss of control: how long the attitude error must stay above FS_LOC_ERR.";
-        f32 FS_LOC_TILT = loc_tilt_rad: 75.0_f32.to_radians(), TINY, PI, "rad", Failsafe, live,
-            "Loss of control: tilt above this for FS_LOC_TILT_T.";
-        f32 FS_LOC_TILT_T = loc_tilt_s: 0.25, 0.0, DUR, "s", Failsafe, live,
-            "Loss of control: how long the tilt must stay above FS_LOC_TILT.";
+        f32 FS_LOC_ERR = loc_error_rad: 45.0_f32.to_radians(), 0.35, PI, "rad", Failsafe, live,
+            "Loss of control: attitude error above this for FS_LOC_ERR_T. At least 0.35 rad (20 degrees): below it normal flight switches the motors off.";
+        f32 FS_LOC_ERR_T = loc_error_s: 0.5, 0.1, DUR, "s", Failsafe, live,
+            "Loss of control: how long the attitude error must stay above FS_LOC_ERR. At least 0.1 s.";
+        f32 FS_LOC_TILT = loc_tilt_rad: 75.0_f32.to_radians(), 0.185, PI, "rad", Failsafe, live,
+            "Loss of control: tilt above this for FS_LOC_TILT_T. Must be at least 0.175 rad (10 degrees) above both LIM_TILT and LIM_TILT_STAB, or the tilt the controller commands switches the motors off.";
+        f32 FS_LOC_TILT_T = loc_tilt_s: 0.25, 0.05, DUR, "s", Failsafe, live,
+            "Loss of control: how long the tilt must stay above FS_LOC_TILT. At least 0.05 s.";
         f32 RTL_ALT = rtl_altitude_m: 10.0, 0.0, 10000.0, "m", Return, live,
             "Return altitude above home.";
         f32 RTL_SPEED = rtl_speed_mps: 3.0, 0.1, 100.0, "m/s", Return, live,
@@ -1100,6 +1100,9 @@ mod tests {
             "LAND_SPEED",
             "LIM_IDLE",
             "LIM_SPEED_DOWN",
+            "LIM_TILT",
+            "LIM_TILT_STAB",
+            "FS_LOC_TILT",
             "EKF_OUT_TAU",
             "BAT_CRIT_V",
             "BAT_LOW_V",

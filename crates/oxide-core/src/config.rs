@@ -407,6 +407,10 @@ impl FailsafeParams {
         Self::CONTACT_DESCENT_RATIO * self.touchdown_speed_mps
     }
 
+    /// The loss-of-control tilt threshold must exceed the larger of the two
+    /// tilt limits by this much, rad (10 degrees).
+    pub const LOC_TILT_MARGIN_RAD: f32 = 0.175;
+
     /// Shortest accepted timeout, µs: below this a single late frame at
     /// the slowest supervisor rate would count as a loss.
     pub const MIN_TIMEOUT_US: u32 = 50_000;
@@ -501,6 +505,10 @@ pub enum ConfigError {
     /// counts as a command to move (twice the touchdown speed): the landing
     /// would be clamped below it and ground contact declared in mid-air.
     DescentLimitTooLow,
+    /// The loss-of-control tilt threshold is not at least 10 degrees above
+    /// the larger tilt limit: normal commanded flight would switch the motors
+    /// off.
+    LossOfControlTooTight,
 }
 
 impl<const N: usize> VehicleConfig<N> {
@@ -567,6 +575,15 @@ impl<const N: usize> VehicleConfig<N> {
         // descent is at most `max_speed_down`, and is judged on thrust.)
         if self.limits.max_speed_down < self.failsafe.contact_descent_mps() {
             return Err(ConfigError::DescentLimitTooLow);
+        }
+        // Loss of control switches the motors off. Its tilt threshold must sit
+        // above any tilt the controller itself commands, with a margin.
+        let widest_tilt = self
+            .limits
+            .max_tilt_rad
+            .max(self.limits.max_tilt_stabilized_rad);
+        if self.failsafe.loc_tilt_rad < widest_tilt + FailsafeParams::LOC_TILT_MARGIN_RAD {
+            return Err(ConfigError::LossOfControlTooTight);
         }
         // `idle_command` is a floor on every motor on every tick while armed.
         // Above about hover it pins the thrust at or above the weight and

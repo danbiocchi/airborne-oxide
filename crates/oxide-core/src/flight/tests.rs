@@ -448,14 +448,16 @@ fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
         (
             "loc_error_s",
             |p, v| p.loc_error_s = v,
-            &[-0.001, 3600.1],
-            &[0.0, 3600.0],
+            // At least 0.1 s now (wave 4, task P).
+            &[-0.001, 0.0, 0.0999, 3600.1],
+            &[0.1, 3600.0],
         ),
         (
             "loc_tilt_s",
             |p, v| p.loc_tilt_s = v,
-            &[-0.001, 3600.1],
-            &[0.0, 3600.0],
+            // At least 0.05 s now.
+            &[-0.001, 0.0, 0.0499, 3600.1],
+            &[0.05, 3600.0],
         ),
         (
             "touchdown_s",
@@ -492,14 +494,17 @@ fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
         (
             "loc_error_rad",
             |p, v| p.loc_error_rad = v,
-            &[0.0, -0.1, pi + 0.001],
-            &[1e-6, pi],
+            // At least 0.35 rad (20 degrees) now.
+            &[0.0, -0.1, 1e-6, 0.3499, pi + 0.001],
+            &[0.35, pi],
         ),
         (
             "loc_tilt_rad",
             |p, v| p.loc_tilt_rad = v,
-            &[0.0, -0.1, pi + 0.001],
-            &[1e-6, pi],
+            // At least 0.185 rad, and 0.175 above the larger tilt limit
+            // (0.785 by default): 0.96 is the lowest accepted here.
+            &[0.0, -0.1, 1e-6, 0.1849, pi + 0.001],
+            &[0.97, pi],
         ),
         (
             "rtl_altitude_m",

@@ -49,8 +49,8 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 
 | Name | Type | Default | Min | Max | Unit | Change | Description |
 |---|---|---|---|---|---|---|---|
-| `LIM_TILT` | Float | 0.61086524 | 0.01 | 1.39 | rad | live | Maximum tilt in the position and offboard modes. |
-| `LIM_TILT_STAB` | Float | 0.7853982 | 0.01 | 1.39 | rad | live | Maximum tilt in the stabilized mode, at full stick. |
+| `LIM_TILT` | Float | 0.61086524 | 0.01 | 1.39 | rad | live | Maximum tilt in the position and offboard modes. FS_LOC_TILT must be at least 0.175 rad above it. |
+| `LIM_TILT_STAB` | Float | 0.7853982 | 0.01 | 1.39 | rad | live | Maximum tilt in the stabilized mode, at full stick. FS_LOC_TILT must be at least 0.175 rad above it. |
 | `LIM_RATE_ROLL` | Float | 3.8 | 0.01 | 35 | rad/s | live | Maximum body rate, roll axis. |
 | `LIM_RATE_PITCH` | Float | 3.8 | 0.01 | 35 | rad/s | live | Maximum body rate, pitch axis. |
 | `LIM_RATE_YAW` | Float | 3.5 | 0.01 | 35 | rad/s | live | Maximum body rate, yaw axis. |
@@ -111,10 +111,10 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | `FS_CLEAR_HYST` | Float | 1 | 0 | 3600 | s | live | A hold ends when its reasons have been clear this long. |
 | `FS_FENCE_RAD` | Float | 0 | 0 | 1000000 | m | live | Geofence radius around home. Zero disables it. |
 | `FS_FENCE_ALT` | Float | 0 | 0 | 1000000 | m | live | Geofence height above home. Zero disables it. |
-| `FS_LOC_ERR` | Float | 0.7853982 | > 0 | 3.1415927 | rad | live | Loss of control: attitude error above this for FS_LOC_ERR_T. |
-| `FS_LOC_ERR_T` | Float | 0.5 | 0 | 3600 | s | live | Loss of control: how long the attitude error must stay above FS_LOC_ERR. |
-| `FS_LOC_TILT` | Float | 1.3089969 | > 0 | 3.1415927 | rad | live | Loss of control: tilt above this for FS_LOC_TILT_T. |
-| `FS_LOC_TILT_T` | Float | 0.25 | 0 | 3600 | s | live | Loss of control: how long the tilt must stay above FS_LOC_TILT. |
+| `FS_LOC_ERR` | Float | 0.7853982 | 0.35 | 3.1415927 | rad | live | Loss of control: attitude error above this for FS_LOC_ERR_T. At least 0.35 rad (20 degrees): below it normal flight switches the motors off. |
+| `FS_LOC_ERR_T` | Float | 0.5 | 0.1 | 3600 | s | live | Loss of control: how long the attitude error must stay above FS_LOC_ERR. At least 0.1 s. |
+| `FS_LOC_TILT` | Float | 1.3089969 | 0.185 | 3.1415927 | rad | live | Loss of control: tilt above this for FS_LOC_TILT_T. Must be at least 0.175 rad (10 degrees) above both LIM_TILT and LIM_TILT_STAB, or the tilt the controller commands switches the motors off. |
+| `FS_LOC_TILT_T` | Float | 0.25 | 0.05 | 3600 | s | live | Loss of control: how long the tilt must stay above FS_LOC_TILT. At least 0.05 s. |
 
 ## Battery
 

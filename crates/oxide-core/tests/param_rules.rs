@@ -452,3 +452,137 @@ fn the_touchdown_speed_and_time_have_ranges_that_can_be_detected() {
         );
     }
 }
+
+// ---- loss of control ----
+
+#[test]
+fn loss_of_control_must_sit_above_the_tilt_the_controller_commands() {
+    let q = quad();
+    // The review's case: LIM_TILT_STAB = 1.39 rad (79.6 deg) with the default
+    // FS_LOC_TILT (75 deg = 1.309 rad) put the commanded tilt above the
+    // loss-of-control threshold: a full stick terminated the flight.
+    let mut c = q;
+    assert_eq!(
+        set(&mut c, "LIM_TILT_STAB", 1.39),
+        Err(ParamError::Invalid(ConfigError::LossOfControlTooTight))
+    );
+    assert_eq!(
+        set(&mut c, "LIM_TILT", 1.39),
+        Err(ParamError::Invalid(ConfigError::LossOfControlTooTight))
+    );
+    // Raising FS_LOC_TILT first makes it acceptable. The margin is 10 deg
+    // (0.175 rad): 1.39 + 0.175 = 1.565.
+    let mut c = q;
+    assert_eq!(set(&mut c, "FS_LOC_TILT", 1.6), Ok(()));
+    assert_eq!(set(&mut c, "LIM_TILT_STAB", 1.39), Ok(()));
+    assert_eq!(set(&mut c, "LIM_TILT", 1.39), Ok(()));
+    // And the threshold cannot be lowered back under the limit.
+    assert_eq!(
+        set(&mut c, "FS_LOC_TILT", 1.5),
+        Err(ParamError::Invalid(ConfigError::LossOfControlTooTight))
+    );
+    // The boundary, for each limit: limit + 0.175 accepted, a hair below not.
+    for name in ["LIM_TILT", "LIM_TILT_STAB"] {
+        let mut c = q;
+        assert_eq!(set(&mut c, "FS_LOC_TILT", 1.2), Ok(()));
+        assert_eq!(
+            set(&mut c, name, 1.0),
+            Ok(()),
+            "{name} 1.0 under 1.2 - 0.175"
+        );
+        assert_eq!(
+            set(&mut c, name, 1.03),
+            Err(ParamError::Invalid(ConfigError::LossOfControlTooTight)),
+            "{name} 1.03"
+        );
+    }
+    // All three in one change, in either profile.
+    for profile in [&F405_LEAN, &H743_FULL] {
+        let mut c = q;
+        assert_eq!(
+            set_both(
+                &mut c,
+                profile,
+                &[
+                    ("LIM_TILT_STAB", 1.39),
+                    ("LIM_TILT", 1.39),
+                    ("FS_LOC_TILT", 1.6)
+                ]
+            ),
+            Ok(())
+        );
+        let mut c = q;
+        assert!(matches!(
+            set_both(
+                &mut c,
+                profile,
+                &[("LIM_TILT_STAB", 1.39), ("FS_LOC_TILT", 1.5)]
+            ),
+            Err((
+                None,
+                ParamError::Invalid(ConfigError::LossOfControlTooTight)
+            ))
+        ));
+        assert_eq!(c, q);
+    }
+    // The defaults pass, and so does validate for a hand-built value.
+    let mut v = q;
+    v.limits.max_tilt_stabilized_rad = 1.2;
+    assert_eq!(v.validate(), Err(ConfigError::LossOfControlTooTight));
+}
+
+#[test]
+fn loss_of_control_angles_and_timers_have_minimums() {
+    let q = quad();
+    for (name, min) in [
+        ("FS_LOC_ERR", 0.35),
+        ("FS_LOC_ERR_T", 0.1),
+        ("FS_LOC_TILT_T", 0.05),
+        ("FS_LOC_TILT", 0.185),
+    ] {
+        let def = &params::PARAMS[id(name).index()];
+        assert_eq!(def.min, ParamValue::F32(min), "{name}");
+        let mut c = q;
+        assert_eq!(
+            set(&mut c, name, min * 0.99),
+            Err(ParamError::OutOfRange),
+            "{name} below its minimum"
+        );
+        assert_eq!(
+            set(&mut c, name, 1e-6),
+            Err(ParamError::OutOfRange),
+            "{name}"
+        );
+        assert_eq!(c, q);
+    }
+    // The minimum of each is accepted where no other rule stands in the way.
+    let mut c = q;
+    assert_eq!(set(&mut c, "FS_LOC_ERR", 0.35), Ok(()));
+    assert_eq!(set(&mut c, "FS_LOC_ERR_T", 0.1), Ok(()));
+    assert_eq!(set(&mut c, "FS_LOC_TILT_T", 0.05), Ok(()));
+    // FS_LOC_TILT at its minimum needs the tilt limits at theirs.
+    for profile in [&F405_LEAN, &H743_FULL] {
+        let mut c = q;
+        assert_eq!(
+            set_both(
+                &mut c,
+                profile,
+                &[
+                    ("LIM_TILT", 0.01),
+                    ("LIM_TILT_STAB", 0.01),
+                    ("FS_LOC_TILT", 0.185)
+                ]
+            ),
+            Ok(())
+        );
+    }
+    // Zero is no longer a way to switch a timer off.
+    let mut c = q;
+    for name in ["FS_LOC_ERR_T", "FS_LOC_TILT_T"] {
+        assert_eq!(
+            set(&mut c, name, 0.0),
+            Err(ParamError::OutOfRange),
+            "{name}"
+        );
+    }
+}

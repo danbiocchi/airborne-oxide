@@ -127,6 +127,10 @@ fn describe_rule(c: oxide_core::config::ConfigError) -> String {
         ConfigError::DescentLimitTooLow => "LIM_SPEED_DOWN must be at least twice LAND_TD_SPEED, \
              or the landing would be clamped below the speed that counts as a command to move"
             .into(),
+        ConfigError::LossOfControlTooTight => "FS_LOC_TILT must be at least 0.175 rad above both \
+             LIM_TILT and LIM_TILT_STAB, or the tilt the controller commands would count as a \
+             loss of control"
+            .into(),
         other => format!("{other:?}"),
     }
 }
