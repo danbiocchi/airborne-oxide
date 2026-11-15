@@ -8,7 +8,7 @@ Airborne Oxide is flight software for drones, written in Rust. It has three part
 2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that flies multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
 3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and will move onto smaller drones as AI hardware shrinks.
 
-> **Status: milestone M1c, part two.** The flight core flies a simulated 5" quad on its own state estimate and handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. Every tunable value is now a named parameter with a range, changeable in flight, and kept on flash by a store that survives a power cut at any moment. The scenarios are data files, flown across random seeds on both chip profiles. Logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
+> **Status: milestone M1c, part two.** The flight core flies a simulated 5" quad on its own state estimate and handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. The 93 tuning parameters are named, range-checked and changeable in flight. A parameter store that survives a power cut at any moment is written and tested against simulated flash; it meets real flash at F405 bring-up. The scenarios are data files, flown across random seeds on both chip profiles. Logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
 
 ## Try it
 
@@ -38,7 +38,7 @@ Fly a failure and print what the flight core did about it, event by event (`scen
 cargo run --release -p oxide-sim-cli -- scenario rc-loss-position
 ```
 
-Fly 200 gust-hold seeds on every core and print the worst case of each pass criterion:
+Fly 200 gust-hold seeds, using every CPU core, and print the worst case of each pass criterion (`--profile h743` picks the other chip profile):
 
 ```bash
 cargo run --release -p oxide-sim-cli -- montecarlo --seeds 200
@@ -67,7 +67,7 @@ cargo run --release -p oxide-sim-cli -- scenarios scenarios
 
 ## Write and fly a scenario file
 
-A scenario is one TOML file: the pilot, the faults, the wind, the parameter overrides, and what must happen. The 43 in [`scenarios/`](scenarios/) are the only definition of those scenarios; they are compiled into the simulator, and any other file is flown by its path. Unknown keys are errors, and heights are up-positive. The fully commented schema is in the documentation of [`scenario_file.rs`](crates/oxide-sim/src/scenario_file.rs).
+A scenario is one TOML file: the pilot, the faults, the wind, the parameter overrides, and what must happen. The 43 in [`scenarios/`](scenarios/) define those scenarios; they are compiled into the simulator, and any other file is flown by its path. (`hover-step` and `gust-hold` also keep a pilot written in Rust, which the `run`, `hash` and `montecarlo` commands and the viewer use; a test checks that both forms fly the same flight.) Unknown keys are errors, and heights are up-positive. The fully commented schema is in the documentation of [`scenario_file.rs`](crates/oxide-sim/src/scenario_file.rs).
 
 ```toml
 name = "gps-loss-short"

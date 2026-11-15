@@ -68,6 +68,10 @@ jobs:
         # (the M1b criteria), hover-step on 1, each on both profiles: 1222
         # flights, in parallel. Fails if any run fails.
         run: cargo run --release --locked -p oxide-sim-cli -- scenarios scenarios
+      - name: The 129 pinned flights have not moved (ADR-0004 section 7)
+        # The workspace tests check 43 of them; this is the full table. The
+        # test is named so that the table's regenerator is not run.
+        run: cargo test --release --locked -p oxide-sim --test scenario_files -- --ignored every_scenario_file_still_flies_its_pinned_flight_full
 
   determinism:
     name: Linux and Windows traces are bit-identical
