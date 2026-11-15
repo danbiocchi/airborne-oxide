@@ -34,6 +34,28 @@
 //!   (`Inputs::param_ack`) clears the fault and marks the parameters unsaved;
 //!   the next `service` then rewrites the store from the values in use,
 //!   removing what was not understood. A corrupt store is formatted first.
+//! * **An acknowledgement after an unreadable boot rewrites the store from the
+//!   values in use.** After `unreadable` the firmware holds its own values, not
+//!   what the store holds, so the save that follows the acknowledgement makes
+//!   the store hold only the differences from the firmware's values: whatever
+//!   the store held is gone, including values a later read could have
+//!   recovered. If the cause may be passing (a loose connection, a glitch),
+//!   restart first and acknowledge only a fault that comes back. (Pinned by
+//!   `an_acknowledgement_after_an_unreadable_boot_rewrites_the_store_from_the_values_in_use`.)
+//! * **Changes made while a fault is held live in RAM only.** `service` is idle
+//!   while the fault is held, so a parameter changed in that time is in use but
+//!   not stored, and a restart before the acknowledgement loses it (the same
+//!   fault is reported again). Nothing says so beyond the held fault.
+//! * **A value equal to the firmware's own is not stored.** A save holds the
+//!   differences from [`ParamStore::baseline`]; a value the operator chose that
+//!   equals the firmware's default is "no difference", so it follows a later
+//!   change of that default, and a stored value that a new default now equals
+//!   is dropped by the next save (and is not back when the old firmware boots
+//!   again).
+//! * **A save that keeps failing stops.** After [`MAX_FAILED_SAVES`] failed
+//!   saves in a row `service` returns [`Error::GaveUp`] without touching the
+//!   flash until the next boot ([`ParamStore::gave_up`]); a success resets the
+//!   count. Without it every call from the idle loop would erase a sector.
 //! * **A save of several parameters is all or nothing.** It is one
 //!   `replace_all`: either one appended record, or a whole new sector that
 //!   becomes the live one in a single program call. A power cut anywhere
@@ -42,6 +64,10 @@
 //!   (the tests cut at every byte and inside every program call).
 //! * **After a flash error** the store is mounted again by the next `service`
 //!   (which also finishes or finds finished an interrupted save).
+//!
+//! * **The flash must be plain NOR flash** (see [`crate::flash::Flash`]): the
+//!   layout writes a record in two calls and the state word in a later call,
+//!   which a flash that programs a word only once cannot take.
 //!
 //! The firmware still decides when to call `service` (a save can erase a
 //! sector, which stalls the part for tens to hundreds of milliseconds on some

@@ -812,3 +812,98 @@ fn a_save_that_fails_once_and_then_works_saves_on_the_second_call_and_the_count_
         assert!(!ps.gave_up(), "round {round}");
     }
 }
+
+// ---- Documented behaviours, pinned so that a change to them is a decision ----
+
+#[test]
+fn an_acknowledgement_after_an_unreadable_boot_rewrites_the_store_from_the_values_in_use() {
+    // The store holds two chosen values. A boot whose reads fail once leaves
+    // the firmware's values and a fault. The glitch passes, the operator
+    // acknowledges, and the store is rewritten from the values in use: what
+    // was readable all along is gone. (Restart first if the cause may be
+    // passing: see the module docs.)
+    let (mut ps0, cfg0, report0) = boot_on(Flash8::new());
+    let mut rig0 = Rig::new(cfg0, report0);
+    rig0.set(ParamId::LIM_TILT, 0.3);
+    rig0.set(ParamId::LIM_RATE_ROLL, 3.0);
+    assert!(matches!(
+        ps0.service(&mut rig0.core),
+        Ok(Serviced::Saved(_))
+    ));
+    let flash = Flaky::new(ps0.into_flash());
+
+    flash.failing.set(true);
+    let mut cfg = quad();
+    let (mut ps, report) = ParamStore::boot(flash, &mut cfg, &PROFILE);
+    assert!(report.unreadable);
+    assert!(cfg == quad());
+    ps.flash_mut().failing.set(false);
+    let mut rig = Rig::new(cfg, report);
+    rig.ack();
+    assert!(matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))));
+
+    // Restart: the values the store held are gone, with a clean report.
+    let (_, cfg2, report2) = boot_on(ps.into_flash().inner);
+    assert!(report2.clean() && report2.applied == 0, "{report2:?}");
+    assert!(cfg2 == quad());
+}
+
+#[test]
+fn changes_made_while_a_fault_is_held_are_lost_by_a_restart_before_the_acknowledgement() {
+    let extra = (0x0BAD_CAFE, 7);
+    let (mut ps, cfg, report) = boot_on(flash_with_raw(&[extra]));
+    assert!(!report.clean());
+    let mut rig = Rig::new(cfg, report);
+    rig.set(ParamId::LIM_RATE_ROLL, 3.0);
+    assert!(rig.core.params_unsaved());
+    assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle));
+    // Restart without the acknowledgement: the change is gone, and the same
+    // fault is reported again.
+    let (_, cfg2, report2) = boot_on(ps.into_flash());
+    assert_eq!(report2, report);
+    assert_eq!(cfg2.limits.max_rate.x, quad().limits.max_rate.x);
+}
+
+#[test]
+fn a_chosen_value_equal_to_the_firmwares_own_is_not_stored_and_follows_a_later_default() {
+    // Firmware v1: tilt default 0.61. The pilot chooses 0.3 and it is stored.
+    let (mut ps, cfg, report) = boot_on(Flash8::new());
+    let v1_tilt = cfg.limits.max_tilt_rad;
+    assert!(v1_tilt != 0.3);
+    let mut rig = Rig::new(cfg, report);
+    rig.set(ParamId::LIM_TILT, 0.3);
+    assert!(matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))));
+    let flash = ps.into_flash();
+
+    // Firmware v2 has 0.3 as its default. The stored value loads clean; the
+    // pilot changes another parameter; the save is measured against v2's
+    // default, so 0.3 is no longer a difference and is dropped.
+    let mut v2 = quad();
+    v2.limits.max_tilt_rad = 0.3;
+    let mut cfg2 = v2;
+    let (mut ps2, report2) = ParamStore::boot(flash, &mut cfg2, &PROFILE);
+    assert!(report2.clean() && report2.applied == 1);
+    let mut rig2 = Rig::new(cfg2, report2);
+    rig2.set(ParamId::LIM_RATE_ROLL, 3.0);
+    assert!(matches!(
+        ps2.service(&mut rig2.core),
+        Ok(Serviced::Saved(_))
+    ));
+    // Back on v1: the chosen 0.3 is gone.
+    let (_, cfg3, report3) = boot_on(ps2.into_flash());
+    assert!(report3.clean());
+    assert_eq!(cfg3.limits.max_tilt_rad, v1_tilt);
+
+    // And a value chosen equal to the default is not stored at all.
+    let (mut ps4, cfg4, report4) = boot_on(Flash8::new());
+    let mut rig4 = Rig::new(cfg4, report4);
+    rig4.set(ParamId::LIM_TILT, v1_tilt);
+    assert_eq!(
+        ps4.service(&mut rig4.core),
+        Ok(Serviced::Saved(Replaced::Unchanged))
+    );
+    assert_eq!(ps4.flash().total_erases(), 0);
+    let mut peek = ps4.into_flash();
+    let (s, _) = Store::mount(&mut peek).unwrap();
+    assert_eq!(s.iter().count(), 0, "nothing stored");
+}
