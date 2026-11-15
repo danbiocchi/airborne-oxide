@@ -169,8 +169,11 @@ fn to_change(name: &str, value: f64) -> Result<(params::ParamId, ParamValue), Pa
 /// checked once, on the result. So any valid combination can be stated in any
 /// order. All or nothing: a refused list leaves `cfg` untouched.
 ///
-/// On an error, the index of the entry at fault comes with it (`None` when the
-/// values are each fine but together break a rule).
+/// On an error, the index of the entry at fault comes with it. When the values
+/// together break a rule, each entry is tried alone on the starting
+/// configuration: if exactly one breaks a rule alone it is blamed (name, value,
+/// reason, as for a bad single value); otherwise the index is `None` and the
+/// message is the joint one.
 pub fn apply_params_at<const N: usize>(
     cfg: &mut VehicleConfig<N>,
     profile: &Profile,
@@ -191,7 +194,23 @@ pub fn apply_params_at<const N: usize>(
         }
         changes.push(change);
     }
-    params::set_all(cfg, profile, changes).map_err(|(_, e)| {
+    let start = *cfg;
+    params::set_all(cfg, profile, changes.iter().copied()).map_err(|(_, e)| {
+        // Which entries break a rule even alone, on the starting
+        // configuration? Exactly one: it is the culprit, reported as a
+        // single value is.
+        let mut culprits = Vec::new();
+        for (i, ((name, value), change)) in list.iter().zip(&changes).enumerate() {
+            let mut scratch = start;
+            if let Err((_, single)) = params::set_all(&mut scratch, profile, [*change]) {
+                culprits.push((i, fail(name, *value, single)));
+            }
+        }
+        if culprits.len() == 1
+            && let Some((i, err)) = culprits.pop()
+        {
+            return (Some(i), err);
+        }
         let rule = match e {
             ParamError::Invalid(c) => describe_rule(c),
             other => describe(other),

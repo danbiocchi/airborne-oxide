@@ -149,8 +149,10 @@ fn a_combination_valid_only_together_loads_from_a_scenario_file() {
         load_str("name = \"x\"\nduration_s = 5.0\n[params]\nBAT_LOW_V = 3.8\nBAT_CRIT_V = 3.6\n")
             .expect("loads");
     assert_eq!(s.params.len(), 2);
-    // Together they still have to hold: this pair does not.
-    let e = refused("[params]\nBAT_CRIT_V = 3.9\nBAT_LOW_V = 3.8\n");
+    // Together they still have to hold: this pair does not, though each is
+    // fine on its own (critical 3.45 against the default low 3.5, low 3.4
+    // against the default critical 3.3).
+    let e = refused("[params]\nBAT_CRIT_V = 3.45\nBAT_LOW_V = 3.4\n");
     assert!(e.reason.contains("together"), "{e}");
     // An unknown name is still named.
     let e = refused("[params]\nFS_NOLINK_RTL = 5.0\nEKF_HGT_TMO = 2\n");
@@ -649,4 +651,19 @@ fn an_expect_must_say_how_the_flight_ends() {
         "{MINIMAL}[[pilot.setpoint]]\nt = 0.0\nposition = [0.0, 0.0, 1.0]\n[expect.hold]\nmax_h_error_m = 1.0\n"
     ))
     .expect("a hold alone needs no ending");
+}
+
+#[test]
+fn a_single_value_that_breaks_a_rule_is_blamed_by_name() {
+    // Ten entries; BAT_CRIT_V = 3.9 alone breaks BAT_CRIT_V <= BAT_LOW_V
+    // (the default low level is 3.5). The others are fine alone.
+    let e = refused(
+        "[params]\nPOS_X_P = 1.1\nPOS_Y_P = 1.1\nPOS_Z_P = 1.2\nRTL_ALT = 12.0\nLAND_SPEED = 0.8\nBAT_CRIT_V = 3.9\nFS_GPS_LAND = 12.0\nLIM_TILT = 0.5\nLIM_SPEED_UP = 3.0\nLIM_SPEED_DOWN = 1.5\n",
+    );
+    assert_eq!(e.key, "params.BAT_CRIT_V", "{e}");
+    assert!(
+        e.reason.contains("value 3.9") && e.reason.contains("break a rule"),
+        "{e}"
+    );
+    assert!(!e.reason.contains("together"), "{e}");
 }
