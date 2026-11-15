@@ -131,8 +131,25 @@ fn failure_lines(path: &str, profile: &str, index: usize, reason: &str) -> Vec<S
     vec![
         format!("    first failure, run {index}: {reason}"),
         format!("    file: {path}"),
-        format!("    repeat: oxide-sim scenario {path} --profile {profile} --seed {index}"),
+        format!(
+            "    repeat: oxide-sim scenario {} --profile {profile} --seed {index}",
+            shell_word(path)
+        ),
     ]
+}
+
+/// `path` as one word for a shell: as it is when it holds only letters,
+/// digits and `/ . _ - +`, otherwise in single quotes.
+fn shell_word(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c));
+    if plain {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
 }
 
 /// Flies the directory; true when every run passed.
@@ -322,6 +339,20 @@ mod tests {
         assert_eq!(
             lines[2],
             "    repeat: oxide-sim scenario scenarios/gps-loss.toml --profile h743 --seed 7"
+        );
+    }
+
+    #[test]
+    fn the_repeat_command_quotes_a_path_a_shell_would_split() {
+        let lines = failure_lines("my scenarios/a.toml", "f405", 0, "x");
+        assert_eq!(
+            lines[2],
+            "    repeat: oxide-sim scenario 'my scenarios/a.toml' --profile f405 --seed 0"
+        );
+        assert_eq!(shell_word("it's.toml"), "'it'\\''s.toml'");
+        assert_eq!(
+            shell_word("scenarios/pair-gps-loss+baro-loss.toml"),
+            "scenarios/pair-gps-loss+baro-loss.toml"
         );
     }
 

@@ -124,8 +124,10 @@ impl<F: Flash, const N: usize> ParamStore<F, N> {
     /// read gives the firmware's values and a report with `unreadable` set.
     /// Hand the report to `Core::report_param_load`.
     ///
-    /// Nothing is written, except by [`Store::mount`] itself when the flash
-    /// holds nothing but headers (a first start, or an interrupted one).
+    /// Nothing is written, except by [`Store::mount`] itself in two cases:
+    /// when the flash holds nothing but headers (a first start, or an
+    /// interrupted one), and when it finds two valid sectors and retires the
+    /// older one.
     pub fn boot(flash: F, cfg: &mut VehicleConfig<N>, profile: &Profile) -> (Self, LoadReport) {
         let mut store = Store::unmounted(flash);
         let unreadable = LoadReport {

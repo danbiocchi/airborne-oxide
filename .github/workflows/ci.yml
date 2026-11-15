@@ -72,6 +72,8 @@ jobs:
         # The workspace tests check 43 of them; this is the full table. The
         # test is named so that the table's regenerator is not run.
         run: cargo test --release --locked -p oxide-sim --test scenario_files -- --ignored every_scenario_file_still_flies_its_pinned_flight_full
+      - name: Every parameter flies at both ends of its range (no panic, no runaway)
+        run: cargo test --release --locked -p oxide-sim --test param_bounds -- --ignored every_bound_flies
 
   determinism:
     name: Linux and Windows traces are bit-identical

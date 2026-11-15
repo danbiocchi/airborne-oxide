@@ -171,9 +171,9 @@ fn to_change(name: &str, value: f64) -> Result<(params::ParamId, ParamValue), Pa
 ///
 /// On an error, the index of the entry at fault comes with it. When the values
 /// together break a rule, each entry is tried alone on the starting
-/// configuration: if exactly one breaks a rule alone it is blamed (name, value,
-/// reason, as for a bad single value); otherwise the index is `None` and the
-/// message is the joint one.
+/// configuration: if exactly one breaks a rule alone, and the list is valid
+/// without it, it is blamed (name, value, reason, as for a bad single value);
+/// otherwise the index is `None` and the message is the joint one.
 pub fn apply_params_at<const N: usize>(
     cfg: &mut VehicleConfig<N>,
     profile: &Profile,
@@ -206,10 +206,21 @@ pub fn apply_params_at<const N: usize>(
                 culprits.push((i, fail(name, *value, single)));
             }
         }
+        // It is the cause only if the rest of the list is fine without it:
+        // an entry that fails alone can be made valid by another entry,
+        // while a different pair is what breaks the rule.
         if culprits.len() == 1
             && let Some((i, err)) = culprits.pop()
         {
-            return (Some(i), err);
+            let rest = changes
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k != i)
+                .map(|(_, c)| *c);
+            let mut scratch = start;
+            if params::set_all(&mut scratch, profile, rest).is_ok() {
+                return (Some(i), err);
+            }
         }
         let rule = match e {
             ParamError::Invalid(c) => describe_rule(c),

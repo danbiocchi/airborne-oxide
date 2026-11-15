@@ -31,7 +31,11 @@ pub enum FlashError {
 /// * An interrupted `erase` leaves each byte of the sector unchanged, `0xFF`,
 ///   or anything between (bits are only ever set, never cleared).
 /// * Calls take effect in the order the store makes them: the store never
-///   starts a call before the previous one has returned `Ok`.
+///   starts a call before the previous one has returned `Ok`. One exception:
+///   when mount retires the older of two valid sectors and that call fails,
+///   the store carries on with the newer sector. The failed call touched only
+///   the state word of the sector that is no longer used, and a state word
+///   left half-programmed never reads as valid.
 /// * A read returns what is stored, or an error; it never changes the flash.
 ///
 /// # Which flash this fits

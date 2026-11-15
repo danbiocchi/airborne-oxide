@@ -667,3 +667,15 @@ fn a_single_value_that_breaks_a_rule_is_blamed_by_name() {
     );
     assert!(!e.reason.contains("together"), "{e}");
 }
+
+#[test]
+fn a_value_that_another_entry_makes_valid_is_not_blamed_for_a_different_pair() {
+    // BAT_CRIT_V = 3.9 breaks a rule alone (the default low level is 3.5),
+    // but BAT_LOW_V = 4.0 makes it valid. What breaks the list is the other
+    // pair: the touchdown thrust must stay below the blind-landing thrust.
+    let e = refused(
+        "[params]\nBAT_CRIT_V = 3.9\nBAT_LOW_V = 4.0\nLAND_BLIND_THR = 0.35\nLAND_TD_THRUST = 0.4\n",
+    );
+    assert_eq!(e.key, "params", "{e}");
+    assert!(e.reason.contains("together"), "{e}");
+}
