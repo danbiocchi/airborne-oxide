@@ -28,13 +28,18 @@
 //! | Sectors | Meaning | Active | Report |
 //! |---|---|---|---|
 //! | `Valid` + `Blank` or `Retired` | normal | the valid one | `Clean` (`Recovered` if it holds torn records) |
-//! | `Valid` + `Valid` | cut between steps 4 and 5 | higher sequence (wrapping compare) | `Recovered` |
+//! | `Valid` + `Valid` | cut between steps 4 and 5 | higher sequence (wrapping compare); the older sector is then retired (step 5, one 4-byte program call) | `Recovered` |
 //! | `Valid` + `Valid`, equal sequences | not a power cut: damage | none | `Corrupt` |
 //! | `Valid` + `Writing` or `Bad` | cut during an erase or the copy | the valid one | `Recovered` |
 //! | no `Valid`, and no byte outside the two 16-byte headers differs from `0xFF` | a first initialisation or a format was cut; nothing was ever stored | erase what is not blank, write a header on sector 0 | `Fresh` |
 //! | anything else | damage | none | `Corrupt` |
 //!
-//! Mount writes to flash only in the `Fresh` row. A valid sector beside a
+//! Mount writes to flash in two rows only: `Fresh`, and `Valid` + `Valid`,
+//! where it programs the older sector's state word to retired (as step 5 would
+//! have), so that a later damage to the live header is `Corrupt` and not a
+//! return to old values. A failure of that one call is not a mount failure
+//! (the store is usable; the next mount tries again), and a power cut inside
+//! it leaves a state word that is not valid, so the sector reads as retired. A valid sector beside a
 //! `Retired` one is reported `Clean` even when the retired sector is really a
 //! half-written new one whose state word was cut short (the two look alike and
 //! are treated alike: not used, erased by the next compaction).
@@ -123,7 +128,7 @@ pub enum MountReport {
     /// No valid sector and nothing but (perhaps cut-short) headers on the
     /// flash: it was blank, or a first initialisation or a `format` was
     /// interrupted. Nothing was ever stored, so nothing is lost. The store was
-    /// initialised empty (the only case in which mount writes).
+    /// initialised empty.
     Fresh,
     /// A valid sector, but torn records, a second valid sector (a compaction
     /// was cut before it retired the old one; the newer was taken), or a
@@ -158,7 +163,8 @@ impl<F: Flash> Store<F> {
     };
 
     /// Opens the store. Writes only to initialise a flash that holds nothing
-    /// but headers (`MountReport::Fresh`). See [`MountReport`] and the table in
+    /// but headers (`MountReport::Fresh`) and to retire the older of two valid
+    /// sectors. See [`MountReport`] and the table in
     /// the module docs.
     ///
     /// # Errors
@@ -232,6 +238,15 @@ impl<F: Flash> Store<F> {
                 h.get(a ^ 1),
                 Some(Header::Valid(_) | Header::Writing(_) | Header::Bad)
             );
+            if matches!(h.get(a ^ 1), Some(Header::Valid(_))) {
+                // Retire the stale sector now (the call a compaction ends
+                // with), so that damage to the live header later is `Corrupt`
+                // and not a silent return to the old values. If this fails
+                // the store is still usable, and the next mount tries again.
+                let _ = self
+                    .flash
+                    .program(a ^ 1, STATE_OFFSET, &pack::<4>(&[STATE_RETIRED]));
+            }
             let report = if self.torn > 0 || other_ignored {
                 MountReport::Recovered
             } else {

@@ -1754,3 +1754,130 @@ fn two_valid_sectors_with_the_same_sequence_are_corrupt_not_an_arbitrary_pick() 
     assert_eq!(s.get(1).unwrap(), None);
     assert_eq!([*f.bytes(0).unwrap(), *f.bytes(1).unwrap()], before);
 }
+
+// ---- mount retires a stale sector (Valid + Valid) ----
+
+/// A flash with two valid sectors, sequences 5 (sector 0, key 1 = 100) and 6
+/// (sector 1, key 1 = 101): a compaction cut between its steps 4 and 5.
+fn two_valid_sectors() -> Small {
+    use crate::layout::{STATE_VALID, header_body, record_bytes};
+    let mut f = fresh();
+    for (sector, seq) in [(0, 5), (1, 6)] {
+        let b = f.bytes_mut(sector).unwrap();
+        b[..12].copy_from_slice(&header_body(seq));
+        b[12..16].copy_from_slice(&STATE_VALID.to_le_bytes());
+        b[16..28].copy_from_slice(&record_bytes(1, 100 + sector as u32, false));
+    }
+    f
+}
+
+fn header_of(f: &Small, sector: usize) -> crate::layout::Header {
+    let b = f.bytes(sector).unwrap();
+    let w = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    crate::layout::decode_header([w(0), w(4), w(8), w(12)])
+}
+
+#[test]
+fn mounting_two_valid_sectors_retires_the_older_one_and_the_next_mount_is_clean() {
+    use crate::layout::Header;
+    let mut f = two_valid_sectors();
+    {
+        let (s, r) = Store::mount(&mut f).unwrap();
+        assert_eq!(r, MountReport::Recovered);
+        assert_eq!(s.get(1).unwrap(), Some(101));
+    }
+    assert_eq!(header_of(&f, 0), Header::Retired(5), "the stale sector");
+    assert_eq!(header_of(&f, 1), Header::Valid(6));
+    assert_eq!(f.program_calls(), 1, "one 4-byte program call");
+    assert_eq!(f.total_erases(), 0);
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Clean);
+    assert_eq!(s.get(1).unwrap(), Some(101));
+    // The point of it: damage to the live header is Corrupt, not a return to
+    // the old values.
+    drop(s);
+    f.bytes_mut(1).unwrap()[4] &= !2;
+    let (s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Corrupt);
+    assert_eq!(s.get(1).unwrap(), None);
+}
+
+#[test]
+fn a_power_cut_anywhere_in_the_retire_at_mount_leaves_a_store_that_mounts_with_the_newer_content() {
+    use crate::layout::{STATE_RETIRED, STATE_VALID};
+    let bits = (STATE_VALID & !STATE_RETIRED).count_ones() as usize;
+    let mut cuts: Vec<Cut> = (0..4).map(|n| Cut::Byte(n, n)).collect();
+    for seed in 0..16 {
+        cuts.push(Cut::Bits(0, BitCut::Seeded(seed)));
+    }
+    for k in 0..bits {
+        cuts.push(Cut::Bits(0, BitCut::AllBut(k)));
+        cuts.push(Cut::Bits(0, BitCut::Only(k)));
+    }
+    for cut in cuts {
+        let mut f = two_valid_sectors();
+        {
+            let mut s = Store::unmounted(&mut f);
+            cut.arm(s.flash_mut());
+            // The retire failing is not a mount failure.
+            let r = s.remount();
+            assert_eq!(r, Ok(MountReport::Recovered), "{cut:?}");
+            assert_eq!(s.get(1).unwrap(), Some(101), "{cut:?}");
+        }
+        assert!(f.is_dead(), "{cut:?}");
+        f.restore_power();
+        for round in 0..2 {
+            let (s, r) = Store::mount(&mut f).unwrap();
+            assert_ne!(r, MountReport::Corrupt, "{cut:?} round {round}");
+            assert_eq!(s.get(1).unwrap(), Some(101), "{cut:?} round {round}");
+            assert_eq!(f.total_erases(), 0);
+        }
+        let (_, r) = Store::mount(&mut f).unwrap();
+        assert_eq!(r, MountReport::Clean, "{cut:?}: settled");
+    }
+}
+
+/// A flash whose programs fail while `fail` is set.
+struct FailingPrograms {
+    inner: Small,
+    fail: bool,
+}
+
+impl Flash for FailingPrograms {
+    const SECTOR_SIZE: usize = SMALL;
+    fn read(&self, s: usize, o: usize, b: &mut [u8]) -> Result<(), FlashError> {
+        self.inner.read(s, o, b)
+    }
+    fn program(&mut self, s: usize, o: usize, d: &[u8]) -> Result<(), FlashError> {
+        if self.fail {
+            Err(FlashError::Device)
+        } else {
+            self.inner.program(s, o, d)
+        }
+    }
+    fn erase(&mut self, s: usize) -> Result<(), FlashError> {
+        self.inner.erase(s)
+    }
+}
+
+#[test]
+fn a_failed_retire_at_mount_is_not_a_mount_failure_and_a_later_mount_retires() {
+    use crate::layout::Header;
+    let mut f = FailingPrograms {
+        inner: two_valid_sectors(),
+        fail: true,
+    };
+    let (mut s, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Recovered);
+    assert_eq!(s.get(1).unwrap(), Some(101));
+    // The store is usable once the flash is.
+    s.flash_mut().fail = false;
+    s.set(2, 7).unwrap();
+    assert_eq!(s.get(2).unwrap(), Some(7));
+    drop(s);
+    assert_eq!(header_of(&f.inner, 0), Header::Valid(5), "not retired yet");
+    f.fail = false;
+    let (_, r) = Store::mount(&mut f).unwrap();
+    assert_eq!(r, MountReport::Recovered);
+    assert_eq!(header_of(&f.inner, 0), Header::Retired(5));
+}
