@@ -63,7 +63,8 @@
 //! t = 15.0
 //! silent = true               # the brain sends nothing from t on
 //!
-//! [expect]                    # default: nothing required (see `Expect::default`)
+//! [expect]                    # an [expect] must have an [expect.ending]; every other key is optional:
+//!                             # the default is to require nothing more (see `Expect::default`)
 //! nav_contains = ["hold", "land"]     # in this order
 //! nav_never = []
 //! reasons = ["GPS_LOST"]              # all of these raised
@@ -1462,6 +1463,7 @@ fn convert_expect(raw: RawExpect) -> Result<(Option<Expect>, Option<HoldCriteria
     }
     let d = Expect::default();
     let opt = |key: &str, v: Option<f64>| v.map(|v| finite(key, v)).transpose();
+    let ending_missing = raw.ending.is_none();
     let ending = match raw.ending {
         None => d.ending,
         Some(RawEnding::Flying { point, tolerance_m }) => {
@@ -1530,6 +1532,12 @@ fn convert_expect(raw: RawExpect) -> Result<(Option<Expect>, Option<HoldCriteria
             raw.max_distance_from_home_m,
         )?,
     };
+    if ending_missing {
+        return Err(ScenarioError::new(
+            "expect.ending",
+            "an [expect] must say how the flight ends: [expect.ending] kind = one of flying (point, tolerance_m), flying-at-height (height_m, tolerance_m), landed (within_m_of_home), terminated, disarmed (reason), down",
+        ));
+    }
     Ok((Some(expect), hold))
 }
 

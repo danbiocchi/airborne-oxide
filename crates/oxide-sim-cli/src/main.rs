@@ -1045,7 +1045,7 @@ mod tests {
     fn scenario_command_flies_a_file_by_path_and_names_the_ways_to_name_one() {
         let path = temp_file(
             "mine.toml",
-            "name = \"mine\"\nduration_s = 2.0\n[expect]\nmin_height_m = 4.0\n",
+            "name = \"mine\"\nduration_s = 2.0\n[expect]\nmin_height_m = 4.0\n[expect.ending]\nkind = \"down\"\n",
         );
         let r = scenario_command([path.clone()].into_iter());
         assert!(

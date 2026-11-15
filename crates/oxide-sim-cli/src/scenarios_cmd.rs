@@ -263,7 +263,7 @@ mod tests {
 
     const PASSING: &str = "name = \"calm\"\nduration_s = 2.0\n";
     /// Needs a height the flight (which never arms) cannot reach.
-    const FAILING: &str = "name = \"never\"\nduration_s = 2.0\n[expect]\nmin_height_m = 4.0\n[run]\nseeds = 2\nprofiles = [\"f405\"]\n";
+    const FAILING: &str = "name = \"never\"\nduration_s = 2.0\n[expect]\nmin_height_m = 4.0\n[expect.ending]\nkind = \"down\"\n[run]\nseeds = 2\nprofiles = [\"f405\"]\n";
 
     #[test]
     fn a_directory_with_a_failing_scenario_fails() {

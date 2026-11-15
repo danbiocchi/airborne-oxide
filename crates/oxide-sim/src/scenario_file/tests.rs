@@ -625,3 +625,28 @@ fn seeds_and_duration_have_limits() {
     dur("0.001").expect("one tick");
     dur("86400.0").expect("a day");
 }
+
+#[test]
+fn an_expect_must_say_how_the_flight_ends() {
+    let e = refused("[expect]\nreasons_never = [\"GPS_LOST\"]\n");
+    assert_eq!(e.key, "expect.ending", "{e}");
+    for kind in [
+        "flying",
+        "flying-at-height",
+        "landed",
+        "terminated",
+        "disarmed",
+        "down",
+    ] {
+        assert!(e.reason.contains(kind), "{e}");
+    }
+    // With an ending it loads; `[expect.hold]` alone needs none.
+    load_str(&format!(
+        "{MINIMAL}[expect]\nreasons_never = [\"GPS_LOST\"]\n[expect.ending]\nkind = \"terminated\"\n"
+    ))
+    .expect("an ending is stated");
+    load_str(&format!(
+        "{MINIMAL}[[pilot.setpoint]]\nt = 0.0\nposition = [0.0, 0.0, 1.0]\n[expect.hold]\nmax_h_error_m = 1.0\n"
+    ))
+    .expect("a hold alone needs no ending");
+}
