@@ -328,7 +328,9 @@ pub struct Verdict {
     /// The hold statistics, when the file has `[expect.hold]`.
     pub hold: Option<HoldMetrics>,
     /// Every expectation the flight broke, in words; empty = passed. A file
-    /// with neither `[expect]` nor `[expect.hold]` has none to break.
+    /// with neither `[expect]` nor `[expect.hold]` is judged by the
+    /// invariants every flight gets (finite truth, no timing faults, motors
+    /// off while disarmed, the failsafe action never decreasing).
     pub violations: Vec<String>,
 }
 
@@ -361,10 +363,12 @@ impl Checker {
     }
 
     pub fn finish(self) -> Verdict {
-        let mut violations = self
-            .expect
-            .as_ref()
-            .map_or_else(Vec::new, |e| e.check(&self.outcome));
+        // `Expect::check` starts with the invariants every flight gets; a
+        // file with no `[expect]` is still judged by those.
+        let mut violations = match &self.expect {
+            Some(e) => e.check(&self.outcome),
+            None => self.outcome.invariant_violations(),
+        };
         let hold = self.hold.map(|(m, c, _)| {
             violations.extend(m.failures(&c));
             m
@@ -406,6 +410,12 @@ pub struct ScenarioFile {
 }
 
 impl ScenarioFile {
+    /// True when the file states what must happen (`[expect]` or
+    /// `[expect.hold]`); otherwise a flight is judged by the invariants only.
+    pub fn states_expectations(&self) -> bool {
+        self.expect.is_some() || self.hold.is_some()
+    }
+
     /// The seed of run `index`.
     pub fn seed(&self, index: u64) -> u64 {
         run_seed(&self.name, index)

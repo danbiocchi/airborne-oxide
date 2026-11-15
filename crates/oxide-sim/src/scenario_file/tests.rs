@@ -494,3 +494,37 @@ fn a_hold_without_a_point_to_hold_is_refused() {
     assert_eq!(e.key, "expect.hold", "{e}");
     assert!(e.reason.contains("setpoint"), "{e}");
 }
+
+// ---- Wave 4 (S) ---------------------------------------------------------------
+
+#[test]
+fn a_file_with_no_expect_is_still_judged_by_the_invariants() {
+    let f = load_str(MINIMAL).expect("loads");
+    assert!(f.expect.is_none() && f.hold.is_none());
+    let mut clean = Checker::new(&f);
+    assert!(clean.outcome.invariant_violations().is_empty());
+    clean.outcome.max_action = Action::Hold;
+    assert!(
+        clean.finish().violations.is_empty(),
+        "a quiet flight passes"
+    );
+
+    let mut c = Checker::new(&f);
+    c.outcome.non_finite = true;
+    c.outcome.timing_faults = 2;
+    c.outcome.motor_ticks_while_disarmed = 3;
+    c.outcome.action_decreased = true;
+    c.outcome.physics_faults = 1;
+    let v = c.finish();
+    assert_eq!(v.violations.len(), 5, "{:?}", v.violations);
+    assert!(v.violations.iter().any(|m| m.contains("timing faults")));
+    assert!(v.violations.iter().any(|m| m.contains("while disarmed")));
+}
+
+#[test]
+fn states_expectations_tells_a_judged_file_from_an_invariants_only_one() {
+    assert!(!load_str(MINIMAL).expect("loads").states_expectations());
+    let with =
+        format!("{MINIMAL}[expect]\nmin_action = \"hold\"\n[expect.ending]\nkind = \"down\"\n");
+    assert!(load_str(&with).expect("loads").states_expectations());
+}

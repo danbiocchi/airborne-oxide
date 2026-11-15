@@ -725,17 +725,28 @@ fn scenario_command(
         );
     }
     println!("trace hash {:016x}", sim.trace_hash());
-    if scenario.expect.is_none() && scenario.hold.is_none() {
-        println!("result     PASS (the file states no expectations)");
-    } else if verdict.violations.is_empty() {
-        println!("result     PASS");
-    } else {
-        println!("result     FAIL");
-        for v in &verdict.violations {
-            println!("  violated: {v}");
-        }
+    for line in result_lines(&scenario, &verdict.violations) {
+        println!("{line}");
     }
     Ok(verdict.violations.is_empty())
+}
+
+/// The `result` line of `scenario` and the violations under it. A file that
+/// states no expectations is judged by the invariants, and says so.
+fn result_lines(scenario: &ScenarioFile, violations: &[String]) -> Vec<String> {
+    let note = if scenario.states_expectations() {
+        ""
+    } else {
+        " (invariants only: the file states no expectations)"
+    };
+    let mut out = Vec::new();
+    if violations.is_empty() {
+        out.push(format!("result     PASS{note}"));
+    } else {
+        out.push(format!("result     FAIL{note}"));
+        out.extend(violations.iter().map(|v| format!("  violated: {v}")));
+    }
+    out
 }
 
 fn main() -> ExitCode {
@@ -1052,6 +1063,20 @@ mod tests {
             .expect_err("missing file");
         assert!(e.to_string().contains("no-such-file.toml"), "{e}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_result_line_says_when_only_the_invariants_were_judged() {
+        let bare = scenario_file::load_str("name = \"bare\"\nduration_s = 2.0\n").expect("loads");
+        assert_eq!(
+            result_lines(&bare, &[]),
+            vec!["result     PASS (invariants only: the file states no expectations)"]
+        );
+        let broken = result_lines(&bare, &["2 timing faults".to_string()]);
+        assert!(broken[0].starts_with("result     FAIL"), "{broken:?}");
+        assert_eq!(broken[1], "  violated: 2 timing faults");
+        let judged = fault_scenarios::by_name("gcs-loss").expect("embedded");
+        assert_eq!(result_lines(&judged, &[]), vec!["result     PASS"]);
     }
 
     #[test]

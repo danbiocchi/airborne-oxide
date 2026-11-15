@@ -357,13 +357,14 @@ pub fn event_line(e: &Event) -> String {
     format!("{:8.3} s  {what}", e.t.as_secs_f64())
 }
 
-impl Expect {
-    /// One line per violation; empty when the outcome is as required.
-    /// Always also: no non-finite values, no physics or timing faults, the
-    /// action never decreased, and no motor command while disarmed.
-    pub fn check(&self, o: &FlightOutcome) -> Vec<String> {
+impl FlightOutcome {
+    /// The checks every flight gets, whether or not its file states an
+    /// `[expect]`: no non-finite truth, no physics or timing faults, the
+    /// action never decreased while armed, no motor command while disarmed.
+    /// One line per violation; empty when the flight kept them all.
+    pub fn invariant_violations(&self) -> Vec<String> {
+        let o = self;
         let mut v: Vec<String> = Vec::new();
-
         if o.non_finite {
             v.push("non-finite value in truth".into());
         }
@@ -382,6 +383,16 @@ impl Expect {
                 o.motor_ticks_while_disarmed
             ));
         }
+        v
+    }
+}
+
+impl Expect {
+    /// One line per violation; empty when the outcome is as required.
+    /// Always also the flight's invariants
+    /// ([`FlightOutcome::invariant_violations`]), listed first.
+    pub fn check(&self, o: &FlightOutcome) -> Vec<String> {
+        let mut v: Vec<String> = o.invariant_violations();
 
         // Navigation states, in order.
         let mut seq = o.nav_sequence.iter();

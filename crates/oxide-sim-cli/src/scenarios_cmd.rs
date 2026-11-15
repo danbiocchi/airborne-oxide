@@ -102,6 +102,17 @@ fn first_failure(file: &ScenarioFile, job: &Job) -> Option<String> {
     }
 }
 
+/// One line per scenario and profile. A file that states no `[expect]` is
+/// judged by the invariants every flight gets, and says so.
+fn group_line(name: &str, profile: &str, n: usize, bad: usize, invariants_only: bool) -> String {
+    let note = if invariants_only {
+        " (invariants only)"
+    } else {
+        ""
+    };
+    format!("{name:<36} {profile:<5} passed {}/{n}{note}", n - bad)
+}
+
 /// Flies the directory; true when every run passed.
 pub fn run(args: impl Iterator<Item = String>) -> Result<bool, Box<dyn std::error::Error>> {
     let o = parse(args)?;
@@ -137,7 +148,16 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<bool, Box<dyn std::erro
         let bad = runs.iter().filter(|r| r.is_some()).count();
         total += n;
         failed += bad;
-        println!("{name:<36} {:<5} passed {}/{n}", profile.name(), n - bad);
+        println!(
+            "{}",
+            group_line(
+                name,
+                profile.name(),
+                n,
+                bad,
+                !files[file].states_expectations()
+            )
+        );
         if let Some((i, reason)) = runs
             .iter()
             .enumerate()
@@ -252,6 +272,21 @@ mod tests {
         let e = run(args(&["/no/such/dir"])).expect_err("missing");
         assert!(e.to_string().contains("/no/such/dir"), "{e}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_group_without_expectations_says_invariants_only() {
+        let judged = group_line("gps-loss", "f405", 3, 1, false);
+        assert_eq!(judged, format!("{:<36} f405  passed 2/3", "gps-loss"));
+        let bare = group_line("hover-step", "h743", 1, 0, true);
+        assert!(bare.ends_with("passed 1/1 (invariants only)"), "{bare}");
+        // The real file hover-step has no [expect]; gust-hold has [expect.hold].
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let files = load_dir(&dir).expect("loads");
+        let by = |n: &str| files.iter().find(|f| f.name == n).expect(n);
+        assert!(!by("hover-step").states_expectations());
+        assert!(by("gust-hold").states_expectations());
+        assert!(by("gps-loss").states_expectations());
     }
 
     #[test]
