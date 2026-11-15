@@ -164,20 +164,54 @@ impl<F: Flash> Store<F> {
     /// # Errors
     /// A flash read or program failure.
     pub fn mount(flash: F) -> Result<(Self, MountReport), Error> {
-        let mut s = Self {
+        let mut s = Self::unmounted(flash);
+        let report = s.remount()?;
+        Ok((s, report))
+    }
+
+    /// A store over `flash` that has not been mounted: it holds nothing and
+    /// refuses writes ([`Error::Corrupt`]) until [`Store::remount`] succeeds or
+    /// [`Store::format`] is called. Unlike [`Store::mount`] it cannot fail, so
+    /// the flash is never lost to a failed mount.
+    #[must_use]
+    pub fn unmounted(flash: F) -> Self {
+        Self {
             flash,
             active: None,
             sequence: 0,
             used: 0,
             torn: 0,
             faulted: false,
-        };
-        let h = [s.read_header(0)?, s.read_header(1)?];
+        }
+    }
+
+    /// Mounts again, from what the flash holds now: the same as
+    /// [`Store::mount`] on a store whose in-memory state is rebuilt from
+    /// scratch. The way back after a flash error (`Error::NeedsRemount`). On an
+    /// error the store is left unmounted (as after [`Store::unmounted`]).
+    ///
+    /// # Errors
+    /// A flash read or program failure.
+    pub fn remount(&mut self) -> Result<MountReport, Error> {
+        self.active = None;
+        self.sequence = 0;
+        self.used = 0;
+        self.torn = 0;
+        self.faulted = false;
+        let r = self.mount_inner();
+        if r.is_err() {
+            self.active = None;
+        }
+        r.map_err(Error::from)
+    }
+
+    fn mount_inner(&mut self) -> Result<MountReport, FlashError> {
+        let h = [self.read_header(0)?, self.read_header(1)?];
         let best = match (h[0], h[1]) {
             // Equal sequences cannot come from a power cut (each compaction
             // adds one): it is damage or tampering, and which sector is right
             // is unknowable.
-            (Header::Valid(a), Header::Valid(b)) if a == b => return Ok((s, MountReport::Corrupt)),
+            (Header::Valid(a), Header::Valid(b)) if a == b => return Ok(MountReport::Corrupt),
             (Header::Valid(a), Header::Valid(b)) => Some(usize::from(b.wrapping_sub(a) as i32 > 0)),
             (Header::Valid(_), _) => Some(0),
             (_, Header::Valid(_)) => Some(1),
@@ -188,9 +222,9 @@ impl<F: Flash> Store<F> {
                 Some(Header::Valid(q)) => *q,
                 _ => 0,
             };
-            s.active = Some(a);
-            s.sequence = seq;
-            s.scan_active()?;
+            self.active = Some(a);
+            self.sequence = seq;
+            self.scan_active()?;
             // Both valid: a compaction was cut between marking the new sector
             // valid and retiring the old one. A sector being written or
             // damaged: a compaction or an erase was cut.
@@ -198,27 +232,27 @@ impl<F: Flash> Store<F> {
                 h.get(a ^ 1),
                 Some(Header::Valid(_) | Header::Writing(_) | Header::Bad)
             );
-            let report = if s.torn > 0 || other_ignored {
+            let report = if self.torn > 0 || other_ignored {
                 MountReport::Recovered
             } else {
                 MountReport::Clean
             };
-            return Ok((s, report));
+            return Ok(report);
         }
         // No valid sector. If nothing but (perhaps damaged) headers was ever
         // written, no value was ever stored: a first initialisation or a
         // format was interrupted, and starting empty loses nothing.
-        if s.is_blank_from(0, HEADER_SIZE)? && s.is_blank_from(1, HEADER_SIZE)? {
+        if self.is_blank_from(0, HEADER_SIZE)? && self.is_blank_from(1, HEADER_SIZE)? {
             for sector in 0..2 {
-                if !s.is_blank_from(sector, 0)? {
-                    s.flash.erase(sector)?;
+                if !self.is_blank_from(sector, 0)? {
+                    self.flash.erase(sector)?;
                 }
             }
-            s.write_header(0, 0)?;
-            s.active = Some(0);
-            return Ok((s, MountReport::Fresh));
+            self.write_header(0, 0)?;
+            self.active = Some(0);
+            return Ok(MountReport::Fresh);
         }
-        Ok((s, MountReport::Corrupt))
+        Ok(MountReport::Corrupt)
     }
 
     /// Access to the flash, for tests that arm a power cut.

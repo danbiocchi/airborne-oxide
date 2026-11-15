@@ -15,6 +15,9 @@ publish.workspace = true
 std = []
 
 [dependencies]
+# Used only by `param_store` (the parameter policy); the generic store does not
+# know it. Both crates are `no_std`.
+oxide-core.workspace = true
 
 [lints]
 workspace = true
