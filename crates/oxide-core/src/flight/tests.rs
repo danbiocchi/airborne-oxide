@@ -460,8 +460,10 @@ fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
         (
             "touchdown_s",
             |p, v| p.touchdown_s = v,
-            &[0.0, -1.0, 3600.1],
-            &[1e-6, 3600.0],
+            // 0.1 to 10 s now (wave 4, task P): an hour-long touchdown test
+            // is a vehicle that never disarms.
+            &[0.0, -1.0, 1e-6, 0.0999, 10.1, 3600.0],
+            &[0.1, 10.0],
         ),
         (
             "battery_low_v",
@@ -530,8 +532,10 @@ fn failsafe_values_outside_their_bounds_are_refused_and_on_the_bound_pass() {
         (
             "touchdown_speed_mps",
             |p, v| p.touchdown_speed_mps = v,
-            &[0.0, -0.1],
-            &[1e-3, 0.35],
+            // The minimum is 0.1 m/s now: the estimated vertical speed of a
+            // landed vehicle reaches 0.09 (wave 4, task P).
+            &[0.0, -0.1, 1e-3, 0.0999],
+            &[0.1, 0.35],
         ),
     ];
     for (name, set, refused, accepted) in table {

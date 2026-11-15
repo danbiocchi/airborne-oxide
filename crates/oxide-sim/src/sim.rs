@@ -124,6 +124,9 @@ fn describe_rule(c: oxide_core::config::ConfigError) -> String {
         ConfigError::IdleTooHigh => "LIM_IDLE gives more than half of the hover thrust of a \
              rotor (it is a floor on every motor)"
             .into(),
+        ConfigError::DescentLimitTooLow => "LIM_SPEED_DOWN must be at least twice LAND_TD_SPEED, \
+             or the landing would be clamped below the speed that counts as a command to move"
+            .into(),
         other => format!("{other:?}"),
     }
 }

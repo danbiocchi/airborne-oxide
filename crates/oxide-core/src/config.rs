@@ -497,6 +497,10 @@ pub enum ConfigError {
     /// rotor: it is a floor on every motor, so the vehicle could not be held
     /// down or steered.
     IdleTooHigh,
+    /// The descent speed limit is below the slowest commanded descent that
+    /// counts as a command to move (twice the touchdown speed): the landing
+    /// would be clamped below it and ground contact declared in mid-air.
+    DescentLimitTooLow,
 }
 
 impl<const N: usize> VehicleConfig<N> {
@@ -555,6 +559,14 @@ impl<const N: usize> VehicleConfig<N> {
             || !self.estimator.ekf.output_tau_covers_horizon()
         {
             return Err(ConfigError::BadEstimator);
+        }
+        // The velocity loop clamps the descent that `land_speed_mps` commands
+        // (landing, return, land-now, blind landing) to `max_speed_down`.
+        // Below the speed that counts as a command to move, the landing
+        // would read as standing on the ground, in mid-air. (A pilot's own
+        // descent is at most `max_speed_down`, and is judged on thrust.)
+        if self.limits.max_speed_down < self.failsafe.contact_descent_mps() {
+            return Err(ConfigError::DescentLimitTooLow);
         }
         // `idle_command` is a floor on every motor on every tick while armed.
         // Above about hover it pins the thrust at or above the weight and

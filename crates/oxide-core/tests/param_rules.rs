@@ -312,3 +312,143 @@ fn the_output_time_constant_has_a_minimum_and_follows_the_delay_horizon() {
         Err(ConfigError::BadEstimator)
     );
 }
+
+// ---- landing ----
+
+#[test]
+fn the_descent_limit_must_allow_the_landing_speed_to_count_as_a_command() {
+    let q = quad();
+    // Contact is declared at twice LAND_TD_SPEED (0.25 by default), so
+    // LIM_SPEED_DOWN, which clamps the descent LAND_SPEED commands, must be at
+    // least that.
+    let mut c = q;
+    assert_eq!(
+        set(&mut c, "LIM_SPEED_DOWN", 0.49),
+        Err(ParamError::Invalid(ConfigError::DescentLimitTooLow))
+    );
+    assert_eq!(
+        set(&mut c, "LIM_SPEED_DOWN", 0.01),
+        Err(ParamError::Invalid(ConfigError::DescentLimitTooLow))
+    );
+    assert_eq!(
+        set(&mut c, "LIM_SPEED_DOWN", 0.5),
+        Ok(()),
+        "equal is accepted"
+    );
+    assert_eq!(set(&mut c, "LIM_SPEED_DOWN", 1.5), Ok(()), "the default");
+    // The touchdown speed cannot rise past what the limit allows either.
+    let mut c = q;
+    assert_eq!(set(&mut c, "LIM_SPEED_DOWN", 0.6), Ok(()));
+    assert_eq!(
+        set(&mut c, "LAND_TD_SPEED", 0.31),
+        Err(ParamError::Invalid(ConfigError::DescentLimitTooLow))
+    );
+    assert_eq!(set(&mut c, "LAND_TD_SPEED", 0.3), Ok(()));
+    // Together, in one change: a faster landing with a limit to match.
+    for profile in [&F405_LEAN, &H743_FULL] {
+        let mut c = q;
+        assert_eq!(
+            set_both(
+                &mut c,
+                profile,
+                &[
+                    ("LAND_TD_SPEED", 1.0),
+                    ("LAND_SPEED", 2.0),
+                    ("LIM_SPEED_DOWN", 2.0)
+                ]
+            ),
+            Ok(())
+        );
+        let mut c = q;
+        assert!(matches!(
+            set_both(
+                &mut c,
+                profile,
+                &[
+                    ("LAND_TD_SPEED", 1.0),
+                    ("LAND_SPEED", 2.0),
+                    ("LIM_SPEED_DOWN", 1.9)
+                ]
+            ),
+            Err((None, ParamError::Invalid(ConfigError::DescentLimitTooLow)))
+        ));
+        assert_eq!(c, q);
+    }
+    let mut v = q;
+    v.limits.max_speed_down = 0.4;
+    assert_eq!(v.validate(), Err(ConfigError::DescentLimitTooLow));
+}
+
+#[test]
+fn the_touchdown_speed_and_time_have_ranges_that_can_be_detected() {
+    let q = quad();
+    let td_speed = &params::PARAMS[id("LAND_TD_SPEED").index()];
+    assert_eq!(td_speed.min, ParamValue::F32(0.1));
+    assert!(
+        td_speed.description.contains("0.1"),
+        "{}",
+        td_speed.description
+    );
+    let td_time = &params::PARAMS[id("LAND_TD_TIME").index()];
+    assert_eq!(
+        (td_time.min, td_time.max),
+        (ParamValue::F32(0.1), ParamValue::F32(10.0))
+    );
+    for (name, bad) in [
+        ("LAND_TD_SPEED", 0.09),
+        ("LAND_TD_SPEED", 0.01),
+        ("LAND_TD_SPEED", 1e-6),
+        ("LAND_TD_TIME", 0.09),
+        ("LAND_TD_TIME", 1e-6),
+        ("LAND_TD_TIME", 10.1),
+        ("LAND_TD_TIME", 3600.0),
+    ] {
+        let mut c = q;
+        assert_eq!(
+            set(&mut c, name, bad),
+            Err(ParamError::OutOfRange),
+            "{name} {bad}"
+        );
+        assert_eq!(c, q);
+    }
+    for (name, ok) in [
+        ("LAND_TD_SPEED", 0.1),
+        ("LAND_TD_TIME", 0.1),
+        ("LAND_TD_TIME", 10.0),
+        ("LAND_TD_TIME", 1.0),
+        ("LAND_TD_SPEED", 0.25),
+    ] {
+        let mut c = q;
+        assert_eq!(set(&mut c, name, ok), Ok(()), "{name} {ok}");
+    }
+    // At the new minimum of the touchdown speed the landing and descent
+    // limits may go to the smallest values the rules then allow: 0.2.
+    for profile in [&F405_LEAN, &H743_FULL] {
+        let mut c = q;
+        assert_eq!(
+            set_both(
+                &mut c,
+                profile,
+                &[
+                    ("LAND_TD_SPEED", 0.1),
+                    ("LAND_SPEED", 0.2),
+                    ("LIM_SPEED_DOWN", 0.2)
+                ]
+            ),
+            Ok(())
+        );
+        let mut c = q;
+        assert!(
+            set_both(
+                &mut c,
+                profile,
+                &[
+                    ("LAND_TD_SPEED", 0.1),
+                    ("LAND_SPEED", 0.19),
+                    ("LIM_SPEED_DOWN", 0.2)
+                ]
+            )
+            .is_err()
+        );
+    }
+}

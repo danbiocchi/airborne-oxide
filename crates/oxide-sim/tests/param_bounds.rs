@@ -117,3 +117,63 @@ fn gust_hold_holds_at_the_smallest_output_time_constant_the_rules_allow() {
         }
     }
 }
+
+#[test]
+fn rc_loss_position_at_the_smallest_touchdown_speed_lands_and_disarms_by_touchdown() {
+    // LAND_TD_SPEED 0.1 is the new minimum; LAND_SPEED and LIM_SPEED_DOWN at
+    // the smallest values the rules then allow (twice that, 0.2 m/s).
+    let mut f = scenario("rc-loss-position");
+    // A landing at 0.2 m/s from the 10 m return height takes about 50 s: give
+    // the flight the time (the file's own 80 s is for 0.7 m/s).
+    f.duration_s = 160.0;
+    if let Some(e) = f.expect.as_mut() {
+        e.by_s = 150.0;
+    }
+    let p = [
+        ("LAND_TD_SPEED", 0.1),
+        ("LAND_SPEED", 0.2),
+        ("LIM_SPEED_DOWN", 0.2),
+    ];
+    for (pname, profile) in PROFILES {
+        for seed in 0..5 {
+            let v = fly(&f, profile, seed, &p);
+            assert!(
+                v.violations.is_empty(),
+                "{pname} seed {seed}: {:?}",
+                v.violations
+            );
+            assert_eq!(
+                v.outcome.disarm_reason,
+                Some(DisarmReason::Touchdown),
+                "{pname} seed {seed}"
+            );
+            let speed = v.outcome.touchdown_speed_mps.expect("touched down");
+            let limit = f.expect.as_ref().map_or(1.5, |e| e.max_touchdown_mps);
+            assert!(speed <= limit, "{pname} seed {seed}: touchdown {speed} m/s");
+        }
+    }
+}
+
+#[test]
+fn a_touchdown_time_of_a_tenth_of_a_second_does_not_disarm_above_the_ground() {
+    let f = scenario("rc-loss-position");
+    for (pname, profile) in PROFILES {
+        for seed in 0..3 {
+            let params = vec![("LAND_TD_TIME".to_string(), 0.1)];
+            let mut sim = f.build_with_params(profile, seed, &params).expect("builds");
+            let mut was_armed = false;
+            let mut disarm_height = None;
+            sim.run_until(f.end(), |r| {
+                if was_armed && !r.status.armed && disarm_height.is_none() {
+                    disarm_height = Some(-r.position.z);
+                }
+                was_armed |= r.status.armed;
+            });
+            let h = disarm_height.expect("disarmed");
+            assert!(
+                h < 0.3,
+                "{pname} seed {seed}: disarmed {h} m above the ground"
+            );
+        }
+    }
+}

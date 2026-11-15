@@ -56,7 +56,7 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | `LIM_RATE_YAW` | Float | 3.5 | 0.01 | 35 | rad/s | live | Maximum body rate, yaw axis. |
 | `LIM_SPEED_XY` | Float | 5 | 0.01 | 30 | m/s | live | Maximum horizontal speed. |
 | `LIM_SPEED_UP` | Float | 3 | 0.01 | 30 | m/s | live | Maximum climb speed. |
-| `LIM_SPEED_DOWN` | Float | 1.5 | 0.01 | 30 | m/s | live | Maximum descent speed. |
+| `LIM_SPEED_DOWN` | Float | 1.5 | 0.01 | 30 | m/s | live | Maximum descent speed. It clamps the descent LAND_SPEED commands, so it must be at least twice LAND_TD_SPEED. |
 | `LIM_YAW_RATE` | Float | 2 | 0.01 | 35 | rad/s | live | Yaw rate at full yaw stick. |
 | `LIM_RATE_I` | Float | 30 | 0 | 1000 | rad/s^2 | live | Limit on the rate loop integral term. |
 | `LIM_VEL_I` | Float | 3 | 0 | 30 | m/s^2 | live | Limit on the velocity loop integral term. |
@@ -139,5 +139,5 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | `LAND_SPEED` | Float | 0.7 | 0 | 10 | m/s | live | Landing descent rate. Must be at least twice LAND_TD_SPEED. |
 | `LAND_BLIND_THR` | Float | 0.9 | 0 | 1 |  | live | Landing without a valid height: thrust as a fraction of hover thrust. Must be above LAND_TD_THRUST. |
 | `LAND_TD_THRUST` | Float | 0.3 | > 0 | < 1 |  | live | Touchdown: thrust below this fraction of hover thrust. Must be above LIM_MIN_THRUST and below LAND_BLIND_THR. |
-| `LAND_TD_SPEED` | Float | 0.25 | > 0 | 5 | m/s | live | Touchdown: vertical speed below this. |
-| `LAND_TD_TIME` | Float | 1 | > 0 | 3600 | s | live | Touchdown: for this long. |
+| `LAND_TD_SPEED` | Float | 0.25 | 0.1 | 5 | m/s | live | Touchdown: vertical speed below this. At least 0.1 m/s: the estimated vertical speed of a landed vehicle on realistic sensors reaches 0.09 m/s, and below its noise the touchdown is never detected. LAND_SPEED and LIM_SPEED_DOWN must each be at least twice this. |
+| `LAND_TD_TIME` | Float | 1 | 0.1 | 10 | s | live | Touchdown: for this long, 0.1 to 10 s (a longer test is a vehicle that never disarms). |

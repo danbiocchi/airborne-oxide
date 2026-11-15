@@ -478,7 +478,7 @@ declare_params! {
         f32 LIM_SPEED_UP = max_speed_up: 3.0, 0.01, 30.0, "m/s", Limits, live,
             "Maximum climb speed.";
         f32 LIM_SPEED_DOWN = max_speed_down: 1.5, 0.01, 30.0, "m/s", Limits, live,
-            "Maximum descent speed.";
+            "Maximum descent speed. It clamps the descent LAND_SPEED commands, so it must be at least twice LAND_TD_SPEED.";
         f32 LIM_YAW_RATE = max_yaw_rate: 2.0, 0.01, 35.0, "rad/s", Limits, live,
             "Yaw rate at full yaw stick.";
         f32 LIM_RATE_I = rate_integral_limit: 30.0, 0.0, 1000.0, "rad/s^2", Limits, live,
@@ -599,10 +599,10 @@ declare_params! {
             "Landing without a valid height: thrust as a fraction of hover thrust. Must be above LAND_TD_THRUST.";
         f32 LAND_TD_THRUST = touchdown_thrust: 0.3, TINY, BELOW_ONE, "", Land, live,
             "Touchdown: thrust below this fraction of hover thrust. Must be above LIM_MIN_THRUST and below LAND_BLIND_THR.";
-        f32 LAND_TD_SPEED = touchdown_speed_mps: 0.25, TINY, 5.0, "m/s", Land, live,
-            "Touchdown: vertical speed below this.";
-        f32 LAND_TD_TIME = touchdown_s: 1.0, TINY, DUR, "s", Land, live,
-            "Touchdown: for this long.";
+        f32 LAND_TD_SPEED = touchdown_speed_mps: 0.25, 0.1, 5.0, "m/s", Land, live,
+            "Touchdown: vertical speed below this. At least 0.1 m/s: the estimated vertical speed of a landed vehicle on realistic sensors reaches 0.09 m/s, and below its noise the touchdown is never detected. LAND_SPEED and LIM_SPEED_DOWN must each be at least twice this.";
+        f32 LAND_TD_TIME = touchdown_s: 1.0, 0.1, 10.0, "s", Land, live,
+            "Touchdown: for this long, 0.1 to 10 s (a longer test is a vehicle that never disarms).";
     }
 }
 
@@ -1099,6 +1099,7 @@ mod tests {
             "LAND_BLIND_THR",
             "LAND_SPEED",
             "LIM_IDLE",
+            "LIM_SPEED_DOWN",
             "EKF_OUT_TAU",
             "BAT_CRIT_V",
             "BAT_LOW_V",
