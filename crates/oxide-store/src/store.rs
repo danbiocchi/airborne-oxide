@@ -255,6 +255,12 @@ impl<F: Flash> Store<F> {
         Ok(MountReport::Corrupt)
     }
 
+    /// Read access to the flash.
+    #[must_use]
+    pub fn flash(&self) -> &F {
+        &self.flash
+    }
+
     /// Access to the flash, for tests that arm a power cut.
     pub fn flash_mut(&mut self) -> &mut F {
         &mut self.flash
