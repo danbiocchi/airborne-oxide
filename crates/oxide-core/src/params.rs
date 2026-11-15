@@ -735,11 +735,16 @@ pub struct LoadReport {
     /// The store itself could not be read. Set by the caller, never by
     /// [`load`].
     pub unreadable: bool,
+    /// Records the store skipped as damaged or half-written, so the values
+    /// taken may be older than the last save. Set by the caller, never by
+    /// [`load`]. It does not make the report unclean: the core reports it
+    /// (`EventKind::ParamLoadRecovered`) and holds no fault.
+    pub torn: u16,
 }
 
 impl LoadReport {
     /// Everything stored was understood and taken: nothing unknown, dropped,
-    /// invalid or unreadable (`applied` does not matter).
+    /// invalid or unreadable (`applied` and `torn` do not matter).
     pub const fn clean(&self) -> bool {
         self.unknown == 0 && self.dropped == 0 && !self.invalid && !self.unreadable
     }
@@ -1758,5 +1763,22 @@ mod tests {
         let mut c = cfg();
         c.failsafe.rtl_speed_mps = 0.0;
         assert_eq!(c.validate(), Err(ConfigError::BadFailsafe));
+    }
+
+    #[test]
+    fn torn_records_are_reported_but_never_make_a_report_unclean_or_come_from_load() {
+        let r = LoadReport {
+            torn: 3,
+            applied: 2,
+            ..LoadReport::default()
+        };
+        assert!(r.clean());
+        assert!(!LoadReport { unknown: 1, ..r }.clean());
+        // `load` leaves `torn` to the caller.
+        let mut c = cfg();
+        let rep = load(&mut c, &F405_LEAN, [(KEYS[0], 0u32)]);
+        assert_eq!(rep.torn, 0);
+        let rep = load(&mut c, &F405_LEAN, []);
+        assert_eq!(rep, LoadReport::default());
     }
 }

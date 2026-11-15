@@ -613,3 +613,110 @@ fn a_parameter_set_while_the_fault_is_held_is_applied_and_stays_unsaved() {
     assert!(core.params_unsaved() && out.status.params_unsaved);
     assert_eq!(out.status.timing_faults, 0);
 }
+
+// ---- skipped records: a clean load that may hold older values ----
+
+#[test]
+fn a_clean_report_with_torn_records_holds_no_fault_and_emits_one_recovered_event() {
+    let report = LoadReport {
+        applied: 4,
+        torn: 2,
+        ..LoadReport::default()
+    };
+    assert!(report.clean());
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(report);
+    assert!(!core.params_fault(), "torn records are not a fault");
+    let mut all = Vec::new();
+    let (k, _) = run_events(&mut core, 0, 1100, rc(false, false), &mut all);
+    let (_, out) = run_events(&mut core, k, 100, rc(true, false), &mut all);
+    // Arming is not refused.
+    assert!(out.status.armed && core.is_armed());
+    assert!(out.status.prearm.is_empty());
+    // One event, on the first tick, carrying the report; no fault event.
+    let recovered: Vec<_> = all
+        .iter()
+        .filter(|(_, e)| matches!(e, EventKind::ParamLoadRecovered(_)))
+        .collect();
+    assert_eq!(recovered, vec![&(0, EventKind::ParamLoadRecovered(report))]);
+    assert!(
+        all.iter()
+            .all(|(_, e)| !matches!(e, EventKind::ParamLoadFault(_)))
+    );
+    // A clean report with nothing torn emits nothing.
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(LoadReport {
+        applied: 4,
+        ..LoadReport::default()
+    });
+    let mut all = Vec::new();
+    run_events(&mut core, 0, 50, rc(false, false), &mut all);
+    assert!(all.is_empty(), "{all:?}");
+}
+
+#[test]
+fn an_unclean_report_with_torn_records_is_a_fault_and_carries_the_count() {
+    let report = LoadReport {
+        unknown: 1,
+        torn: 5,
+        ..LoadReport::default()
+    };
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(report);
+    assert!(core.params_fault());
+    let mut all = Vec::new();
+    run_events(&mut core, 0, 50, rc(false, false), &mut all);
+    assert_eq!(all, vec![(0, EventKind::ParamLoadFault(report))]);
+}
+
+#[test]
+fn a_second_report_replaces_the_first_and_emits_nothing_more() {
+    let first = LoadReport {
+        unknown: 1,
+        ..LoadReport::default()
+    };
+    let second = LoadReport {
+        dropped: 2,
+        ..LoadReport::default()
+    };
+    // Before the first tick: one event, carrying the later report.
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(first);
+    core.report_param_load(second);
+    let mut all = Vec::new();
+    run_events(&mut core, 0, 50, rc(false, false), &mut all);
+    assert_eq!(all, vec![(0, EventKind::ParamLoadFault(second))]);
+    // After the event went out: the fault now holds the second report (an
+    // acknowledgement is still needed) but no second event follows.
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(first);
+    let mut all = Vec::new();
+    let (k, _) = run_events(&mut core, 0, 10, rc(false, false), &mut all);
+    core.report_param_load(second);
+    assert!(core.params_fault());
+    let (k, _) = run_events(&mut core, k, 100, rc(false, false), &mut all);
+    assert_eq!(all, vec![(0, EventKind::ParamLoadFault(first))]);
+    let t = Micros(k * 1000);
+    let mut i = inputs(t, rc(false, false));
+    i.param_ack = true;
+    let out = core.tick(t, &i);
+    assert!(!core.params_fault());
+    assert!(
+        out.events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ParamFaultAcked))
+    );
+    // A second report with torn records after the first one's event: no
+    // second recovered event.
+    let torn = LoadReport {
+        torn: 1,
+        ..LoadReport::default()
+    };
+    let mut core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    core.report_param_load(torn);
+    let mut all = Vec::new();
+    let (_, _) = run_events(&mut core, 0, 10, rc(false, false), &mut all);
+    core.report_param_load(torn);
+    run_events(&mut core, 10, 100, rc(false, false), &mut all);
+    assert_eq!(all, vec![(0, EventKind::ParamLoadRecovered(torn))]);
+}

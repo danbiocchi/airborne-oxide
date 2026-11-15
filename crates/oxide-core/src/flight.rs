@@ -137,6 +137,13 @@ pub struct Core<const N: usize> {
     param_fault: Option<LoadReport>,
     /// The `ParamLoadFault` event has not been emitted yet.
     param_fault_event_due: bool,
+    /// A `ParamLoadFault` event has been emitted (once per core).
+    param_fault_event_sent: bool,
+    /// A clean report that skipped records, whose `ParamLoadRecovered` event
+    /// has not been emitted yet.
+    param_recovered_due: Option<LoadReport>,
+    /// A `ParamLoadRecovered` event has been emitted (once per core).
+    param_recovered_sent: bool,
 }
 
 impl<const N: usize> Core<N> {
@@ -192,6 +199,9 @@ impl<const N: usize> Core<N> {
             params_unsaved: false,
             param_fault: None,
             param_fault_event_due: false,
+            param_fault_event_sent: false,
+            param_recovered_due: None,
+            param_recovered_sent: false,
         })
     }
 
@@ -243,16 +253,28 @@ impl<const N: usize> Core<N> {
     }
 
     /// Tells the core what loading the stored parameters did. Call once after
-    /// [`Core::new`], with the report of `params::load` (and `unreadable` set if
-    /// the store could not be read). A report that is not clean puts the core
-    /// in a parameter fault: arming is refused (pre-arm flag `CONFIG`), one
-    /// `ParamLoadFault` event is emitted on the next tick, and the fault
-    /// stays until an operator acknowledges it (`Inputs::param_ack`). A clean
-    /// report changes nothing.
+    /// [`Core::new`], with the report of `params::load` (with `unreadable`
+    /// and `torn` set by the caller from what the store saw).
+    ///
+    /// - A report that is not clean puts the core in a parameter fault:
+    ///   arming is refused (pre-arm flag `CONFIG`), one `ParamLoadFault`
+    ///   event is emitted on the next tick, and the fault stays until an
+    ///   operator acknowledges it (`Inputs::param_ack`).
+    /// - A clean report with `torn > 0` holds no fault and does not refuse
+    ///   arming, but emits one `ParamLoadRecovered` event on the next tick:
+    ///   the values taken may be older than the last save.
+    /// - Any other clean report changes nothing.
+    ///
+    /// It is called once. A second unclean report replaces the fault the
+    /// first one set (it holds the later report) and emits no second
+    /// `ParamLoadFault` event; a second report with torn records emits no
+    /// second `ParamLoadRecovered` event.
     pub fn report_param_load(&mut self, report: LoadReport) {
         if !report.clean() {
             self.param_fault = Some(report);
-            self.param_fault_event_due = true;
+            self.param_fault_event_due = !self.param_fault_event_sent;
+        } else if report.torn > 0 && !self.param_recovered_sent {
+            self.param_recovered_due = Some(report);
         }
     }
 
@@ -285,7 +307,12 @@ impl<const N: usize> Core<N> {
             && self.param_fault_event_due
         {
             self.param_fault_event_due = false;
+            self.param_fault_event_sent = true;
             self.emit(now, EventKind::ParamLoadFault(report));
+        }
+        if let Some(report) = self.param_recovered_due.take() {
+            self.param_recovered_sent = true;
+            self.emit(now, EventKind::ParamLoadRecovered(report));
         }
         if inputs.param_ack && self.param_fault.is_some() && !self.is_armed() {
             self.param_fault = None;

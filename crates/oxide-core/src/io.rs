@@ -409,6 +409,11 @@ pub enum EventKind {
     /// the report. Emitted once, on the first tick; arming is refused until
     /// an operator acknowledges.
     ParamLoadFault(LoadReport),
+    /// Loading the stored parameters was clean but the store skipped damaged
+    /// or half-written records (`LoadReport::torn`): the values taken may be
+    /// older than the last save. Emitted once, on the first tick; no fault is
+    /// held and arming is not refused.
+    ParamLoadRecovered(LoadReport),
     /// An operator acknowledged the parameter fault; the store must now be
     /// rewritten from the values in use (`Status::params_unsaved`).
     ParamFaultAcked,

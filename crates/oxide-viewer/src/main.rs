@@ -280,6 +280,10 @@ fn describe(kind: EventKind) -> String {
             if r.invalid { ", broke a rule" } else { "" },
             if r.unreadable { ", unreadable" } else { "" },
         ),
+        EventKind::ParamLoadRecovered(r) => format!(
+            "Stored parameters loaded; {} damaged records skipped",
+            r.torn
+        ),
         EventKind::ParamFaultAcked => "Parameter fault acknowledged".to_string(),
     }
 }
