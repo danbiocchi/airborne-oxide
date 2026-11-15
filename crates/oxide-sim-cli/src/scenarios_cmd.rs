@@ -66,8 +66,11 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Options, String> {
     Ok(o)
 }
 
-/// Every `*.toml` of `dir`, loaded, in file-name order.
-pub fn load_dir(dir: &Path) -> Result<Vec<ScenarioFile>, String> {
+/// Every `*.toml` of `dir`, loaded, in file-name order, each with the path it
+/// came from. Two files with the same `name` are an error naming both: the
+/// name is what the run seeds are derived from, so they would fly the same
+/// flights, and the output could not tell them apart.
+pub fn load_dir(dir: &Path) -> Result<Vec<(String, ScenarioFile)>, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut paths = Vec::new();
     for entry in entries {
@@ -80,10 +83,19 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ScenarioFile>, String> {
     if paths.is_empty() {
         return Err(format!("{}: no *.toml scenario files", dir.display()));
     }
-    paths
-        .iter()
-        .map(|p| scenario_file::load_path(p).map_err(|e| e.to_string()))
-        .collect()
+    let mut out: Vec<(String, ScenarioFile)> = Vec::new();
+    for p in &paths {
+        let file = scenario_file::load_path(p).map_err(|e| e.to_string())?;
+        let shown = p.display().to_string();
+        if let Some((first, _)) = out.iter().find(|(_, f)| f.name == file.name) {
+            return Err(format!(
+                "{first} and {shown} both have the name `{}`: the name seeds the runs, so they would fly the same flights; give one of them another name",
+                file.name
+            ));
+        }
+        out.push((shown, file));
+    }
+    Ok(out)
 }
 
 /// One flight to fly: file, profile, run index.
@@ -113,10 +125,21 @@ fn group_line(name: &str, profile: &str, n: usize, bad: usize, invariants_only: 
     format!("{name:<36} {profile:<5} passed {}/{n}{note}", n - bad)
 }
 
+/// What a failing group prints under its line: the first failure, the file,
+/// and the command that repeats that run.
+fn failure_lines(path: &str, profile: &str, index: usize, reason: &str) -> Vec<String> {
+    vec![
+        format!("    first failure, run {index}: {reason}"),
+        format!("    file: {path}"),
+        format!("    repeat: oxide-sim scenario {path} --profile {profile} --seed {index}"),
+    ]
+}
+
 /// Flies the directory; true when every run passed.
 pub fn run(args: impl Iterator<Item = String>) -> Result<bool, Box<dyn std::error::Error>> {
     let o = parse(args)?;
-    let files = load_dir(Path::new(&o.dir))?;
+    let loaded = load_dir(Path::new(&o.dir))?;
+    let files: Vec<&ScenarioFile> = loaded.iter().map(|(_, f)| f).collect();
     // One flight per (file, profile, index), in a fixed order, flown in
     // parallel; the lines come out in the same order whatever the schedule.
     let mut jobs = Vec::new();
@@ -144,6 +167,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<bool, Box<dyn std::erro
     let (mut total, mut failed) = (0_usize, 0_usize);
     for (file, profile, first, n) in groups {
         let name = &files[file].name;
+        let path = &loaded[file].0;
         let runs = results.get(first..first + n).unwrap_or(&[]);
         let bad = runs.iter().filter(|r| r.is_some()).count();
         total += n;
@@ -163,7 +187,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<bool, Box<dyn std::erro
             .enumerate()
             .find_map(|(i, r)| r.as_ref().map(|r| (i, r)))
         {
-            println!("    first failure, run {i}: {reason}");
+            for line in failure_lines(path, profile.name(), i, reason) {
+                println!("{line}");
+            }
         }
     }
     println!(
@@ -275,6 +301,31 @@ mod tests {
     }
 
     #[test]
+    fn two_files_with_one_name_are_an_error_naming_both() {
+        let dir = temp_dir("dup");
+        std::fs::write(dir.join("a.toml"), PASSING).expect("write");
+        std::fs::write(dir.join("b.toml"), PASSING).expect("write");
+        let d = dir.to_string_lossy().into_owned();
+        let e = run(args(&[&d])).expect_err("duplicate names").to_string();
+        assert!(
+            e.contains("a.toml") && e.contains("b.toml") && e.contains("`calm`"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failure_names_the_file_and_the_command_that_repeats_it() {
+        let lines = failure_lines("scenarios/gps-loss.toml", "h743", 7, "no Land event");
+        assert_eq!(lines[0], "    first failure, run 7: no Land event");
+        assert_eq!(lines[1], "    file: scenarios/gps-loss.toml");
+        assert_eq!(
+            lines[2],
+            "    repeat: oxide-sim scenario scenarios/gps-loss.toml --profile h743 --seed 7"
+        );
+    }
+
+    #[test]
     fn a_group_without_expectations_says_invariants_only() {
         let judged = group_line("gps-loss", "f405", 3, 1, false);
         assert_eq!(judged, format!("{:<36} f405  passed 2/3", "gps-loss"));
@@ -283,7 +334,7 @@ mod tests {
         // The real file hover-step has no [expect]; gust-hold has [expect.hold].
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
         let files = load_dir(&dir).expect("loads");
-        let by = |n: &str| files.iter().find(|f| f.name == n).expect(n);
+        let by = |n: &str| &files.iter().find(|(_, f)| f.name == n).expect(n).1;
         assert!(!by("hover-step").states_expectations());
         assert!(by("gust-hold").states_expectations());
         assert!(by("gps-loss").states_expectations());
