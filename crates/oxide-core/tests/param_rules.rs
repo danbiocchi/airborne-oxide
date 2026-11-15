@@ -219,3 +219,96 @@ fn the_idle_rule_follows_the_thrust_curve_and_the_weight() {
         Err(ParamError::Invalid(ConfigError::IdleTooHigh))
     );
 }
+
+// ---- EKF_OUT_TAU ----
+
+fn set_both(
+    cfg: &mut VehicleConfig<4>,
+    profile: &oxide_core::schedule::Profile,
+    list: &[(&str, f32)],
+) -> Result<(), (Option<ParamId>, ParamError)> {
+    let changes: Vec<_> = list
+        .iter()
+        .map(|(n, v)| (id(n), ParamValue::F32(*v)))
+        .collect();
+    params::set_all(cfg, profile, changes)
+}
+
+#[test]
+fn the_output_time_constant_has_a_minimum_and_follows_the_delay_horizon() {
+    let q = quad();
+    let def = &params::PARAMS[id("EKF_OUT_TAU").index()];
+    assert_eq!(def.min, ParamValue::F32(0.15));
+    assert!(
+        def.description.contains("EKF_HORIZON") && def.description.contains("0.15"),
+        "{}",
+        def.description
+    );
+    // Below the minimum is out of range, whatever the horizon.
+    for tau in [0.14, 0.1, 0.05, 1e-3, 1e-6] {
+        let mut c = q;
+        assert_eq!(set(&mut c, "EKF_OUT_TAU", tau), Err(ParamError::OutOfRange));
+    }
+    // With the default horizon (0.2 s) a time constant below it is refused by
+    // the rule between the two, with the configuration left alone.
+    let mut c = q;
+    assert_eq!(
+        set(&mut c, "EKF_OUT_TAU", 0.15),
+        Err(ParamError::Invalid(ConfigError::BadEstimator))
+    );
+    assert_eq!(
+        set(&mut c, "EKF_OUT_TAU", 0.19),
+        Err(ParamError::Invalid(ConfigError::BadEstimator))
+    );
+    // Equal to the horizon, and the default, are accepted.
+    assert_eq!(set(&mut c, "EKF_OUT_TAU", 0.2), Ok(()));
+    assert_eq!(set(&mut c, "EKF_OUT_TAU", 0.25), Ok(()));
+    // The horizon cannot move above the time constant either.
+    let mut c = q;
+    assert_eq!(set(&mut c, "EKF_OUT_TAU", 0.2), Ok(()));
+    assert_eq!(
+        set(&mut c, "EKF_HORIZON", 0.21),
+        Err(ParamError::Invalid(ConfigError::BadEstimator))
+    );
+    // Both at their lowest together: the minimum time constant with a horizon
+    // that long or shorter. Equality holds at the table's upper horizon too.
+    for profile in [&F405_LEAN, &H743_FULL] {
+        let mut c = q;
+        assert_eq!(
+            set_both(
+                &mut c,
+                profile,
+                &[("EKF_HORIZON", 0.15), ("EKF_OUT_TAU", 0.15)]
+            ),
+            Ok(())
+        );
+        let mut c = q;
+        assert_eq!(
+            set_both(
+                &mut c,
+                profile,
+                &[("EKF_HORIZON", 0.248), ("EKF_OUT_TAU", 0.248)]
+            ),
+            Ok(())
+        );
+        let mut c = q;
+        assert!(matches!(
+            set_both(
+                &mut c,
+                profile,
+                &[("EKF_HORIZON", 0.248), ("EKF_OUT_TAU", 0.247)]
+            ),
+            Err((None, ParamError::Invalid(ConfigError::BadEstimator)))
+        ));
+        assert_eq!(c, q);
+    }
+    // validate and the estimator's own check see it however the value got
+    // there.
+    let mut v = q;
+    v.estimator.ekf.output_tau_s = 0.15;
+    assert_eq!(v.validate(), Err(ConfigError::BadEstimator));
+    assert_eq!(
+        v.estimator.ekf.validate(&F405_LEAN),
+        Err(ConfigError::BadEstimator)
+    );
+}

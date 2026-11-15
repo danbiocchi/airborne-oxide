@@ -68,7 +68,7 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 
 | Name | Type | Default | Min | Max | Unit | Change | Description |
 |---|---|---|---|---|---|---|---|
-| `EKF_HORIZON` | Float | 0.2 | 0.000001 | 0.248 | s | disarmed | How far the filter runs behind real time. Must exceed the largest GPS latency and fit the profile's IMU buffer. |
+| `EKF_HORIZON` | Float | 0.2 | 0.000001 | 0.248 | s | disarmed | How far the filter runs behind real time. Must exceed the largest GPS latency, fit the profile's IMU buffer, and not exceed EKF_OUT_TAU. |
 | `EKF_GYR_NOISE` | Float | 0.015 | > 0 | 1 | rad/s | disarmed | Gyro process noise (1 sigma). |
 | `EKF_ACC_NOISE` | Float | 0.35 | > 0 | 10 | m/s^2 | disarmed | Accelerometer process noise (1 sigma). |
 | `EKF_GYR_BNOISE` | Float | 0.001 | > 0 | 0.1 | rad/s^2 | disarmed | Gyro bias random walk. |
@@ -92,7 +92,7 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | `EKF_POS_TMO` | Float | 1.5 | 0.000001 | 3600 | s | disarmed | Horizontal position stays valid this long after the last accepted GPS fix. |
 | `EKF_BARO_TMO` | Float | 5 | 0.000001 | 3600 | s | disarmed | Height stays valid this long after the last accepted barometer reading. |
 | `EKF_MAG_TMO` | Float | 30 | 0.000001 | 3600 | s | disarmed | Heading stays valid this long after the last accepted magnetometer reading. |
-| `EKF_OUT_TAU` | Float | 0.25 | > 0 | 10 | s | disarmed | Time constant with which the output predictor follows the filter. |
+| `EKF_OUT_TAU` | Float | 0.25 | 0.15 | 10 | s | disarmed | Time constant with which the output predictor follows the filter. At least 0.15 s and at least EKF_HORIZON: flown on gust-hold, the estimate oscillates and the flight is lost below about 0.7 of the horizon (0.14 s at the default horizon). |
 | `EKF_SOURCE` | Int32 | 0 | 0 | 1 |  | disarmed | Where the state estimate comes from: 0 external (simulator truth or motion capture), 1 the EKF. |
 
 ## Failsafe

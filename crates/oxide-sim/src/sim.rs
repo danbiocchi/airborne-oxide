@@ -113,7 +113,9 @@ fn describe_rule(c: oxide_core::config::ConfigError) -> String {
              must stay below LAND_TD_THRUST, which must stay below LAND_BLIND_THR)"
             .into(),
         ConfigError::BadEstimator => {
-            "an estimator rule (the delay horizon must fit the profile's buffers)".into()
+            "an estimator rule (the delay horizon must fit the profile's buffers, and \
+             EKF_OUT_TAU must be at least EKF_HORIZON)"
+                .into()
         }
         ConfigError::CannotLift => {
             "the vehicle cannot lift itself (the rotors' total thrust must exceed the weight)"

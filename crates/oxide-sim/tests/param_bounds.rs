@@ -80,3 +80,40 @@ fn rc_loss_position_with_the_largest_accepted_idle_still_lands_and_disarms() {
         }
     }
 }
+
+/// The hold criteria of `gust-hold` pass (the scenario's own `[expect.hold]`).
+fn assert_holds(name: &str, v: &Verdict, what: &str) {
+    assert!(v.violations.is_empty(), "{name} {what}: {:?}", v.violations);
+    assert!(v.hold.is_some(), "{name} {what}: no hold statistics");
+}
+
+#[test]
+fn gust_hold_holds_at_the_smallest_output_time_constant_the_rules_allow() {
+    let f = scenario("gust-hold");
+    // The table minimum is 0.15 s and the time constant must be at least the
+    // delay horizon: the minimum belongs with the shortest horizon that
+    // still covers the GPS latency (0.15 s). Also the horizon's own upper
+    // end, where the rule is tightest, and the default horizon.
+    let cases: [(&str, [(&str, f64); 2]); 3] = [
+        (
+            "tau 0.15 horizon 0.15",
+            [("EKF_OUT_TAU", 0.15), ("EKF_HORIZON", 0.15)],
+        ),
+        (
+            "tau 0.2 horizon 0.2",
+            [("EKF_OUT_TAU", 0.2), ("EKF_HORIZON", 0.2)],
+        ),
+        (
+            "tau 0.248 horizon 0.248",
+            [("EKF_OUT_TAU", 0.248), ("EKF_HORIZON", 0.248)],
+        ),
+    ];
+    for (pname, profile) in PROFILES {
+        for (what, p) in &cases {
+            for seed in 0..3 {
+                let v = fly(&f, profile, seed, p);
+                assert_holds("gust-hold", &v, &format!("{pname} seed {seed} {what}"));
+            }
+        }
+    }
+}

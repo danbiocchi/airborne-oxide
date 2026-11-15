@@ -249,12 +249,22 @@ impl Default for EkfParams {
 }
 
 impl EkfParams {
+    /// The output predictor's time constant must be at least the delay
+    /// horizon, compared in whole microseconds. Flown on `gust-hold` with
+    /// both profiles, the hold fails below about 0.7 of the horizon (0.14 s
+    /// at the default 0.2 s, 0.17 s at 0.248 s); the rule keeps a margin of
+    /// 40 % or more over that.
+    pub fn output_tau_covers_horizon(&self) -> bool {
+        let tau_us = f64::from(self.output_tau_s) * 1_000_000.0 + 0.5;
+        tau_us >= f64::from(self.delay_horizon_us)
+    }
+
     /// Checks the parameters against their table ranges and the delay
     /// horizon against the profile: it must fit the IMU buffer,
     /// `ceil(delay_horizon_us / filter period) + 2 <= IMU_BUFFER`. Fails
     /// with [`ConfigError::BadEstimator`].
     pub fn validate(&self, profile: &Profile) -> Result<(), ConfigError> {
-        if !crate::params::in_range(self) {
+        if !crate::params::in_range(self) || !self.output_tau_covers_horizon() {
             return Err(ConfigError::BadEstimator);
         }
         let period_us = u64::from(profile.filter_period_ticks) * u64::from(profile.base_period_us);
@@ -542,6 +552,7 @@ impl<const N: usize> VehicleConfig<N> {
         }
         if !crate::params::in_range(&self.estimator.ekf)
             || !crate::params::in_range(&self.estimator)
+            || !self.estimator.ekf.output_tau_covers_horizon()
         {
             return Err(ConfigError::BadEstimator);
         }

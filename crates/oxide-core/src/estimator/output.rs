@@ -41,11 +41,13 @@ pub struct OutputPredictor {
 }
 
 impl OutputPredictor {
-    /// `tau_s`: correction time constant, s (floored at 1 ms; a non-finite
-    /// value gives 0.25 s).
+    /// `tau_s`: correction time constant, s. A validated configuration has
+    /// at least 0.15 s (`EKF_OUT_TAU`); a value that is not finite and
+    /// positive, which only a configuration that skipped validation can have,
+    /// gives 0.25 s so that no division by it can fail.
     pub fn new(tau_s: f32) -> Self {
-        let tau = if tau_s.is_finite() {
-            tau_s.max(1e-3)
+        let tau = if tau_s.is_finite() && tau_s > 0.0 {
+            tau_s
         } else {
             0.25
         };
@@ -317,5 +319,15 @@ mod tests {
         op.correct(Micros(4000), &x, 0.004);
         assert!((op.state().p.x - 10.0).abs() < 1e-6);
         assert!((op.state().v.y - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_time_constant_is_used_as_given_and_a_bad_one_falls_back() {
+        // No silent floor: the range of EKF_OUT_TAU guarantees the minimum.
+        assert_eq!(OutputPredictor::new(0.15).tau, 0.15);
+        assert_eq!(OutputPredictor::new(5.0e-4).tau, 5.0e-4);
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(OutputPredictor::new(bad).tau, 0.25, "{bad}");
+        }
     }
 }

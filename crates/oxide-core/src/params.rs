@@ -494,7 +494,7 @@ declare_params! {
     }
     EkfParams {
         secs EKF_HORIZON = delay_horizon_us: 0.2, MIN_US, 0.248, "s", Estimator, disarmed,
-            "How far the filter runs behind real time. Must exceed the largest GPS latency and fit the profile's IMU buffer.";
+            "How far the filter runs behind real time. Must exceed the largest GPS latency, fit the profile's IMU buffer, and not exceed EKF_OUT_TAU.";
         f32 EKF_GYR_NOISE = gyro_noise: 0.015, TINY, 1.0, "rad/s", Estimator, disarmed,
             "Gyro process noise (1 sigma).";
         f32 EKF_ACC_NOISE = accel_noise: 0.35, TINY, 10.0, "m/s^2", Estimator, disarmed,
@@ -541,8 +541,8 @@ declare_params! {
             "Height stays valid this long after the last accepted barometer reading.";
         secs EKF_MAG_TMO = mag_timeout_us: 30.0, MIN_US, DUR, "s", Estimator, disarmed,
             "Heading stays valid this long after the last accepted magnetometer reading.";
-        f32 EKF_OUT_TAU = output_tau_s: 0.25, TINY, 10.0, "s", Estimator, disarmed,
-            "Time constant with which the output predictor follows the filter.";
+        f32 EKF_OUT_TAU = output_tau_s: 0.25, 0.15, 10.0, "s", Estimator, disarmed,
+            "Time constant with which the output predictor follows the filter. At least 0.15 s and at least EKF_HORIZON: flown on gust-hold, the estimate oscillates and the flight is lost below about 0.7 of the horizon (0.14 s at the default horizon).";
     }
     EstimatorConfig {
         source EKF_SOURCE = source: 0, 0, 1, "", Estimator, disarmed,
@@ -1099,6 +1099,7 @@ mod tests {
             "LAND_BLIND_THR",
             "LAND_SPEED",
             "LIM_IDLE",
+            "EKF_OUT_TAU",
             "BAT_CRIT_V",
             "BAT_LOW_V",
         ];
