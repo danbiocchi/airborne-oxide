@@ -161,7 +161,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<bool, Box<dyn std::erro
     let start = Instant::now();
     let results = run_indexed(jobs.len(), o.threads, |j| {
         let job = &jobs[j];
-        first_failure(&files[job.file], job)
+        first_failure(files[job.file], job)
     });
     let wall_s = start.elapsed().as_secs_f64();
     let (mut total, mut failed) = (0_usize, 0_usize);
