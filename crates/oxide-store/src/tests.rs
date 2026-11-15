@@ -1879,3 +1879,50 @@ fn a_failed_retire_at_mount_is_not_a_mount_failure_and_a_later_mount_retires() {
     assert_eq!(r, MountReport::Recovered);
     assert_eq!(header_of(&f.inner, 0), Header::Retired(5));
 }
+
+#[test]
+fn every_program_call_the_store_makes_has_one_of_the_declared_shapes() {
+    use crate::layout::PROGRAM_CALLS;
+    let mut calls: Vec<Call> = Vec::new();
+    let mut run = |f: &mut Small, go: &dyn Fn(&mut Store<&mut CallLog<'_>>)| {
+        let mut l = CallLog {
+            flash: f,
+            calls: Vec::new(),
+        };
+        let (mut s, _) = Store::mount(&mut l).unwrap();
+        go(&mut s);
+        calls.extend(l.calls);
+    };
+    // First initialisation, appends, a tombstone, a compaction, a rewrite,
+    // a format, and the retire of a stale sector at mount.
+    let mut f = fresh();
+    run(&mut f, &|s| {
+        for i in 0..8 {
+            s.set(1, i).unwrap();
+        }
+        s.set(2, 2).unwrap();
+        s.remove(2).unwrap();
+        let wanted = [(1, 1), (2, 2), (3, 3)];
+        assert_eq!(s.replace_all(pairs(&wanted)), Ok(Replaced::Rewritten));
+        s.format().unwrap();
+    });
+    let mut f = two_valid_sectors();
+    run(&mut f, &|_| {});
+    assert!(calls.len() > 20);
+    let mut seen = [false; 4];
+    for (i, (_, offset, data)) in calls.iter().enumerate() {
+        let hit = PROGRAM_CALLS.iter().position(|c| {
+            data.len() == c.len
+                && *offset >= c.first
+                && if c.stride == 0 {
+                    *offset == c.first
+                } else {
+                    (offset - c.first) % c.stride == 0
+                }
+        });
+        let hit = hit.unwrap_or_else(|| panic!("call {i}: {offset}+{} fits no shape", data.len()));
+        seen[hit] = true;
+        assert!(offset % 4 == 0 && data.len() % 4 == 0 && data.len() < 32);
+    }
+    assert_eq!(seen, [true; 4], "every declared shape is exercised");
+}

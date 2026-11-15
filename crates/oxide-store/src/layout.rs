@@ -82,6 +82,64 @@ pub const STATE_WRITING: u32 = 0xFFFF_FFFF;
 /// retirement or a valid-marking that was cut short; the sector is not used).
 pub const STATE_RETIRED: u32 = 0x0000_0000;
 
+/// One kind of program call the store makes: `len` bytes at `first` in the
+/// sector, then (when `stride` is nonzero) at every `stride` bytes after that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallShape {
+    /// What the call writes.
+    pub what: &'static str,
+    /// Sector offset of the first such call, bytes.
+    pub first: usize,
+    /// Distance between such calls (0: only one per sector), bytes.
+    pub stride: usize,
+    /// Bytes programmed by the call.
+    pub len: usize,
+}
+
+/// Every program call the store makes, in the sector: the shapes the flash
+/// must support. All are 4-byte aligned and 4, 8 or 12 bytes long; none is a
+/// whole 32-byte flash word, none is aligned to one (records are 12 bytes
+/// apart), and the state word is programmed a second time over a sector whose
+/// header body is already written. Flash that programs a word only once per
+/// erase (the STM32H743's) cannot take these (see [`crate::flash::Flash`]).
+pub const PROGRAM_CALLS: [CallShape; 4] = [
+    CallShape {
+        what: "header body: magic, version, sequence, CRC",
+        first: 0,
+        stride: 0,
+        len: STATE_OFFSET,
+    },
+    CallShape {
+        what: "state word: valid (after the records) or retired (over valid)",
+        first: STATE_OFFSET,
+        stride: 0,
+        len: 4,
+    },
+    CallShape {
+        what: "record key and value",
+        first: RECORDS_OFFSET,
+        stride: RECORD_SIZE,
+        len: CHECK_OFFSET,
+    },
+    CallShape {
+        what: "record check word",
+        first: RECORDS_OFFSET + CHECK_OFFSET,
+        stride: RECORD_SIZE,
+        len: 4,
+    },
+];
+
+const _: () = {
+    const fn word_sized(c: CallShape) -> bool {
+        c.first.is_multiple_of(4)
+            && c.stride.is_multiple_of(4)
+            && c.len.is_multiple_of(4)
+            && c.len < 32
+    }
+    let [a, b, c, d] = PROGRAM_CALLS;
+    assert!(word_sized(a) && word_sized(b) && word_sized(c) && word_sized(d));
+};
+
 /// Packs little-endian words into bytes.
 #[must_use]
 pub fn pack<const N: usize>(words: &[u32]) -> [u8; N] {

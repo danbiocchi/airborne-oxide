@@ -34,6 +34,22 @@ pub enum FlashError {
 ///   starts a call before the previous one has returned `Ok`.
 /// * A read returns what is stored, or an error; it never changes the flash.
 ///
+/// # Which flash this fits
+///
+/// This is the contract of plain NOR flash such as the STM32F405's: a program
+/// only clears bits, may be repeated on the same bytes (the state word is
+/// programmed after the header body beside it, and again to retire a sector),
+/// and an interrupted program leaves a subset of its bits. It is **not** the
+/// STM32H743's: that flash programs whole 32-byte words with an
+/// error-correcting code, a word can be programmed only once per erase, and an
+/// interrupted word reads as an uncorrectable error. The two-call record, the
+/// state word programmed later and the retire call all break that. An H7
+/// layout (one write per 32-byte word, a torn word treated as a read error
+/// that is skipped) comes with H743 bring-up. The calls the store makes, with
+/// their offsets and lengths, are [`crate::layout::PROGRAM_CALLS`] (every one
+/// is 4-byte aligned and 4, 8 or 12 bytes long; a test checks that no call
+/// falls outside the list).
+///
 /// The store is written so that nothing else is needed (see
 /// [`crate::layout`] for why an interrupted write can never read as a valid
 /// record, and [`crate::store`] for the mount rules).

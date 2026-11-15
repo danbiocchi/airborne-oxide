@@ -7,6 +7,12 @@
 //! and the argument that a torn record never reads as valid in [`layout`], the
 //! mount rules and costs in [`store`]. [`Store::replace_all`] makes the store
 //! hold exactly a given set of pairs, all or nothing. `no_std`, no allocation.
+//! The layout fits plain NOR flash (the STM32F405's): programs only clear bits
+//! and may be repeated on the same bytes. It does not fit flash that programs a
+//! 32-byte word once per erase with an error-correcting code (the STM32H743's);
+//! that needs its own layout at H743 bring-up. See [`flash::Flash`] and
+//! [`layout::PROGRAM_CALLS`].
+//!
 //! The store itself knows nothing about parameters; [`param_store`] is the one
 //! module that does (it depends on `oxide-core`): the policy of ADR-0004 §6 for
 //! loading parameters at boot and saving them while disarmed.
@@ -38,7 +44,7 @@ pub mod sim;
 pub mod store;
 
 pub use flash::{Flash, FlashError};
-pub use param_store::{ParamStore, Serviced};
+pub use param_store::{MAX_FAILED_SAVES, ParamStore, Serviced};
 pub use store::{Error, Iter, MountReport, Replaced, Store};
 
 #[cfg(test)]
