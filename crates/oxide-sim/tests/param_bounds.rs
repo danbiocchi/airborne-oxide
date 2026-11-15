@@ -7,6 +7,7 @@ use std::path::Path;
 
 use oxide_core::config::VehicleConfig;
 use oxide_core::io::DisarmReason;
+use oxide_core::math::Real;
 use oxide_core::params::{self, ParamValue};
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_sim::scenario_file::{self, ScenarioFile, Verdict};
@@ -175,5 +176,166 @@ fn a_touchdown_time_of_a_tenth_of_a_second_does_not_disarm_above_the_ground() {
                 "{pname} seed {seed}: disarmed {h} m above the ground"
             );
         }
+    }
+}
+
+// ---- every bound flies ----
+
+/// The most a bound may do to a flight: not fly away, blow up or panic.
+const RUNAWAY_M: f64 = 200.0;
+
+/// What one flight at one bound did wrong; empty = nothing.
+fn fly_bound(f: &ScenarioFile, name: &str, value: f64) -> Vec<String> {
+    let params = vec![(name.to_string(), value)];
+    let run = std::panic::catch_unwind(|| {
+        let mut sim = f.build_with_params(F405_LEAN, 0, &params).expect("builds");
+        let mut bad = Vec::new();
+        let mut start: Option<oxide_core::math::Vec3<f64>> = None;
+        let (mut max_h, mut max_d, mut timing) = (0.0_f64, 0.0_f64, 0);
+        let mut finite = true;
+        sim.run_until(f.end(), |r| {
+            let est_ok = r.estimate.is_none_or(|e| {
+                e.position.is_finite()
+                    && e.velocity.is_finite()
+                    && e.attitude.is_finite()
+                    && e.rate.is_finite()
+            });
+            finite &= r.position.is_finite()
+                && r.velocity.is_finite()
+                && r.attitude.is_finite()
+                && r.rate.is_finite()
+                && r.motors.iter().all(|m| m.is_finite())
+                && r.battery_v.is_finite()
+                && est_ok;
+            let s = *start.get_or_insert(r.position);
+            max_h = max_h.max(-r.position.z);
+            if r.position.is_finite() {
+                let dn = r.position.x - s.x;
+                let de = r.position.y - s.y;
+                max_d = max_d.max(Real::sqrt(dn * dn + de * de));
+            }
+            timing = r.status.timing_faults;
+        });
+        if !finite {
+            bad.push("a truth or estimate value is not finite".to_string());
+        }
+        if timing != 0 {
+            bad.push(format!("{timing} timing faults"));
+        }
+        if max_d.is_nan() || max_d > RUNAWAY_M || max_h.is_nan() || max_h > RUNAWAY_M {
+            bad.push(format!("ran away: {max_d:.0} m out, {max_h:.0} m high"));
+        }
+        bad
+    });
+    match run {
+        Ok(bad) => bad,
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
+            vec![format!("panicked: {msg}")]
+        }
+    }
+}
+
+/// A bound that does not fly well on the reference quad and is known: the
+/// parameter, the bound, the scenario, and why.
+const KNOWN: &[(&str, &str, &str, &str)] = &[
+    (
+        "POS_VELX_P",
+        "min",
+        "rc-loss-position",
+        "a zero north velocity gain leaves the horizontal speed uncontrolled: 250 m out \
+         (the review's zero-p-gains finding; a floor above zero needs the loops' own tuning)",
+    ),
+    (
+        "EKF_MAG_DECL",
+        "min",
+        "rc-loss-position",
+        "the simulated site has declination 0, so -pi turns the heading estimate round and the \
+         position estimate disagrees with it: 1377 m out. Real declinations reach pi only at \
+         the geomagnetic poles, so the range is right and the value is wrong for this site",
+    ),
+    (
+        "EKF_MAG_DECL",
+        "max",
+        "rc-loss-position",
+        "as the minimum: +pi against a site with declination 0",
+    ),
+];
+
+#[test]
+#[ignore = "flies every bound of every parameter: run with --release -- --ignored"]
+fn every_bound_flies() {
+    let files = [scenario("gust-hold"), scenario("rc-loss-position")];
+    let cfg = config_of(&files[0], F405_LEAN);
+    let mut jobs: Vec<(&str, &str, f64)> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for (i, def) in params::PARAMS.iter().enumerate() {
+        for (bound, v) in [("min", def.min), ("max", def.max)] {
+            let mut c = cfg;
+            match params::set(&mut c, &F405_LEAN, params::ParamId(i as u16), v) {
+                Ok(()) => {
+                    let x = match v {
+                        ParamValue::F32(x) => f64::from(x),
+                        ParamValue::I32(x) => f64::from(x),
+                    };
+                    jobs.push((def.name, bound, x));
+                }
+                Err(params::ParamError::Invalid(why)) => {
+                    refused.push(format!("{} {bound} {v:?}: {why:?}", def.name));
+                }
+                Err(e) => panic!("{} {bound} {v:?}: {e:?}: the table lies", def.name),
+            }
+        }
+    }
+    let n = jobs.len() * files.len();
+    let results = oxide_sim::montecarlo::run_indexed(n, 2, |k| {
+        let (name, bound, value) = jobs[k / files.len()];
+        let f = &files[k % files.len()];
+        (name, bound, f.name.clone(), fly_bound(f, name, value))
+    });
+    let mut failing: Vec<(String, String, String, Vec<String>)> = Vec::new();
+    for (name, bound, scen, bad) in results {
+        if !bad.is_empty() {
+            failing.push((name.to_string(), bound.to_string(), scen, bad));
+        }
+    }
+    let is_known =
+        |n: &str, b: &str, s: &str| KNOWN.iter().any(|k| k.0 == n && k.1 == b && k.2 == s);
+    let (known, unknown): (Vec<_>, Vec<_>) =
+        failing.iter().partition(|(n, b, s, _)| is_known(n, b, s));
+    println!(
+        "bounds flown {} ({} flights), refused by a rule {}, known {}, failing {}",
+        jobs.len(),
+        n,
+        refused.len(),
+        known.len(),
+        unknown.len()
+    );
+    // The line the report quotes: bounds, not flights.
+    println!(
+        "summary: {} bounds flown, {} refused by a rule on the reference quad, {} known",
+        jobs.len(),
+        refused.len(),
+        KNOWN.len()
+    );
+    for r in &refused {
+        println!("  refused by a rule: {r}");
+    }
+    for (n, b, s, bad) in &failing {
+        println!(
+            "  {} {n} {b} {s}: {bad:?}",
+            if is_known(n, b, s) { "known" } else { "FAIL" }
+        );
+    }
+    assert!(unknown.is_empty(), "bounds that do not fly: {unknown:#?}");
+    for (n, b, s, why) in KNOWN {
+        assert!(
+            failing.iter().any(|f| f.0 == *n && f.1 == *b && f.2 == *s),
+            "{n} {b} {s} is listed as known ({why}) but flies now: remove it"
+        );
     }
 }
