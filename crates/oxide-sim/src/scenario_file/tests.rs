@@ -528,3 +528,100 @@ fn states_expectations_tells_a_judged_file_from_an_invariants_only_one() {
         format!("{MINIMAL}[expect]\nmin_action = \"hold\"\n[expect.ending]\nkind = \"down\"\n");
     assert!(load_str(&with).expect("loads").states_expectations());
 }
+
+const RANDOM_WIND: &str = "[wind]\nkind = \"random\"\nsteady_speed_mps = [0.0, 1.0]\nsigma_h_mps = [0.1, 0.2]\ntau_s = 2.0\n";
+
+#[test]
+fn turbulence_without_a_time_constant_is_refused() {
+    assert_eq!(
+        refused("[wind]\nkind = \"fixed\"\nturbulence_sigma = [0.5, 0.5, 0.2]\n").key,
+        "wind.turbulence_tau_s"
+    );
+    assert_eq!(
+        refused(&RANDOM_WIND.replace("tau_s = 2.0", "tau_s = 0.0")).key,
+        "wind.tau_s"
+    );
+    assert_eq!(
+        refused("[wind]\nkind = \"fixed\"\nturbulence_sigma = [0.5, 0.5, 0.2]\nturbulence_tau_s = -1.0\n").key,
+        "wind.turbulence_tau_s"
+    );
+    // Without turbulence a time constant of zero is fine; with it, a positive one.
+    load_str(&format!(
+        "{MINIMAL}[wind]\nkind = \"fixed\"\nsteady_ned = [1.0, 0.0, 0.0]\n"
+    ))
+    .expect("no turbulence, no tau");
+    load_str(&format!(
+        "{MINIMAL}[wind]\nkind = \"fixed\"\nturbulence_sigma = [0.5, 0.5, 0.2]\nturbulence_tau_s = 1.5\n"
+    ))
+    .expect("turbulence with tau");
+    load_str(&format!(
+        "{MINIMAL}[wind]\nkind = \"random\"\nsteady_speed_mps = [0.0, 1.0]\nsigma_h_mps = [0.0, 0.0]\ntau_s = 0.0\n"
+    ))
+    .expect("no turbulence drawn, no tau needed");
+}
+
+#[test]
+fn negative_sigmas_ratios_and_durations_are_refused() {
+    assert_eq!(
+        refused("[wind]\nkind = \"fixed\"\nturbulence_sigma = [0.5, -0.5, 0.2]\nturbulence_tau_s = 1.0\n").key,
+        "wind.turbulence_sigma"
+    );
+    assert_eq!(
+        refused(&RANDOM_WIND.replace("[0.1, 0.2]", "[-0.1, 0.2]")).key,
+        "wind.sigma_h_mps"
+    );
+    assert_eq!(
+        refused(&format!("{RANDOM_WIND}sigma_v_ratio = -5.0\n")).key,
+        "wind.sigma_v_ratio"
+    );
+    assert_eq!(
+        refused("[wind]\nkind = \"fixed\"\n[[wind.gust]]\nstart_s = 1.0\nduration_s = -2.0\npeak_ned = [1.0, 0.0, 0.0]\n").key,
+        "wind.gust[0].duration_s"
+    );
+    let gusts = |dur: &str| {
+        format!(
+            "{RANDOM_WIND}[wind.gusts]\ncount = 1\nstart_s = [1.0, 2.0]\nduration_s = {dur}\npeak_h_mps = [1.0, 2.0]\npeak_v_mps = [0.0, 0.0]\n"
+        )
+    };
+    assert_eq!(refused(&gusts("[-1.0, 2.0]")).key, "wind.gusts.duration_s");
+    load_str(&format!("{MINIMAL}{}", gusts("[0.0, 2.0]"))).expect("zero is a duration");
+}
+
+#[test]
+fn at_most_64_gusts() {
+    let fixed = |n: usize| {
+        let mut s = String::from("[wind]\nkind = \"fixed\"\n");
+        for i in 0..n {
+            s.push_str(&format!(
+                "[[wind.gust]]\nstart_s = {i}.0\nduration_s = 1.0\npeak_ned = [1.0, 0.0, 0.0]\n"
+            ));
+        }
+        s
+    };
+    assert_eq!(refused(&fixed(65)).key, "wind.gust");
+    load_str(&format!("{MINIMAL}{}", fixed(64))).expect("64 fit");
+    let random = |n: u32| {
+        format!(
+            "{RANDOM_WIND}[wind.gusts]\ncount = {n}\nstart_s = [1.0, 2.0]\nduration_s = [1.0, 2.0]\npeak_h_mps = [1.0, 2.0]\npeak_v_mps = [0.0, 0.0]\n"
+        )
+    };
+    assert_eq!(refused(&random(3_000_000)).key, "wind.gusts.count");
+    assert_eq!(refused(&random(65)).key, "wind.gusts.count");
+    load_str(&format!("{MINIMAL}{}", random(64))).expect("64 fit");
+}
+
+#[test]
+fn seeds_and_duration_have_limits() {
+    assert_eq!(refused("[run]\nseeds = 100001\n").key, "run.seeds");
+    load_str(&format!("{MINIMAL}[run]\nseeds = 100000\n")).expect("the limit itself");
+    let dur = |d: &str| load_str(&format!("name = \"d\"\nduration_s = {d}\n"));
+    // One tick of the slower profile (the F405's 1 ms) up to a day.
+    assert_eq!(
+        dur("1e-7").expect_err("rounds to no tick").key,
+        "duration_s"
+    );
+    assert_eq!(dur("0.0005").expect_err("under a tick").key, "duration_s");
+    assert_eq!(dur("86401.0").expect_err("over a day").key, "duration_s");
+    dur("0.001").expect("one tick");
+    dur("86400.0").expect("a day");
+}

@@ -13,7 +13,7 @@
 //! name = "gps-loss"
 //! about = "GPS lost for good in Offboard: ..."   # default ""
 //! airframe = "quad-x-5in"                        # default; the embedded reference
-//! duration_s = 70.0
+//! duration_s = 70.0                              # one tick of the slower profile (1 ms) to a day
 //!
 //! [sim]                       # default: ideal sensors, external estimator, brain link only
 //! sensors = "realistic"       # "ideal" | "realistic"
@@ -30,6 +30,8 @@
 //! sigma_v_ratio = 0.5             # default 0.5: sigma_z = ratio * sigma_h
 //! tau_s = 2.0
 //! # [wind.gusts]              # optional: count, start_s, duration_s, peak_h_mps, peak_v_mps (ranges)
+//! # turbulence with a sigma above zero needs tau_s above zero; sigmas, ratios and gust durations are
+//! # not negative; at most 64 gusts.
 //! # fixed: steady_ned = [n, e, d], turbulence_sigma = [n, e, d], turbulence_tau_s,
 //! #        and [[wind.gust]] start_s, duration_s, peak_ned = [n, e, d] (m/s, NED)
 //!
@@ -78,7 +80,7 @@
 //! # [expect.hold]             # the hold criteria of `metrics::HoldCriteria` (gust-hold)
 //!
 //! [run]                       # for the Monte-Carlo job
-//! seeds = 10                  # default 1
+//! seeds = 10                  # default 1, at most 100000
 //! profiles = ["f405", "h743"] # default both
 //! ```
 
@@ -108,6 +110,20 @@ mod tests;
 
 /// The airframe every scenario flies until files can name another.
 pub const REFERENCE_AIRFRAME: &str = "quad-x-5in";
+
+/// Most gusts a wind may hold (every step walks all of them).
+pub const MAX_GUSTS: usize = 64;
+
+/// Most runs `[run] seeds` may ask for.
+pub const MAX_SEEDS: u64 = 100_000;
+
+/// Longest run, s: a day.
+pub const MAX_DURATION_S: f64 = 86_400.0;
+
+/// The shortest run: one tick of the slower profile, s.
+fn min_duration_s() -> f64 {
+    f64::from(F405_LEAN.base_period_us.max(H743_FULL.base_period_us)) * 1e-6
+}
 
 /// The rotor count of the airframe (compile-time size of the simulation).
 const ROTORS: usize = 4;
@@ -929,6 +945,36 @@ fn range(key: &str, r: [f64; 2]) -> Result<[f64; 2]> {
     Ok(r)
 }
 
+/// A number that is finite and not negative.
+fn not_negative(key: &str, v: f64) -> Result<f64> {
+    if v.is_finite() && v >= 0.0 {
+        Ok(v)
+    } else {
+        Err(ScenarioError::new(key, "must be zero or more"))
+    }
+}
+
+/// A `[low, high]` range whose low end is not negative.
+fn range_not_negative(key: &str, r: [f64; 2]) -> Result<[f64; 2]> {
+    let r = range(key, r)?;
+    if r[0] < 0.0 {
+        return Err(ScenarioError::new(key, "must not be negative"));
+    }
+    Ok(r)
+}
+
+/// Turbulence that is drawn (`sigma > 0`) needs a time constant above zero:
+/// the wind generator leaves it out otherwise, silently.
+fn needs_tau(key: &str, sigma_positive: bool, tau: f64) -> Result<()> {
+    if sigma_positive && tau <= 0.0 {
+        return Err(ScenarioError::new(
+            key,
+            "turbulence with a sigma above zero needs a time constant above zero (otherwise it is silently left out)",
+        ));
+    }
+    Ok(())
+}
+
 /// Entry times must be finite, not negative and strictly increasing.
 fn sorted(key: &str, times: impl Iterator<Item = f64>) -> Result<()> {
     let mut prev: Option<f64> = None;
@@ -968,10 +1014,16 @@ fn convert(raw: RawFile) -> Result<ScenarioFile> {
             ),
         ));
     }
-    if !(raw.duration_s.is_finite() && raw.duration_s > 0.0) {
+    if !(raw.duration_s.is_finite()
+        && raw.duration_s >= min_duration_s()
+        && raw.duration_s <= MAX_DURATION_S)
+    {
         return Err(ScenarioError::new(
             "duration_s",
-            "must be more than zero seconds",
+            format!(
+                "must be at least one tick of the slower profile ({} s) and at most a day ({MAX_DURATION_S} s)",
+                min_duration_s()
+            ),
         ));
     }
 
@@ -1089,21 +1141,44 @@ fn convert_wind(raw: RawWind) -> Result<WindSpec> {
             gust,
         } => {
             let mut gusts = Vec::new();
-            for (i, g) in gust.unwrap_or_default().iter().enumerate() {
+            let list = gust.unwrap_or_default();
+            if list.len() > MAX_GUSTS {
+                return Err(ScenarioError::new(
+                    "wind.gust",
+                    format!("at most {MAX_GUSTS} gusts ({} given)", list.len()),
+                ));
+            }
+            for (i, g) in list.iter().enumerate() {
                 let key = format!("wind.gust[{i}]");
                 gusts.push(Gust {
                     start_s: time(&format!("{key}.start_s"), g.start_s)?,
-                    duration_s: finite(&format!("{key}.duration_s"), g.duration_s)?,
+                    duration_s: not_negative(&format!("{key}.duration_s"), g.duration_s)?,
                     peak_ned: vec3(&format!("{key}.peak_ned"), g.peak_ned)?,
                 });
             }
+            let sigma = vec3(
+                "wind.turbulence_sigma",
+                turbulence_sigma.unwrap_or([0.0; 3]),
+            )?;
+            for v in [sigma.x, sigma.y, sigma.z] {
+                not_negative("wind.turbulence_sigma", v)?;
+            }
+            let tau = finite("wind.turbulence_tau_s", turbulence_tau_s.unwrap_or(0.0))?;
+            if tau < 0.0 {
+                return Err(ScenarioError::new(
+                    "wind.turbulence_tau_s",
+                    "must be zero or more",
+                ));
+            }
+            needs_tau(
+                "wind.turbulence_tau_s",
+                sigma.x > 0.0 || sigma.y > 0.0 || sigma.z > 0.0,
+                tau,
+            )?;
             WindSpec::Fixed(WindConfig {
                 steady_ned: vec3("wind.steady_ned", steady_ned.unwrap_or([0.0; 3]))?,
-                turbulence_sigma: vec3(
-                    "wind.turbulence_sigma",
-                    turbulence_sigma.unwrap_or([0.0; 3]),
-                )?,
-                turbulence_tau_s: finite("wind.turbulence_tau_s", turbulence_tau_s.unwrap_or(0.0))?,
+                turbulence_sigma: sigma,
+                turbulence_tau_s: tau,
                 gusts,
             })
         }
@@ -1113,23 +1188,35 @@ fn convert_wind(raw: RawWind) -> Result<WindSpec> {
             sigma_v_ratio,
             tau_s,
             gusts,
-        } => WindSpec::Random(RandomWind {
-            steady_speed_mps: range("wind.steady_speed_mps", steady_speed_mps)?,
-            sigma_h_mps: range("wind.sigma_h_mps", sigma_h_mps)?,
-            sigma_v_ratio: finite("wind.sigma_v_ratio", sigma_v_ratio.unwrap_or(0.5))?,
-            tau_s: finite("wind.tau_s", tau_s)?,
-            gusts: gusts
-                .map(|g| -> Result<RandomGusts> {
-                    Ok(RandomGusts {
-                        count: g.count,
-                        start_s: range("wind.gusts.start_s", g.start_s)?,
-                        duration_s: range("wind.gusts.duration_s", g.duration_s)?,
-                        peak_h_mps: range("wind.gusts.peak_h_mps", g.peak_h_mps)?,
-                        peak_v_mps: range("wind.gusts.peak_v_mps", g.peak_v_mps)?,
+        } => {
+            let sigma_h = range_not_negative("wind.sigma_h_mps", sigma_h_mps)?;
+            let ratio = not_negative("wind.sigma_v_ratio", sigma_v_ratio.unwrap_or(0.5))?;
+            let tau = not_negative("wind.tau_s", tau_s)?;
+            needs_tau("wind.tau_s", sigma_h[1] > 0.0, tau)?;
+            WindSpec::Random(RandomWind {
+                steady_speed_mps: range("wind.steady_speed_mps", steady_speed_mps)?,
+                sigma_h_mps: sigma_h,
+                sigma_v_ratio: ratio,
+                tau_s: tau,
+                gusts: gusts
+                    .map(|g| -> Result<RandomGusts> {
+                        if g.count as usize > MAX_GUSTS {
+                            return Err(ScenarioError::new(
+                                "wind.gusts.count",
+                                format!("at most {MAX_GUSTS} gusts ({} given)", g.count),
+                            ));
+                        }
+                        Ok(RandomGusts {
+                            count: g.count,
+                            start_s: range("wind.gusts.start_s", g.start_s)?,
+                            duration_s: range_not_negative("wind.gusts.duration_s", g.duration_s)?,
+                            peak_h_mps: range("wind.gusts.peak_h_mps", g.peak_h_mps)?,
+                            peak_v_mps: range("wind.gusts.peak_v_mps", g.peak_v_mps)?,
+                        })
                     })
-                })
-                .transpose()?,
-        }),
+                    .transpose()?,
+            })
+        }
     })
 }
 
@@ -1487,8 +1574,11 @@ fn convert_run(raw: Option<RawRun>) -> Result<RunSpec> {
         return Ok(run);
     };
     if let Some(n) = r.seeds {
-        if n == 0 {
-            return Err(ScenarioError::new("run.seeds", "must be at least 1"));
+        if n == 0 || n > MAX_SEEDS {
+            return Err(ScenarioError::new(
+                "run.seeds",
+                format!("must be between 1 and {MAX_SEEDS}"),
+            ));
         }
         run.seeds = n;
     }
