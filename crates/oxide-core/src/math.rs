@@ -53,7 +53,10 @@ pub trait Real:
     fn max(self, other: Self) -> Self {
         if other > self { other } else { self }
     }
-    /// Clamps into `[lo, hi]` (assumes `lo <= hi`).
+    /// Clamps into `[lo, hi]`. Never panics (unlike `f32::clamp`): if
+    /// `lo > hi` the result is `hi`, a NaN bound is ignored, and a NaN `self`
+    /// stays NaN. For `lo <= hi` the result is bit for bit that of
+    /// `f32::clamp`.
     fn clamp(self, lo: Self, hi: Self) -> Self {
         self.max(lo).min(hi)
     }
@@ -152,6 +155,17 @@ impl Real for f64 {
     fn is_finite(self) -> bool {
         f64::is_finite(self)
     }
+}
+
+/// `x` limited to `[lo, hi]` without the panic of `f32::clamp`, which panics
+/// when `lo > hi` or a bound is NaN (in release builds too, and clippy's panic
+/// lint does not see it). Use it wherever a bound comes from configuration.
+///
+/// If `lo > hi` the result is `hi`; a NaN bound is ignored; a NaN `x` stays
+/// NaN. Whenever `lo <= hi` the result equals `f32::clamp(x, lo, hi)` bit for
+/// bit.
+pub fn clamp_between<T: Real>(x: T, lo: T, hi: T) -> T {
+    Real::clamp(x, lo, hi)
 }
 
 /// 3-vector. In the world frame axes are North-East-Down; in the body frame
@@ -538,5 +552,41 @@ mod tests {
             1e-9
         ));
         assert!(close(wrap_pi(-0.5_f64), -0.5, 1e-12));
+    }
+
+    #[test]
+    fn clamp_between_never_panics_and_has_defined_edge_cases() {
+        // lo > hi: the result is hi.
+        assert_eq!(clamp_between(5.0_f32, 3.0, 1.0), 1.0);
+        assert_eq!(clamp_between(-5.0_f32, 3.0, 1.0), 1.0);
+        assert_eq!(clamp_between(2.0_f32, 3.0, 1.0), 1.0);
+        // A NaN bound is ignored.
+        assert_eq!(clamp_between(5.0_f32, f32::NAN, 1.0), 1.0);
+        assert_eq!(clamp_between(-5.0_f32, -1.0, f32::NAN), -1.0);
+        assert_eq!(clamp_between(0.5_f32, f32::NAN, f32::NAN), 0.5);
+        // A NaN value stays NaN.
+        assert!(clamp_between(f32::NAN, 0.0, 1.0).is_nan());
+        assert!(clamp_between(f32::NAN, 1.0, 0.0).is_nan());
+        assert!(clamp_between(f64::NAN, 0.0, 1.0).is_nan());
+    }
+
+    proptest::proptest! {
+        /// Bit-identical to `clamp` whenever `lo <= hi`, so replacing it
+        /// cannot change a flight.
+        #[test]
+        fn clamp_between_is_bit_identical_to_clamp(
+            x in proptest::num::f32::ANY,
+            a in proptest::num::f32::NORMAL | proptest::num::f32::ZERO | proptest::num::f32::INFINITE,
+            b in proptest::num::f32::NORMAL | proptest::num::f32::ZERO | proptest::num::f32::INFINITE,
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let got = clamp_between(x, lo, hi);
+            let want = x.clamp(lo, hi);
+            proptest::prop_assert!(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()));
+            // And with any bounds at all it does not panic and a finite
+            // input stays out of NaN.
+            let any = clamp_between(x, a, b);
+            proptest::prop_assert!(x.is_nan() || !any.is_nan() || a.is_nan() && b.is_nan());
+        }
     }
 }

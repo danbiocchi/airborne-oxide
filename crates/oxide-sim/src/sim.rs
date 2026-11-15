@@ -115,6 +115,10 @@ fn describe_rule(c: oxide_core::config::ConfigError) -> String {
         ConfigError::BadEstimator => {
             "an estimator rule (the delay horizon must fit the profile's buffers)".into()
         }
+        ConfigError::CannotLift => {
+            "the vehicle cannot lift itself (the rotors' total thrust must exceed the weight)"
+                .into()
+        }
         other => format!("{other:?}"),
     }
 }

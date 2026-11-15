@@ -4,7 +4,7 @@
 use crate::GRAVITY;
 use crate::config::{Gains, Limits, VehicleConfig};
 use crate::io::StateSample;
-use crate::math::{Quat, Real, Vec3};
+use crate::math::{Quat, Real, Vec3, clamp_between};
 
 /// Attitude and collective-thrust target, produced by guidance.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -249,7 +249,7 @@ impl PositionController {
         }
         let mut z_speed_limited = false;
         if v_fb {
-            let vz = vel_sp.z.clamp(-l.max_speed_up, l.max_speed_down);
+            let vz = clamp_between(vel_sp.z, -l.max_speed_up, l.max_speed_down);
             z_speed_limited = vz != vel_sp.z;
             vel_sp.z = vz;
         }
@@ -288,8 +288,8 @@ impl PositionController {
         }
 
         let (target, thrust_limited) = if let Horizontal::Tilt { roll, pitch } = h {
-            let roll = roll.clamp(-l.max_tilt_rad, l.max_tilt_rad);
-            let pitch = pitch.clamp(-l.max_tilt_rad, l.max_tilt_rad);
+            let roll = clamp_between(roll, -l.max_tilt_rad, l.max_tilt_rad);
+            let pitch = clamp_between(pitch, -l.max_tilt_rad, l.max_tilt_rad);
             let min_thrust = l.min_thrust_fraction_of_hover * cfg.weight_n();
             let max_thrust = cfg.total_max_thrust_n();
             let raw = match v {
@@ -299,7 +299,7 @@ impl PositionController {
                     cfg.mass_kg * (GRAVITY - acc.z) / c
                 }
             };
-            let thrust = raw.clamp(min_thrust, max_thrust);
+            let thrust = clamp_between(raw, min_thrust, max_thrust);
             (
                 AttitudeTarget {
                     attitude: Quat::from_euler(roll, pitch, yaw_sp),
@@ -382,7 +382,7 @@ pub fn thrust_target_with_limit<const N: usize>(
 
     let min_thrust = l.min_thrust_fraction_of_hover * cfg.weight_n();
     let raw = cfg.mass_kg * (-f).dot(zb);
-    let thrust = raw.clamp(min_thrust, cfg.total_max_thrust_n());
+    let thrust = clamp_between(raw, min_thrust, cfg.total_max_thrust_n());
     limited |= thrust != raw;
     (
         AttitudeTarget {
@@ -494,7 +494,7 @@ mod tests {
                 vel_sp.x *= k;
                 vel_sp.y *= k;
             }
-            let vz = vel_sp.z.clamp(-l.max_speed_up, l.max_speed_down);
+            let vz = clamp_between(vel_sp.z, -l.max_speed_up, l.max_speed_down);
             let z_speed_limited = vz != vel_sp.z;
             vel_sp.z = vz;
             let err = vel_sp - est.velocity;
@@ -866,5 +866,60 @@ mod tests {
             &cfg,
         );
         assert!(t.attitude.is_finite() && t.thrust_n.is_finite());
+    }
+
+    /// A configuration that bypasses `validate` and has the thrust limits and
+    /// the speed limits crossed (or NaN) must not panic: `f32::clamp` panics
+    /// when `min > max` or a bound is NaN, in release builds too.
+    #[test]
+    fn crossed_or_nan_limits_do_not_panic_and_the_output_is_finite() {
+        // 5 kg on 4 x 8 N: the minimum thrust (0.8 of hover, 39.2 N) is above
+        // the total thrust (32 N).
+        let mut heavy = cfg();
+        heavy.mass_kg = 5.0;
+        heavy.limits.min_thrust_fraction_of_hover = 0.8;
+        let mut nan = cfg();
+        nan.limits.max_speed_up = f32::NAN;
+        nan.limits.max_speed_down = f32::NAN;
+        nan.limits.max_tilt_rad = f32::NAN;
+        let mut crossed = cfg();
+        crossed.limits.max_speed_up = -2.0;
+        crossed.limits.max_speed_down = -1.0;
+        crossed.limits.max_tilt_rad = -0.3;
+        for cfg in [heavy, nan, crossed] {
+            let mut c = PositionController::default();
+            let mut s = hover_state();
+            s.position = Vec3::new(1.0, -2.0, 1.0);
+            for _ in 0..5 {
+                let t = c.update(Vec3::new(3.0, 2.0, -4.0), Vec3::zero(), 0.5, &s, 0.02, &cfg);
+                assert!(t.thrust_n.is_finite() && t.attitude.is_finite());
+                let t = c.update_axes(
+                    Horizontal::Tilt {
+                        roll: 0.4,
+                        pitch: -0.4,
+                    },
+                    Vertical::Velocity(1.0),
+                    Yaw::Heading(0.0),
+                    &s,
+                    0.02,
+                    &cfg,
+                );
+                assert!(t.thrust_n.is_finite() && t.attitude.is_finite());
+                // Direct call: no panic (its output is only as good as its limits).
+                let _ = thrust_target(Vec3::new(1.0, 0.0, -3.0), 0.0, &cfg);
+            }
+        }
+        // The heavy one has finite output everywhere: thrust is the maximum.
+        let mut c = PositionController::default();
+        let t = c.update(
+            Vec3::zero(),
+            Vec3::zero(),
+            0.0,
+            &hover_state(),
+            0.02,
+            &heavy,
+        );
+        assert!(t.thrust_n.is_finite());
+        assert!(t.thrust_n <= heavy.total_max_thrust_n());
     }
 }

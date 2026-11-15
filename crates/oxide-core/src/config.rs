@@ -478,6 +478,10 @@ pub enum ConfigError {
     BadGains,
     /// A limit is outside its range in the parameter table.
     BadLimits,
+    /// The rotors' total thrust at nominal voltage does not exceed the
+    /// weight: the vehicle could not climb (mass in grams, thrust in grams-
+    /// force, or a rotor that is far too small).
+    CannotLift,
 }
 
 impl<const N: usize> VehicleConfig<N> {
@@ -503,6 +507,12 @@ impl<const N: usize> VehicleConfig<N> {
         }
         if !pos(self.nominal_voltage_v) {
             return Err(ConfigError::BadMassProperties);
+        }
+        // A multirotor must be able to lift itself. This also keeps the
+        // minimum thrust (a fraction below one of the hover thrust) below the
+        // maximum, which the controllers clamp between.
+        if self.total_max_thrust_n().is_nan() || self.total_max_thrust_n() <= self.weight_n() {
+            return Err(ConfigError::CannotLift);
         }
         self.failsafe.validate()?;
         // On ground contact guidance commands the minimum thrust, and
