@@ -87,6 +87,9 @@ pub enum Error {
     Full,
     /// An earlier flash error left the in-memory state unreliable; mount again.
     NeedsRemount,
+    /// [`crate::ParamStore`] stopped trying to save after repeated failures
+    /// and touches nothing until the next boot.
+    GaveUp,
 }
 
 impl From<FlashError> for Error {
@@ -102,6 +105,7 @@ impl core::fmt::Display for Error {
             Self::Corrupt => f.write_str("store is corrupt: format it first"),
             Self::Full => f.write_str("more live keys than one sector holds"),
             Self::NeedsRemount => f.write_str("an earlier flash error: mount again"),
+            Self::GaveUp => f.write_str("saving failed repeatedly: given up until the next boot"),
         }
     }
 }

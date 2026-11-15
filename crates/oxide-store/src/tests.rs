@@ -1795,7 +1795,6 @@ fn mounting_two_valid_sectors_retires_the_older_one_and_the_next_mount_is_clean(
     assert_eq!(s.get(1).unwrap(), Some(101));
     // The point of it: damage to the live header is Corrupt, not a return to
     // the old values.
-    drop(s);
     f.bytes_mut(1).unwrap()[4] &= !2;
     let (s, r) = Store::mount(&mut f).unwrap();
     assert_eq!(r, MountReport::Corrupt);
@@ -1874,7 +1873,6 @@ fn a_failed_retire_at_mount_is_not_a_mount_failure_and_a_later_mount_retires() {
     s.flash_mut().fail = false;
     s.set(2, 7).unwrap();
     assert_eq!(s.get(2).unwrap(), Some(7));
-    drop(s);
     assert_eq!(header_of(&f.inner, 0), Header::Valid(5), "not retired yet");
     f.fail = false;
     let (_, r) = Store::mount(&mut f).unwrap();

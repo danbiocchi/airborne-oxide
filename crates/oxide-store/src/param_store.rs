@@ -85,7 +85,12 @@ pub struct ParamStore<F: Flash, const N: usize> {
     /// The firmware's own configuration, as `boot` was given it before it
     /// applied the stored values: what a save is measured against.
     baseline: VehicleConfig<N>,
+    /// Saves that failed one after another (a success resets it).
+    failed_saves: u8,
 }
+
+/// Failed saves in a row after which `service` stops touching the flash.
+pub const MAX_FAILED_SAVES: u8 = 3;
 
 impl<F: Flash, const N: usize> ParamStore<F, N> {
     /// Mounts the store and applies what it holds onto `cfg`, which holds the
@@ -135,6 +140,7 @@ impl<F: Flash, const N: usize> ParamStore<F, N> {
                 store,
                 health,
                 baseline,
+                failed_saves: 0,
             },
             report,
         )
@@ -153,11 +159,27 @@ impl<F: Flash, const N: usize> ParamStore<F, N> {
     ///
     /// # Errors
     /// A flash failure (the next call mounts again) or [`Error::Full`].
-    /// `Core::params_unsaved` stays set, so the next call tries again.
+    /// `Core::params_unsaved` stays set, so the next call tries again, up to
+    /// [`MAX_FAILED_SAVES`] failures in a row (a success resets the count):
+    /// after that every call returns [`Error::GaveUp`] without touching the
+    /// flash, until the next boot. (A save that cannot complete would
+    /// otherwise erase a sector on every call from the idle loop.)
     pub fn service(&mut self, core: &mut Core<N>) -> Result<Serviced, Error> {
         if core.is_armed() || core.params_fault() || !core.params_unsaved() {
             return Ok(Serviced::Idle);
         }
+        if self.gave_up() {
+            return Err(Error::GaveUp);
+        }
+        let r = self.save(core);
+        match r {
+            Ok(_) => self.failed_saves = 0,
+            Err(_) => self.failed_saves = self.failed_saves.saturating_add(1),
+        }
+        r
+    }
+
+    fn save(&mut self, core: &mut Core<N>) -> Result<Serviced, Error> {
         if self.health == Health::NeedsRemount {
             if self.store.remount()? == MountReport::Corrupt {
                 self.health = Health::NeedsFormat;
@@ -185,6 +207,12 @@ impl<F: Flash, const N: usize> ParamStore<F, N> {
                 Err(e)
             }
         }
+    }
+
+    /// Whether `service` has given up saving until the next boot.
+    #[must_use]
+    pub fn gave_up(&self) -> bool {
+        self.failed_saves >= MAX_FAILED_SAVES
     }
 
     /// The firmware's own configuration that `boot` was given, before the

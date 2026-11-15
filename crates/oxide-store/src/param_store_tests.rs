@@ -710,3 +710,105 @@ fn a_clean_store_reports_no_torn_records() {
     let (_, _, report) = boot_on(flash);
     assert!(report.clean() && report.torn == 0, "{report:?}");
 }
+
+/// A flash whose programs fail while `fail_programs` is nonzero (each failure
+/// uses one up; `u32::MAX` never runs out).
+struct BadCells {
+    inner: Flash8,
+    fail_programs: Cell<u32>,
+}
+
+impl Flash for BadCells {
+    const SECTOR_SIZE: usize = Flash8::SECTOR_SIZE;
+    fn read(&self, s: usize, o: usize, b: &mut [u8]) -> Result<(), FlashError> {
+        self.inner.read(s, o, b)
+    }
+    fn program(&mut self, s: usize, o: usize, d: &[u8]) -> Result<(), FlashError> {
+        let n = self.fail_programs.get();
+        if n > 0 {
+            if n != u32::MAX {
+                self.fail_programs.set(n - 1);
+            }
+            return Err(FlashError::Device);
+        }
+        self.inner.program(s, o, d)
+    }
+    fn erase(&mut self, s: usize) -> Result<(), FlashError> {
+        self.inner.erase(s)
+    }
+}
+
+fn bad_cells(fail: u32) -> (ParamStore<BadCells, 4>, Rig) {
+    let flash = BadCells {
+        inner: Flash8::new(),
+        fail_programs: Cell::new(0),
+    };
+    let mut cfg = quad();
+    let (ps, report) = ParamStore::boot(flash, &mut cfg, &PROFILE);
+    let mut rig = Rig::new(cfg, report);
+    // Two changes: the save is a rewrite (one erase per attempt).
+    rig.set(ParamId::LIM_TILT, 0.3);
+    rig.set(ParamId::LIM_RATE_ROLL, 3.0);
+    ps.flash().fail_programs.set(fail);
+    (ps, rig)
+}
+
+#[test]
+fn a_save_that_keeps_failing_erases_three_times_and_then_gives_up_until_the_next_boot() {
+    let (mut ps, mut rig) = bad_cells(u32::MAX);
+    assert!(!ps.gave_up());
+    for call in 0..3 {
+        assert!(
+            matches!(ps.service(&mut rig.core), Err(Error::Flash(_))),
+            "call {call}"
+        );
+        assert_eq!(ps.flash().inner.total_erases(), call + 1, "call {call}");
+    }
+    assert!(ps.gave_up());
+    let before = activity(&ps.flash().inner);
+    let reads = ps.flash().inner.reads();
+    for call in 0..20 {
+        assert_eq!(ps.service(&mut rig.core), Err(Error::GaveUp), "call {call}");
+    }
+    assert_eq!(activity(&ps.flash().inner), before, "no write");
+    assert_eq!(ps.flash().inner.reads(), reads, "not even a read");
+    assert_eq!(ps.flash().inner.total_erases(), 3);
+    assert!(rig.core.params_unsaved(), "still unsaved");
+
+    // The next boot starts again (the flash has healed).
+    let flash = ps.into_flash();
+    flash.fail_programs.set(0);
+    let mut cfg = quad();
+    let (mut ps2, report) = ParamStore::boot(flash, &mut cfg, &PROFILE);
+    assert!(!ps2.gave_up());
+    let mut rig2 = Rig::new(cfg, report);
+    rig2.set(ParamId::LIM_TILT, 0.3);
+    assert!(matches!(
+        ps2.service(&mut rig2.core),
+        Ok(Serviced::Saved(_))
+    ));
+}
+
+#[test]
+fn a_save_that_fails_once_and_then_works_saves_on_the_second_call_and_the_count_resets() {
+    let (mut ps, mut rig) = bad_cells(1);
+    assert!(matches!(ps.service(&mut rig.core), Err(Error::Flash(_))));
+    assert!(!ps.gave_up());
+    assert!(matches!(
+        ps.service(&mut rig.core),
+        Ok(Serviced::Saved(Replaced::Rewritten))
+    ));
+    assert!(!rig.core.params_unsaved());
+    // Two failures, a success, two more failures: never three in a row.
+    for round in 0..3 {
+        rig.set(ParamId::LIM_TILT, 0.2 + 0.05 * round as f32);
+        rig.set(ParamId::LIM_RATE_ROLL, 3.0 + 0.1 * round as f32);
+        ps.flash().fail_programs.set(u32::MAX);
+        for _ in 0..2 {
+            assert!(matches!(ps.service(&mut rig.core), Err(Error::Flash(_))));
+        }
+        ps.flash().fail_programs.set(0);
+        assert!(matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))));
+        assert!(!ps.gave_up(), "round {round}");
+    }
+}
