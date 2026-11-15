@@ -77,12 +77,15 @@ enum Health {
 }
 
 /// A [`Store`] holding the parameters of a vehicle (see the module docs).
-pub struct ParamStore<F: Flash> {
+pub struct ParamStore<F: Flash, const N: usize> {
     store: Store<F>,
     health: Health,
+    /// The firmware's own configuration, as `boot` was given it before it
+    /// applied the stored values: what a save is measured against.
+    baseline: VehicleConfig<N>,
 }
 
-impl<F: Flash> ParamStore<F> {
+impl<F: Flash, const N: usize> ParamStore<F, N> {
     /// Mounts the store and applies what it holds onto `cfg`, which holds the
     /// firmware's own values. Never fails: a store that cannot be mounted or
     /// read gives the firmware's values and a report with `unreadable` set.
@@ -90,16 +93,13 @@ impl<F: Flash> ParamStore<F> {
     ///
     /// Nothing is written, except by [`Store::mount`] itself when the flash
     /// holds nothing but headers (a first start, or an interrupted one).
-    pub fn boot<const N: usize>(
-        flash: F,
-        cfg: &mut VehicleConfig<N>,
-        profile: &Profile,
-    ) -> (Self, LoadReport) {
+    pub fn boot(flash: F, cfg: &mut VehicleConfig<N>, profile: &Profile) -> (Self, LoadReport) {
         let mut store = Store::unmounted(flash);
         let unreadable = LoadReport {
             unreadable: true,
             ..LoadReport::default()
         };
+        let baseline = *cfg;
         let (health, report) = match store.remount() {
             Err(_) => (Health::NeedsRemount, unreadable),
             Ok(MountReport::Corrupt) => (Health::NeedsFormat, unreadable),
@@ -127,27 +127,31 @@ impl<F: Flash> ParamStore<F> {
                 }
             }
         };
-        (Self { store, health }, report)
+        (
+            Self {
+                store,
+                health,
+                baseline,
+            },
+            report,
+        )
     }
 
     /// Call between ticks. Writes only when the core is disarmed, holds no
     /// parameter fault and reports unsaved parameters; then it makes the store
-    /// hold exactly `params::changed(core.config(), baseline)` with
+    /// hold exactly `params::changed(core.config(), self.baseline())` with
     /// [`Store::replace_all`] (remounting first after a flash error, and
     /// formatting first if the store was corrupt) and tells the core it is
     /// saved.
     ///
-    /// `baseline` is the firmware's own configuration, the one `boot` was
-    /// given before it applied the stored values.
+    /// The baseline is the firmware's own configuration, the one `boot` was
+    /// given before it applied the stored values: the store keeps it, so a
+    /// caller cannot pass the loaded configuration by mistake.
     ///
     /// # Errors
     /// A flash failure (the next call mounts again) or [`Error::Full`].
     /// `Core::params_unsaved` stays set, so the next call tries again.
-    pub fn service<const N: usize>(
-        &mut self,
-        core: &mut Core<N>,
-        baseline: &VehicleConfig<N>,
-    ) -> Result<Serviced, Error> {
+    pub fn service(&mut self, core: &mut Core<N>) -> Result<Serviced, Error> {
         if core.is_armed() || core.params_fault() || !core.params_unsaved() {
             return Ok(Serviced::Idle);
         }
@@ -165,7 +169,7 @@ impl<F: Flash> ParamStore<F> {
         }
         match self
             .store
-            .replace_all(params::changed(core.config(), baseline))
+            .replace_all(params::changed(core.config(), &self.baseline))
         {
             Ok(replaced) => {
                 core.clear_unsaved();
@@ -178,6 +182,13 @@ impl<F: Flash> ParamStore<F> {
                 Err(e)
             }
         }
+    }
+
+    /// The firmware's own configuration that `boot` was given, before the
+    /// stored values were applied to it.
+    #[must_use]
+    pub fn baseline(&self) -> &VehicleConfig<N> {
+        &self.baseline
     }
 
     /// The flash (for counters in tests and tools).

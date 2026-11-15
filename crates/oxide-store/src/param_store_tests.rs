@@ -200,7 +200,7 @@ impl Rig {
     }
 }
 
-fn boot_on(flash: Flash8) -> (ParamStore<Flash8>, VehicleConfig<4>, LoadReport) {
+fn boot_on(flash: Flash8) -> (ParamStore<Flash8, 4>, VehicleConfig<4>, LoadReport) {
     let mut cfg = quad();
     let (ps, report) = ParamStore::boot(flash, &mut cfg, &PROFILE);
     (ps, cfg, report)
@@ -218,16 +218,16 @@ fn a_blank_flash_boots_clean_and_a_saved_parameter_comes_back() {
     assert!(report.clean() && report.applied == 0, "{report:?}");
     assert!(cfg == quad(), "a blank store leaves the firmware's values");
     let mut rig = Rig::new(cfg, report);
-    assert_eq!(ps.service(&mut rig.core, &quad()), Ok(Serviced::Idle));
+    assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle));
 
     rig.set(ParamId::LIM_TILT, 0.3);
     assert!(rig.core.params_unsaved());
     assert_eq!(
-        ps.service(&mut rig.core, &quad()),
+        ps.service(&mut rig.core),
         Ok(Serviced::Saved(Replaced::Appended))
     );
     assert!(!rig.core.params_unsaved(), "the core was told it is saved");
-    assert_eq!(ps.service(&mut rig.core, &quad()), Ok(Serviced::Idle));
+    assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle));
 
     let (ps2, cfg2, report2) = boot_on(ps.into_flash());
     assert!(report2.clean() && report2.applied == 1, "{report2:?}");
@@ -291,10 +291,7 @@ fn flash_with_one_saved() -> (Flash8, VehicleConfig<4>) {
     let (mut ps, cfg, report) = boot_on(Flash8::new());
     let mut rig = Rig::new(cfg, report);
     rig.set(ParamId::LIM_TILT, 0.3);
-    assert!(matches!(
-        ps.service(&mut rig.core, &quad()),
-        Ok(Serviced::Saved(_))
-    ));
+    assert!(matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))));
     (ps.into_flash(), *rig.core.config())
 }
 
@@ -309,7 +306,7 @@ enum Cut {
 fn save_pair(
     start: &Flash8,
     cut: Option<Cut>,
-) -> (ParamStore<Flash8>, Rig, Result<Serviced, crate::Error>) {
+) -> (ParamStore<Flash8, 4>, Rig, Result<Serviced, crate::Error>) {
     let (mut ps, cfg, report) = boot_on(start.clone());
     assert!(report.clean());
     let mut rig = Rig::new(cfg, report);
@@ -321,7 +318,7 @@ fn save_pair(
         Some(Cut::Bytes(n)) => ps.flash_mut().cut_power_after(n, n),
         Some(Cut::Call(c, how)) => ps.flash_mut().cut_program_call(c, how),
     }
-    let r = ps.service(&mut rig.core, &quad());
+    let r = ps.service(&mut rig.core);
     (ps, rig, r)
 }
 
@@ -348,7 +345,7 @@ fn a_pair_valid_only_together_is_never_half_loaded_whatever_cut_interrupts_the_s
         let e0 = ps.flash().inner.events();
         ps.flash_mut().calls.clear();
         assert_eq!(
-            ps.service(&mut rig.core, &quad()),
+            ps.service(&mut rig.core),
             Ok(Serviced::Saved(Replaced::Rewritten))
         );
         let rec = ps.into_flash();
@@ -401,7 +398,7 @@ fn a_pair_valid_only_together_is_never_half_loaded_whatever_cut_interrupts_the_s
             ps.flash_mut().restore_power();
             assert!(rig.core.params_unsaved());
             assert!(
-                matches!(ps.service(&mut rig.core, &quad()), Ok(Serviced::Saved(_))),
+                matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))),
                 "{cut:?}: the retry must save"
             );
             let (_, cfg3, report3) = boot_on(ps.into_flash());
@@ -430,17 +427,13 @@ fn while_armed_service_never_touches_the_flash_and_after_disarming_it_saves() {
     for (i, v) in [0.25, 0.3, 0.35].into_iter().enumerate() {
         rig.set(ParamId::LIM_TILT, v);
         assert!(rig.core.params_unsaved());
-        assert_eq!(
-            ps.service(&mut rig.core, &quad()),
-            Ok(Serviced::Idle),
-            "{i}"
-        );
+        assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle), "{i}");
         assert_eq!(activity(ps.flash()), before, "nothing programmed or erased");
         assert!(rig.core.params_unsaved(), "still unsaved");
     }
     rig.disarm();
     assert_eq!(
-        ps.service(&mut rig.core, &quad()),
+        ps.service(&mut rig.core),
         Ok(Serviced::Saved(Replaced::Appended))
     );
     assert!(activity(ps.flash()) != before);
@@ -474,7 +467,7 @@ fn a_corrupt_flash_boots_unreadable_refuses_arming_and_is_formatted_only_after_t
     assert!(rig.core.params_unsaved());
     let before = activity(ps.flash());
     for _ in 0..3 {
-        assert_eq!(ps.service(&mut rig.core, &quad()), Ok(Serviced::Idle));
+        assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle));
     }
     assert_eq!(activity(ps.flash()), before);
 
@@ -489,12 +482,12 @@ fn a_corrupt_flash_boots_unreadable_refuses_arming_and_is_formatted_only_after_t
     assert!(!rig.core.params_fault() && rig.core.params_unsaved());
     assert!(rig.events.contains(&EventKind::ParamFaultAcked));
     assert_eq!(
-        ps.service(&mut rig.core, &quad()),
+        ps.service(&mut rig.core),
         Ok(Serviced::Saved(Replaced::Appended)),
         "formatted, then the value in use written"
     );
     assert!(ps.flash().total_erases() > 0);
-    assert_eq!(ps.service(&mut rig.core, &quad()), Ok(Serviced::Idle));
+    assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle));
 
     let (_, cfg2, report2) = boot_on(ps.into_flash());
     assert!(report2.clean() && report2.applied == 1, "{report2:?}");
@@ -527,11 +520,7 @@ fn a_value_or_key_this_firmware_does_not_understand(extra: (u32, u32), what: &st
     // Force something unsaved: the flash is still untouched.
     rig.set(ParamId::LIM_TILT, 0.3);
     let before = activity(ps.flash());
-    assert_eq!(
-        ps.service(&mut rig.core, &quad()),
-        Ok(Serviced::Idle),
-        "{what}"
-    );
+    assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle), "{what}");
     assert_eq!(
         activity(ps.flash()),
         before,
@@ -543,7 +532,7 @@ fn a_value_or_key_this_firmware_does_not_understand(extra: (u32, u32), what: &st
 
     rig.ack();
     assert_eq!(
-        ps.service(&mut rig.core, &quad()),
+        ps.service(&mut rig.core),
         Ok(Serviced::Saved(Replaced::Appended)),
         "{what}: one tombstone"
     );
@@ -646,12 +635,9 @@ fn a_flash_that_fails_a_read_at_boot_is_unreadable_with_the_firmwares_values_at_
             ps.flash_mut().from.set(None);
             let mut rig = Rig::new(cfg, report);
             let before = activity(&ps.flash().inner);
-            assert_eq!(ps.service(&mut rig.core, &quad()), Ok(Serviced::Idle));
+            assert_eq!(ps.service(&mut rig.core), Ok(Serviced::Idle));
             rig.ack();
-            assert!(matches!(
-                ps.service(&mut rig.core, &quad()),
-                Ok(Serviced::Saved(_))
-            ));
+            assert!(matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))));
             assert!(activity(&ps.flash().inner) != before || from > 0);
             let (_, cfg2, report2) = boot_on(ps.into_flash().inner);
             assert!(report2.clean(), "from {from}: {report2:?}");
@@ -660,4 +646,26 @@ fn a_flash_that_fails_a_read_at_boot_is_unreadable_with_the_firmwares_values_at_
             assert!(report.clean() && cfg == saved, "no failure reached");
         }
     }
+}
+
+#[test]
+fn the_store_keeps_the_firmwares_own_values_so_a_save_cannot_be_given_the_wrong_ones() {
+    // Two values stored; boot loads them. The store still knows the
+    // firmware's own configuration, not the loaded one.
+    let (mut ps, cfg, report) = boot_on(flash_with_raw(&[(
+        params::key("BAT_LOW_V"),
+        3.8_f32.to_bits(),
+    )]));
+    assert!(report.clean() && report.applied == 2, "{report:?}");
+    assert!(*ps.baseline() == quad());
+    assert!(cfg != quad());
+    // Another parameter changes; the save keeps all three.
+    let mut rig = Rig::new(cfg, report);
+    rig.set(ParamId::LIM_RATE_ROLL, 3.0);
+    assert!(matches!(ps.service(&mut rig.core), Ok(Serviced::Saved(_))));
+    let (_, cfg2, report2) = boot_on(ps.into_flash());
+    assert!(report2.clean() && report2.applied == 3, "{report2:?}");
+    assert!(cfg2 == *rig.core.config());
+    assert_eq!(cfg2.limits.max_tilt_rad, 0.3);
+    assert_eq!(cfg2.failsafe.battery_low_v, 3.8);
 }

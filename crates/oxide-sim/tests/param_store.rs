@@ -40,7 +40,7 @@ fn script() -> Script {
 /// configuration (the baseline for saving) and the load report.
 struct Booted {
     sim: Sim,
-    store: ParamStore<Flash>,
+    store: ParamStore<Flash, 4>,
     baseline: VehicleConfig<4>,
     report: LoadReport,
 }
@@ -49,20 +49,20 @@ fn boot(flash: Flash) -> Booted {
     let airframe = Airframe::reference_quad().expect("reference airframe");
     let mut flash = Some(flash);
     let mut store = None;
-    let mut baseline = None;
     let mut report = LoadReport::default();
     let sim = Sim::with_boot(&airframe, PROFILE, script(), SimOptions::default(), |cfg| {
-        baseline = Some(*cfg);
         let (s, r) = ParamStore::boot(flash.take().expect("once"), cfg, &PROFILE);
         store = Some(s);
         report = r;
         r
     })
     .expect("simulation");
+    let store = store.expect("booted");
+    let baseline = *store.baseline();
     Booted {
         sim,
-        store: store.expect("booted"),
-        baseline: baseline.expect("booted"),
+        store,
+        baseline,
         report,
     }
 }
@@ -144,7 +144,7 @@ fn fly(b: &mut Booted, changes: &[(f64, ParamSet)], cut: Option<Cut>) -> Flight 
             cut_armed = true;
         }
         let before = activity(b.store.flash());
-        let r = b.store.service(b.sim.core_mut(), &b.baseline);
+        let r = b.store.service(b.sim.core_mut());
         match r {
             Ok(Serviced::Idle) => {
                 assert_eq!(activity(b.store.flash()), before, "tick {k}: idle writes");
