@@ -8,8 +8,10 @@
 //!   firmware's own configuration with [`params::load`]. It never fails: a
 //!   store that cannot be mounted (corrupt) or read (a flash error, even
 //!   half-way through) gives the firmware's own values untouched and a report
-//!   with `unreadable` set. The caller hands the report to
-//!   `Core::report_param_load`.
+//!   with `unreadable` set. The report's `torn` counts the records in the live
+//!   sector that failed their check and were skipped (a cut save, or damage:
+//!   the two look alike); the core reports it (`ParamLoadRecovered`) without
+//!   holding a fault. The caller hands the report to `Core::report_param_load`.
 //! * [`ParamStore::service`] is called between ticks, from the main loop. It
 //!   writes only when the core is disarmed, holds no parameter fault and has
 //!   unsaved parameters. It then makes the store hold exactly
@@ -108,7 +110,7 @@ impl<F: Flash, const N: usize> ParamStore<F, N> {
                 // half-applied configuration.
                 let mut next = *cfg;
                 let mut failed = false;
-                let report = params::load(
+                let mut report = params::load(
                     &mut next,
                     profile,
                     store.iter().map_while(|r| match r {
@@ -123,6 +125,7 @@ impl<F: Flash, const N: usize> ParamStore<F, N> {
                     (Health::NeedsRemount, unreadable)
                 } else {
                     *cfg = next;
+                    report.torn = u16::try_from(store.torn_records()).unwrap_or(u16::MAX);
                     (Health::Ready, report)
                 }
             }

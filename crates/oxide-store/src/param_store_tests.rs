@@ -669,3 +669,44 @@ fn the_store_keeps_the_firmwares_own_values_so_a_save_cannot_be_given_the_wrong_
     assert_eq!(cfg2.limits.max_tilt_rad, 0.3);
     assert_eq!(cfg2.failsafe.battery_low_v, 3.8);
 }
+
+#[test]
+fn a_record_damaged_in_the_store_is_reported_by_boot_as_torn_and_the_vehicle_still_arms() {
+    // Two saves of one parameter: 0.3, then 0.5 (two appended records).
+    let (mut ps, cfg, report) = boot_on(Flash8::new());
+    let mut rig = Rig::new(cfg, report);
+    for v in [0.3, 0.5] {
+        rig.set(ParamId::LIM_TILT, v);
+        assert_eq!(
+            ps.service(&mut rig.core),
+            Ok(Serviced::Saved(Replaced::Appended))
+        );
+    }
+    let mut flash = ps.into_flash();
+    // One bit of the newer record's value (slot 1: header 16 + 12, value at +4).
+    flash.bytes_mut(0).unwrap()[16 + 12 + 4] ^= 0x01;
+
+    let (ps2, cfg2, report2) = boot_on(flash);
+    assert_eq!(cfg2.limits.max_tilt_rad, 0.3, "the older value");
+    assert!(report2.clean() && report2.applied == 1, "{report2:?}");
+    assert_eq!(report2.torn, 1, "{report2:?}");
+    assert_eq!(ps2.torn_records(), 1);
+
+    let mut rig2 = Rig::new(cfg2, report2);
+    let (armed, prearm) = rig2.try_arm();
+    assert!(armed, "{prearm:?}");
+    assert!(!rig2.core.params_fault());
+    let recovered: Vec<_> = rig2
+        .events
+        .iter()
+        .filter(|e| matches!(e, EventKind::ParamLoadRecovered(r) if *r == report2))
+        .collect();
+    assert_eq!(recovered.len(), 1, "{:?}", rig2.events);
+}
+
+#[test]
+fn a_clean_store_reports_no_torn_records() {
+    let (flash, _) = flash_with_one_saved();
+    let (_, _, report) = boot_on(flash);
+    assert!(report.clean() && report.torn == 0, "{report:?}");
+}
