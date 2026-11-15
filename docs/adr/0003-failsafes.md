@@ -127,10 +127,18 @@ Arming needs a rising edge of the arm switch with no pre-arm check failing. Each
 - every value finite;
 - link timeouts between 50 ms and an hour, and delays at most an hour;
 - battery thresholds within 3.0 to 4.0 V per cell (the range in which the monitor can act and its latch can clear on a full pack), with critical not above low;
-- loss-of-control angles within (0, π], fence limits not negative (0 turns the fence off);
-- return speed at least 0.1 m/s, landing speed at least twice the touchdown speed;
+- fence limits not negative (0 turns the fence off);
+- loss of control above what the controller itself commands, or a normal manoeuvre switches the motors off: the tilt threshold at least 10° above both tilt limits, the attitude-error threshold at least 20°, and the two timers at least 0.1 s and 0.05 s;
+- return speed at least 0.1 m/s, landing speed at least twice the touchdown speed, and the descent limit at least twice the touchdown speed too, because it clamps the landing descent (a slower descent reads as standing on the ground);
+- touchdown speed at least 0.1 m/s, because the estimated vertical speed of a landed vehicle is noisy (up to 0.09 m/s in the simulator) and a lower threshold never detects the ground; touchdown time between 0.1 s and 10 s;
 - the minimum thrust below the touchdown thrust, or a vehicle on the ground could never read as landed; the blind-landing thrust above it, or a blind landing would read as landed in the air;
-- thrust fractions within their range, at least one battery cell, resistance not negative.
+- thrust fractions within their range, at least one battery cell, resistance not negative;
+- the rotors together can lift the vehicle (this catches a mass in grams);
+- the idle motor command gives at most half the hover thrust of a rotor: it is a floor on every motor at all times, so a higher one makes the vehicle climb away;
+- the estimator's output time constant at least 0.15 s and not below its delay horizon (measured: below about 0.7 of the horizon the estimate oscillates and the flight is lost);
+- the gyro filter's cut-off below 0.45 of the rate-loop frequency, where the filter would otherwise switch itself off.
+
+The rules from the loss-of-control line onwards were added in part two, after a review flew every parameter at both ends of its range. No limit in the core is applied with a clamp that can panic when its bounds are crossed.
 
 A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. A vehicle armed without a position (Stabilized or Altitude, GPS not yet locked) gets its home at the first run where `position` becomes valid while armed; until then `Rtl` behaves as `Hold`. Home is never overwritten in flight and is cleared on disarm. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
 

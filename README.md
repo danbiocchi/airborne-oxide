@@ -51,6 +51,8 @@ cargo run --release -p oxide-sim-cli -- params list
 cargo run --release -p oxide-sim-cli -- run --param POS_X_P=1.2
 ```
 
+`cargo run --release -p oxide-sim-cli -- help` lists every command and its options.
+
 Run the tests:
 
 ```bash

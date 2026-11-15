@@ -47,7 +47,10 @@ The vehicle description is structural: the rotor count is a compile-time size, a
 
 - **Per parameter:** `set` refuses a value that is not finite or is outside `[min, max]`. The 39 gains and limits that had no check get ranges now.
 - **Together:** after a change the configuration must still pass `validate` (critical battery not above low, landing speed at least twice the touchdown speed, and the rest of ADR-0003 §6). A change that would break it is refused, and the configuration is left as it was.
+- **Against the chip profile:** two values are checked against the task schedule: the estimator's delay horizon must fit the IMU buffer, and the gyro filter's cut-off must stay below 0.45 of the rate-loop frequency.
 - **A refusal says why:** unknown parameter, wrong type, out of range, breaks a rule, or not while armed.
+
+**What a range is for.** A range refuses values that are never right, and where a threshold was measured it says so (the touchdown speed, the estimator's output time constant, the loss-of-control thresholds). It is not a promise that every value inside it flies well: a rate gain of zero is in range and cannot fly. Tuning is the simulator's job. A test flies every parameter at both ends of its range and requires no panic, no non-finite value and no runaway; three bounds are listed in it as known to fly away (a zero horizontal velocity gain, and a magnetic declination of half a turn at a site where it is zero).
 
 ### 4. Changing a parameter at run time
 
@@ -55,6 +58,7 @@ A change arrives through the core's inputs, like every other command: `Inputs.pa
 
 - **`ParamChanged` and `ParamRefused` events** report the outcome. That is the "every change is logged" of DESIGN §4.14.
 - **Live or disarmed-only.** Gains, limits and failsafe values take effect on the next run of the task that reads them, in flight too. Parameters whose change rebuilds something (the gyro filter cut-off, every estimator parameter, the estimator source) are refused while armed.
+- **One exception to "the next run":** the return altitude is read when a return starts, so a change applies from the next return.
 - **Unsaved changes** are flagged in the status until the store has them (§6).
 
 ### 5. Parameters in files
@@ -65,7 +69,7 @@ A `[params]` table of `NAME = value` is accepted in three places:
 2. the scenario file;
 3. the command line (`--param NAME=VALUE`, `--params FILE.toml`).
 
-The three are gathered in that order and applied **as one change**. A later source overrides an earlier one. Each value is checked against its own range, and the rules between fields are checked once, on the result. A file can therefore state any valid combination, whatever order its lines are in.
+The three are gathered in that order and applied **as one change**. A later source overrides an earlier one. Each value is checked against its own range, and the rules between fields are checked once, on the result. A file can therefore state any valid combination, whatever order its lines are in. When the result breaks a rule, the error names the one value at fault if there is exactly one (the list is valid without it); otherwise it names the rule and the values together.
 
 `oxide-sim params list` prints the table, `params json` writes the metadata file QGroundControl reads, and `params doc` writes `docs/PARAMETERS.md`. A test regenerates the last and fails if it differs from the file in the repository.
 
@@ -83,18 +87,22 @@ The three are gathered in that order and applied **as one change**. A later sour
 
 - **Records** are 12 bytes: a 32-bit key (a hash of the parameter name, so reordering the table never changes a meaning), the value's 32 bits, and a check word. The check word is written last, in its own program call. It holds 30 CRC bits and a two-bit kind that is one-hot: set or removed.
 - **A half-written record cannot read as a valid record.** That follows from the layout, not from CRC luck: until the check word is complete its kind is neither of the two valid ones, or its CRC bits are wrong. A torn record is skipped and its slot is never reused.
-- **Compaction** copies the newest value of each key to the other sector, marks that sector valid, then marks the old one retired. A power cut at any point leaves exactly one sector to mount.
-- **No silent rollback.** Because the old sector is retired, damage to the live sector's header is reported as a corrupt store. The store never falls back to older values without saying so.
+- **Compaction** copies the newest value of each key to the other sector, marks that sector valid, then marks the old one retired. A power cut between those last two steps leaves two valid sectors; mount takes the newer and retires the older itself.
+- **No silent rollback.** Because the old sector is retired, damage to the live sector's header is reported as a corrupt store. A damaged record is skipped, so its key reads its previous record or the firmware's value; the number skipped is reported at boot (`LoadReport.torn`, and a `ParamLoadRecovered` event). That is not a fault and does not refuse arming, because a record cut short by a power loss looks the same and is harmless.
 - **Saving several values is all or nothing.** `replace_all` makes the store hold exactly a given set. No difference writes nothing; one difference appends one record; more than one writes a fresh sector that becomes valid in a single step. Two parameters that are valid only together can therefore never be loaded half-saved.
 - **Wear** is the erase count, kept in the sector header and reported. Sequence numbers are compared as a signed wrapping difference, so mount stays correct across the 2^32 wrap.
 - An interrupted first initialisation, with nothing ever stored, mounts as a fresh store and not as a corrupt one.
+- Mount writes to the flash in those two cases only: a fresh store, and retiring the older of two valid sectors.
+- **Which flash this fits:** plain NOR flash such as the STM32F405's, where a program only clears bits and may be repeated on the same bytes. The STM32H743's flash is different (see Deferred).
 
 **Policy** (`ParamStore`, the part the firmware reuses)
 
-- **What is stored:** only the parameters that differ from the firmware's own values (the table defaults plus the airframe's). A parameter set back to that value leaves the store. So a firmware update that changes a default changes it for everyone who never touched it.
+- **What is stored:** only the parameters that differ from the firmware's own values (the table defaults plus the airframe's). `ParamStore` keeps those values from boot, so a save cannot be given the wrong ones. A parameter set back to that value leaves the store. So a firmware update that changes a default changes it for everyone who never touched it, and also for someone who deliberately chose the old default: a choice equal to the firmware's value is not recorded.
 - **Never while armed.** A save happens only while disarmed.
 - **A load that was not fully understood sets a parameter fault.** The causes: the store cannot be read; it holds a key this firmware does not know; a value is out of this firmware's range (it is dropped for the firmware's value); or the values together break a rule (none is taken). While the fault is held the `CONFIG` pre-arm bit refuses arming, and the store is not modified.
-- **An operator's acknowledgement** (`Inputs.param_ack`) clears the fault and rewrites the store from the values in use.
+- **An operator's acknowledgement** (`Inputs.param_ack`) clears the fault and rewrites the store from the values in use. After an unreadable boot that discards whatever the store held, including values a later read might have recovered: restart first if the cause may be passing.
+- **Changes made while a fault is held** stay in RAM and are lost by a restart before the acknowledgement.
+- **A save that keeps failing stops.** After three failed saves in a row the store is left alone until the next start, so a broken flash is not erased again on every attempt.
 
 **Tests.** The store is tested on the host against a simulated flash that cuts the power at every byte of every operation, inside every program call (seeded subsets of its bits, all bits but one, one bit only) and part-way through every erase. After each cut the store must mount, return for every key the old or the new value and nothing else, and never lose an acknowledged write. The policy is tested with a real flight core on that flash, and end to end in the simulator: a parameter changed in flight is saved after the disarm and is there after a reboot.
 
@@ -117,6 +125,8 @@ One TOML file per scenario in `scenarios/`. A file holds:
 | `[run]` | seeds and profiles for the Monte-Carlo job |
 
 - **Unknown keys are errors.** A typo must not become a default.
+- **Values that do nothing or cannot run are errors:** turbulence with no time constant, a negative strength or duration, more than 64 gusts, a flight shorter than one tick or longer than a day.
+- **Every flight is judged.** The invariants apply to every file: values stay finite, no timing fault, motors off while disarmed, the failsafe action never drops while armed. `[expect]` adds to them and must say how the flight ends. A file with no `[expect]` is reported as `(invariants only)`.
 - **Names, not numbers,** for states, reasons, actions and modes.
 - **Heights are up-positive in files;** the loader converts to NED.
 - **Concrete numbers only.** The 21 pairings become 21 files. Battery sizes that were computed from a target time are written out. A test checks that every pairing of the seven failure kinds has a file, so coverage cannot quietly shrink.
@@ -124,7 +134,7 @@ One TOML file per scenario in `scenarios/`. A file holds:
 
 **The files replaced the Rust definitions, and the proof was the hashes.** Every scenario was exported from Rust to TOML and loaded back, and the trace hash from the file equalled the hash from the Rust definition for all 43 scenarios, on two run indices of one chip profile and one of the other. Then the Rust definitions were deleted, and the hashes of those 129 flights were pinned in `crates/oxide-sim/tests/data/scenario_hashes.txt`. A change that moves one of them changes a flight: it is a decision, and the table is regenerated only on request (`OXIDE_REGENERATE=1`). The tests check 43 of the pinned flights on Linux and on Windows; CI's release job checks all 129.
 
-`oxide-sim scenario` takes a name or a path: an argument that ends in `.toml` or contains a path separator is a path, anything else is the name of a scenario in `scenarios/`. `oxide-sim scenarios DIR` flies every file on the seeds and profiles its `[run]` table names and prints one line each; CI's Monte-Carlo job runs that.
+`oxide-sim scenario` takes a name or a path: an argument that ends in `.toml` or contains a path separator is a path, anything else is the name of a scenario in `scenarios/`. `oxide-sim scenarios DIR` flies every file on the seeds and profiles its `[run]` table names and prints one line each; CI's Monte-Carlo job runs that. Two files with the same `name` in one directory are an error, because the name seeds the runs. A failing line names the file and the command that repeats the failing run.
 
 `hover-step` keeps its M1a requirements as Rust tests (they check positions at set times, which `[expect]` does not express); the file carries its flight. `hover-step` and `gust-hold` also keep a pilot written in Rust, used by the `run`, `hash` and `montecarlo` commands and the viewer; a test checks that both forms fly the same flight.
 
@@ -142,6 +152,9 @@ One TOML file per scenario in `scenarios/`. A file holds:
 - Several parameters changed together **at run time** (a transaction over the link). Files and saves are already one change. Until then, change run-time parameters in an order that keeps the configuration valid.
 - Per-parameter access levels for the brain (with the command gateway, M3).
 - The flash driver, and at F405 bring-up: the erase stall, the size of a program word, whether a cell can read unstable after an interrupted program or erase, and the measured time of a compaction (about 1.9 million key reads for a full 16 KB sector).
+- **A store layout for the STM32H743.** Its flash programs whole 32-byte words with an error-correcting code, a word can be programmed only once per erase, and a word cut short by a power loss reads as an uncorrectable error. The layout here writes a record in two calls, programs the state word after the header and retires a sector by programming over its state word, none of which that flash allows. The H743 needs one write per 32-byte word and a torn word treated as a skipped record. The algorithms carry over; the layout and the simulated flash's rules do not. It comes with H743 bring-up.
+- One definition of `hover-step` and `gust-hold`: the `run`, `hash` and `montecarlo` commands and the viewer still use the Rust pilots.
+- The touchdown-speed and estimator minimums were measured in the simulator. They are measured again on hardware at bring-up.
 - When the firmware calls the store's service routine, and what it shows the operator for a parameter fault.
 - Terrain and missions in scenario files (they do not exist yet).
 
