@@ -112,7 +112,8 @@ pub struct Limits {
     pub velocity_integral_limit: f32,
     /// Minimum collective thrust while flying, as a fraction of hover.
     pub min_thrust_fraction_of_hover: f32,
-    /// Motor command while armed with no demand (keeps props spinning).
+    /// Lowest motor command on every motor while armed (a floor, not only a
+    /// command for no demand); at most half of the hover thrust of a rotor.
     pub idle_command: f32,
     /// Stick deadband: a stick within this of centre reads as centred, and
     /// the rest of the travel is rescaled to the full range.
@@ -482,6 +483,10 @@ pub enum ConfigError {
     /// weight: the vehicle could not climb (mass in grams, thrust in grams-
     /// force, or a rotor that is far too small).
     CannotLift,
+    /// The idle motor command gives more than half of the hover thrust per
+    /// rotor: it is a floor on every motor, so the vehicle could not be held
+    /// down or steered.
+    IdleTooHigh,
 }
 
 impl<const N: usize> VehicleConfig<N> {
@@ -539,6 +544,20 @@ impl<const N: usize> VehicleConfig<N> {
             || !crate::params::in_range(&self.estimator)
         {
             return Err(ConfigError::BadEstimator);
+        }
+        // `idle_command` is a floor on every motor on every tick while armed.
+        // Above about hover it pins the thrust at or above the weight and
+        // overrides the differences that steer, so it must give at most half
+        // of the hover thrust of a rotor (through the thrust curve).
+        let hover_per_rotor_n = self.weight_n() / (N.max(1) as f32);
+        let idle_fraction =
+            crate::allocation::fraction_for_command(self.limits.idle_command, self.thrust_expo);
+        if self
+            .rotors
+            .iter()
+            .any(|r| idle_fraction * r.max_thrust_n > 0.5 * hover_per_rotor_n)
+        {
+            return Err(ConfigError::IdleTooHigh);
         }
         Ok(())
     }

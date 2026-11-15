@@ -61,7 +61,7 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | `LIM_RATE_I` | Float | 30 | 0 | 1000 | rad/s^2 | live | Limit on the rate loop integral term. |
 | `LIM_VEL_I` | Float | 3 | 0 | 30 | m/s^2 | live | Limit on the velocity loop integral term. |
 | `LIM_MIN_THRUST` | Float | 0.1 | 0 | < 1 |  | live | Minimum collective thrust while flying, as a fraction of hover thrust. Must stay below LAND_TD_THRUST. |
-| `LIM_IDLE` | Float | 0.05 | 0 | 1 |  | live | Motor command while armed with no demand, 0 to 1. |
+| `LIM_IDLE` | Float | 0.05 | 0 | 0.5 |  | live | Lowest motor command on every motor at all times while armed, 0 to 0.5: a floor, not only a command for no demand. The thrust it gives (through the thrust curve) must be at most half of the hover thrust of a rotor, or the vehicle could not be held down or steered. |
 | `LIM_STICK_DB` | Float | 0.05 | 0 | 0.5 |  | live | Stick deadband: a stick within this of centre reads as centred, and the rest of the travel is rescaled to the full range. |
 
 ## State estimator

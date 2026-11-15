@@ -119,6 +119,9 @@ fn describe_rule(c: oxide_core::config::ConfigError) -> String {
             "the vehicle cannot lift itself (the rotors' total thrust must exceed the weight)"
                 .into()
         }
+        ConfigError::IdleTooHigh => "LIM_IDLE gives more than half of the hover thrust of a \
+             rotor (it is a floor on every motor)"
+            .into(),
         other => format!("{other:?}"),
     }
 }

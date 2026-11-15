@@ -130,3 +130,92 @@ fn the_default_configuration_passes_every_rule() {
     }
     let _ = set; // used by later tests
 }
+
+// ---- LIM_IDLE ----
+
+/// The thrust fraction a motor command gives (the curve `run_rate` inverts).
+fn fraction(u: f32, expo: f32) -> f32 {
+    (1.0 - expo) * u + expo * u * u
+}
+
+#[test]
+fn idle_must_give_at_most_half_the_hover_thrust() {
+    let q = quad();
+    // The table maximum is 0.5 now.
+    let def = &params::PARAMS[id("LIM_IDLE").index()];
+    assert_eq!(def.max, ParamValue::F32(0.5));
+    assert!(def.description.contains("half"), "{}", def.description);
+    // Hover is 0.65 * g / 32 N = 0.199 of full thrust per rotor; half of that
+    // is reached by command sqrt(0.0996) = 0.3156 with expo 1.
+    let hover_fraction = q.weight_n() / q.total_max_thrust_n();
+    let mut ok = 0.0_f32;
+    let mut bad = 0.5_f32;
+    // Bisect the largest accepted value through `set`.
+    for _ in 0..40 {
+        let mid = 0.5 * (ok + bad);
+        let mut c = q;
+        if set(&mut c, "LIM_IDLE", mid).is_ok() {
+            ok = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    assert!(
+        (fraction(ok, 1.0) - 0.5 * hover_fraction).abs() < 1e-4,
+        "largest accepted idle {ok} gives fraction {} against half hover {}",
+        fraction(ok, 1.0),
+        0.5 * hover_fraction
+    );
+    // Just above is refused with the rule's own error, below is accepted, the
+    // default is accepted, and a refusal leaves the configuration alone.
+    let mut c = q;
+    assert_eq!(set(&mut c, "LIM_IDLE", 0.05), Ok(()));
+    assert_eq!(set(&mut c, "LIM_IDLE", ok), Ok(()));
+    assert_eq!(c.limits.idle_command, ok);
+    let mut c = q;
+    assert_eq!(
+        set(&mut c, "LIM_IDLE", 0.45),
+        Err(ParamError::Invalid(ConfigError::IdleTooHigh))
+    );
+    assert_eq!(
+        set(&mut c, "LIM_IDLE", 0.6),
+        Err(ParamError::OutOfRange),
+        "above the table maximum"
+    );
+    // The old table maximum, 1, is out of range; 0.5 is not accepted on this
+    // vehicle either.
+    assert_eq!(
+        set(&mut c, "LIM_IDLE", 0.5),
+        Err(ParamError::Invalid(ConfigError::IdleTooHigh))
+    );
+    // validate sees it too, whatever way the value got there.
+    let mut v = q;
+    v.limits.idle_command = 0.45;
+    assert_eq!(v.validate(), Err(ConfigError::IdleTooHigh));
+    v.limits.idle_command = ok;
+    assert_eq!(v.validate(), Ok(()));
+}
+
+#[test]
+fn the_idle_rule_follows_the_thrust_curve_and_the_weight() {
+    // Expo 0: thrust is linear in the command, so half of hover is
+    // 0.5 * 0.199 = 0.0996.
+    let mut lin = quad();
+    lin.thrust_expo = 0.0;
+    let mut c = lin;
+    assert_eq!(set(&mut c, "LIM_IDLE", 0.09), Ok(()));
+    assert_eq!(
+        set(&mut c, "LIM_IDLE", 0.11),
+        Err(ParamError::Invalid(ConfigError::IdleTooHigh))
+    );
+    // A heavier vehicle (hover at 0.4 of full thrust) allows a larger idle
+    // command than the light one: 0.5 * 0.4 = 0.2 of thrust, command 0.447.
+    let mut heavy = quad();
+    heavy.mass_kg = 1.3;
+    let mut c = heavy;
+    assert_eq!(set(&mut c, "LIM_IDLE", 0.4), Ok(()));
+    assert_eq!(
+        set(&mut c, "LIM_IDLE", 0.5),
+        Err(ParamError::Invalid(ConfigError::IdleTooHigh))
+    );
+}

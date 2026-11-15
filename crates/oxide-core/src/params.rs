@@ -487,8 +487,8 @@ declare_params! {
             "Limit on the velocity loop integral term.";
         f32 LIM_MIN_THRUST = min_thrust_fraction_of_hover: 0.1, 0.0, BELOW_ONE, "", Limits, live,
             "Minimum collective thrust while flying, as a fraction of hover thrust. Must stay below LAND_TD_THRUST.";
-        f32 LIM_IDLE = idle_command: 0.05, 0.0, 1.0, "", Limits, live,
-            "Motor command while armed with no demand, 0 to 1.";
+        f32 LIM_IDLE = idle_command: 0.05, 0.0, 0.5, "", Limits, live,
+            "Lowest motor command on every motor at all times while armed, 0 to 0.5: a floor, not only a command for no demand. The thrust it gives (through the thrust curve) must be at most half of the hover thrust of a rotor, or the vehicle could not be held down or steered.";
         f32 LIM_STICK_DB = stick_deadband: 0.05, 0.0, 0.5, "", Limits, live,
             "Stick deadband: a stick within this of centre reads as centred, and the rest of the travel is rescaled to the full range.";
     }
@@ -1098,6 +1098,7 @@ mod tests {
             "LIM_MIN_THRUST",
             "LAND_BLIND_THR",
             "LAND_SPEED",
+            "LIM_IDLE",
             "BAT_CRIT_V",
             "BAT_LOW_V",
         ];
