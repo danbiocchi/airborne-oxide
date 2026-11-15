@@ -9,12 +9,13 @@
 
 use oxide_core::Core;
 use oxide_core::config::{EstimatorSource, FailsafeParams, VehicleConfig};
+use oxide_core::io::ParamSet;
 use oxide_core::io::{
     BrainHeartbeat, EventList, GcsHeartbeat, Inputs, Outputs, RcSample, Stamped, StateSample,
     Status, TrajectorySetpoint,
 };
 use oxide_core::math::{Quat, Vec3};
-use oxide_core::params::{self, ParamError, ParamKind, ParamValue};
+use oxide_core::params::{self, LoadReport, ParamError, ParamKind, ParamValue};
 use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
 
@@ -248,6 +249,10 @@ pub struct Simulation<P: Pilot, const N: usize> {
     last_rc: Option<RcSample>,
     brain_progress: u32,
     last_inputs: Inputs,
+    /// A parameter change for the next tick's inputs.
+    next_param_set: Option<ParamSet>,
+    /// An acknowledgement of a parameter fault for the next tick's inputs.
+    next_param_ack: bool,
 }
 
 impl<P: Pilot, const N: usize> Simulation<P, N> {
@@ -261,6 +266,23 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         profile: Profile,
         pilot: P,
         options: SimOptions,
+    ) -> Result<Self, SimError> {
+        Self::with_boot(airframe, profile, pilot, options, |_| LoadReport::default())
+    }
+
+    /// Like [`Simulation::with_options`], with a boot step: `boot` receives the
+    /// configuration after the airframe's and options' parameters were
+    /// applied, and before the core is built, and may change it (this is where
+    /// firmware applies the values it loaded from flash, `ParamStore::boot`).
+    /// The [`LoadReport`] it returns is handed to `Core::report_param_load`
+    /// before the first tick. A boot step that changes nothing and returns a
+    /// clean report gives exactly the simulation `with_options` builds.
+    pub fn with_boot(
+        airframe: &Airframe,
+        profile: Profile,
+        pilot: P,
+        options: SimOptions,
+        boot: impl FnOnce(&mut VehicleConfig<N>) -> LoadReport,
     ) -> Result<Self, SimError> {
         let mut airframe = airframe.clone();
         if let Some(b) = options.battery {
@@ -286,9 +308,12 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             },
             (_, other) => other,
         })?;
-        // A parameter may have changed the source: the state input follows it.
+        let report = boot(&mut cfg);
+        // A parameter (or a stored value) may have changed the source: the
+        // state input follows it.
         let truth_state = cfg.estimator.source == EstimatorSource::External;
-        let core = Core::new(cfg, profile).map_err(SimError::Core)?;
+        let mut core = Core::new(cfg, profile).map_err(SimError::Core)?;
+        core.report_param_load(report);
         let base_us = u64::from(profile.base_period_us);
         // One time base: every period must be a whole number of ticks.
         if base_us == 0 || !crate::scenario::COMMAND_PERIOD_US.is_multiple_of(base_us) {
@@ -320,6 +345,8 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             last_rc: None,
             brain_progress: 0,
             last_inputs: Inputs::default(),
+            next_param_set: None,
+            next_param_ack: false,
         })
     }
 
@@ -343,6 +370,21 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     }
     pub fn core(&self) -> &Core<N> {
         &self.core
+    }
+    /// The core, between ticks (for the parameter store's `service`, which
+    /// tells it that values are saved).
+    pub fn core_mut(&mut self) -> &mut Core<N> {
+        &mut self.core
+    }
+    /// Puts a parameter change into the next tick's inputs (at most one per
+    /// tick: a later call before the tick replaces it).
+    pub fn queue_param_set(&mut self, set: ParamSet) {
+        self.next_param_set = Some(set);
+    }
+    /// Puts an operator's acknowledgement of a parameter fault into the next
+    /// tick's inputs.
+    pub fn queue_param_ack(&mut self) {
+        self.next_param_ack = true;
     }
     pub fn sensors(&self) -> &SensorSuite<N> {
         &self.sensors
@@ -405,8 +447,8 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             setpoint: setpoint.map(|s| Stamped::ideal(t, s)),
             gcs_heartbeat,
             brain_heartbeat,
-            param_set: None,
-            param_ack: false,
+            param_set: self.next_param_set.take(),
+            param_ack: core::mem::take(&mut self.next_param_ack),
         };
         self.last_inputs = inputs;
 
