@@ -143,12 +143,18 @@ fn the_airframe_table_and_the_options_form_one_change() {
 
 #[test]
 fn a_list_that_breaks_a_rule_together_is_refused_naming_the_rule_and_the_parameters() {
-    let e = refused(&[("BAT_CRIT_V", 3.9), ("BAT_LOW_V", 3.8)]);
+    // Each is fine against the defaults (low 3.5, critical 3.3); only the pair breaks.
+    let e = refused(&[("BAT_CRIT_V", 3.45), ("BAT_LOW_V", 3.4)]);
     assert!(
         e.contains("BAT_CRIT_V") && e.contains("BAT_LOW_V") && e.contains("together"),
         "{e}"
     );
     assert!(e.contains("BAT_CRIT_V must not exceed BAT_LOW_V"), "{e}");
+    // A critical level of 3.9 breaks the rule alone (default low 3.5): it is
+    // blamed by name, with its value, and the other entry is not.
+    let e = refused(&[("BAT_CRIT_V", 3.9), ("BAT_LOW_V", 3.8)]);
+    assert!(e.contains("BAT_CRIT_V") && e.contains("value 3.9"), "{e}");
+    assert!(!e.contains("BAT_LOW_V") && !e.contains("together"), "{e}");
     // A bad value is named on its own, whatever else is in the list.
     let e = refused(&[("BAT_LOW_V", 3.8), ("POS_X_P", 1.0e9), ("BAT_CRIT_V", 3.6)]);
     assert!(
