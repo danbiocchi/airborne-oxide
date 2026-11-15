@@ -131,6 +131,11 @@ fn describe_rule(c: oxide_core::config::ConfigError) -> String {
              LIM_TILT and LIM_TILT_STAB, or the tilt the controller commands would count as a \
              loss of control"
             .into(),
+        ConfigError::FilterCutoffTooHigh => {
+            "RATE_GYRO_CUTOFF must be zero (off) or below 0.45 times \
+             the profile's rate-loop frequency (450 Hz at 1 kHz, 1800 Hz at 4 kHz)"
+                .into()
+        }
         other => format!("{other:?}"),
     }
 }

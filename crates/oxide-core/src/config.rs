@@ -63,6 +63,20 @@ pub struct Gains {
     pub position_p: Vec3<f32>,
 }
 
+impl Gains {
+    /// A gyro cut-off the profile's rate loop can realise: zero (off), or
+    /// below 0.45 times the base rate. `LowPass2::new` switches itself off at
+    /// or above that, which would make the parameter mean two things.
+    pub fn check_against(&self, profile: &Profile) -> Result<(), ConfigError> {
+        let base_hz = 1.0e6 / f64::from(profile.base_period_us.max(1));
+        let cutoff = f64::from(self.gyro_cutoff_hz);
+        if cutoff != 0.0 && cutoff >= 0.45 * base_hz {
+            return Err(ConfigError::FilterCutoffTooHigh);
+        }
+        Ok(())
+    }
+}
+
 impl Default for Gains {
     /// Starting gains for a small multirotor; auto-tuned per airframe later.
     /// The values are the defaults in the parameter table.
@@ -509,6 +523,9 @@ pub enum ConfigError {
     /// the larger tilt limit: normal commanded flight would switch the motors
     /// off.
     LossOfControlTooTight,
+    /// The gyro low-pass cut-off is at or above 0.45 times the rate-loop
+    /// frequency of the profile, where the filter would silently be off.
+    FilterCutoffTooHigh,
 }
 
 impl<const N: usize> VehicleConfig<N> {

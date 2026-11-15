@@ -18,7 +18,7 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | `RATE_PITCH_D` | Float | 0.3 | 0 | 2 |  | live | Rate loop derivative gain on pitch, applied to the measurement. |
 | `RATE_YAW_D` | Float | 0 | 0 | 1 |  | live | Rate loop derivative gain on yaw, applied to the measurement. |
 | `RATE_D_CUTOFF` | Float | 60 | 0 | 500 | Hz | live | Cut-off of the first-order low-pass on the rate loop derivative term. Zero turns it off. |
-| `RATE_GYRO_CUTOFF` | Float | 80 | 0 | 500 | Hz | disarmed | Cut-off of the second-order Butterworth low-pass on the gyro for the rate loop. Zero turns it off. The filter is rebuilt when this changes. |
+| `RATE_GYRO_CUTOFF` | Float | 80 | 0 | 500 | Hz | disarmed | Cut-off of the second-order Butterworth low-pass on the gyro for the rate loop. Zero turns it off. Must be below 0.45 times the rate-loop frequency of the profile (450 Hz at 1 kHz, 1800 Hz at 4 kHz); at or above that the filter used to be switched off silently, and now the value is refused. The filter is rebuilt when this changes. |
 
 ## Attitude loop
 

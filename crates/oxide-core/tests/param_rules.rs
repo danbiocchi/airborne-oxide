@@ -586,3 +586,51 @@ fn loss_of_control_angles_and_timers_have_minimums() {
         );
     }
 }
+
+// ---- gyro cut-off against the profile ----
+
+#[test]
+fn a_gyro_cutoff_the_filter_would_silently_drop_is_refused_against_the_profile() {
+    let q = quad();
+    let id = id("RATE_GYRO_CUTOFF");
+    // F405: 1 kHz rate loop, so 0.45 x 1000 = 450 Hz. At or above that
+    // `LowPass2::new` used to switch the filter off without a word.
+    for hz in [450.0_f32, 460.0, 500.0] {
+        let mut c = q;
+        assert_eq!(
+            params::set(&mut c, &F405_LEAN, id, ParamValue::F32(hz)),
+            Err(ParamError::Invalid(ConfigError::FilterCutoffTooHigh)),
+            "{hz} Hz on 1 kHz"
+        );
+        assert_eq!(c, q);
+        // The same value is a real filter on the 4 kHz profile.
+        let mut c = q;
+        assert_eq!(
+            params::set(&mut c, &H743_FULL, id, ParamValue::F32(hz)),
+            Ok(()),
+            "{hz} Hz on 4 kHz"
+        );
+    }
+    // Just under the limit, and zero (off), are accepted on both.
+    for profile in [&F405_LEAN, &H743_FULL] {
+        for hz in [0.0_f32, 80.0, 449.0, 449.9] {
+            let mut c = q;
+            assert_eq!(
+                params::set(&mut c, profile, id, ParamValue::F32(hz)),
+                Ok(()),
+                "{hz}"
+            );
+        }
+    }
+    // The core refuses to start with such a configuration on that profile.
+    let mut bad = q;
+    bad.gains.gyro_cutoff_hz = 460.0;
+    assert_eq!(
+        oxide_core::Core::new(bad, F405_LEAN).err(),
+        Some(ConfigError::FilterCutoffTooHigh)
+    );
+    assert!(oxide_core::Core::new(bad, H743_FULL).is_ok());
+    // The description says so.
+    let def = &params::PARAMS[id.index()];
+    assert!(def.description.contains("0.45"), "{}", def.description);
+}

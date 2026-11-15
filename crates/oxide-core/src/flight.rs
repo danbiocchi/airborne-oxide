@@ -144,6 +144,7 @@ impl<const N: usize> Core<N> {
     pub fn new(cfg: VehicleConfig<N>, profile: Profile) -> Result<Self, ConfigError> {
         cfg.validate()?;
         profile.validate()?;
+        cfg.gains.check_against(&profile)?;
         let mixer = Mixer::new(&cfg.rotors)?;
         let p = |id| {
             profile

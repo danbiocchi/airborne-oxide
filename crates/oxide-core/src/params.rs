@@ -430,7 +430,7 @@ declare_params! {
         f32 RATE_D_CUTOFF = rate_d_cutoff_hz: 60.0, 0.0, 500.0, "Hz", Rate, live,
             "Cut-off of the first-order low-pass on the rate loop derivative term. Zero turns it off.";
         f32 RATE_GYRO_CUTOFF = gyro_cutoff_hz: 80.0, 0.0, 500.0, "Hz", Rate, disarmed,
-            "Cut-off of the second-order Butterworth low-pass on the gyro for the rate loop. Zero turns it off. The filter is rebuilt when this changes.";
+            "Cut-off of the second-order Butterworth low-pass on the gyro for the rate loop. Zero turns it off. Must be below 0.45 times the rate-loop frequency of the profile (450 Hz at 1 kHz, 1800 Hz at 4 kHz); at or above that the filter used to be switched off silently, and now the value is refused. The filter is rebuilt when this changes.";
         f32 ATT_ROLL_P = attitude_p.x: 6.5, 0.0, 50.0, "1/s", Attitude, live,
             "Attitude loop proportional gain on roll: rate demanded per rad of attitude error.";
         f32 ATT_PITCH_P = attitude_p.y: 6.5, 0.0, 50.0, "1/s", Attitude, live,
@@ -669,6 +669,9 @@ fn check_together<const N: usize>(
     profile: &Profile,
 ) -> Result<(), ParamError> {
     next.validate().map_err(ParamError::Invalid)?;
+    next.gains
+        .check_against(profile)
+        .map_err(ParamError::Invalid)?;
     next.estimator
         .ekf
         .validate(profile)
@@ -1103,6 +1106,7 @@ mod tests {
             "LIM_TILT",
             "LIM_TILT_STAB",
             "FS_LOC_TILT",
+            "RATE_GYRO_CUTOFF",
             "EKF_OUT_TAU",
             "BAT_CRIT_V",
             "BAT_LOW_V",
