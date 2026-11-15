@@ -634,3 +634,24 @@ fn a_gyro_cutoff_the_filter_would_silently_drop_is_refused_against_the_profile()
     let def = &params::PARAMS[id.index()];
     assert!(def.description.contains("0.45"), "{}", def.description);
 }
+
+// ---- descriptions ----
+
+#[test]
+fn descriptions_state_what_a_user_must_know() {
+    let text = |name: &str| params::PARAMS[id(name).index()].description;
+    // The three link timeouts must be longer than the sender's period.
+    for name in ["FS_GCS_TIMEOUT", "FS_BRAIN_TMO", "FS_SETPT_TMO"] {
+        assert!(
+            text(name).contains("longer than the period"),
+            "{name}: {}",
+            text(name)
+        );
+    }
+    // RTL_ALT applies from the next return, not one under way.
+    assert!(
+        text("RTL_ALT").contains("next return"),
+        "{}",
+        text("RTL_ALT")
+    );
+}

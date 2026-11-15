@@ -150,8 +150,8 @@ pub fn doc() -> String {
         out,
         "Every tunable value of the flight core is one of these {} parameters (ADR-0004). \
 Set one for a simulated flight with `--param NAME=VALUE` (repeatable), with `--params FILE.toml` \
-(a `[params]` table of `NAME = value`) or in the `[params]` table of an airframe file; \
-they are applied in that order of increasing priority: airframe file, `--params` file, then the flags. \
+(a `[params]` table of `NAME = value`), or in the `[params]` table of an airframe file or of a scenario file; \
+they are applied in this order of increasing priority: airframe file, scenario file, `--params` file, then the flags. \
 A value outside its range, of the wrong type, or that would break a rule between two parameters is refused \
 and the run does not start. Units are the core's own: radians, metres, seconds, volts. \
 \"live\" parameters take effect in flight; \"disarmed\" ones are accepted only while disarmed. \
@@ -494,6 +494,15 @@ mod tests {
             .find(|l| l.starts_with("RATE_ROLL_P "))
             .expect("line");
         assert!(line.contains("28"), "{line}");
+    }
+
+    #[test]
+    fn the_intro_names_the_scenario_file_between_the_airframe_and_the_command_line() {
+        let text = doc();
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let order = "airframe file, scenario file, `--params` file, then the flags";
+        assert!(text.contains(order), "{}", &text[..600]);
+        assert!(at("airframe file, scenario file") < at("then the flags"));
     }
 
     #[test]

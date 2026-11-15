@@ -556,15 +556,15 @@ declare_params! {
         f32 FS_RC_HOLD = rc_loss_hold_s: 3.0, 0.0, DUR, "s", Failsafe, live,
             "After RC loss in a pilot mode: hold this long, then return.";
         secs FS_GCS_TIMEOUT = gcs_timeout_us: 3.0, MIN_TIMEOUT, MAX_TIMEOUT, "s", Failsafe, live,
-            "The ground station counts as lost after this long without a heartbeat.";
+            "The ground station counts as lost after this long without a heartbeat. Must be longer than the period at which the ground station sends it (the simulator's is 1 s), or a live link flaps between lost and found.";
         f32 FS_NOLINK_RTL = no_link_rtl_s: 60.0, 0.0, DUR, "s", Failsafe, live,
             "Offboard with no human link: continue this long, then return.";
         secs FS_BRAIN_TMO = brain_timeout_us: 2.0, MIN_TIMEOUT, MAX_TIMEOUT, "s", Failsafe, live,
-            "The brain counts as lost when its progress counter has not advanced for this long.";
+            "The brain counts as lost when its progress counter has not advanced for this long. Must be longer than the period at which the brain sends its heartbeat (the simulator's is 0.2 s), or a live brain counts as lost.";
         f32 FS_BRAIN_RTL = brain_loss_rtl_s: 10.0, 0.0, DUR, "s", Failsafe, live,
             "After brain loss: hold this long, then return.";
         secs FS_SETPT_TMO = setpoint_timeout_us: 0.5, MIN_TIMEOUT, MAX_TIMEOUT, "s", Failsafe, live,
-            "Tier-2 setpoints count as stale after this long.";
+            "Tier-2 setpoints count as stale after this long. Must be longer than the period at which the brain sends setpoints (the simulator's is 0.02 s), or live setpoints count as stale.";
         f32 FS_GPS_LAND = gps_loss_land_s: 30.0, 0.0, DUR, "s", Failsafe, live,
             "After losing position with nobody flying: hold this long, then land.";
         f32 FS_CLEAR_HYST = clear_hysteresis_s: 1.0, 0.0, DUR, "s", Failsafe, live,
@@ -590,7 +590,7 @@ declare_params! {
         f32 FS_LOC_TILT_T = loc_tilt_s: 0.25, 0.05, DUR, "s", Failsafe, live,
             "Loss of control: how long the tilt must stay above FS_LOC_TILT. At least 0.05 s.";
         f32 RTL_ALT = rtl_altitude_m: 10.0, 0.0, 10000.0, "m", Return, live,
-            "Return altitude above home.";
+            "Return altitude above home. A change applies from the next return: one already under way keeps the height it started with.";
         f32 RTL_SPEED = rtl_speed_mps: 3.0, 0.1, 100.0, "m/s", Return, live,
             "Return ground speed.";
         f32 LAND_SPEED = land_speed_mps: 0.7, 0.0, 10.0, "m/s", Land, live,
