@@ -208,5 +208,6 @@ mod events;
 mod newest;
 mod rates;
 mod replay_level;
+mod samples;
 mod text;
 mod whole;

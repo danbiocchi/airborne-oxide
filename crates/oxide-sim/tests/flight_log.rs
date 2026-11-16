@@ -5,6 +5,7 @@
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_log::reader::{Item, UlogFile};
 use oxide_sim::fault_scenarios;
+use oxide_sim::faults::FaultKind;
 use oxide_sim::flight_log::{Level, LogBuild, LogError, SharedBuffer};
 use oxide_sim::scenario::Script;
 use oxide_sim::{Airframe, SimOptions, Simulation};
@@ -129,6 +130,124 @@ fn the_log_of_a_whole_flight_parses_and_each_topic_has_its_rate() {
                 "{topic} on {}: {n} records, {want} expected",
                 profile.name
             );
+        }
+    }
+}
+
+/// The five topics made from an input sample: the topic's rate in Hz, the
+/// period of the sensor in the simulator (µs; the IMU's is the profile's base
+/// period) and the fault that silences it.
+const SENSOR_TOPICS: [(&str, u64, Option<FaultKind>); 5] = [
+    ("sensor_combined", 100, Some(FaultKind::ImuLoss)),
+    ("manual_control_setpoint", 10, None),
+    ("vehicle_magnetometer", 10, Some(FaultKind::MagLoss)),
+    ("vehicle_air_data", 10, Some(FaultKind::BaroLoss)),
+    ("battery_status", 5, None),
+];
+
+/// The age of the sample a record of one of those topics carries, µs: the
+/// record's `timestamp` minus the sample's own time (`timestamp_sample`, or
+/// `timestamp + accelerometer_timestamp_relative` for `sensor_combined`).
+/// `battery_status` has no time of its sample.
+fn sample_age_us(topic: &str, r: &oxide_log::reader::RecordView<'_>) -> Option<i64> {
+    let now = i64::try_from(r.u64("timestamp")?).ok()?;
+    match topic {
+        "sensor_combined" => Some(-i64::from(r.i32("accelerometer_timestamp_relative")?)),
+        "battery_status" => None,
+        _ => Some(now - i64::try_from(r.u64("timestamp_sample")?).ok()?),
+    }
+}
+
+fn sensor_period_us(topic: &str, profile: &Profile) -> i64 {
+    match topic {
+        "sensor_combined" => i64::from(profile.base_period_us),
+        _ => 20_000, // the simulator's baro, mag and RC periods
+    }
+}
+
+#[test]
+fn a_sensor_topic_carries_a_fresh_sample_and_stops_when_its_sensor_stops() {
+    for name in [
+        "imu-loss",
+        "baro-loss",
+        "mag-loss",
+        "rc-loss-position",
+        "gps-loss",
+    ] {
+        let scenario = fault_scenarios::by_name(name).expect("scenario");
+        for profile in BOTH {
+            let f = fly(name, profile, true);
+            let bytes = f.file.expect("file");
+            let file = UlogFile::parse(&bytes).expect("parses");
+            for (topic, hz, lost_by) in SENSOR_TOPICS {
+                let period = (1_000_000 / hz) as i64;
+                let bound = period + sensor_period_us(topic, &profile);
+                let mut n = 0;
+                for r in file.records(topic) {
+                    n += 1;
+                    if let Some(age) = sample_age_us(topic, &r) {
+                        assert!(
+                            (0..bound).contains(&age),
+                            "{name} on {}: a {topic} record carries a sample {age} us old \
+                             (limit {bound})",
+                            profile.name
+                        );
+                    }
+                }
+                assert!(n > 0, "{name}: no {topic} record");
+                // Inside the loss window of its own sensor, a topic is silent
+                // after its first period.
+                for fault in scenario.faults.iter().filter(|x| Some(x.kind) == lost_by) {
+                    let from = fault.start_us() + period as u64;
+                    let to = fault.end_s.map_or(u64::MAX, |e| (e * 1e6).round() as u64);
+                    let inside: Vec<u64> = file
+                        .records(topic)
+                        .filter_map(|r| r.u64("timestamp"))
+                        .filter(|t| (from..to).contains(t))
+                        .collect();
+                    assert!(
+                        inside.is_empty(),
+                        "{name} on {}: {topic} has {} records inside the loss",
+                        profile.name,
+                        inside.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_lost_sensors_topic_has_the_records_before_the_loss_and_the_rest_are_unchanged() {
+    // Before this change `sensor_combined` of imu-loss had 2500 records,
+    // `vehicle_air_data` of baro-loss 600 and `vehicle_magnetometer` of
+    // mag-loss 900: the last sample repeated to the end of the flight.
+    for (name, lost, lost_hz) in [
+        ("imu-loss", "sensor_combined", 100u64),
+        ("baro-loss", "vehicle_air_data", 10),
+        ("mag-loss", "vehicle_magnetometer", 10),
+    ] {
+        let scenario = fault_scenarios::by_name(name).expect("scenario");
+        let start_us = scenario.faults[0].start_us();
+        for profile in BOTH {
+            let f = fly(name, profile, true);
+            let bytes = f.file.expect("file");
+            let file = UlogFile::parse(&bytes).expect("parses");
+            for (topic, hz, _) in SENSOR_TOPICS {
+                let n = file.records(topic).count() as u64;
+                let want = if topic == lost {
+                    // The grid before the loss, and the grid point at the
+                    // loss itself, which the last sample before it feeds.
+                    start_us * lost_hz / 1_000_000 + 1
+                } else {
+                    scenario.end().0 * hz / 1_000_000
+                };
+                assert!(
+                    n.abs_diff(want) <= u64::from(topic != lost),
+                    "{name} on {}: {topic} has {n} records, {want} expected",
+                    profile.name
+                );
+            }
         }
     }
 }

@@ -264,16 +264,17 @@ fn a_topic_that_comes_from_an_input_is_absent_until_its_first_sample() {
     assert_eq!(first("vehicle_magnetometer"), Some(220_000));
     assert_eq!(first("vehicle_air_data"), Some(300_000));
     assert_eq!(first("battery_status"), Some(350_000));
-    // Once seen, the newest sample is held and written at the topic's rate
-    // even on ticks without a new one.
+    // A topic made from an input sample waits for a sample (ADR-0005 §3):
+    // with samples only on the first tick, each is written once and then
+    // nothing is repeated.
     let held = run(1000, 400_000, |t| {
         if t.now > 0 {
             t.inputs = Inputs::default();
         }
     })
     .0;
-    assert_eq!(times(&held, "sensor_combined").len(), 40);
-    assert_eq!(times(&held, "battery_status").len(), 2);
+    assert_eq!(times(&held, "sensor_combined"), [0]);
+    assert_eq!(times(&held, "battery_status"), [0]);
 }
 
 #[test]

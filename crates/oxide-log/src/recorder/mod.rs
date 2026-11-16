@@ -329,10 +329,36 @@ pub struct Recorder<const CAP: usize> {
     mag: Option<Stamped<MagSample>>,
     baro: Option<Stamped<BaroSample>>,
     battery: Option<Stamped<BatterySample>>,
+    /// A sample of each input has arrived since its topic's last record.
+    fresh: Fresh,
     clocks: Clocks,
     vehicle_status: OnChange<(u8, u8, u8, bool, bool)>,
     failsafe_flags: OnChange<u16>,
     oxide_status: OnChange<OxideStatusKey>,
+}
+
+/// Which inputs have delivered a sample since their topic's last record. A
+/// topic made from an input sample is written when it is due and its input
+/// is fresh, so a sensor that stops leaves a gap in its topic.
+#[derive(Clone, Copy, Debug)]
+struct Fresh {
+    imu: bool,
+    rc: bool,
+    mag: bool,
+    baro: bool,
+    battery: bool,
+}
+
+impl Fresh {
+    const fn new() -> Self {
+        Self {
+            imu: false,
+            rc: false,
+            mag: false,
+            baro: false,
+            battery: false,
+        }
+    }
 }
 
 /// One clock per streamed topic.
@@ -402,6 +428,7 @@ impl<const CAP: usize> Recorder<CAP> {
             mag: None,
             baro: None,
             battery: None,
+            fresh: Fresh::new(),
             clocks: Clocks::new(),
             vehicle_status: OnChange::new(),
             failsafe_flags: OnChange::new(),
@@ -475,7 +502,9 @@ impl<const CAP: usize> Recorder<CAP> {
     }
 
     /// Writes what is due after a tick: streamed topics at their rates, on
-    /// the tick clock, from the newest sample of each input; the status
+    /// the tick clock; a topic made from an input sample only when a sample
+    /// has arrived since its last record (a sensor that stops leaves a gap,
+    /// and its first sample after the gap is written at once); the status
     /// topics when they change and at least once a second; `oxide_logger`
     /// once a second. Nothing is written before [`start`](Self::start). A
     /// record that does not fit the ring is dropped and counted.
@@ -549,8 +578,10 @@ impl<const CAP: usize> Recorder<CAP> {
         // Streams, in the order of their message ids.
         let dt = self.imu_dt_us;
         if let Some(imu) = self.imu
+            && self.fresh.imu
             && take(&mut self.clocks.sensor_combined, t)
         {
+            self.fresh.imu = false;
             self.stream(t, id::SENSOR_COMBINED, &topics::SENSOR_COMBINED, |w| {
                 topics::sensor_combined(w, now, &imu, dt)
             });
@@ -670,8 +701,10 @@ impl<const CAP: usize> Recorder<CAP> {
             );
         }
         if let Some(rc) = self.rc
+            && self.fresh.rc
             && take(&mut self.clocks.manual_control, t)
         {
+            self.fresh.rc = false;
             self.stream(
                 t,
                 id::MANUAL_CONTROL_SETPOINT,
@@ -680,8 +713,10 @@ impl<const CAP: usize> Recorder<CAP> {
             );
         }
         if let Some(mag) = self.mag
+            && self.fresh.mag
             && take(&mut self.clocks.magnetometer, t)
         {
+            self.fresh.mag = false;
             self.stream(
                 t,
                 id::VEHICLE_MAGNETOMETER,
@@ -690,15 +725,19 @@ impl<const CAP: usize> Recorder<CAP> {
             );
         }
         if let Some(baro) = self.baro
+            && self.fresh.baro
             && take(&mut self.clocks.air_data, t)
         {
+            self.fresh.baro = false;
             self.stream(t, id::VEHICLE_AIR_DATA, &topics::VEHICLE_AIR_DATA, |w| {
                 topics::vehicle_air_data(w, now, &baro)
             });
         }
         if let Some(b) = self.battery
+            && self.fresh.battery
             && take(&mut self.clocks.battery, t)
         {
+            self.fresh.battery = false;
             self.stream(t, id::BATTERY_STATUS, &topics::BATTERY_STATUS, |w| {
                 topics::battery_status(
                     w,
@@ -836,6 +875,11 @@ impl<const CAP: usize> Recorder<CAP> {
 
     /// Remembers the newest sample of each input that feeds a topic.
     fn observe(&mut self, inputs: &Inputs) {
+        self.fresh.imu |= inputs.imu.is_some();
+        self.fresh.rc |= inputs.rc.is_some();
+        self.fresh.mag |= inputs.mag.is_some();
+        self.fresh.baro |= inputs.baro.is_some();
+        self.fresh.battery |= inputs.battery.is_some();
         if let Some(s) = inputs.imu {
             self.imu_dt_us = match self.imu {
                 Some(prev) => u32::try_from(s.t_sample.since(prev.t_sample)).unwrap_or(u32::MAX),
