@@ -74,9 +74,17 @@ struct Flown {
     refused: usize,
     fault_events: usize,
     acked: usize,
+    refused_arms: usize,
+    recovered: usize,
 }
 
 fn fly(flash: Flash) -> Flown {
+    fly_with(flash, true, 0)
+}
+
+/// `ack`: whether the operator acknowledges a parameter fault at 1 s.
+/// `torn`: records the store claims to have skipped at boot.
+fn fly_with(flash: Flash, ack: bool, torn: u16) -> Flown {
     let airframe = Airframe::reference_quad().expect("reference airframe");
     let mut flash = Some(flash);
     let mut store = None;
@@ -84,8 +92,8 @@ fn fly(flash: Flash) -> Flown {
     let mut sim = Sim::with_boot(&airframe, PROFILE, script(), SimOptions::default(), |cfg| {
         let (s, r) = ParamStore::boot(flash.take().expect("once"), cfg, &PROFILE);
         store = Some(s);
-        report = r;
-        r
+        report = LoadReport { torn, ..r };
+        report
     })
     .expect("simulation");
     let mut store: ParamStore<Flash, 4> = store.expect("booted");
@@ -111,11 +119,13 @@ fn fly(flash: Flash) -> Flown {
         refused: 0,
         fault_events: 0,
         acked: 0,
+        refused_arms: 0,
+        recovered: 0,
     };
     let mut was_armed = false;
     while sim.time().as_secs_f64() < 16.0 {
         let t = sim.time().as_secs_f64();
-        if !acked_queued && t >= 1.0 {
+        if ack && !acked_queued && t >= 1.0 {
             sim.queue_param_ack();
             acked_queued = true;
         } else if let Some((at, ps)) = changes.get(next)
@@ -131,6 +141,8 @@ fn fly(flash: Flash) -> Flown {
                 EventKind::ParamRefused { .. } => out.refused += 1,
                 EventKind::ParamLoadFault(_) => out.fault_events += 1,
                 EventKind::ParamFaultAcked => out.acked += 1,
+                EventKind::ArmRefused(_) => out.refused_arms += 1,
+                EventKind::ParamLoadRecovered(_) => out.recovered += 1,
                 _ => {}
             }
         }
@@ -273,4 +285,49 @@ fn a_clean_boot_flight_has_no_fault_and_replays_identically_too() {
     let r = replay(&flown.bytes, &ReplayOptions::default()).expect("replays");
     assert!(r.identical(), "{:?}", r.first_difference);
     assert_eq!(r.ticks, flown.ticks);
+}
+
+#[test]
+fn a_flight_whose_arming_is_refused_by_an_unacknowledged_fault_replays_identically() {
+    // The fault is never acknowledged: the arm switch goes up at 2 s and the
+    // core refuses (pre-arm flag CONFIG), so the vehicle never flies.
+    let flown = fly_with(flash_with_an_unknown_key(), false, 0);
+    assert_eq!(flown.fault_events, 1);
+    assert_eq!(flown.acked, 0);
+    assert_eq!(flown.refused_arms, 1, "arming is refused");
+    assert_eq!(flown.disarmed_at, 0, "and it never armed");
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    assert!(f.records("oxide_event").count() >= 2);
+    drop(f);
+    let r = replay(&flown.bytes, &ReplayOptions::default()).expect("replays");
+    assert!(r.identical(), "{:?}", r.first_difference);
+    assert_eq!(r.ticks, flown.ticks);
+    assert_eq!(r.stop, Stop::End);
+}
+
+#[test]
+fn a_clean_boot_with_torn_records_emits_a_recovery_and_replays_identically() {
+    let flown = fly_with(Flash::new(), true, 3);
+    assert!(flown.report.clean());
+    assert_eq!(flown.report.torn, 3);
+    assert_eq!(flown.fault_events, 0, "no fault");
+    assert_eq!(flown.recovered, 1, "one ParamLoadRecovered event");
+    assert_eq!(flown.refused_arms, 0, "arming is not refused");
+    let r = replay(&flown.bytes, &ReplayOptions::default()).expect("replays");
+    assert!(r.identical(), "{:?}", r.first_difference);
+    assert_eq!(r.ticks, flown.ticks);
+    assert_eq!(r.stop, Stop::End);
+}
+
+#[test]
+fn the_torn_count_of_the_boot_report_is_what_replays_the_recovery_event() {
+    // Taking the torn count out of the recorded report loses the event: the
+    // replay differs.
+    let flown = fly_with(Flash::new(), true, 3);
+    let mut bytes = flown.bytes.clone();
+    let at = field_at(&flown.bytes, "oxide_boot", 0, "torn");
+    bytes[at..at + 2].fill(0);
+    let r = replay(&bytes, &ReplayOptions::default()).expect("replays");
+    assert!(r.first_difference.is_some());
+    assert_eq!(r.stop, Stop::Difference);
 }
