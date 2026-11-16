@@ -32,7 +32,10 @@ pub struct Stats {
     pub written: u32,
     /// `Stream` messages dropped (too big, or into the reserve, or the builder failed).
     pub dropped_stream: u32,
-    /// `Must` messages dropped.
+    /// `Must` write attempts that failed. This counts attempts, not distinct
+    /// lost messages: the recorder tries a status record again on the next
+    /// tick when it did not fit, and each failed try counts, and an event's
+    /// text and its data record count separately.
     pub dropped_must: u32,
     /// Bytes committed to the ring, prefixes included.
     pub bytes: u64,
