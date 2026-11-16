@@ -29,7 +29,10 @@
     )
 )]
 
+#[cfg(any(test, feature = "std"))]
+pub mod format;
 pub mod msg;
+pub mod record;
 
 pub use msg::{Error, Sink};
 
