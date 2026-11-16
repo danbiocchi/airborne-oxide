@@ -109,7 +109,7 @@ Records go into a fixed ring buffer of whole messages; a lower-priority task dra
 
 - **When the buffer is full the record is dropped and counted.** When room returns, a dropout message with the length of the gap is written first, as PX4 does.
 - **Events, parameters and status may use the whole buffer;** streamed data stops short of the last quarter, so a burst of samples cannot push out the message that says why the vehicle landed.
-- **`oxide_logger`** reports messages written and dropped and the buffer's high-water mark once a second, because PX4's dropout message has a duration and no count. The count for streamed data is exact. A status record that did not fit is tried again on the next tick, so the count for events and status is of attempts.
+- **`oxide_logger`** reports messages written and dropped and the buffer's high-water mark once a second, because PX4's dropout message has a duration and no count. The count for streamed data is exact. A status record that did not fit is tried again on the next tick, so the count for events and status is of attempts. The counters are 32-bit and stop at their maximum instead of wrapping: after 63 days at the normal level, 12 days at the replay level on the F405 profile and under 4 days on the H743 profile.
 - A message is in the buffer whole or not at all, and so are the dropout and synchronisation messages written ahead of it.
 - The recorder is the buffer plus under 1 kB of state, and a tick on which nothing is due costs a few comparisons.
 
@@ -143,11 +143,12 @@ In the simulator the buffer is 64 kB and is drained to the file after every tick
 
 ## Consequences
 
-- A flight in the simulator or on the bench opens in PlotJuggler and Flight Review with the plots a PX4 user expects.
+- A flight in the simulator or on the bench is written for PlotJuggler and Flight Review: PX4's topic names, fields and units, and the fields Flight Review's source needs. `pyulog` reads the files in CI. Nobody has opened one in Flight Review or PlotJuggler yet (see Deferred).
 - A bug seen in a flight can be reproduced on a desk from its log, and a fix can be shown to change the flight at the tick it should.
-- A normal-level log is about 41 kB/s on either profile: 3.3 MB for the 80 s of `rc-loss-position`, of which 10 kB are the definitions.
+- A normal-level log is about 41 kB/s on either profile: 3.2 MB for the 80 s of `rc-loss-position`, of which 10 kB are the definitions.
 - Replay logs are large. The tick record, an IMU sample and the outputs are 165 bytes a tick. A whole replay-level file of the simulator, with every sensor and the normal level's records, is about 219 kB/s on the F405 profile (1 kHz) and 714 kB/s on the H743 profile (4 kHz): 17.5 MB and 57 MB for those 80 s. Whether an SD card keeps up is measured at bring-up; the outputs record can be packed tighter if it does not.
-- Replaying is fast: the 80 s flight replays in about 0.2 s on the F405 profile and 0.7 s on the H743 profile.
+- Replaying is fast: the 80 s flight replays in about 0.2 s on the F405 profile and 0.7 s on the H743 profile. The tool reads the whole file into memory and needs about four times the file's size, so an hour at the H743 profile's replay level (2.6 GB) wants about 10 GB.
+- A log written on the chip is replayed on a desk. That is exact only if the core computes the same bits on both. The simulator's determinism rules are written for that (no library float functions, no fused multiply-add), and CI holds Linux against Windows, but the first replay of a log from real hardware is the test.
 - The replay tool flies four rotors, like the rest of this build. The records hold up to eight.
 - The codes of states, actions and events in a log are now a format. They are fixed in one table with a test, and a new variant gets a new code.
 
@@ -158,4 +159,7 @@ In the simulator the buffer is 64 kB and is drained to the file after every tick
 - `vehicle_gnss`, `cpuload`, the estimator's innovation ratios, PX4's event metadata (§4).
 - Reading ULog and DataFlash logs of real flights into the simulator for comparison (M2).
 - Log rates as parameters.
-- Checking a real log in Flight Review and PlotJuggler by hand. The automated check is `pyulog`, the strictest reader of the three.
+- Opening a log in Flight Review and PlotJuggler. The automated check is `pyulog`, the strictest reader of the three.
+- Replaying up to damage in the middle of a file. A file damaged before its end is refused whole today; only a cut at the end and a counted dropout are replayed up to.
+- Reading a replay log as a stream, so that memory does not grow with the file.
+- Keeping a statically allocated recorder out of initialised data. The recorder holds its ring, and its clocks start non-zero, so a static one costs its size in flash and a copy at start-up. At bring-up the ring moves into its own section of DMA-reachable memory anyway.
