@@ -3,11 +3,16 @@
 """Read a ULog with pyulog, the strictest reader we know, and report what it sees.
 
     ulog_check.py FILE                  one line per topic: name, instance, record count
+    ulog_check.py FILE --expect-topics a,b,c
+                                        as above; fails if a named topic is missing or empty
     ulog_check.py FILE --dump TOPIC     the topic's records as CSV, floats as hex bits
     ulog_check.py FILE --meta           start time, parameters, changes, strings, dropouts, syncs
 
-Exit status 1 if pyulog flags file corruption, if a topic has no records, or if
-`PX4ULog.add_roll_pitch_yaw()` (the first thing Flight Review calls) fails.
+Exit status 1 if pyulog flags file corruption, if no topic has any record, if a
+topic named by `--expect-topics` is missing or has no records, or if
+`PX4ULog.add_roll_pitch_yaw()` (the first thing Flight Review calls) fails. A
+subscribed topic that has no record is not an error unless it is named there:
+a flight without a parameter change, or a quiet topic, is normal.
 `--dump` takes `--multi N` for an instance other than 0.
 
 CSV format: the first line is the column names as pyulog flattens them
@@ -55,6 +60,7 @@ def main():
     ap.add_argument("--dump", metavar="TOPIC")
     ap.add_argument("--multi", type=int, default=0)
     ap.add_argument("--meta", action="store_true")
+    ap.add_argument("--expect-topics", metavar="a,b,c", help="topics that must be present with records")
     a = ap.parse_args()
 
     ulog = ULog(a.file)
@@ -62,9 +68,15 @@ def main():
         fail("pyulog reports file corruption")
     if not ulog.data_list:
         fail("no topic has any data")
-    for d in ulog.data_list:
-        if len(d.data["timestamp"]) == 0:
-            fail("topic %s has no records" % d.name)
+    if a.expect_topics:
+        have = {}
+        for d in ulog.data_list:
+            have[d.name] = have.get(d.name, 0) + len(d.data["timestamp"])
+        for name in [n.strip() for n in a.expect_topics.split(",") if n.strip()]:
+            if name not in have:
+                fail("expected topic %s is missing" % name)
+            if have[name] == 0:
+                fail("expected topic %s has no records" % name)
     PX4ULog(ulog).add_roll_pitch_yaw()
 
     if a.dump:
