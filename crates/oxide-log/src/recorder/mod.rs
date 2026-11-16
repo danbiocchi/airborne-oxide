@@ -15,7 +15,8 @@ use oxide_core::io::{
     Action, BaroSample, BatterySample, Event, EventKind, ImuSample, Inputs, MagSample, NavState,
     Outputs, RcSample, Reasons, Stamped, Status,
 };
-use oxide_core::params::{self, ParamValue as CoreValue};
+use oxide_core::params::{self, LoadReport, ParamValue as CoreValue};
+use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
 use text::{TextBuf, event_level, event_text};
 
@@ -185,6 +186,27 @@ fn topic_list(level: Level) -> &'static [Topic] {
     }
 }
 
+/// What the core was booted with: the scheduling profile and the report of
+/// the stored-parameter load it was given before its first tick. The normal
+/// level uses only the profile's name; the replay level writes both.
+#[derive(Debug, Clone, Copy)]
+pub struct Boot<'a> {
+    /// The scheduling profile the core was built with.
+    pub profile: &'a Profile,
+    /// The report given to `Core::report_param_load`.
+    pub report: LoadReport,
+}
+
+impl<'a> Boot<'a> {
+    /// A boot with a clean parameter load.
+    pub fn clean(profile: &'a Profile) -> Self {
+        Self {
+            profile,
+            report: LoadReport::default(),
+        }
+    }
+}
+
 /// Records what the core did, tick by tick, into a [`Logger`] ring.
 #[derive(Debug)]
 pub struct Recorder<const CAP: usize> {
@@ -280,14 +302,14 @@ impl<const CAP: usize> Recorder<CAP> {
         sink: &mut S,
         now: Micros,
         build: BuildInfo<'_>,
-        profile: &str,
+        boot: Boot<'_>,
         level: Level,
         cfg: &VehicleConfig<N>,
     ) -> Result<(), Error> {
         let h = crate::header::Header {
             start_us: now.0,
             build,
-            profile,
+            profile: boot.profile.name,
             level,
             nested: topics::NESTED,
         };

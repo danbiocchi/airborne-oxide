@@ -5,7 +5,7 @@ use super::rates::{Tick, run, times};
 use super::{BUILD, started};
 use crate::header::Level;
 use crate::reader::{Item, UlogFile};
-use crate::recorder::Recorder;
+use crate::recorder::{Boot, Recorder};
 use crate::topics::decode_event;
 use oxide_core::config::VehicleConfig;
 use oxide_core::flight::Core;
@@ -32,7 +32,7 @@ fn a_full_ring_drops_the_stream_and_keeps_events_and_status() {
         &mut file,
         Micros(0),
         BUILD,
-        "f405-lean",
+        Boot::clean(&F405_LEAN),
         Level::Normal,
         &cfg,
     )
@@ -160,7 +160,7 @@ fn a_log_that_the_ring_cannot_hold_still_parses() {
         &mut file,
         Micros(0),
         BUILD,
-        "f405-lean",
+        Boot::clean(&F405_LEAN),
         Level::Normal,
         &cfg,
     )
@@ -312,18 +312,22 @@ fn pyulog_reads_a_scripted_run_without_corruption() {
 fn a_real_core_driven_for_a_few_hundred_ticks_records_a_parseable_log() {
     let cfg: VehicleConfig<4> = super::super::topics::quad();
     let mut core = Core::<4>::new(cfg, F405_LEAN).unwrap();
-    core.report_param_load(LoadReport {
+    let report = LoadReport {
         applied: 90,
         unknown: 3,
         ..LoadReport::default()
-    });
+    };
+    core.report_param_load(report);
     let mut file = Vec::new();
     let mut rec = Recorder::<{ 32 * 1024 }>::new();
     rec.start(
         &mut file,
         Micros(0),
         BUILD,
-        "f405-lean",
+        Boot {
+            profile: &F405_LEAN,
+            report,
+        },
         Level::Replay,
         core.config(),
     )

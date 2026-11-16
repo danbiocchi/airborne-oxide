@@ -470,7 +470,8 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         let log = FlightLog::start(
             level,
             build,
-            self.core.profile().name,
+            self.core.profile(),
+            &self.load_report,
             self.core.config(),
             writer,
         )?;

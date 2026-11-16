@@ -4,7 +4,7 @@
 use super::topics::quad;
 use crate::header::{BuildInfo, Level};
 use crate::reader::UlogFile;
-use crate::recorder::Recorder;
+use crate::recorder::{Boot, Recorder};
 use crate::topics::NORMAL;
 use oxide_core::config::VehicleConfig;
 use oxide_core::flight::{RateCommand, Telemetry};
@@ -13,6 +13,7 @@ use oxide_core::io::{
     StateSample, Validity,
 };
 use oxide_core::math::{Quat, Vec3};
+use oxide_core::schedule::F405_LEAN;
 use oxide_core::time::Micros;
 
 pub(crate) const CAP: usize = 16 * 1024;
@@ -89,7 +90,7 @@ pub(crate) fn inputs_at(t: u64) -> Inputs {
 pub(crate) fn started(file: &mut Vec<u8>, level: Level) -> (Recorder<CAP>, VehicleConfig<4>) {
     let cfg = quad();
     let mut rec = Recorder::<CAP>::new();
-    rec.start(file, Micros(0), BUILD, "f405-lean", level, &cfg)
+    rec.start(file, Micros(0), BUILD, Boot::clean(&F405_LEAN), level, &cfg)
         .unwrap();
     (rec, cfg)
 }

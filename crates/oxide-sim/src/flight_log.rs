@@ -15,11 +15,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use oxide_core::config::VehicleConfig;
 use oxide_core::flight::Telemetry;
 use oxide_core::io::{Inputs, Outputs};
+use oxide_core::params::LoadReport;
+use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
 use oxide_log::header::BuildInfo;
 pub use oxide_log::header::Level;
 pub use oxide_log::logger::Stats;
-use oxide_log::recorder::Recorder;
+use oxide_log::recorder::{Boot, Recorder};
 
 /// Bytes of the recorder's ring (about 66 kB, kept on the heap).
 pub const RING_BYTES: usize = 65_536;
@@ -126,7 +128,8 @@ impl FlightLog {
     pub(crate) fn start<const N: usize>(
         level: Level,
         build: &LogBuild,
-        profile: &str,
+        profile: &Profile,
+        report: &LoadReport,
         cfg: &VehicleConfig<N>,
         mut writer: LogWriter,
     ) -> Result<Self, LogError> {
@@ -140,7 +143,17 @@ impl FlightLog {
             board: &build.board,
         };
         recorder
-            .start(&mut head, Micros::ZERO, info, profile, level, cfg)
+            .start(
+                &mut head,
+                Micros::ZERO,
+                info,
+                Boot {
+                    profile,
+                    report: *report,
+                },
+                level,
+                cfg,
+            )
             .map_err(LogError::Format)?;
         writer.write_all(&head).map_err(LogError::Io)?;
         Ok(Self {
