@@ -57,8 +57,6 @@ pub enum LogError {
     AlreadyStarted,
     /// There is no log to finish.
     NotStarted,
-    /// The replay level is not available yet.
-    ReplayNotBuilt,
     /// The configuration could never replay (the text names the parameter).
     NotReplayable(String),
     /// The header did not fit the recorder's format limits.
@@ -75,7 +73,6 @@ impl fmt::Display for LogError {
             }
             LogError::AlreadyStarted => write!(f, "the simulation already has a log"),
             LogError::NotStarted => write!(f, "the simulation has no log"),
-            LogError::ReplayNotBuilt => write!(f, "the replay level is not built yet"),
             LogError::NotReplayable(why) => write!(f, "cannot log at the replay level: {why}"),
             LogError::Format(e) => write!(f, "log header: {e:?}"),
             LogError::Io(e) => write!(f, "log: {e}"),
@@ -124,6 +121,10 @@ pub(crate) struct FlightLog {
     recorder: Box<Recorder<RING_BYTES>>,
     writer: LogWriter,
     error: Option<std::io::Error>,
+    /// `Status::params_unsaved` of the previous tick's outputs: what the
+    /// core held when the tick began, unless the store's saved call came in
+    /// between.
+    was_unsaved: bool,
 }
 
 impl FlightLog {
@@ -136,9 +137,6 @@ impl FlightLog {
         cfg: &VehicleConfig<N>,
         mut writer: LogWriter,
     ) -> Result<Self, LogError> {
-        if level == Level::Replay {
-            return Err(LogError::ReplayNotBuilt);
-        }
         let mut recorder = Box::new(Recorder::<RING_BYTES>::new());
         let mut head: Vec<u8> = Vec::new();
         let info = BuildInfo {
@@ -166,18 +164,32 @@ impl FlightLog {
             recorder,
             writer,
             error: None,
+            was_unsaved: false,
         })
     }
 
     /// Hands the tick to the recorder and drains the ring to the writer.
+    ///
+    /// `unsaved_before` is `Core::params_unsaved()` read just before the tick.
+    /// The store's one call between ticks, `Core::clear_unsaved`, is not
+    /// intercepted but detected: `params_unsaved` was true in the previous
+    /// tick's status and is false now, before this tick ran. Nothing else
+    /// clears it between ticks (`Core::params_unsaved` is cleared only by
+    /// `clear_unsaved`, and set again only by a tick), and `clear_unsaved`
+    /// when it is already false changes nothing and need not be replayed.
     pub(crate) fn record<const N: usize>(
         &mut self,
         now: Micros,
+        unsaved_before: bool,
         inputs: &Inputs,
         outputs: &Outputs<N>,
         telemetry: &Telemetry,
         cfg: &VehicleConfig<N>,
     ) {
+        if self.was_unsaved && !unsaved_before {
+            self.recorder.note_saved();
+        }
+        self.was_unsaved = outputs.status.params_unsaved;
         self.recorder.record(now, inputs, outputs, telemetry, cfg);
         let (writer, error) = (&mut self.writer, &mut self.error);
         self.recorder.drain_with(|chunk| {

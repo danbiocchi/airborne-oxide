@@ -14,6 +14,7 @@
 //! oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE]
 //!                [--log FILE.ulg] [--log-level normal|replay]
 //! oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
+//! oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]
 //! oxide-sim params list | json | doc
 //! ```
 //! `run`, `hash`, `montecarlo` and `scenario` also take `--params FILE.toml`
@@ -26,6 +27,12 @@
 //! header's `ver_sw` is the git hash the binary was built from (`build.rs`),
 //! `-dirty` when the tree had changes the last time that script ran (edits made
 //! after it are not seen until it runs again), `ver_hw` is `SIM`.
+//! `replay FILE.ulg` rebuilds the flight core from a replay-level log
+//! (`--log-level replay`) and runs the recorded ticks through it, comparing
+//! every output bit for bit; it exits 0 when every tick replayed is identical
+//! (also when the file ends in a cut), 1 on a difference or a gap, and 2 on a
+//! file it cannot replay. `--param` replays through a changed setting,
+//! `--continue` counts every tick that differs instead of stopping at the first.
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
@@ -73,6 +80,7 @@ const GIT_HASH: &str = env!("OXIDE_GIT_HASH");
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LogLevel {
     Normal,
+    Replay,
 }
 
 /// `--log FILE.ulg` and `--log-level`.
@@ -83,8 +91,7 @@ struct LogSpec {
 }
 
 impl LogSpec {
-    /// The two options as given: a level needs a file, and `replay` is not
-    /// built yet.
+    /// The two options as given: a level needs a file.
     fn from_options(path: Option<String>, level: Option<&str>) -> Result<Option<Self>, String> {
         let Some(path) = path else {
             return match level {
@@ -94,7 +101,7 @@ impl LogSpec {
         };
         let level = match level {
             None | Some("normal") => LogLevel::Normal,
-            Some("replay") => return Err("the replay level is not built yet".into()),
+            Some("replay") => LogLevel::Replay,
             Some(other) => return Err(format!("unknown log level {other} (normal | replay)")),
         };
         Ok(Some(Self { path, level }))
@@ -103,6 +110,7 @@ impl LogSpec {
     fn level(&self) -> Level {
         match self.level {
             LogLevel::Normal => Level::Normal,
+            LogLevel::Replay => Level::Replay,
         }
     }
 
@@ -129,17 +137,19 @@ enum Command {
     Montecarlo,
     Scenario,
     Scenarios,
+    Replay,
     Params,
 }
 
 impl Command {
     /// Every command, in the order the usage text lists them.
-    const ALL: [Command; 6] = [
+    const ALL: [Command; 7] = [
         Command::Run,
         Command::Hash,
         Command::Montecarlo,
         Command::Scenario,
         Command::Scenarios,
+        Command::Replay,
         Command::Params,
     ];
 
@@ -150,6 +160,7 @@ impl Command {
             Command::Montecarlo => "montecarlo",
             Command::Scenario => "scenario",
             Command::Scenarios => "scenarios",
+            Command::Replay => "replay",
             Command::Params => "params",
         }
     }
@@ -177,6 +188,7 @@ const USAGE: &str = "usage:
   oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--log FILE.ulg] [--log-level normal|replay]
                 [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
+  oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]
   oxide-sim params list|json|doc
   oxide-sim help | --help | -h
 ";
@@ -971,6 +983,63 @@ fn scenario_command(
     Ok(verdict.violations.is_empty())
 }
 
+/// Replays the log at `path` with the parameter overrides given, and returns
+/// the report with the lines the command prints for it.
+fn replay_file_report(
+    path: &str,
+    params: &[(String, f64)],
+    keep_going: bool,
+) -> Result<(oxide_sim::replay::ReplayReport, Vec<String>), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let options = oxide_sim::replay::ReplayOptions {
+        params: params.to_vec(),
+        keep_going,
+    };
+    let report = oxide_sim::replay::replay(&bytes, &options).map_err(|e| format!("{path}: {e}"))?;
+    let lines = report.lines();
+    Ok((report, lines))
+}
+
+/// `oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]`: rebuilds
+/// the flight core from a replay-level log and flies the recorded ticks
+/// through it, comparing every output bit for bit (ADR-0005 §5). Prints the
+/// number of ticks replayed and `identical`, or the first difference (tick,
+/// field, recorded and replayed values); `--continue` goes on and counts the
+/// ticks that differ. The status is the command's exit code: `Ok(true)` (0)
+/// when every tick replayed is identical, also when the file ends in a cut;
+/// `Ok(false)` (1) on a difference, a gap, a missing tick or a malformed one;
+/// an error (2) for a file that cannot be replayed.
+fn replay_command(
+    mut it: impl Iterator<Item = String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let path = it
+        .next()
+        .ok_or("replay needs the path of a replay-level log")?;
+    if path.starts_with("--") {
+        return Err(format!("replay needs the path of a log first, got {path}").into());
+    }
+    let mut params: Vec<(String, f64)> = Vec::new();
+    let mut keep_going = false;
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--param" => {
+                let v = it.next().ok_or("--param needs NAME=VALUE")?;
+                params.push(parse_param_flag(&v)?);
+            }
+            "--continue" => keep_going = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option {other}").into());
+            }
+            other => return Err(format!("unexpected argument {other}").into()),
+        }
+    }
+    let (report, lines) = replay_file_report(&path, &params, keep_going)?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(report.exit_code() == 0)
+}
+
 /// The `result` line of `scenario` and the violations under it. A file that
 /// states no expectations is judged by the invariants, and says so.
 fn result_lines(scenario: &ScenarioFile, violations: &[String]) -> Vec<String> {
@@ -1017,6 +1086,9 @@ fn main() -> ExitCode {
         }
         Some(Command::Scenario) => {
             return finish(scenario_command(std::env::args().skip(2)));
+        }
+        Some(Command::Replay) => {
+            return finish(replay_command(std::env::args().skip(2)));
         }
         Some(Command::Run | Command::Hash | Command::Montecarlo) | None => {}
     }
@@ -1077,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_unknown_command_messages_list_all_six() {
+    fn missing_and_unknown_command_messages_list_every_command() {
         let missing = p(&[]).err().expect("error");
         let unknown = p(&["frobnicate"]).err().expect("error");
         for c in Command::ALL {
@@ -1393,10 +1465,8 @@ mod tests {
             .err()
             .expect("error");
         assert!(e.contains("normal | replay"), "{e}");
-        let e = p(&["run", "--log", "f.ulg", "--log-level", "replay"])
-            .err()
-            .expect("error");
-        assert_eq!(e, "the replay level is not built yet");
+        let a = p(&["run", "--log", "f.ulg", "--log-level", "replay"]).expect("valid");
+        assert_eq!(a.log.expect("a log").level, LogLevel::Replay);
         assert!(p(&["run", "--log"]).is_err());
         // hash and montecarlo do not write logs.
         let e = p(&["hash", "--log", "f.ulg"]).err().expect("error");
@@ -1411,11 +1481,120 @@ mod tests {
             .expect_err("level without a file");
         assert_eq!(e.to_string(), "--log-level needs --log FILE.ulg");
         let e = scenario_command(
-            args(&["gcs-loss", "--log", &path, "--log-level", "replay"]).into_iter(),
+            args(&["gcs-loss", "--log", &path, "--log-level", "loud"]).into_iter(),
         )
-        .expect_err("replay");
-        assert_eq!(e.to_string(), "the replay level is not built yet");
+        .expect_err("unknown level");
+        assert_eq!(e.to_string(), "unknown log level loud (normal | replay)");
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// A replay-level log of `gcs-loss` (seed 1), written by the command.
+    fn replay_log(name: &str) -> String {
+        let path = temp_path(name);
+        let r = scenario_command(
+            args(&[
+                "gcs-loss",
+                "--seed",
+                "1",
+                "--log",
+                &path,
+                "--log-level",
+                "replay",
+            ])
+            .into_iter(),
+        );
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        path
+    }
+
+    #[test]
+    fn scenario_writes_a_replay_level_log_and_replay_proves_it() {
+        let path = replay_log("replay-level.ulg");
+        let bytes = std::fs::read(&path).expect("the log");
+        let file = oxide_log::reader::UlogFile::parse(&bytes).expect("parses");
+        assert_eq!(file.info_str("oxide_log_level"), Some("replay"));
+        assert!(file.records("oxide_in_tick").count() > 1000);
+        assert!(file.records("vehicle_attitude").count() > 100);
+        // Identical: exit 0 (true).
+        let r = replay_command(args(&[&path]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let (report, lines) = replay_file_report(&path, &[], false).expect("replays");
+        assert!(report.identical());
+        assert_eq!(
+            lines[0],
+            format!("replayed {} ticks (f405-lean): identical", report.ticks)
+        );
+        // A changed gain: a difference, exit 1 (false).
+        let r = replay_command(args(&[&path, "--param", "RATE_ROLL_P=9"]).into_iter());
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        let (report, lines) =
+            replay_file_report(&path, &[("RATE_ROLL_P".to_string(), 9.0)], false).expect("replays");
+        let d = report.first_difference.as_ref().expect("a difference");
+        assert!(d.field.starts_with("motors["), "{d}");
+        assert!(
+            lines[0].contains(&format!("first difference at tick {}", d.seq)),
+            "{lines:?}"
+        );
+        // --continue counts the ticks that differ.
+        let (all, lines) =
+            replay_file_report(&path, &[("RATE_ROLL_P".to_string(), 9.0)], true).expect("replays");
+        assert!(all.differing > 1);
+        assert!(
+            lines[0].contains(" differ, the first at tick "),
+            "{lines:?}"
+        );
+        let r =
+            replay_command(args(&[&path, "--continue", "--param", "RATE_ROLL_P=9"]).into_iter());
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_exits_2_on_a_file_it_cannot_replay_and_on_bad_arguments() {
+        // A normal-level log, a missing file, bytes that are not a log.
+        let normal = temp_path("normal-for-replay.ulg");
+        let r = scenario_command(args(&["gcs-loss", "--log", &normal]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let e = replay_command(args(&[&normal]).into_iter()).expect_err("normal level");
+        assert!(e.to_string().contains("not a replay-level log"), "{e}");
+        let _ = std::fs::remove_file(&normal);
+        let missing = temp_path("no-such-file.ulg");
+        assert!(replay_command(args(&[&missing]).into_iter()).is_err());
+        let junk = temp_path("junk.ulg");
+        std::fs::write(&junk, b"not a log").expect("writes");
+        assert!(replay_command(args(&[&junk]).into_iter()).is_err());
+        let _ = std::fs::remove_file(&junk);
+        // Arguments.
+        assert!(replay_command(args(&[]).into_iter()).is_err());
+        let path = replay_log("replay-args.ulg");
+        for bad in [
+            vec![path.as_str(), "--param"],
+            vec![path.as_str(), "--param", "RATE_ROLL_P"],
+            vec![path.as_str(), "--param", "NO_SUCH=1"],
+            vec![path.as_str(), "--frobnicate"],
+            vec![path.as_str(), "other.ulg"],
+        ] {
+            assert!(replay_command(args(&bad).into_iter()).is_err(), "{bad:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cut_replay_log_still_exits_0_and_says_it_is_cut() {
+        let path = replay_log("replay-cut.ulg");
+        let bytes = std::fs::read(&path).expect("the log");
+        let cut = temp_path("replay-cut-short.ulg");
+        std::fs::write(&cut, &bytes[..bytes.len() - 7]).expect("writes");
+        let r = replay_command(args(&[&cut]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let (report, lines) = replay_file_report(&cut, &[], false).expect("replays");
+        assert!(report.identical());
+        assert!(
+            lines[1].starts_with("the file ends in a cut after tick "),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&cut);
     }
 
     #[test]
@@ -1466,6 +1645,14 @@ mod tests {
     fn the_usage_names_the_log_options() {
         let run = USAGE.split("  oxide-sim hash").next().expect("run part");
         assert!(run.contains("--log FILE.ulg") && run.contains("--log-level normal|replay"));
+        let replay = USAGE
+            .lines()
+            .find(|l| l.starts_with("  oxide-sim replay"))
+            .expect("replay line");
+        assert_eq!(
+            replay,
+            "  oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]"
+        );
         let scenario = USAGE
             .lines()
             .find(|l| l.starts_with("  oxide-sim scenario NAME"))

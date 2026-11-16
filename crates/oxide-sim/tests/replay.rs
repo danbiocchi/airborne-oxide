@@ -435,3 +435,158 @@ fn a_ring_too_small_makes_a_gap_and_the_replay_stops_there() {
         r.lines()
     );
 }
+
+// ---- whole flights of the simulator ----
+
+mod flights {
+    use super::*;
+    use oxide_core::schedule::{H743_FULL, Profile};
+    use oxide_sim::fault_scenarios;
+    use oxide_sim::flight_log::{Level, LogBuild, SharedBuffer};
+    use oxide_sim::scenario::Script;
+    use oxide_sim::{SimOptions, Simulation};
+
+    /// A flight: the file (with a log), the trace hash and the number of ticks.
+    pub struct Flight {
+        pub bytes: Vec<u8>,
+        pub hash: u64,
+        pub ticks: u64,
+    }
+
+    pub fn fly(name: &str, profile: Profile, level: Option<Level>) -> Flight {
+        let scenario = fault_scenarios::by_name(name).expect("scenario");
+        let mut sim = scenario.build(profile, 0).expect("builds");
+        let buf = SharedBuffer::new();
+        if let Some(level) = level {
+            sim.start_log(level, &LogBuild::sim("test"), Box::new(buf.clone()))
+                .expect("log starts");
+        }
+        let mut ticks = 0;
+        sim.run_until(scenario.end(), |_| ticks += 1);
+        if level.is_some() {
+            sim.finish_log().expect("finishes");
+        }
+        Flight {
+            bytes: buf.bytes(),
+            hash: sim.trace_hash(),
+            ticks,
+        }
+    }
+
+    fn proves(name: &str, profile: Profile) {
+        let flight = fly(name, profile, Some(Level::Replay));
+        let r = replay(&flight.bytes, &ReplayOptions::default()).expect("replays");
+        assert!(
+            r.identical(),
+            "{name} on {}: {:?}",
+            profile.name,
+            r.first_difference
+        );
+        assert_eq!(r.stop, Stop::End, "{name} on {}", profile.name);
+        assert_eq!(r.ticks, flight.ticks, "{name} on {}", profile.name);
+        assert_eq!(r.profile, profile.name);
+    }
+
+    #[test]
+    fn rc_loss_position_replays_identically_on_the_f405() {
+        proves("rc-loss-position", F405_LEAN);
+    }
+
+    #[test]
+    fn gps_loss_replays_identically_on_the_f405() {
+        proves("gps-loss", F405_LEAN);
+    }
+
+    #[test]
+    fn motor_loss_replays_identically_on_the_f405() {
+        proves("motor-loss", F405_LEAN);
+    }
+
+    #[test]
+    fn rc_loss_position_replays_identically_on_the_h743() {
+        proves("rc-loss-position", H743_FULL);
+    }
+
+    #[test]
+    fn a_replay_level_log_does_not_change_the_flight() {
+        for (name, profile) in [
+            ("rc-loss-position", F405_LEAN),
+            ("gps-loss", F405_LEAN),
+            ("motor-loss", F405_LEAN),
+            ("rc-loss-position", H743_FULL),
+        ] {
+            let plain = fly(name, profile, None);
+            let logged = fly(name, profile, Some(Level::Replay));
+            assert_eq!(plain.hash, logged.hash, "{name} on {}", profile.name);
+            assert_eq!(plain.ticks, logged.ticks);
+        }
+    }
+
+    #[test]
+    fn nothing_drops_in_the_simulator_at_the_replay_level() {
+        let scenario = fault_scenarios::by_name("rc-loss-position").expect("scenario");
+        for profile in [F405_LEAN, H743_FULL] {
+            let mut sim = scenario.build(profile, 0).expect("builds");
+            sim.start_log(
+                Level::Replay,
+                &LogBuild::sim("test"),
+                Box::new(SharedBuffer::new()),
+            )
+            .expect("starts");
+            sim.run_until(scenario.end(), |_| {});
+            let st = sim.log_stats().expect("stats");
+            assert_eq!(
+                (st.dropped_stream, st.dropped_must, st.dropouts),
+                (0, 0, 0),
+                "{}",
+                profile.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_stores_saved_call_between_ticks_is_recorded_on_the_next_tick_and_replays() {
+        let airframe = Airframe::reference_quad().expect("airframe");
+        let mut sim = Simulation::<Script, 4>::with_options(
+            &airframe,
+            F405_LEAN,
+            Script::default(),
+            SimOptions::default(),
+        )
+        .expect("builds");
+        let buf = SharedBuffer::new();
+        sim.start_log(Level::Replay, &LogBuild::sim("test"), Box::new(buf.clone()))
+            .expect("starts");
+        let id = params::find("RATE_ROLL_P").unwrap();
+        for k in 0..60 {
+            if k == 10 {
+                sim.queue_param_set(ParamSet {
+                    id,
+                    value: ParamValue::F32(31.0),
+                });
+            }
+            if k == 40 {
+                assert!(sim.core().params_unsaved());
+                sim.core_mut().clear_unsaved();
+                assert!(!sim.core().params_unsaved());
+            }
+            sim.step();
+        }
+        sim.finish_log().expect("finishes");
+        let bytes = buf.bytes();
+        let file = UlogFile::parse(&bytes).unwrap();
+        let saved: Vec<u64> = file
+            .records("oxide_in_tick")
+            .filter(|r| r.bool("saved") == Some(true))
+            .filter_map(|r| r.u64("seq"))
+            .collect();
+        assert_eq!(saved, [40]);
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert_eq!(
+            (r.ticks, r.identical()),
+            (60, true),
+            "{:?}",
+            r.first_difference
+        );
+    }
+}

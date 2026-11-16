@@ -212,13 +212,56 @@ fn a_log_cannot_start_after_the_first_tick_or_twice() {
 }
 
 #[test]
-fn the_replay_level_is_not_built_yet() {
+fn the_replay_level_starts_and_its_header_says_so() {
     let scenario = fault_scenarios::by_name("hover-step").expect("scenario");
     let mut sim = scenario.build(F405_LEAN, 0).expect("builds");
+    let buf = SharedBuffer::new();
+    sim.start_log(Level::Replay, &build(), Box::new(buf.clone()))
+        .expect("replay level starts");
+    sim.finish_log().expect("finishes");
+    let file = UlogFile::parse(&buf.bytes()).expect("parses");
+    assert_eq!(file.info_str("oxide_log_level"), Some("replay"));
+    assert_eq!(file.info_str("oxide_profile"), Some("f405-lean"));
+    // The start records of ADR-0005 §5 are in the data section already.
+    assert_eq!(file.records("oxide_boot").count(), 1);
+    assert_eq!(file.records("oxide_param_us").count(), 10);
+    assert!(file.records("oxide_vehicle").count() > 20);
+    assert_eq!(file.records("oxide_in_tick").count(), 0);
+}
+
+#[test]
+fn a_configuration_that_could_never_replay_is_refused_at_start_and_names_the_parameter() {
+    use oxide_core::params::LoadReport;
+    use oxide_sim::scenario::Script;
+    let airframe = Airframe::reference_quad().expect("airframe");
+    let boot = |cfg: &mut oxide_core::config::VehicleConfig<4>| {
+        // 16,000,001 us is not the f32 number of seconds it reads back as.
+        cfg.failsafe.rc_timeout_us = 16_000_001;
+        LoadReport::default()
+    };
+    let mut sim = Simulation::<Script, 4>::with_boot(
+        &airframe,
+        F405_LEAN,
+        Script::default(),
+        SimOptions::default(),
+        boot,
+    )
+    .expect("builds");
+    let buf = SharedBuffer::new();
     let e = sim
-        .start_log(Level::Replay, &build(), Box::new(SharedBuffer::new()))
-        .expect_err("replay");
-    assert_eq!(e.to_string(), "the replay level is not built yet");
+        .start_log(Level::Replay, &build(), Box::new(buf.clone()))
+        .expect_err("not replayable");
+    assert!(matches!(e, LogError::NotReplayable(_)), "{e}");
+    let text = e.to_string();
+    assert!(text.contains("FS_RC_TIMEOUT"), "{text}");
+    assert!(
+        text.starts_with("cannot log at the replay level: "),
+        "{text}"
+    );
+    // Nothing was written, and the normal level is fine with it.
+    assert!(buf.bytes().is_empty());
+    sim.start_log(Level::Normal, &build(), Box::new(SharedBuffer::new()))
+        .expect("normal level");
 }
 
 /// A writer that fails after `limit` bytes.

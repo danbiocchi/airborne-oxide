@@ -452,8 +452,9 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
 
     /// Starts a log: writes its header to `writer` and, from then on, hands
     /// every tick to the recorder and drains the ring to the writer. Only
-    /// before the first tick, and once. The replay level is refused until it
-    /// is built. A writer that fails later never changes the flight;
+    /// before the first tick, and once. At the replay level the boot report
+    /// and the profile are recorded too, and a configuration that could never
+    /// replay is refused ([`LogError::NotReplayable`]). A writer that fails later never changes the flight;
     /// [`finish_log`](Self::finish_log) returns the first error.
     pub fn start_log(
         &mut self,
@@ -556,10 +557,19 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         };
         self.last_inputs = inputs;
 
-        // 2. Core tick.
+        // 2. Core tick. The log needs to know whether the store has made its
+        // "saved" call since the last tick: the flag is read before the tick.
+        let unsaved_before = self.core.params_unsaved();
         let out = self.core.tick(t, &inputs);
         if let Some(log) = self.log.as_mut() {
-            log.record(t, &inputs, &out, &self.core.telemetry(), self.core.config());
+            log.record(
+                t,
+                unsaved_before,
+                &inputs,
+                &out,
+                &self.core.telemetry(),
+                self.core.config(),
+            );
         }
 
         // 3. Physics over [t, t + base] with the command valid at t.
