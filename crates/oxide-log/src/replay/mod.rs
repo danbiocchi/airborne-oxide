@@ -87,24 +87,10 @@ pub const VEHICLE: Topic = Topic {
     record_len: 38,
 };
 
-/// The parameters the core holds as whole microseconds, in table order. The
-/// log's `P` messages carry them as `f32` seconds, which names the microsecond
-/// exactly only up to 16 s; [`MICROS`] carries the integer.
-pub const MICRO_PARAMS: [&str; 10] = [
-    "EKF_HORIZON",
-    "EKF_ALIGN_TIME",
-    "EKF_GPS_TMO",
-    "EKF_POS_TMO",
-    "EKF_BARO_TMO",
-    "EKF_MAG_TMO",
-    "FS_RC_TIMEOUT",
-    "FS_GCS_TIMEOUT",
-    "FS_BRAIN_TMO",
-    "FS_SETPT_TMO",
-];
-
-/// The exact microseconds of one parameter of [`MICRO_PARAMS`], by the
-/// parameter's stable key.
+/// The exact microseconds of one parameter the core holds as whole
+/// microseconds ([`params::micro_ids`], in table order), by the parameter's
+/// stable key. The log's `P` messages carry them as `f32` seconds, which
+/// names the microsecond exactly only up to 16 s; this carries the integer.
 pub const MICROS: Topic = Topic {
     name: "oxide_param_us",
     format: "uint64_t timestamp;uint32_t key;uint32_t micros;",
@@ -346,39 +332,23 @@ pub fn write_vehicle<const N: usize, S: Sink + ?Sized>(
     result
 }
 
-/// The value of `cfg`'s parameter `name` of [`MICRO_PARAMS`], in whole
-/// microseconds; `None` for any other name.
-pub fn micros_of<const N: usize>(cfg: &VehicleConfig<N>, name: &str) -> Option<u32> {
-    let (e, f) = (&cfg.estimator.ekf, &cfg.failsafe);
-    Some(match name {
-        "EKF_HORIZON" => e.delay_horizon_us,
-        "EKF_ALIGN_TIME" => e.align_time_us,
-        "EKF_GPS_TMO" => e.gps_timeout_us,
-        "EKF_POS_TMO" => e.pos_timeout_us,
-        "EKF_BARO_TMO" => e.baro_timeout_us,
-        "EKF_MAG_TMO" => e.mag_timeout_us,
-        "FS_RC_TIMEOUT" => f.rc_timeout_us,
-        "FS_GCS_TIMEOUT" => f.gcs_timeout_us,
-        "FS_BRAIN_TMO" => f.brain_timeout_us,
-        "FS_SETPT_TMO" => f.setpoint_timeout_us,
-        _ => return None,
-    })
-}
-
 /// One `oxide_param_us` record: the parameter's stable key and its exact
-/// microseconds. Writes nothing for a name that is not in [`MICRO_PARAMS`].
+/// microseconds. Writes nothing for a name that is not a parameter held as
+/// microseconds ([`params::is_micros`]).
 pub fn fill_micros<S: Sink + ?Sized>(
     w: &mut RecordWriter<'_, S>,
     t: Micros,
     name: &str,
     micros: u32,
 ) {
-    if let Some(key) = params::find(name).and_then(params::key_of) {
+    if let Some(id) = params::find(name).filter(|id| params::is_micros(*id))
+        && let Some(key) = params::key_of(id)
+    {
         w.u64(t.0).u32(key).u32(micros);
     }
 }
 
-/// Writes the exact microseconds of every parameter of [`MICRO_PARAMS`],
+/// Writes the exact microseconds of every parameter of [`params::micro_ids`],
 /// straight into `sink` like [`write_vehicle`]. `msg_id` is the topic's
 /// subscription id.
 pub fn write_micros<const N: usize, S: Sink + ?Sized>(
@@ -387,8 +357,9 @@ pub fn write_micros<const N: usize, S: Sink + ?Sized>(
     t: Micros,
     cfg: &VehicleConfig<N>,
 ) -> Result<(), Error> {
-    for name in MICRO_PARAMS {
-        let us = micros_of(cfg, name).unwrap_or(0);
+    for id in params::micro_ids() {
+        let name = params::PARAMS.get(id.index()).map_or("", |d| d.name);
+        let us = params::micros(cfg, id).unwrap_or(0);
         crate::record::data(sink, msg_id, &MICROS, |w| fill_micros(w, t, name, us))?;
     }
     Ok(())
@@ -658,22 +629,9 @@ fn same_param_bits(a: ParamValue, b: ParamValue) -> bool {
     }
 }
 
-/// Seconds as `f32` to whole microseconds, rounded: what the core stores for
-/// a parameter held in microseconds (`params` keeps the same rule private).
-fn secs_to_us(v: f32) -> Option<u32> {
-    if !v.is_finite() || v < 0.0 {
-        return None;
-    }
-    let us = f64::from(v) * 1_000_000.0 + 0.5;
-    if us >= f64::from(u32::MAX) + 1.0 {
-        return None;
-    }
-    Some(us as u32)
-}
-
 /// Rebuilds a configuration from the vehicle numbers (any order; names as in
 /// `VehicleConfig::vehicle_numbers`), **all** the parameters by name (any
-/// order), and the exact microseconds of every parameter of [`MICRO_PARAMS`]
+/// order), and the exact microseconds of every parameter of [`params::micro_ids`]
 /// as `(key, microseconds)` (any order), checked against `profile` as
 /// `params::set_all` does. Every parameter of this build must appear exactly
 /// once. Each must read back from the result with the bits it was given, and
@@ -705,23 +663,21 @@ pub fn rebuild_config<'a, const N: usize>(
         }
         *slot = Some(value);
     }
-    let mut exact: [Option<u32>; MICRO_PARAMS.len()] = [None; MICRO_PARAMS.len()];
+    let mut exact: [Option<u32>; params::COUNT] = [None; params::COUNT];
     for (position, (key, us)) in micros.into_iter().enumerate() {
         let unknown = RebuildError::UnknownParam { position, key };
         let id = params::find_key(key).ok_or(unknown)?;
-        let at = MICRO_PARAMS
-            .iter()
-            .position(|n| params::find(n) == Some(id))
-            .ok_or(unknown)?;
-        let slot = exact.get_mut(at).ok_or(unknown)?;
+        if !params::is_micros(id) {
+            return Err(unknown);
+        }
+        let slot = exact.get_mut(id.index()).ok_or(unknown)?;
         if slot.is_some() {
             return Err(RebuildError::DuplicateParam(id));
         }
         *slot = Some(us);
     }
-    for (name, slot) in MICRO_PARAMS.iter().zip(&exact) {
-        if slot.is_none() {
-            let id = params::find(name).ok_or(RebuildError::MissingParam(ParamId(u16::MAX)))?;
+    for id in params::micro_ids() {
+        if exact.get(id.index()).is_none_or(Option::is_none) {
             return Err(RebuildError::MissingParam(id));
         }
     }
@@ -748,13 +704,13 @@ pub fn rebuild_config<'a, const N: usize>(
         }
     }
     // The seconds name one microsecond; it must be the one that was logged.
-    for (name, us) in MICRO_PARAMS.iter().zip(&exact) {
-        let id = params::find(name).ok_or(RebuildError::NotExact(ParamId(u16::MAX)))?;
+    for id in params::micro_ids() {
+        let us = exact.get(id.index()).copied().flatten();
         let secs = match given.get(id.index()) {
-            Some(Some(ParamValue::F32(v))) => secs_to_us(*v),
+            Some(Some(ParamValue::F32(v))) => params::secs_to_micros(*v),
             _ => None,
         };
-        if secs.is_none() || secs != *us || micros_of(&cfg, name) != *us {
+        if secs.is_none() || secs != us || params::micros(&cfg, id) != us {
             return Err(RebuildError::NotExact(id));
         }
     }

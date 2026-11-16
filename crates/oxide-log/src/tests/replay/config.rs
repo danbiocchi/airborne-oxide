@@ -28,13 +28,19 @@ fn param_list<const N: usize>(cfg: &VehicleConfig<N>) -> Vec<(&'static str, Para
 
 /// The exact microseconds as the log carries them: (key, µs).
 fn micros_list<const N: usize>(cfg: &VehicleConfig<N>) -> Vec<(u32, u32)> {
-    replay::MICRO_PARAMS
-        .iter()
-        .map(|n| {
-            let key = params::key_of(params::find(n).unwrap()).unwrap();
-            (key, replay::micros_of(cfg, n).unwrap())
+    params::micro_ids()
+        .map(|id| {
+            (
+                params::key_of(id).unwrap(),
+                params::micros(cfg, id).unwrap(),
+            )
         })
         .collect()
+}
+
+/// The name of the parameter with stable key `key`.
+fn name_of_key(key: u32) -> &'static str {
+    params::PARAMS[params::find_key(key).unwrap().index()].name
 }
 
 fn rebuild<const N: usize>(
@@ -303,11 +309,7 @@ fn log_of<const N: usize>(cfg: &VehicleConfig<N>, hash: Option<u64>) -> Builder 
     }
     for (key, us) in micros_list(cfg) {
         b.push(&replay::MICROS, |w| {
-            let name = replay::MICRO_PARAMS
-                .iter()
-                .find(|n| params::key_of(params::find(n).unwrap()) == Some(key))
-                .unwrap();
-            replay::fill_micros(w, Micros(0), name, us);
+            replay::fill_micros(w, Micros(0), name_of_key(key), us);
         });
     }
     for (n, v) in param_list(cfg) {
@@ -410,39 +412,39 @@ fn a_microsecond_parameter_that_is_not_the_canonical_f32_is_refused_by_the_rebui
 }
 
 #[test]
-fn the_list_of_microsecond_parameters_is_the_core_s_and_its_values_are_read_from_the_fields() {
-    // A parameter is held as microseconds iff the core quantizes a value that
-    // is not a whole microsecond. Probe every f32 parameter in seconds.
-    let mut probed = Vec::new();
-    for (i, d) in params::PARAMS.iter().enumerate() {
-        if !matches!((d.default, d.unit), (ParamValue::F32(_), "s")) {
-            continue;
-        }
-        let id = ParamId(i as u16);
-        let mut c = quad();
-        // 0.1 s and 0.4 us: no whole microsecond is this f32.
-        let off = 0.100_000_4_f32;
-        if params::set(&mut c, &F405_LEAN, id, ParamValue::F32(off)).is_ok()
-            && params::get(&c, id) != Some(ParamValue::F32(off))
-        {
-            probed.push(d.name);
-        }
-    }
-    assert_eq!(probed, replay::MICRO_PARAMS);
-    // `micros_of` reads the field the parameter writes.
+fn the_microsecond_records_follow_the_cores_list_in_table_order_and_carry_its_values() {
+    // The replay module keeps no list of its own: its records are the core's
+    // `micro_ids`, in order, with `params::micros` as the value.
     let mut c = quad();
-    for (k, name) in replay::MICRO_PARAMS.iter().enumerate() {
+    for (k, id) in params::micro_ids().enumerate() {
         let us = 100_000 + 1000 * k as u32;
-        params::set(
-            &mut c,
-            &F405_LEAN,
-            params::find(name).unwrap(),
-            ParamValue::F32(us as f32 / 1e6),
-        )
-        .unwrap();
-        assert_eq!(replay::micros_of(&c, name), Some(us), "{name}");
+        params::set(&mut c, &F405_LEAN, id, ParamValue::F32(us as f32 / 1e6)).unwrap();
     }
-    assert_eq!(replay::micros_of(&c, "RATE_ROLL_P"), None);
+    let want: Vec<(u32, u32)> = params::micro_ids()
+        .map(|id| (params::key_of(id).unwrap(), params::micros(&c, id).unwrap()))
+        .collect();
+    assert_eq!(want.len(), 10);
+    assert_eq!(micros_list(&c), want);
+    // `write_micros` writes them in that order: after the 3-byte message
+    // header and the 2-byte subscription id, timestamp, key, microseconds.
+    let mut v = Vec::new();
+    replay::write_micros(&mut v, 3, Micros(5), &c).unwrap();
+    let got: Vec<(u32, u32)> = v
+        .chunks(3 + 2 + 16)
+        .map(|r| {
+            let key = u32::from_le_bytes(r[5 + 8..5 + 12].try_into().unwrap());
+            let us = u32::from_le_bytes(r[5 + 12..5 + 16].try_into().unwrap());
+            (key, us)
+        })
+        .collect();
+    assert_eq!(got, want);
+    // `fill_micros` writes nothing for a parameter that is not a duration,
+    // so the record is the wrong length and the writer refuses it.
+    let mut sink = Vec::new();
+    let r = crate::record::data(&mut sink, 3, &replay::MICROS, |w| {
+        replay::fill_micros(w, Micros(0), "RATE_ROLL_P", 1)
+    });
+    assert!(r.is_err());
 }
 
 #[test]
@@ -505,7 +507,7 @@ fn the_exact_microsecond_records_must_be_complete_and_known() {
     assert_eq!(
         err_us(numbers(&c), param_list(&c), us),
         RebuildError::UnknownParam {
-            position: replay::MICRO_PARAMS.len(),
+            position: params::micro_ids().count(),
             key: key("RATE_ROLL_P")
         }
     );
@@ -525,12 +527,8 @@ fn write_micros_and_decode_micros_round_trip() {
     let f = {
         let mut b = Builder::new();
         for (k, us) in micros_list(&c) {
-            let name = replay::MICRO_PARAMS
-                .iter()
-                .find(|n| params::key_of(params::find(n).unwrap()) == Some(k))
-                .unwrap();
             b.push(&replay::MICROS, |w| {
-                replay::fill_micros(w, Micros(77), name, us)
+                replay::fill_micros(w, Micros(77), name_of_key(k), us)
             });
         }
         b.file()
@@ -540,5 +538,5 @@ fn write_micros_and_decode_micros_round_trip() {
         .map(|r| decode::decode_micros(&r).unwrap())
         .collect();
     assert_eq!(got, micros_list(&c));
-    assert_eq!(v.len(), replay::MICRO_PARAMS.len() * (3 + 2 + 16));
+    assert_eq!(v.len(), params::micro_ids().count() * (3 + 2 + 16));
 }

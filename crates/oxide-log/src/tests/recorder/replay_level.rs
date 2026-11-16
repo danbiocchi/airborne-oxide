@@ -7,7 +7,7 @@ use crate::header::Level;
 use crate::reader::{Item, UlogFile};
 use crate::recorder::{Boot, Recorder, StartError};
 use crate::replay::decode::{self, config_of};
-use crate::replay::{self, MICRO_PARAMS, RebuildError, TOPICS};
+use crate::replay::{self, RebuildError, TOPICS};
 use crate::topics::NORMAL;
 use oxide_core::config::{Rotor, Spin, VehicleConfig};
 use oxide_core::io::{Event, EventKind, Inputs, Outputs, Reasons};
@@ -106,7 +106,7 @@ fn the_start_writes_the_vehicle_the_exact_microseconds_and_the_boot_record() {
     cfg.vehicle_numbers(|_, _| count += 1);
     let names = names_of(&f);
     let mut want = vec!["oxide_vehicle"; count];
-    want.extend(vec!["oxide_param_us"; MICRO_PARAMS.len()]);
+    want.extend(vec!["oxide_param_us"; params::micro_ids().count()]);
     want.push("oxide_boot");
     assert_eq!(names, want);
     let boot = f.records("oxide_boot").next().unwrap();
