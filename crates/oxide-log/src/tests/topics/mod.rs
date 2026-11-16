@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Steps 1 and 2: the normal level's topics, their encoders and the scales.
 
+mod oxide;
 mod px4;
 
 use crate::format::check_topic;
@@ -101,6 +102,9 @@ pub(crate) fn ints(r: &RecordView<'_>, want: &[(&str, i64)]) {
 /// differ from zero. Message id `i` is the position in [`NORMAL`].
 pub(crate) fn sample_records() -> Vec<Vec<u8>> {
     px4::all_samples()
+        .into_iter()
+        .chain(oxide::all_samples())
+        .collect()
 }
 
 #[test]
@@ -133,6 +137,10 @@ fn the_list_has_the_topics_of_the_adr_in_a_fixed_order() {
             "battery_status",
             "vehicle_status",
             "failsafe_flags",
+            "oxide_status",
+            "oxide_estimator",
+            "oxide_event",
+            "oxide_logger",
         ]
     );
     // A topic's id is its position; the named ids say the same.
@@ -164,6 +172,10 @@ fn record_lengths_are_pinned() {
             ("battery_status", 166),
             ("vehicle_status", 78),
             ("failsafe_flags", 101),
+            ("oxide_status", 33),
+            ("oxide_estimator", 31),
+            ("oxide_event", 39),
+            ("oxide_logger", 40),
         ]
     );
 }

@@ -20,8 +20,10 @@
 //! the `@invalid` value its message declares (battery), and zero otherwise.
 //! Each encoder lists its own.
 
+mod oxide;
 mod px4;
 
+pub use oxide::*;
 pub use px4::*;
 
 use crate::Sink;
@@ -49,6 +51,10 @@ pub const NORMAL: &[Topic] = &[
     px4::BATTERY_STATUS,
     px4::VEHICLE_STATUS,
     px4::FAILSAFE_FLAGS,
+    oxide::OXIDE_STATUS,
+    oxide::OXIDE_ESTIMATOR,
+    oxide::OXIDE_EVENT,
+    oxide::OXIDE_LOGGER,
 ];
 
 /// Message ids of [`NORMAL`]: `(topic name, id)`.
@@ -72,6 +78,10 @@ pub const IDS: &[(&str, u16)] = &[
     ("battery_status", id::BATTERY_STATUS),
     ("vehicle_status", id::VEHICLE_STATUS),
     ("failsafe_flags", id::FAILSAFE_FLAGS),
+    ("oxide_status", id::OXIDE_STATUS),
+    ("oxide_estimator", id::OXIDE_ESTIMATOR),
+    ("oxide_event", id::OXIDE_EVENT),
+    ("oxide_logger", id::OXIDE_LOGGER),
 ];
 
 /// The message id of each topic of [`NORMAL`] (its position in the list).
@@ -92,6 +102,10 @@ pub mod id {
     pub const BATTERY_STATUS: u16 = 13;
     pub const VEHICLE_STATUS: u16 = 14;
     pub const FAILSAFE_FLAGS: u16 = 15;
+    pub const OXIDE_STATUS: u16 = 16;
+    pub const OXIDE_ESTIMATOR: u16 = 17;
+    pub const OXIDE_EVENT: u16 = 18;
+    pub const OXIDE_LOGGER: u16 = 19;
 }
 
 /// Formats that topics of [`NORMAL`] nest, written before the topics. None of
