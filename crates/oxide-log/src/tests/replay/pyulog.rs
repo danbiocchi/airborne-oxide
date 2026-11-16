@@ -22,6 +22,9 @@ fn one_of_everything() -> Vec<u8> {
     b.push(&replay::VEHICLE, |w| {
         replay::fill_vehicle_number(w, t, 0, "mass_kg", 0.65);
     });
+    b.push(&replay::MICROS, |w| {
+        replay::fill_micros(w, t, "EKF_MAG_TMO", 16_000_001)
+    });
     b.push(&replay::BOOT, |w| {
         replay::fill_boot(w, t, &LoadReport::default(), 4, &H743_FULL).unwrap();
     });

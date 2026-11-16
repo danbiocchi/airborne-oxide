@@ -26,11 +26,22 @@ fn param_list<const N: usize>(cfg: &VehicleConfig<N>) -> Vec<(&'static str, Para
         .collect()
 }
 
+/// The exact microseconds as the log carries them: (key, µs).
+fn micros_list<const N: usize>(cfg: &VehicleConfig<N>) -> Vec<(u32, u32)> {
+    replay::MICRO_PARAMS
+        .iter()
+        .map(|n| {
+            let key = params::key_of(params::find(n).unwrap()).unwrap();
+            (key, replay::micros_of(cfg, n).unwrap())
+        })
+        .collect()
+}
+
 fn rebuild<const N: usize>(
     cfg: &VehicleConfig<N>,
     profile: &Profile,
 ) -> Result<VehicleConfig<N>, RebuildError> {
-    replay::rebuild_config::<N>(numbers(cfg), param_list(cfg), profile)
+    replay::rebuild_config::<N>(numbers(cfg), param_list(cfg), micros_list(cfg), profile)
 }
 
 fn same<const N: usize>(cfg: &VehicleConfig<N>, profile: &Profile) {
@@ -129,12 +140,20 @@ fn the_order_of_the_lists_does_not_matter() {
     let mut p = param_list(&c);
     n.reverse();
     p.reverse();
-    let back = replay::rebuild_config::<4>(n, p, &F405_LEAN).unwrap();
+    let back = replay::rebuild_config::<4>(n, p, micros_list(&c), &F405_LEAN).unwrap();
     assert_eq!(back, c);
 }
 
 fn err(n: Vec<(&'static str, f32)>, p: Vec<(&'static str, ParamValue)>) -> RebuildError {
-    replay::rebuild_config::<4>(n, p, &F405_LEAN).unwrap_err()
+    err_us(n, p, micros_list(&quad()))
+}
+
+fn err_us(
+    n: Vec<(&'static str, f32)>,
+    p: Vec<(&'static str, ParamValue)>,
+    us: Vec<(u32, u32)>,
+) -> RebuildError {
+    replay::rebuild_config::<4>(n, p, us, &F405_LEAN).unwrap_err()
 }
 
 #[test]
@@ -205,7 +224,7 @@ fn values_that_are_fine_alone_but_break_a_rule_together_are_refused() {
     // The configuration breaks `validate` through the vehicle numbers.
     let mut n = numbers(&c);
     n.iter_mut().find(|(name, _)| *name == "mass_kg").unwrap().1 = 1e6;
-    let e = replay::rebuild_config::<4>(n, param_list(&c), &F405_LEAN);
+    let e = replay::rebuild_config::<4>(n, param_list(&c), micros_list(&c), &F405_LEAN);
     // A mass that the vehicle cannot lift is not a parameter: the rules
     // between fields are checked on the whole.
     match e {
@@ -253,11 +272,12 @@ fn microseconds_above_16_seconds_may_not_and_the_parameter_is_named() {
             Err(RebuildError::NotExact(id)),
             "{us}"
         );
-        // The hash cannot tell: it is over the seconds as f32.
-        let back = rebuild(&c, &F405_LEAN).unwrap();
-        assert_ne!(back, c);
-        assert_eq!(back.config_hash(), c.config_hash());
-        assert_ne!(back.estimator.ekf.mag_timeout_us, us);
+        // The hash cannot tell (it is over the seconds as f32), so the
+        // rebuild must never hand back a different configuration.
+        match rebuild(&c, &F405_LEAN) {
+            Ok(back) => assert_eq!(back, c, "{us}: a silently different configuration"),
+            Err(e) => assert_eq!(e, RebuildError::NotExact(id), "{us}"),
+        }
     }
     // Round values are exact all the way up, 3600 s included.
     for us in [30_000_000u32, 60_000_000, 3_600_000_000, 100_000_000] {
@@ -280,6 +300,15 @@ fn log_of<const N: usize>(cfg: &VehicleConfig<N>, hash: Option<u64>) -> Builder 
     let mut b = Builder::new();
     if let Some(h) = hash {
         b.info_u64("oxide_config_hash", h);
+    }
+    for (key, us) in micros_list(cfg) {
+        b.push(&replay::MICROS, |w| {
+            let name = replay::MICRO_PARAMS
+                .iter()
+                .find(|n| params::key_of(params::find(n).unwrap()) == Some(key))
+                .unwrap();
+            replay::fill_micros(w, Micros(0), name, us);
+        });
     }
     for (n, v) in param_list(cfg) {
         b.param(
@@ -341,4 +370,173 @@ fn vehicle_records_whose_indices_do_not_run_from_zero_are_refused() {
             index: 5
         }
     );
+}
+
+#[test]
+fn a_file_with_a_lossy_microsecond_value_is_not_replayed_against_another_configuration() {
+    let mut c = quad();
+    c.failsafe.rc_timeout_us = 16_000_001;
+    let f = log_of(&c, Some(c.config_hash())).file();
+    if let Ok(back) = decode::config_of::<4>(&f, &F405_LEAN) {
+        assert_eq!(back, c, "a silently different configuration");
+    }
+}
+
+#[test]
+fn a_microsecond_parameter_that_is_not_the_canonical_f32_is_refused_by_the_rebuild() {
+    // 1.0000004 s is not the f32 of any whole microsecond: it would be read
+    // back as 1.0 s. The exact microseconds agree (1,000,000), so only the
+    // read-back of the rebuild can refuse it, and it must name the parameter.
+    let mut c = quad();
+    c.failsafe.rc_timeout_us = 1_000_000;
+    let id = params::find("FS_RC_TIMEOUT").unwrap();
+    let mut p = param_list(&c);
+    p.iter_mut().find(|(n, _)| *n == "FS_RC_TIMEOUT").unwrap().1 = ParamValue::F32(1.000_000_4);
+    assert_eq!(
+        replay::rebuild_config::<4>(numbers(&c), p, micros_list(&c), &F405_LEAN).unwrap_err(),
+        RebuildError::NotExact(id)
+    );
+    // The same through a file: its P message is the non-canonical value.
+    let mut b = log_of(&c, Some(c.config_hash()));
+    for (n, v) in &mut b.params {
+        if n == "FS_RC_TIMEOUT" {
+            *v = MsgParam::F32(1.000_000_4);
+        }
+    }
+    assert_eq!(
+        decode::config_of::<4>(&b.file(), &F405_LEAN).unwrap_err(),
+        FileConfigError::Rebuild(RebuildError::NotExact(id))
+    );
+}
+
+#[test]
+fn the_list_of_microsecond_parameters_is_the_core_s_and_its_values_are_read_from_the_fields() {
+    // A parameter is held as microseconds iff the core quantizes a value that
+    // is not a whole microsecond. Probe every f32 parameter in seconds.
+    let mut probed = Vec::new();
+    for (i, d) in params::PARAMS.iter().enumerate() {
+        if !matches!((d.default, d.unit), (ParamValue::F32(_), "s")) {
+            continue;
+        }
+        let id = ParamId(i as u16);
+        let mut c = quad();
+        // 0.1 s and 0.4 us: no whole microsecond is this f32.
+        let off = 0.100_000_4_f32;
+        if params::set(&mut c, &F405_LEAN, id, ParamValue::F32(off)).is_ok()
+            && params::get(&c, id) != Some(ParamValue::F32(off))
+        {
+            probed.push(d.name);
+        }
+    }
+    assert_eq!(probed, replay::MICRO_PARAMS);
+    // `micros_of` reads the field the parameter writes.
+    let mut c = quad();
+    for (k, name) in replay::MICRO_PARAMS.iter().enumerate() {
+        let us = 100_000 + 1000 * k as u32;
+        params::set(
+            &mut c,
+            &F405_LEAN,
+            params::find(name).unwrap(),
+            ParamValue::F32(us as f32 / 1e6),
+        )
+        .unwrap();
+        assert_eq!(replay::micros_of(&c, name), Some(us), "{name}");
+    }
+    assert_eq!(replay::micros_of(&c, "RATE_ROLL_P"), None);
+}
+
+#[test]
+fn with_the_exact_microseconds_a_lossy_value_is_named_and_a_round_one_is_rebuilt() {
+    let id = params::find("EKF_MAG_TMO").unwrap();
+    for us in [16_000_001u32, 16_777_217, 30_000_001] {
+        let mut c = quad();
+        c.estimator.ekf.mag_timeout_us = us;
+        assert_eq!(rebuild(&c, &F405_LEAN), Err(RebuildError::NotExact(id)));
+        let f = log_of(&c, Some(c.config_hash())).file();
+        assert_eq!(
+            decode::config_of::<4>(&f, &F405_LEAN).unwrap_err(),
+            FileConfigError::Rebuild(RebuildError::NotExact(id)),
+            "{us}"
+        );
+    }
+    for us in [30_000_000u32, 3_600_000_000, 16_000_000, 123_457] {
+        let mut c = quad();
+        c.estimator.ekf.mag_timeout_us = us;
+        same(&c, &F405_LEAN);
+        let f = log_of(&c, Some(c.config_hash())).file();
+        assert_eq!(decode::config_of::<4>(&f, &F405_LEAN).unwrap(), c);
+    }
+}
+
+#[test]
+fn a_file_whose_exact_microseconds_disagree_with_its_parameters_is_refused() {
+    // The file says 0.75 s in the P message and 750,001 us in the exact record.
+    let mut c = quad();
+    c.failsafe.rc_timeout_us = 750_000;
+    let id = params::find("FS_RC_TIMEOUT").unwrap();
+    let mut us = micros_list(&c);
+    let key = params::key_of(id).unwrap();
+    us.iter_mut().find(|(k, _)| *k == key).unwrap().1 = 750_001;
+    assert_eq!(
+        err_us(numbers(&c), param_list(&c), us),
+        RebuildError::NotExact(id)
+    );
+}
+
+#[test]
+fn the_exact_microsecond_records_must_be_complete_and_known() {
+    let c = quad();
+    let key = |n: &str| params::key_of(params::find(n).unwrap()).unwrap();
+    let mut us = micros_list(&c);
+    us.retain(|(k, _)| *k != key("FS_GCS_TIMEOUT"));
+    assert_eq!(
+        err_us(numbers(&c), param_list(&c), us),
+        RebuildError::MissingParam(params::find("FS_GCS_TIMEOUT").unwrap())
+    );
+    let mut us = micros_list(&c);
+    us.push((key("FS_GCS_TIMEOUT"), 3_000_000));
+    assert_eq!(
+        err_us(numbers(&c), param_list(&c), us),
+        RebuildError::DuplicateParam(params::find("FS_GCS_TIMEOUT").unwrap())
+    );
+    // A parameter that is not held in microseconds has no such record.
+    let mut us = micros_list(&c);
+    us.push((key("RATE_ROLL_P"), 1));
+    assert_eq!(
+        err_us(numbers(&c), param_list(&c), us),
+        RebuildError::UnknownParam {
+            position: replay::MICRO_PARAMS.len(),
+            key: key("RATE_ROLL_P")
+        }
+    );
+    let mut us = micros_list(&c);
+    us.push((0xDEAD_BEEF, 1));
+    assert!(matches!(
+        err_us(numbers(&c), param_list(&c), us),
+        RebuildError::UnknownParam { .. }
+    ));
+}
+
+#[test]
+fn write_micros_and_decode_micros_round_trip() {
+    let c = odd();
+    let mut v = Vec::new();
+    replay::write_micros(&mut v, 3, Micros(77), &c).unwrap();
+    let f = {
+        let mut b = Builder::new();
+        for (k, us) in micros_list(&c) {
+            let name = replay::MICRO_PARAMS
+                .iter()
+                .find(|n| params::key_of(params::find(n).unwrap()) == Some(k))
+                .unwrap();
+            b.push(&replay::MICROS, |w| replay::fill_micros(w, Micros(77), name, us));
+        }
+        b.file()
+    };
+    let got: Vec<(u32, u32)> = f
+        .records("oxide_param_us")
+        .map(|r| decode::decode_micros(&r).unwrap())
+        .collect();
+    assert_eq!(got, micros_list(&c));
+    assert_eq!(v.len(), replay::MICRO_PARAMS.len() * (3 + 2 + 16));
 }

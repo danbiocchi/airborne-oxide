@@ -263,6 +263,12 @@ pub fn decode_vehicle(r: &RecordView<'_>) -> Res<VehicleNumber> {
     })
 }
 
+/// `oxide_param_us`: the exact microseconds of one parameter, by key.
+pub fn decode_micros(r: &RecordView<'_>) -> Res<(u32, u32)> {
+    let d = Rd::new(r, &super::MICROS)?;
+    Ok((d.u32("key")?, d.u32("micros")?))
+}
+
 /// `oxide_boot`: what the core was booted with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boot {
@@ -778,19 +784,24 @@ pub fn core_param(v: MsgParam) -> ParamValue {
 }
 
 /// Rebuilds the configuration a file was flown with: the `oxide_vehicle`
-/// records, the initial parameters of the definitions (all of them), `profile`
-/// for the rules between fields, and the `oxide_config_hash` information as a
-/// check on the result.
+/// records, the initial parameters of the definitions (all of them),
+/// the exact microseconds of `oxide_param_us`, `profile` for the rules between
+/// fields, and the `oxide_config_hash` information as a check on the result.
 pub fn config_of<const N: usize>(
     file: &UlogFile,
     profile: &Profile,
 ) -> Result<VehicleConfig<N>, FileConfigError> {
     let numbers = vehicle_numbers_of(file)?;
+    let micros = file
+        .records("oxide_param_us")
+        .map(|r| decode_micros(&r))
+        .collect::<Result<Vec<_>, _>>()?;
     let cfg = rebuild_config::<N>(
         numbers.iter().map(|n| (n.name.as_str(), n.value)),
         file.initial_params
             .iter()
             .map(|p| (p.name.as_str(), core_param(p.value))),
+        micros,
         profile,
     )?;
     let logged = file

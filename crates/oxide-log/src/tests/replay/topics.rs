@@ -35,6 +35,7 @@ fn the_topics_in_their_fixed_order_with_their_record_lengths() {
         got,
         [
             ("oxide_vehicle", 38),
+            ("oxide_param_us", 16),
             ("oxide_boot", 47),
             ("oxide_in_tick", 20),
             ("oxide_in_imu", 48),
@@ -53,20 +54,21 @@ fn the_topics_in_their_fixed_order_with_their_record_lengths() {
     );
     // The constants and the list are the same topics.
     assert_eq!(TOPICS[0], replay::VEHICLE);
-    assert_eq!(TOPICS[1], replay::BOOT);
-    assert_eq!(TOPICS[2], replay::IN_TICK);
-    assert_eq!(TOPICS[3], replay::IN_IMU);
-    assert_eq!(TOPICS[4], replay::IN_STATE);
-    assert_eq!(TOPICS[5], replay::IN_RC);
-    assert_eq!(TOPICS[6], replay::IN_BATTERY);
-    assert_eq!(TOPICS[7], replay::IN_SETPOINT);
-    assert_eq!(TOPICS[8], replay::IN_GPS);
-    assert_eq!(TOPICS[9], replay::IN_BARO);
-    assert_eq!(TOPICS[10], replay::IN_MAG);
-    assert_eq!(TOPICS[11], replay::IN_GCS);
-    assert_eq!(TOPICS[12], replay::IN_BRAIN);
-    assert_eq!(TOPICS[13], replay::IN_PARAM_SET);
-    assert_eq!(TOPICS[14], replay::OUT);
+    assert_eq!(TOPICS[1], replay::MICROS);
+    assert_eq!(TOPICS[2], replay::BOOT);
+    assert_eq!(TOPICS[3], replay::IN_TICK);
+    assert_eq!(TOPICS[4], replay::IN_IMU);
+    assert_eq!(TOPICS[5], replay::IN_STATE);
+    assert_eq!(TOPICS[6], replay::IN_RC);
+    assert_eq!(TOPICS[7], replay::IN_BATTERY);
+    assert_eq!(TOPICS[8], replay::IN_SETPOINT);
+    assert_eq!(TOPICS[9], replay::IN_GPS);
+    assert_eq!(TOPICS[10], replay::IN_BARO);
+    assert_eq!(TOPICS[11], replay::IN_MAG);
+    assert_eq!(TOPICS[12], replay::IN_GCS);
+    assert_eq!(TOPICS[13], replay::IN_BRAIN);
+    assert_eq!(TOPICS[14], replay::IN_PARAM_SET);
+    assert_eq!(TOPICS[15], replay::OUT);
 }
 
 #[test]
@@ -149,6 +151,12 @@ fn every_encoder_writes_exactly_its_declared_length() {
         &replay::VEHICLE,
         write(&replay::VEHICLE, |w| {
             replay::fill_vehicle_number(w, t, 3, "rotor15_torque_coeff_m", -0.0);
+        }),
+    );
+    n(
+        &replay::MICROS,
+        write(&replay::MICROS, |w| {
+            replay::fill_micros(w, t, "FS_RC_TIMEOUT", u32::MAX)
         }),
     );
     n(

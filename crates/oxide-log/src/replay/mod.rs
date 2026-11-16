@@ -5,7 +5,9 @@
 //! records, written in this order by the replay recorder:
 //!
 //! - once, at the start: [`VEHICLE`] (one record per number of the vehicle
-//!   description) and [`BOOT`] (the stored-parameter load report, the rotor
+//!   description), [`MICROS`] (the exact value of each parameter the core
+//!   holds as whole microseconds, which the `f32` seconds of the `P`
+//!   messages cannot always name) and [`BOOT`] (the stored-parameter load report, the rotor
 //!   count, the profile's rates);
 //! - every tick: [`IN_TICK`] (which inputs are present, the sequence number,
 //!   the parameter acknowledgement, whether the store's "saved" call
@@ -83,6 +85,30 @@ pub const VEHICLE: Topic = Topic {
     name: "oxide_vehicle",
     format: "uint64_t timestamp;float value;uint16_t index;char[24] name;uint8_t[2] _padding0;",
     record_len: 38,
+};
+
+/// The parameters the core holds as whole microseconds, in table order. The
+/// log's `P` messages carry them as `f32` seconds, which names the microsecond
+/// exactly only up to 16 s; [`MICROS`] carries the integer.
+pub const MICRO_PARAMS: [&str; 10] = [
+    "EKF_HORIZON",
+    "EKF_ALIGN_TIME",
+    "EKF_GPS_TMO",
+    "EKF_POS_TMO",
+    "EKF_BARO_TMO",
+    "EKF_MAG_TMO",
+    "FS_RC_TIMEOUT",
+    "FS_GCS_TIMEOUT",
+    "FS_BRAIN_TMO",
+    "FS_SETPT_TMO",
+];
+
+/// The exact microseconds of one parameter of [`MICRO_PARAMS`], by the
+/// parameter's stable key.
+pub const MICROS: Topic = Topic {
+    name: "oxide_param_us",
+    format: "uint64_t timestamp;uint32_t key;uint32_t micros;",
+    record_len: 16,
 };
 
 /// The stored-parameter load report, the rotor count and the profile's rates.
@@ -206,8 +232,9 @@ pub const OUT: Topic = Topic {
 };
 
 /// The replay topics in their fixed order, for the header.
-pub const TOPICS: [Topic; 15] = [
+pub const TOPICS: [Topic; 16] = [
     VEHICLE,
+    MICROS,
     BOOT,
     IN_TICK,
     IN_IMU,
@@ -317,6 +344,54 @@ pub fn write_vehicle<const N: usize, S: Sink + ?Sized>(
         }
     });
     result
+}
+
+/// The value of `cfg`'s parameter `name` of [`MICRO_PARAMS`], in whole
+/// microseconds; `None` for any other name.
+pub fn micros_of<const N: usize>(cfg: &VehicleConfig<N>, name: &str) -> Option<u32> {
+    let (e, f) = (&cfg.estimator.ekf, &cfg.failsafe);
+    Some(match name {
+        "EKF_HORIZON" => e.delay_horizon_us,
+        "EKF_ALIGN_TIME" => e.align_time_us,
+        "EKF_GPS_TMO" => e.gps_timeout_us,
+        "EKF_POS_TMO" => e.pos_timeout_us,
+        "EKF_BARO_TMO" => e.baro_timeout_us,
+        "EKF_MAG_TMO" => e.mag_timeout_us,
+        "FS_RC_TIMEOUT" => f.rc_timeout_us,
+        "FS_GCS_TIMEOUT" => f.gcs_timeout_us,
+        "FS_BRAIN_TMO" => f.brain_timeout_us,
+        "FS_SETPT_TMO" => f.setpoint_timeout_us,
+        _ => return None,
+    })
+}
+
+/// One `oxide_param_us` record: the parameter's stable key and its exact
+/// microseconds. Writes nothing for a name that is not in [`MICRO_PARAMS`].
+pub fn fill_micros<S: Sink + ?Sized>(
+    w: &mut RecordWriter<'_, S>,
+    t: Micros,
+    name: &str,
+    micros: u32,
+) {
+    if let Some(key) = params::find(name).and_then(params::key_of) {
+        w.u64(t.0).u32(key).u32(micros);
+    }
+}
+
+/// Writes the exact microseconds of every parameter of [`MICRO_PARAMS`],
+/// straight into `sink` like [`write_vehicle`]. `msg_id` is the topic's
+/// subscription id.
+pub fn write_micros<const N: usize, S: Sink + ?Sized>(
+    sink: &mut S,
+    msg_id: u16,
+    t: Micros,
+    cfg: &VehicleConfig<N>,
+) -> Result<(), Error> {
+    for name in MICRO_PARAMS {
+        let us = micros_of(cfg, name).unwrap_or(0);
+        crate::record::data(sink, msg_id, &MICROS, |w| fill_micros(w, t, name, us))?;
+    }
+    Ok(())
 }
 
 /// The boot record: the report of the stored-parameter load, the number of
@@ -583,18 +658,32 @@ fn same_param_bits(a: ParamValue, b: ParamValue) -> bool {
     }
 }
 
+/// Seconds as `f32` to whole microseconds, rounded: what the core stores for
+/// a parameter held in microseconds (`params` keeps the same rule private).
+fn secs_to_us(v: f32) -> Option<u32> {
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    let us = f64::from(v) * 1_000_000.0 + 0.5;
+    if us >= f64::from(u32::MAX) + 1.0 {
+        return None;
+    }
+    Some(us as u32)
+}
+
 /// Rebuilds a configuration from the vehicle numbers (any order; names as in
-/// `VehicleConfig::vehicle_numbers`) and **all** the parameters by name (any
-/// order), checked against `profile` as `params::set_all` does. Every
-/// parameter of this build must appear exactly once. Each must read back from
-/// the result with the bits it was given, else [`RebuildError::NotExact`].
-///
-/// Equal hashes do not prove equal configurations when a parameter held in
-/// microseconds does not survive (`config_hash` reads seconds as `f32`): the
-/// recorder checks [`check_exact`] on the configuration before it logs it.
+/// `VehicleConfig::vehicle_numbers`), **all** the parameters by name (any
+/// order), and the exact microseconds of every parameter of [`MICRO_PARAMS`]
+/// as `(key, microseconds)` (any order), checked against `profile` as
+/// `params::set_all` does. Every parameter of this build must appear exactly
+/// once. Each must read back from the result with the bits it was given, and
+/// each microsecond parameter must be the exact value logged for it, else
+/// [`RebuildError::NotExact`] names it: the result is the configuration that
+/// was logged or an error, never another configuration with the same hash.
 pub fn rebuild_config<'a, const N: usize>(
     numbers: impl IntoIterator<Item = (&'a str, f32)>,
     parameters: impl IntoIterator<Item = (&'a str, ParamValue)>,
+    micros: impl IntoIterator<Item = (u32, u32)>,
     profile: &Profile,
 ) -> Result<VehicleConfig<N>, RebuildError> {
     let mut cfg =
@@ -615,6 +704,26 @@ pub fn rebuild_config<'a, const N: usize>(
             return Err(RebuildError::DuplicateParam(id));
         }
         *slot = Some(value);
+    }
+    let mut exact: [Option<u32>; MICRO_PARAMS.len()] = [None; MICRO_PARAMS.len()];
+    for (position, (key, us)) in micros.into_iter().enumerate() {
+        let unknown = RebuildError::UnknownParam { position, key };
+        let id = params::find_key(key).ok_or(unknown)?;
+        let at = MICRO_PARAMS
+            .iter()
+            .position(|n| params::find(n) == Some(id))
+            .ok_or(unknown)?;
+        let slot = exact.get_mut(at).ok_or(unknown)?;
+        if slot.is_some() {
+            return Err(RebuildError::DuplicateParam(id));
+        }
+        *slot = Some(us);
+    }
+    for (name, slot) in MICRO_PARAMS.iter().zip(&exact) {
+        if slot.is_none() {
+            let id = params::find(name).ok_or(RebuildError::MissingParam(ParamId(u16::MAX)))?;
+            return Err(RebuildError::MissingParam(id));
+        }
     }
     for (i, slot) in given.iter().enumerate() {
         if slot.is_none() {
@@ -638,12 +747,26 @@ pub fn rebuild_config<'a, const N: usize>(
             _ => return Err(RebuildError::NotExact(id)),
         }
     }
+    // The seconds name one microsecond; it must be the one that was logged.
+    for (name, us) in MICRO_PARAMS.iter().zip(&exact) {
+        let id = params::find(name).ok_or(RebuildError::NotExact(ParamId(u16::MAX)))?;
+        let secs = match given.get(id.index()) {
+            Some(Some(ParamValue::F32(v))) => secs_to_us(*v),
+            _ => None,
+        };
+        if secs.is_none() || secs != *us || micros_of(&cfg, name) != *us {
+            return Err(RebuildError::NotExact(id));
+        }
+    }
     Ok(cfg)
 }
 
-/// Whether parameter `id` of `cfg` survives being logged as the value
-/// `params::get` reads and set again: setting it on a copy must give `cfg`
-/// back. A parameter held as whole microseconds reads as `f32` seconds, which
+/// Whether parameter `id` of `cfg` survives being read as `f32` seconds and
+/// set again. The log carries the exact microseconds too ([`MICROS`]), so a
+/// parameter that does not survive is not replayable: the rebuild names it
+/// ([`RebuildError::NotExact`]). A recorder may call this (or
+/// [`check_exact`]) to refuse such a configuration up front. Setting it on a
+/// copy must give `cfg` back. A parameter held as whole microseconds reads as `f32` seconds, which
 /// names the microsecond exactly for every value up to 16 s (16,000,000 µs)
 /// and for round values above, but not for every value above (the first
 /// that fails is 16,000,001 µs).

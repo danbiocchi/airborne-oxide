@@ -13,7 +13,7 @@ pub const T: oxide_core::time::Micros = oxide_core::time::Micros(0x1122_3344_556
 #[derive(Default)]
 pub struct Builder {
     infos: Vec<(String, u64)>,
-    params: Vec<(String, MsgParam)>,
+    pub params: Vec<(String, MsgParam)>,
     data: Vec<u8>,
 }
 
