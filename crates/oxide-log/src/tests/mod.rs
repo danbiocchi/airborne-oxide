@@ -2,5 +2,6 @@
 mod format;
 mod logger;
 mod msg;
+mod pyulog;
 mod reader;
 mod record;
