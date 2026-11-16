@@ -32,6 +32,8 @@ jobs:
         run: cargo build -p oxide-core --target thumbv7em-none-eabihf --release --locked
       - name: Parameter store builds for the STM32 target (no_std, no alloc)
         run: cargo build -p oxide-store --target thumbv7em-none-eabihf --release --locked
+      - name: Log format layer builds for the STM32 target (no_std, no alloc)
+        run: cargo build -p oxide-log --target thumbv7em-none-eabihf --release --locked
 
   test:
     name: Test (${{ matrix.os }})
