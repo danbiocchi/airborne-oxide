@@ -30,7 +30,8 @@
 //! `replay FILE.ulg` rebuilds the flight core from a replay-level log
 //! (`--log-level replay`) and runs the recorded ticks through it, comparing
 //! every output bit for bit; it exits 0 when every tick replayed is identical
-//! (also when the file ends in a cut), 1 on a difference or a gap, and 2 on a
+//! (also when the file ends in a cut), 1 on a difference, a gap, a tick that is
+//! not whole, damage at the end of the file or a file with no tick, and 2 on a
 //! file it cannot replay. `--param` replays through a changed setting,
 //! `--continue` counts every tick that differs instead of stopping at the first.
 //! Every command exits 0 when it passed, 1 when a run it judged failed
@@ -1167,8 +1168,9 @@ fn replay_file_report(
 /// field, recorded and replayed values); `--continue` goes on and counts the
 /// ticks that differ. The status is the command's exit code: `Ok(true)` (0)
 /// when every tick replayed is identical, also when the file ends in a cut;
-/// `Ok(false)` (1) on a difference, a gap, a missing tick or a malformed one;
-/// an error (2) for a file that cannot be replayed.
+/// `Ok(false)` (1) on a difference, a gap, a missing tick or a malformed one,
+/// damage at the end of the file, or a file with no tick; an error (2) for a
+/// file that cannot be replayed.
 fn replay_command(
     mut it: impl Iterator<Item = String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
