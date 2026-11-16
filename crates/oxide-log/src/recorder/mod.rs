@@ -45,16 +45,22 @@ impl Clock {
     }
 
     /// Due on the first look, then whenever `now` has reached the next time.
+    /// Also due when the next time is more than a period ahead of `now`: the
+    /// tick clock stepped back, and waiting for it to pass the old time
+    /// would silence the topic ([`advance`](Self::advance) re-anchors).
     pub(crate) fn due(&self, now: u64) -> bool {
         match self.next {
             None => true,
-            Some(n) => now >= n,
+            Some(n) => now >= n || n > now.saturating_add(self.period.max(1)),
         }
     }
 
     /// Sets the next time to the first on the period grid after `now`: a
     /// pause does not make the clock write a burst to catch up, and the
     /// phase of the grid is kept. The grid starts at the first record.
+    ///
+    /// A next time more than a period ahead of `now` (the clock stepped
+    /// back) starts a new grid at `now`.
     ///
     /// Less than a period late is the common case and takes no division
     /// (a library call on the Cortex-M4F and M7).
@@ -64,7 +70,9 @@ impl Clock {
             None => now.saturating_add(period),
             Some(n) => {
                 let on_grid = n.saturating_add(period);
-                if now < on_grid {
+                if n > now.saturating_add(period) {
+                    now.saturating_add(period)
+                } else if now < on_grid {
                     on_grid
                 } else {
                     let late = (now - n) / period;
@@ -91,8 +99,10 @@ impl<K: Copy + PartialEq> OnChange<K> {
         }
     }
 
+    /// Also due when the next time is more than a second ahead of `now`: the
+    /// tick clock stepped back.
     fn due(&self, key: K, now: u64) -> bool {
-        self.last != Some(key) || now >= self.next
+        self.last != Some(key) || now >= self.next || self.next > now.saturating_add(period::SECOND)
     }
 
     fn wrote(&mut self, key: K, now: u64) {

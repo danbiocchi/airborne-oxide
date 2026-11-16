@@ -190,7 +190,11 @@ impl<const CAP: usize> Logger<CAP> {
             wrote_dropout = ok;
         }
         let mut wrote_sync = false;
-        if ok && now_us.saturating_sub(self.last_sync_us) >= SYNC_INTERVAL_US {
+        // A log clock that stepped back by more than the interval would
+        // otherwise wait for the old time to come round again.
+        let sync_due = now_us.saturating_sub(self.last_sync_us) >= SYNC_INTERVAL_US
+            || self.last_sync_us > now_us.saturating_add(SYNC_INTERVAL_US);
+        if ok && sync_due {
             ok = msg::sync(&mut w).is_ok();
             wrote_sync = ok;
         }
