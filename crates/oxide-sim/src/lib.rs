@@ -14,6 +14,7 @@ pub mod hash;
 pub mod metrics;
 pub mod montecarlo;
 pub mod outcome;
+pub mod replay;
 pub mod rng;
 pub mod scenario;
 pub mod scenario_file;
