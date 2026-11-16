@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! What is written after each tick, and when (ADR-0005 §3 and §7).
 
+pub mod text;
+
 use crate::header::{BuildInfo, Level};
 use crate::logger::{Class, Logger, MessageWriter, Stats};
-use crate::msg::{Error, Sink};
+use crate::msg::{self, Error, ParamValue, Sink};
 use crate::record::{self, RecordWriter, Topic};
 use crate::topics::{self, Scales, id};
 use oxide_core::codes::{px4_arming_state, px4_nav_state};
 use oxide_core::config::{EstimatorSource, VehicleConfig};
 use oxide_core::flight::Telemetry;
 use oxide_core::io::{
-    Action, BaroSample, BatterySample, ImuSample, Inputs, MagSample, NavState, Outputs, RcSample,
-    Reasons, Stamped, Status,
+    Action, BaroSample, BatterySample, Event, EventKind, ImuSample, Inputs, MagSample, NavState,
+    Outputs, RcSample, Reasons, Stamped, Status,
 };
+use oxide_core::params::{self, ParamValue as CoreValue};
 use oxide_core::time::Micros;
+use text::{TextBuf, event_level, event_text};
 
 /// Microseconds between records of a topic, by rate (ADR-0005 §3).
 mod period {
@@ -304,6 +308,10 @@ impl<const CAP: usize> Recorder<CAP> {
         let tel = telemetry;
         let source = cfg.estimator.source;
 
+        for e in outputs.events.iter() {
+            self.event(now, e, cfg);
+        }
+
         // Status: written when it changes. A record that did not fit is
         // tried again on the next tick.
         let key = vehicle_status_key(status);
@@ -526,6 +534,32 @@ impl<const CAP: usize> Recorder<CAP> {
             self.must(t, id::OXIDE_LOGGER, &topics::OXIDE_LOGGER, |w| {
                 topics::oxide_logger(w, now, &stats)
             });
+        }
+    }
+
+    /// One event: as a logged string, then as an `oxide_event` record, both
+    /// `Must`; a parameter change also writes the parameter's new value.
+    fn event<const N: usize>(&mut self, now: Micros, e: &Event, cfg: &VehicleConfig<N>) {
+        let t = now.0;
+        let mut text = TextBuf::new();
+        event_text(&e.kind, &mut text);
+        let level = event_level(&e.kind);
+        self.logger.write(Class::Must, t, |w| {
+            msg::logged_string(w, level, e.t.0, text.as_str())
+        });
+        self.must(t, id::OXIDE_EVENT, &topics::OXIDE_EVENT, |w| {
+            topics::oxide_event(w, now, e)
+        });
+        if let EventKind::ParamChanged(pid) = e.kind
+            && let Some(def) = params::PARAMS.get(pid.index())
+            && let Some(v) = params::get(cfg, pid)
+        {
+            let value = match v {
+                CoreValue::F32(x) => ParamValue::F32(x),
+                CoreValue::I32(x) => ParamValue::I32(x),
+            };
+            self.logger
+                .write(Class::Must, t, |w| msg::parameter(w, def.name, value));
         }
     }
 
