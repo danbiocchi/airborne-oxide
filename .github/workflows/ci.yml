@@ -92,6 +92,30 @@ jobs:
           cat hashes/hashes-windows-latest/hashes.txt
           diff hashes/hashes-ubuntu-latest/hashes.txt hashes/hashes-windows-latest/hashes.txt
 
+  pyulog:
+    name: Logs are read by pyulog
+    runs-on: ubuntu-latest
+    env:
+      LOG_FILE: ${{ runner.temp }}/rc-loss-position.ulg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyulog==1.3.0
+      - run: rustup toolchain install "$TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: The tests that use pyulog (ADR-0005 section 9)
+        # OXIDE_PYTHON makes them run instead of printing a notice and skipping.
+        run: |
+          export OXIDE_PYTHON="$(command -v python)"
+          cargo test --locked -p oxide-log pyulog
+          cargo test --locked -p oxide-sim --test log_values
+      - name: A log written by the command line, checked by pyulog
+        run: |
+          cargo run --release --locked -q -p oxide-sim-cli -- scenario rc-loss-position --log "$LOG_FILE"
+          python tools/ulog_check.py "$LOG_FILE" --expect-topics sensor_combined,vehicle_angular_velocity,vehicle_rates_setpoint,actuator_motors,vehicle_thrust_setpoint,vehicle_torque_setpoint,vehicle_attitude,vehicle_attitude_setpoint,vehicle_local_position,vehicle_local_position_setpoint,manual_control_setpoint,vehicle_magnetometer,vehicle_air_data,battery_status,vehicle_status,failsafe_flags,oxide_status,oxide_estimator,oxide_event,oxide_logger
+
   viewer:
     name: Viewer builds (Rerun + joystick)
     runs-on: ubuntu-latest
