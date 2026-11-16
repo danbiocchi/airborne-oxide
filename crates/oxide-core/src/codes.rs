@@ -10,7 +10,8 @@
 //! fails the table tests below.
 //!
 //! [`Reasons`] and [`PrearmFlags`] already have fixed bit positions; the
-//! tests pin them too.
+//! tests pin them too. [`px4_nav_state`] and [`px4_arming_state`] translate
+//! to PX4's numbers for the tools that colour a flight by them.
 
 use crate::config::{ConfigError, EstimatorSource};
 use crate::io::{Action, DisarmReason, EventKind, FlightMode, NavState};
@@ -256,6 +257,50 @@ impl EventKind {
     }
 }
 
+/// PX4's `vehicle_status.arming_state` for the armed flag:
+/// `ARMING_STATE_DISARMED = 1`, `ARMING_STATE_ARMED = 2`.
+pub const fn px4_arming_state(armed: bool) -> u8 {
+    if armed { 2 } else { 1 }
+}
+
+/// PX4's `vehicle_status.nav_state` for the closest PX4 state.
+///
+/// The numbers are `NAVIGATION_STATE_*` of PX4's `msg/versioned/VehicleStatus.msg`
+/// at PX4-Autopilot commit `99a3048735caa5a2c277d6aa8e17a12a6133db5d`, and the
+/// ones Flight Review colours.
+///
+/// | Oxide | PX4 |
+/// |---|---|
+/// | `Stabilized` | `STAB` 15 |
+/// | `Altitude` | `ALTCTL` 1 |
+/// | `Position` | `POSCTL` 2 |
+/// | `Offboard` | `OFFBOARD` 14 |
+/// | `Hold` | `AUTO_LOITER` 4 |
+/// | `Rtl` | `AUTO_RTL` 5 |
+/// | `Land` | `AUTO_LAND` 18 |
+/// | `LandNow` | `DESCEND` 12 |
+/// | `Terminated` | `TERMINATION` 13 |
+/// | `Disarmed` | the state of the pilot's `mode`, as PX4 shows the selected mode while disarmed |
+pub const fn px4_nav_state(nav: NavState, mode: FlightMode) -> u8 {
+    match nav {
+        NavState::Disarmed => match mode {
+            FlightMode::Stabilized => 15,
+            FlightMode::Altitude => 1,
+            FlightMode::Position => 2,
+            FlightMode::Offboard => 14,
+        },
+        NavState::Stabilized => 15,
+        NavState::Altitude => 1,
+        NavState::Position => 2,
+        NavState::Offboard => 14,
+        NavState::Hold => 4,
+        NavState::Rtl => 5,
+        NavState::Land => 18,
+        NavState::LandNow => 12,
+        NavState::Terminated => 13,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +487,35 @@ mod tests {
             assert_eq!(f.0, 1_u16 << bit);
         }
         assert_eq!(PrearmFlags::ALL.0, 0x01ff);
+    }
+
+    #[test]
+    fn px4_state_numbers_are_pinned() {
+        use FlightMode as M;
+        use NavState as N;
+        assert_eq!(px4_arming_state(false), 1);
+        assert_eq!(px4_arming_state(true), 2);
+        let table: &[(N, u8)] = &[
+            (N::Stabilized, 15),
+            (N::Altitude, 1),
+            (N::Position, 2),
+            (N::Offboard, 14),
+            (N::Hold, 4),
+            (N::Rtl, 5),
+            (N::Land, 18),
+            (N::LandNow, 12),
+            (N::Terminated, 13),
+        ];
+        // Armed states do not depend on the pilot's mode.
+        for (n, px4) in table {
+            for m in [M::Stabilized, M::Altitude, M::Position, M::Offboard] {
+                assert_eq!(px4_nav_state(*n, m), *px4, "{n:?} {m:?}");
+            }
+        }
+        // Disarmed shows the pilot's selected mode.
+        assert_eq!(px4_nav_state(N::Disarmed, M::Stabilized), 15);
+        assert_eq!(px4_nav_state(N::Disarmed, M::Altitude), 1);
+        assert_eq!(px4_nav_state(N::Disarmed, M::Position), 2);
+        assert_eq!(px4_nav_state(N::Disarmed, M::Offboard), 14);
     }
 }
