@@ -919,7 +919,10 @@ impl<const N: usize> VehicleConfig<N> {
     /// the bits of every [`Self::vehicle_numbers`] value in their order
     /// (each as its `f32` bits, little endian), then every parameter in table
     /// order (an `f32` as its bits, an `i32` as its two's-complement bits,
-    /// little endian; parameters in seconds as `params::get` reads them).
+    /// little endian; parameters in seconds as `params::get` reads them),
+    /// then the exact microseconds of every parameter held as whole
+    /// microseconds (`params::micros`, as `u32` little endian, in table
+    /// order), which `f32` seconds do not tell apart above 16 s.
     /// Two logs with the same hash and profile were flown with the same
     /// settings.
     pub fn config_hash(&self) -> u64 {
@@ -935,6 +938,10 @@ impl<const N: usize> VehicleConfig<N> {
                 None => 0,
             };
             h = fnv1a_64(h, &bits.to_le_bytes());
+        }
+        for id in crate::params::micro_ids() {
+            let us = crate::params::micros(self, id).unwrap_or(0);
+            h = fnv1a_64(h, &us.to_le_bytes());
         }
         h
     }

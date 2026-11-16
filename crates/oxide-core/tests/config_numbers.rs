@@ -270,7 +270,53 @@ fn changing_any_single_value_changes_the_hash() {
 #[test]
 fn the_hash_of_the_reference_quad_is_pinned() {
     // 28 vehicle numbers and 93 parameters, each as four little-endian bytes
-    // of its bits, through 64-bit FNV-1a: also computed by an independent
-    // Python script from the same list of bits.
-    assert_eq!(quad().config_hash(), 0x4e22_87ac_ee8e_2c79);
+    // of its bits, then the exact microseconds of the ten durations as four
+    // little-endian bytes each, through 64-bit FNV-1a: also computed by an
+    // independent Python script from the same list of bits. The first part
+    // alone gave 0x4e22_87ac_ee8e_2c79; the pin changed only because the hash
+    // now continues over the ten durations.
+    assert_eq!(quad().config_hash(), 0xd5a0_f38d_7ab0_9979);
+}
+
+#[test]
+fn two_durations_one_microsecond_apart_above_16_s_hash_differently() {
+    let mut a = quad();
+    let mut b = quad();
+    // 100 s and 100 s + 1 us: the same f32 seconds.
+    a.failsafe.rc_timeout_us = 100_000_000;
+    b.failsafe.rc_timeout_us = 100_000_001;
+    assert_eq!(
+        params::get(&a, ParamId::FS_RC_TIMEOUT),
+        params::get(&b, ParamId::FS_RC_TIMEOUT)
+    );
+    assert_ne!(a.config_hash(), b.config_hash());
+    // Every duration counts.
+    for id in params::micro_ids() {
+        let c = quad();
+        let mut d = quad();
+        bump(&mut d, id);
+        assert_ne!(c.config_hash(), d.config_hash(), "{id:?}");
+    }
+}
+
+/// Adds one microsecond to the field of duration `id`.
+fn bump(c: &mut VehicleConfig<4>, id: ParamId) {
+    let (e, f) = (&mut c.estimator.ekf, &mut c.failsafe);
+    let all = params::micro_ids().position(|x| x == id).unwrap();
+    let field = [
+        &mut e.delay_horizon_us,
+        &mut e.align_time_us,
+        &mut e.gps_timeout_us,
+        &mut e.pos_timeout_us,
+        &mut e.baro_timeout_us,
+        &mut e.mag_timeout_us,
+        &mut f.rc_timeout_us,
+        &mut f.gcs_timeout_us,
+        &mut f.brain_timeout_us,
+        &mut f.setpoint_timeout_us,
+    ]
+    .into_iter()
+    .nth(all)
+    .unwrap();
+    *field += 1;
 }
