@@ -193,3 +193,5 @@ fn drain_passes_through_to_a_sink_that_takes_bytes_whole_or_not_at_all() {
     let held = rec.drain(&mut file);
     assert!(held > 0);
 }
+
+mod rates;

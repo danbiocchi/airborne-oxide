@@ -5,13 +5,171 @@ use crate::header::{BuildInfo, Level};
 use crate::logger::{Class, Logger, MessageWriter, Stats};
 use crate::msg::{Error, Sink};
 use crate::record::{self, RecordWriter, Topic};
-use crate::topics::{self, Scales};
-use oxide_core::config::VehicleConfig;
+use crate::topics::{self, Scales, id};
+use oxide_core::codes::{px4_arming_state, px4_nav_state};
+use oxide_core::config::{EstimatorSource, VehicleConfig};
 use oxide_core::flight::Telemetry;
 use oxide_core::io::{
-    BaroSample, BatterySample, ImuSample, Inputs, MagSample, Outputs, RcSample, Stamped,
+    Action, BaroSample, BatterySample, ImuSample, Inputs, MagSample, NavState, Outputs, RcSample,
+    Reasons, Stamped, Status,
 };
 use oxide_core::time::Micros;
+
+/// Microseconds between records of a topic, by rate (ADR-0005 §3).
+mod period {
+    pub const HZ_100: u64 = 10_000;
+    pub const HZ_50: u64 = 20_000;
+    pub const HZ_20: u64 = 50_000;
+    pub const HZ_10: u64 = 100_000;
+    pub const HZ_5: u64 = 200_000;
+    /// The longest a status topic and `oxide_logger` go without a record.
+    pub const SECOND: u64 = 1_000_000;
+}
+
+/// When a streamed topic is next due, on the tick clock.
+#[derive(Clone, Copy, Debug)]
+struct Clock {
+    period: u64,
+    next: Option<u64>,
+}
+
+impl Clock {
+    const fn new(period: u64) -> Self {
+        Self { period, next: None }
+    }
+
+    /// Due on the first look, then whenever `now` has reached the next time.
+    fn due(&self, now: u64) -> bool {
+        match self.next {
+            None => true,
+            Some(n) => now >= n,
+        }
+    }
+
+    /// Sets the next time to the first on the period grid after `now`: a
+    /// pause does not make the clock write a burst to catch up, and the
+    /// phase of the grid is kept. The grid starts at the first record.
+    fn advance(&mut self, now: u64) {
+        let period = self.period.max(1);
+        self.next = Some(match self.next {
+            None => now.saturating_add(period),
+            Some(n) => {
+                let late = now.saturating_sub(n) / period;
+                n.saturating_add(period.saturating_mul(late.saturating_add(1)))
+            }
+        });
+    }
+}
+
+/// A status-like topic: written when what it carries changes, and at least
+/// once a second after its last record.
+#[derive(Clone, Copy, Debug)]
+struct OnChange<K> {
+    last: Option<K>,
+    next: u64,
+}
+
+impl<K: Copy + PartialEq> OnChange<K> {
+    const fn new() -> Self {
+        Self {
+            last: None,
+            next: 0,
+        }
+    }
+
+    fn due(&self, key: K, now: u64) -> bool {
+        self.last != Some(key) || now >= self.next
+    }
+
+    fn wrote(&mut self, key: K, now: u64) {
+        self.last = Some(key);
+        self.next = now.saturating_add(period::SECOND);
+    }
+}
+
+/// What `vehicle_status` carries: PX4's arming state, nav state and the
+/// pilot's intention, "a failsafe action is in force" and "no pre-arm check
+/// fails".
+pub(crate) fn vehicle_status_key(s: &Status) -> (u8, u8, u8, bool, bool) {
+    (
+        px4_arming_state(s.armed),
+        px4_nav_state(s.nav, s.mode),
+        px4_nav_state(NavState::Disarmed, s.mode),
+        s.action != Action::None,
+        s.prearm.is_empty(),
+    )
+}
+
+/// What `failsafe_flags` carries, one bit per flag it writes.
+pub(crate) fn failsafe_flags_key(s: &Status) -> u16 {
+    let r = |b: Reasons| s.reasons.intersects(b);
+    let battery = if r(Reasons::BATTERY_CRITICAL) {
+        2
+    } else {
+        u16::from(r(Reasons::BATTERY_LOW))
+    };
+    u16::from(!s.valid.attitude)
+        | u16::from(!s.valid.altitude) << 1
+        | u16::from(!s.valid.position) << 2
+        | u16::from(!s.valid.velocity) << 3
+        | u16::from(r(Reasons::BRAIN_LOST) || r(Reasons::SETPOINT_STALE)) << 4
+        | u16::from(!s.home_set) << 5
+        | u16::from(r(Reasons::RC_LOST)) << 6
+        | battery << 7
+        | u16::from(r(Reasons::LOSS_OF_CONTROL)) << 9
+        | u16::from(r(Reasons::GEOFENCE)) << 10
+        | u16::from(r(Reasons::GPS_LOST)) << 11
+}
+
+/// What `oxide_status` carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OxideStatusKey {
+    timing_faults: u32,
+    events_dropped: u32,
+    reasons: u16,
+    prearm: u16,
+    codes: [u8; 5],
+    flags: u8,
+}
+
+pub(crate) fn oxide_status_key(
+    s: &Status,
+    source: EstimatorSource,
+    events_dropped: u32,
+    landed: bool,
+    ground_contact: bool,
+) -> OxideStatusKey {
+    OxideStatusKey {
+        timing_faults: s.timing_faults,
+        events_dropped,
+        reasons: s.reasons.0,
+        prearm: s.prearm.0,
+        codes: [
+            s.mode.code(),
+            s.nav.code(),
+            s.action.code(),
+            source.code(),
+            topics::validity_bits(&s.valid),
+        ],
+        flags: u8::from(s.armed)
+            | u8::from(s.killed) << 1
+            | u8::from(s.saturated) << 2
+            | u8::from(s.no_estimate) << 3
+            | u8::from(s.home_set) << 4
+            | u8::from(s.params_unsaved) << 5
+            | u8::from(landed) << 6
+            | u8::from(ground_contact) << 7,
+    }
+}
+
+/// True, and the clock moves on, when `clock` is due at `now`.
+fn take(clock: &mut Clock, now: u64) -> bool {
+    let due = clock.due(now);
+    if due {
+        clock.advance(now);
+    }
+    due
+}
 
 /// Records what the core did, tick by tick, into a [`Logger`] ring.
 #[derive(Debug)]
@@ -25,6 +183,54 @@ pub struct Recorder<const CAP: usize> {
     mag: Option<Stamped<MagSample>>,
     baro: Option<Stamped<BaroSample>>,
     battery: Option<Stamped<BatterySample>>,
+    clocks: Clocks,
+    vehicle_status: OnChange<(u8, u8, u8, bool, bool)>,
+    failsafe_flags: OnChange<u16>,
+    oxide_status: OnChange<OxideStatusKey>,
+}
+
+/// One clock per streamed topic.
+#[derive(Clone, Copy, Debug)]
+struct Clocks {
+    sensor_combined: Clock,
+    angular_velocity: Clock,
+    rates_setpoint: Clock,
+    actuator_motors: Clock,
+    thrust_setpoint: Clock,
+    torque_setpoint: Clock,
+    attitude: Clock,
+    attitude_setpoint: Clock,
+    local_position: Clock,
+    local_position_setpoint: Clock,
+    manual_control: Clock,
+    magnetometer: Clock,
+    air_data: Clock,
+    battery: Clock,
+    estimator: Clock,
+    logger: Clock,
+}
+
+impl Clocks {
+    const fn new() -> Self {
+        Self {
+            sensor_combined: Clock::new(period::HZ_100),
+            angular_velocity: Clock::new(period::HZ_100),
+            rates_setpoint: Clock::new(period::HZ_100),
+            actuator_motors: Clock::new(period::HZ_100),
+            thrust_setpoint: Clock::new(period::HZ_100),
+            torque_setpoint: Clock::new(period::HZ_100),
+            attitude: Clock::new(period::HZ_50),
+            attitude_setpoint: Clock::new(period::HZ_50),
+            local_position: Clock::new(period::HZ_20),
+            local_position_setpoint: Clock::new(period::HZ_20),
+            manual_control: Clock::new(period::HZ_10),
+            magnetometer: Clock::new(period::HZ_10),
+            air_data: Clock::new(period::HZ_10),
+            battery: Clock::new(period::HZ_5),
+            estimator: Clock::new(period::HZ_5),
+            logger: Clock::new(period::SECOND),
+        }
+    }
 }
 
 impl<const CAP: usize> Default for Recorder<CAP> {
@@ -47,6 +253,10 @@ impl<const CAP: usize> Recorder<CAP> {
             mag: None,
             baro: None,
             battery: None,
+            clocks: Clocks::new(),
+            vehicle_status: OnChange::new(),
+            failsafe_flags: OnChange::new(),
+            oxide_status: OnChange::new(),
         }
     }
 
@@ -73,7 +283,11 @@ impl<const CAP: usize> Recorder<CAP> {
         Ok(())
     }
 
-    /// Writes what is due after a tick.
+    /// Writes what is due after a tick: streamed topics at their rates, on
+    /// the tick clock, from the newest sample of each input; the status
+    /// topics when they change and at least once a second; `oxide_logger`
+    /// once a second. Nothing is written before [`start`](Self::start). A
+    /// record that does not fit the ring is dropped and counted.
     pub fn record<const N: usize>(
         &mut self,
         now: Micros,
@@ -83,20 +297,66 @@ impl<const CAP: usize> Recorder<CAP> {
         cfg: &VehicleConfig<N>,
     ) {
         let Some(scales) = self.scales else { return };
-        self.observe(now, inputs);
+        self.observe(inputs);
         let t = now.0;
         let t_sample = self.t_sample(now);
         let status = &outputs.status;
         let tel = telemetry;
-        use topics::id;
-        let imu = self.imu;
+        let source = cfg.estimator.source;
+
+        // Status: written when it changes. A record that did not fit is
+        // tried again on the next tick.
+        let key = vehicle_status_key(status);
+        if self.vehicle_status.due(key, t)
+            && self.must(t, id::VEHICLE_STATUS, &topics::VEHICLE_STATUS, |w| {
+                topics::vehicle_status(w, now, status)
+            })
+        {
+            self.vehicle_status.wrote(key, t);
+        }
+        let key = failsafe_flags_key(status);
+        if self.failsafe_flags.due(key, t)
+            && self.must(t, id::FAILSAFE_FLAGS, &topics::FAILSAFE_FLAGS, |w| {
+                topics::failsafe_flags(w, now, status)
+            })
+        {
+            self.failsafe_flags.wrote(key, t);
+        }
+        let key = oxide_status_key(
+            status,
+            source,
+            tel.events_dropped,
+            tel.landed,
+            tel.ground_contact,
+        );
+        if self.oxide_status.due(key, t)
+            && self.must(t, id::OXIDE_STATUS, &topics::OXIDE_STATUS, |w| {
+                topics::oxide_status(
+                    w,
+                    now,
+                    status,
+                    source,
+                    tel.events_dropped,
+                    tel.landed,
+                    tel.ground_contact,
+                )
+            })
+        {
+            self.oxide_status.wrote(key, t);
+        }
+
+        // Streams, in the order of their message ids.
         let dt = self.imu_dt_us;
-        if let Some(imu) = imu {
+        if let Some(imu) = self.imu
+            && take(&mut self.clocks.sensor_combined, t)
+        {
             self.stream(t, id::SENSOR_COMBINED, &topics::SENSOR_COMBINED, |w| {
                 topics::sensor_combined(w, now, &imu, dt)
             });
         }
-        if let Some(e) = tel.estimate {
+        if let Some(e) = tel.estimate
+            && take(&mut self.clocks.angular_velocity, t)
+        {
             self.stream(
                 t,
                 id::VEHICLE_ANGULAR_VELOCITY,
@@ -104,71 +364,85 @@ impl<const CAP: usize> Recorder<CAP> {
                 |w| topics::vehicle_angular_velocity(w, now, t_sample, e.rate),
             );
         }
-        self.stream(
-            t,
-            id::VEHICLE_RATES_SETPOINT,
-            &topics::VEHICLE_RATES_SETPOINT,
-            |w| {
-                topics::vehicle_rates_setpoint(
-                    w,
-                    now,
-                    tel.rate_target,
-                    tel.thrust_target_n,
-                    &scales,
-                )
-            },
-        );
-        self.stream(t, id::ACTUATOR_MOTORS, &topics::ACTUATOR_MOTORS, |w| {
-            topics::actuator_motors(w, now, t_sample, &outputs.motors)
-        });
-        self.stream(
-            t,
-            id::VEHICLE_THRUST_SETPOINT,
-            &topics::VEHICLE_THRUST_SETPOINT,
-            |w| {
-                topics::vehicle_thrust_setpoint(
-                    w,
-                    now,
-                    t_sample,
-                    tel.rate_command.thrust_n,
-                    &scales,
-                )
-            },
-        );
-        self.stream(
-            t,
-            id::VEHICLE_TORQUE_SETPOINT,
-            &topics::VEHICLE_TORQUE_SETPOINT,
-            |w| {
-                topics::vehicle_torque_setpoint(
-                    w,
-                    now,
-                    t_sample,
-                    tel.rate_command.torque_nm,
-                    &scales,
-                )
-            },
-        );
-        if let Some(e) = tel.estimate {
+        if take(&mut self.clocks.rates_setpoint, t) {
+            self.stream(
+                t,
+                id::VEHICLE_RATES_SETPOINT,
+                &topics::VEHICLE_RATES_SETPOINT,
+                |w| {
+                    topics::vehicle_rates_setpoint(
+                        w,
+                        now,
+                        tel.rate_target,
+                        tel.thrust_target_n,
+                        &scales,
+                    )
+                },
+            );
+        }
+        if take(&mut self.clocks.actuator_motors, t) {
+            self.stream(t, id::ACTUATOR_MOTORS, &topics::ACTUATOR_MOTORS, |w| {
+                topics::actuator_motors(w, now, t_sample, &outputs.motors)
+            });
+        }
+        if take(&mut self.clocks.thrust_setpoint, t) {
+            self.stream(
+                t,
+                id::VEHICLE_THRUST_SETPOINT,
+                &topics::VEHICLE_THRUST_SETPOINT,
+                |w| {
+                    topics::vehicle_thrust_setpoint(
+                        w,
+                        now,
+                        t_sample,
+                        tel.rate_command.thrust_n,
+                        &scales,
+                    )
+                },
+            );
+        }
+        if take(&mut self.clocks.torque_setpoint, t) {
+            self.stream(
+                t,
+                id::VEHICLE_TORQUE_SETPOINT,
+                &topics::VEHICLE_TORQUE_SETPOINT,
+                |w| {
+                    topics::vehicle_torque_setpoint(
+                        w,
+                        now,
+                        t_sample,
+                        tel.rate_command.torque_nm,
+                        &scales,
+                    )
+                },
+            );
+        }
+        if let Some(e) = tel.estimate
+            && take(&mut self.clocks.attitude, t)
+        {
             self.stream(t, id::VEHICLE_ATTITUDE, &topics::VEHICLE_ATTITUDE, |w| {
                 topics::vehicle_attitude(w, now, t_sample, e.attitude)
             });
         }
-        self.stream(
-            t,
-            id::VEHICLE_ATTITUDE_SETPOINT,
-            &topics::VEHICLE_ATTITUDE_SETPOINT,
-            |w| {
-                topics::vehicle_attitude_setpoint(
-                    w,
-                    now,
-                    tel.attitude_target,
-                    tel.thrust_target_n,
-                    &scales,
-                )
-            },
-        );
-        if let Some(e) = tel.estimate {
+        if take(&mut self.clocks.attitude_setpoint, t) {
+            self.stream(
+                t,
+                id::VEHICLE_ATTITUDE_SETPOINT,
+                &topics::VEHICLE_ATTITUDE_SETPOINT,
+                |w| {
+                    topics::vehicle_attitude_setpoint(
+                        w,
+                        now,
+                        tel.attitude_target,
+                        tel.thrust_target_n,
+                        &scales,
+                    )
+                },
+            );
+        }
+        if let Some(e) = tel.estimate
+            && take(&mut self.clocks.local_position, t)
+        {
             let gps = status.estimator.gps_aiding;
             self.stream(
                 t,
@@ -177,22 +451,26 @@ impl<const CAP: usize> Recorder<CAP> {
                 |w| topics::vehicle_local_position(w, now, t_sample, &e, &tel.valid, gps),
             );
         }
-        self.stream(
-            t,
-            id::VEHICLE_LOCAL_POSITION_SETPOINT,
-            &topics::VEHICLE_LOCAL_POSITION_SETPOINT,
-            |w| {
-                topics::vehicle_local_position_setpoint(
-                    w,
-                    now,
-                    tel.setpoints.as_ref(),
-                    tel.attitude_target,
-                    tel.thrust_target_n,
-                    &scales,
-                )
-            },
-        );
-        if let Some(rc) = self.rc {
+        if take(&mut self.clocks.local_position_setpoint, t) {
+            self.stream(
+                t,
+                id::VEHICLE_LOCAL_POSITION_SETPOINT,
+                &topics::VEHICLE_LOCAL_POSITION_SETPOINT,
+                |w| {
+                    topics::vehicle_local_position_setpoint(
+                        w,
+                        now,
+                        tel.setpoints.as_ref(),
+                        tel.attitude_target,
+                        tel.thrust_target_n,
+                        &scales,
+                    )
+                },
+            );
+        }
+        if let Some(rc) = self.rc
+            && take(&mut self.clocks.manual_control, t)
+        {
             self.stream(
                 t,
                 id::MANUAL_CONTROL_SETPOINT,
@@ -200,7 +478,9 @@ impl<const CAP: usize> Recorder<CAP> {
                 |w| topics::manual_control_setpoint(w, now, &rc),
             );
         }
-        if let Some(mag) = self.mag {
+        if let Some(mag) = self.mag
+            && take(&mut self.clocks.magnetometer, t)
+        {
             self.stream(
                 t,
                 id::VEHICLE_MAGNETOMETER,
@@ -208,12 +488,16 @@ impl<const CAP: usize> Recorder<CAP> {
                 |w| topics::vehicle_magnetometer(w, now, &mag),
             );
         }
-        if let Some(baro) = self.baro {
+        if let Some(baro) = self.baro
+            && take(&mut self.clocks.air_data, t)
+        {
             self.stream(t, id::VEHICLE_AIR_DATA, &topics::VEHICLE_AIR_DATA, |w| {
                 topics::vehicle_air_data(w, now, &baro)
             });
         }
-        if let Some(b) = self.battery {
+        if let Some(b) = self.battery
+            && take(&mut self.clocks.battery, t)
+        {
             self.stream(t, id::BATTERY_STATUS, &topics::BATTERY_STATUS, |w| {
                 topics::battery_status(
                     w,
@@ -226,42 +510,27 @@ impl<const CAP: usize> Recorder<CAP> {
                 )
             });
         }
-        self.must(t, id::VEHICLE_STATUS, &topics::VEHICLE_STATUS, |w| {
-            topics::vehicle_status(w, now, status)
-        });
-        self.must(t, id::FAILSAFE_FLAGS, &topics::FAILSAFE_FLAGS, |w| {
-            topics::failsafe_flags(w, now, status)
-        });
-        let source = cfg.estimator.source;
-        self.must(t, id::OXIDE_STATUS, &topics::OXIDE_STATUS, |w| {
-            topics::oxide_status(
-                w,
-                now,
-                status,
-                source,
-                tel.events_dropped,
-                tel.landed,
-                tel.ground_contact,
-            )
-        });
-        self.stream(t, id::OXIDE_ESTIMATOR, &topics::OXIDE_ESTIMATOR, |w| {
-            topics::oxide_estimator(
-                w,
-                now,
-                &status.estimator,
-                tel.estimate.is_some(),
-                tel.gyro_filtered,
-            )
-        });
-        let stats = self.logger.stats();
-        self.must(t, id::OXIDE_LOGGER, &topics::OXIDE_LOGGER, |w| {
-            topics::oxide_logger(w, now, &stats)
-        });
+        if take(&mut self.clocks.estimator, t) {
+            self.stream(t, id::OXIDE_ESTIMATOR, &topics::OXIDE_ESTIMATOR, |w| {
+                topics::oxide_estimator(
+                    w,
+                    now,
+                    &status.estimator,
+                    tel.estimate.is_some(),
+                    tel.gyro_filtered,
+                )
+            });
+        }
+        if take(&mut self.clocks.logger, t) {
+            let stats = self.logger.stats();
+            self.must(t, id::OXIDE_LOGGER, &topics::OXIDE_LOGGER, |w| {
+                topics::oxide_logger(w, now, &stats)
+            });
+        }
     }
 
     /// Remembers the newest sample of each input that feeds a topic.
-    fn observe(&mut self, now: Micros, inputs: &Inputs) {
-        let _ = now;
+    fn observe(&mut self, inputs: &Inputs) {
         if let Some(s) = inputs.imu {
             self.imu_dt_us = match self.imu {
                 Some(prev) => u32::try_from(s.t_sample.since(prev.t_sample)).unwrap_or(u32::MAX),
