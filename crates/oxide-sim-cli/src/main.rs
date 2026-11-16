@@ -5,12 +5,14 @@
 //!
 //! ```text
 //! oxide-sim run  [--profile f405|h743] [--airframe FILE] [--csv FILE]
+//!                [--log FILE.ulg] [--log-level normal|replay]
 //!                [--scenario hover-step|gust-hold] [--seed N]
 //!                [--estimator truth|ekf] [--sensors ideal|realistic]
 //! oxide-sim hash [same options]
 //! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
 //! oxide-sim scenario list
 //! oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE]
+//!                [--log FILE.ulg] [--log-level normal|replay]
 //! oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
 //! oxide-sim params list | json | doc
 //! ```
@@ -19,12 +21,18 @@
 //! overrides applied through the checked `set`, the file first, then the flags
 //! in order (ADR-0004). `params list` prints the table, `params json` the
 //! ground-station metadata and `params doc` the text of `docs/PARAMETERS.md`.
+//! `--log FILE.ulg` on `run` and `scenario` writes the flight's log (ADR-0005)
+//! in PX4's ULog format; `--log-level` (default `normal`) needs `--log`. The
+//! header's `ver_sw` is the git hash the binary was built from (`build.rs`),
+//! `ver_hw` is `SIM`.
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
 //! the libm paths, then one line per fault scenario in `HASHED_FAULT_SCENARIOS`
 //! (run 0, `<profile> <name>#0 <hash>`), so that it also covers ground contact,
-//! landings, failsafes and a crash. `montecarlo` flies gust-hold indices 0..N (default 200) on
+//! landings, failsafes and a crash, then one line per logged flight
+//! (`<profile> log-normal <name>#0 <FNV-1a 64 of the log's bytes>`, written with
+//! the fixed build information `hash`/`SIM`). `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
 //! with 1 if any run fails. `scenario` flies a scenario (ADR-0003, ADR-0004
 //! §7): a name among the embedded ones (`scenario list`), or the path of a
@@ -48,12 +56,69 @@ use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
+use oxide_sim::flight_log::{Level, LogBuild};
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
 use oxide_sim::scenario_file::{self, Checker, ScenarioFile};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimError, SimOptions, Simulation, StepRecord};
+
+/// The git hash this binary was built from, `-dirty` when the tree had
+/// changes, `unknown` without git (`build.rs`).
+const GIT_HASH: &str = env!("OXIDE_GIT_HASH");
+
+/// The level of a log (`--log-level`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogLevel {
+    Normal,
+}
+
+/// `--log FILE.ulg` and `--log-level`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogSpec {
+    path: String,
+    level: LogLevel,
+}
+
+impl LogSpec {
+    /// The two options as given: a level needs a file, and `replay` is not
+    /// built yet.
+    fn from_options(path: Option<String>, level: Option<&str>) -> Result<Option<Self>, String> {
+        let Some(path) = path else {
+            return match level {
+                Some(_) => Err("--log-level needs --log FILE.ulg".into()),
+                None => Ok(None),
+            };
+        };
+        let level = match level {
+            None | Some("normal") => LogLevel::Normal,
+            Some("replay") => return Err("the replay level is not built yet".into()),
+            Some(other) => return Err(format!("unknown log level {other} (normal | replay)")),
+        };
+        Ok(Some(Self { path, level }))
+    }
+
+    fn level(&self) -> Level {
+        match self.level {
+            LogLevel::Normal => Level::Normal,
+        }
+    }
+
+    /// Opens the file and starts the simulation's log into it.
+    fn start<P: Pilot>(
+        &self,
+        sim: &mut Simulation<P, 4>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = std::fs::File::create(&self.path).map_err(|e| format!("{}: {e}", self.path))?;
+        sim.start_log(
+            self.level(),
+            &LogBuild::sim(GIT_HASH),
+            Box::new(std::io::BufWriter::new(file)),
+        )?;
+        Ok(())
+    }
+}
 
 /// The commands, as `main` dispatches them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,12 +168,13 @@ fn command_list() -> String {
 /// options. A line that starts a command begins with `  oxide-sim NAME`.
 const USAGE: &str = "usage:
   oxide-sim run [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold]
-                [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]
+                [--log FILE.ulg] [--log-level normal|replay] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]
                 [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim hash [same options as run]
   oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T] [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim scenario list
-  oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--params FILE.toml] [--param NAME=VALUE]
+  oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--log FILE.ulg] [--log-level normal|replay]
+                [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
   oxide-sim params list|json|doc
   oxide-sim help | --help | -h
@@ -131,6 +197,7 @@ struct Args {
     profile: Profile,
     airframe: Option<String>,
     csv: Option<String>,
+    log: Option<LogSpec>,
     scenario: Option<ScenarioKind>,
     seed: u64,
     estimator: Option<EstimatorSource>,
@@ -184,6 +251,7 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         profile: F405_LEAN,
         airframe: None,
         csv: None,
+        log: None,
         scenario: None,
         seed: 0,
         estimator: None,
@@ -194,6 +262,8 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     };
     let mut params_file: Option<String> = None;
     let mut param_flags: Vec<(String, f64)> = Vec::new();
+    let mut log_path: Option<String> = None;
+    let mut log_level: Option<String> = None;
     let mut given: Vec<String> = Vec::new();
     while let Some(flag) = it.next() {
         given.push(flag.clone());
@@ -208,6 +278,8 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--airframe" => args.airframe = Some(value()?),
             "--csv" => args.csv = Some(value()?),
+            "--log" => log_path = Some(value()?),
+            "--log-level" => log_level = Some(value()?),
             "--scenario" => {
                 args.scenario = Some(match value()?.as_str() {
                     "hover-step" => ScenarioKind::HoverStep,
@@ -258,6 +330,7 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     args.params = collect_params(params_file.as_deref(), param_flags)?;
+    args.log = LogSpec::from_options(log_path, log_level.as_deref())?;
     if !matches!(
         Command::from_name(&args.command),
         Some(Command::Run | Command::Hash | Command::Montecarlo)
@@ -267,6 +340,9 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             args.command,
             command_list()
         ));
+    }
+    if args.command == "hash" && args.log.is_some() {
+        return Err("--log applies to run and scenario, not to hash".into());
     }
     if args.command == "montecarlo"
         && let Some(bad) = given
@@ -451,9 +527,13 @@ fn execute<P: Pilot>(
     profile: Profile,
     job: Job<P>,
     csv_path: Option<&str>,
+    log: Option<&LogSpec>,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let duration_us = (job.duration_s * 1e6) as u64;
     let mut sim = Simulation::<_, 4>::with_options(airframe, profile, job.pilot, job.options)?;
+    if let Some(spec) = log {
+        spec.start(&mut sim)?;
+    }
     let mut csv = match csv_path {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
@@ -482,6 +562,9 @@ fn execute<P: Pilot>(
     }
     if let Some(mut f) = csv {
         f.flush()?;
+    }
+    if log.is_some() {
+        sim.finish_log()?;
     }
     let b = sim.body();
     Ok(Outcome {
@@ -532,9 +615,10 @@ fn fault_hash_lines_with(
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let airframe = load_airframe(args.airframe.as_deref())?;
     let profile = args.profile;
+    let log = args.log.as_ref();
     let run_one = |kind: ScenarioKind, csv: Option<&str>| match kind {
-        ScenarioKind::HoverStep => execute(&airframe, profile, hover_step_job(args), csv),
-        ScenarioKind::GustHold => execute(&airframe, profile, gust_hold_job(args), csv),
+        ScenarioKind::HoverStep => execute(&airframe, profile, hover_step_job(args), csv, log),
+        ScenarioKind::GustHold => execute(&airframe, profile, gust_hold_job(args), csv, log),
     };
 
     if args.command == "hash" {
@@ -675,7 +759,7 @@ fn resolve_scenario(arg: &str) -> Result<ScenarioFile, Box<dyn std::error::Error
 }
 
 /// `oxide-sim scenario list | NAME|PATH [--profile P] [--seed N] [--csv FILE]
-/// [--params FILE] [--param NAME=VALUE]`.
+/// [--log FILE.ulg] [--log-level normal|replay] [--params FILE] [--param NAME=VALUE]`.
 fn scenario_command(
     mut it: impl Iterator<Item = String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -693,6 +777,7 @@ fn scenario_command(
     }
     let scenario = resolve_scenario(&first)?;
     let (mut profile, mut index, mut csv_path) = (F405_LEAN, 0_u64, None);
+    let (mut log_path, mut log_level): (Option<String>, Option<String>) = (None, None);
     let mut params_file: Option<String> = None;
     let mut param_flags: Vec<(String, f64)> = Vec::new();
     while let Some(flag) = it.next() {
@@ -712,13 +797,19 @@ fn scenario_command(
                     .map_err(|_| format!("--seed needs a non-negative integer, got {v}"))?;
             }
             "--csv" => csv_path = Some(value()?),
+            "--log" => log_path = Some(value()?),
+            "--log-level" => log_level = Some(value()?),
             "--params" => params_file = Some(value()?),
             "--param" => param_flags.push(parse_param_flag(&value()?)?),
             other => return Err(format!("unknown option {other}").into()),
         }
     }
     let params = collect_params(params_file.as_deref(), param_flags)?;
+    let log = LogSpec::from_options(log_path, log_level.as_deref())?;
     let mut sim = scenario.build_with_params(profile, index, &params)?;
+    if let Some(spec) = &log {
+        spec.start(&mut sim)?;
+    }
     let mut csv = match &csv_path {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
@@ -742,6 +833,9 @@ fn scenario_command(
     }
     if let Some(mut f) = csv {
         f.flush()?;
+    }
+    if log.is_some() {
+        sim.finish_log()?;
     }
     let verdict = checker.finish();
     let outcome = &verdict.outcome;
@@ -1001,7 +1095,7 @@ mod tests {
         v.extend_from_slice(a);
         let args = p(&v)?;
         let airframe = Airframe::reference_quad().map_err(|e| e.to_string())?;
-        execute(&airframe, args.profile, hover_step_job(&args), None)
+        execute(&airframe, args.profile, hover_step_job(&args), None, None)
             .map(|o| o.hash)
             .map_err(|e| e.to_string())
     }
@@ -1190,5 +1284,111 @@ mod tests {
         let a = ["gust-hold", "--seed", "1"];
         let r = scenario_command(a.iter().map(|s| (*s).to_string()));
         assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn temp_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("oxide-sim-{}-{name}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn log_options_parse_and_are_checked_together() {
+        let a = p(&["run", "--log", "f.ulg"]).expect("valid");
+        let spec = a.log.expect("a log");
+        assert_eq!(spec.path, "f.ulg");
+        assert_eq!(spec.level, LogLevel::Normal);
+        let a = p(&["run", "--log", "f.ulg", "--log-level", "normal"]).expect("valid");
+        assert_eq!(a.log.expect("a log").level, LogLevel::Normal);
+        assert!(p(&["run"]).expect("valid").log.is_none());
+        let e = p(&["run", "--log-level", "normal"]).err().expect("error");
+        assert_eq!(e, "--log-level needs --log FILE.ulg");
+        let e = p(&["run", "--log", "f.ulg", "--log-level", "loud"])
+            .err()
+            .expect("error");
+        assert!(e.contains("normal | replay"), "{e}");
+        let e = p(&["run", "--log", "f.ulg", "--log-level", "replay"])
+            .err()
+            .expect("error");
+        assert_eq!(e, "the replay level is not built yet");
+        assert!(p(&["run", "--log"]).is_err());
+        // hash and montecarlo do not write logs.
+        let e = p(&["hash", "--log", "f.ulg"]).err().expect("error");
+        assert!(e.contains("run and scenario"), "{e}");
+        assert!(p(&["montecarlo", "--log", "f.ulg"]).is_err());
+    }
+
+    #[test]
+    fn scenario_command_takes_log_options() {
+        let path = temp_path("none.ulg");
+        let e = scenario_command(args(&["gcs-loss", "--log-level", "normal"]).into_iter())
+            .expect_err("level without a file");
+        assert_eq!(e.to_string(), "--log-level needs --log FILE.ulg");
+        let e = scenario_command(
+            args(&["gcs-loss", "--log", &path, "--log-level", "replay"]).into_iter(),
+        )
+        .expect_err("replay");
+        assert_eq!(e.to_string(), "the replay level is not built yet");
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn scenario_writes_a_log_the_reader_parses() {
+        let path = temp_path("scenario.ulg");
+        let r = scenario_command(args(&["gcs-loss", "--seed", "1", "--log", &path]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let bytes = std::fs::read(&path).expect("the log");
+        let file = oxide_log::reader::UlogFile::parse(&bytes).expect("parses");
+        assert_eq!(file.info_str("ver_hw"), Some("SIM"));
+        assert_eq!(file.info_str("ver_sw"), Some(GIT_HASH));
+        assert_eq!(file.info_str("oxide_log_level"), Some("normal"));
+        assert_eq!(file.info_str("oxide_profile"), Some("f405-lean"));
+        assert!(file.records("vehicle_attitude").count() > 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_writes_a_log_and_the_hash_is_the_same_without_it() {
+        let path = temp_path("run.ulg");
+        let airframe = Airframe::reference_quad().expect("airframe");
+        let with = p(&["run", "--log", &path]).expect("valid");
+        let plain = p(&["run"]).expect("valid");
+        let a = execute(
+            &airframe,
+            with.profile,
+            hover_step_job(&with),
+            None,
+            with.log.as_ref(),
+        )
+        .expect("flies with a log");
+        let b =
+            execute(&airframe, plain.profile, hover_step_job(&plain), None, None).expect("flies");
+        assert_eq!(a.hash, b.hash);
+        let bytes = std::fs::read(&path).expect("the log");
+        assert!(oxide_log::reader::UlogFile::parse(&bytes).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unwritable_log_path_is_an_error_before_the_flight() {
+        let bad = temp_path("no-such-dir/x.ulg");
+        let r = scenario_command(args(&["gcs-loss", "--log", &bad]).into_iter());
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn the_usage_names_the_log_options() {
+        let run = USAGE.split("  oxide-sim hash").next().expect("run part");
+        assert!(run.contains("--log FILE.ulg") && run.contains("--log-level normal|replay"));
+        let scenario = USAGE
+            .lines()
+            .find(|l| l.starts_with("  oxide-sim scenario NAME"))
+            .expect("scenario line");
+        assert!(scenario.contains("--log FILE.ulg") && scenario.contains("--log-level"));
     }
 }

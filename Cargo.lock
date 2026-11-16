@@ -228,6 +228,7 @@ name = "oxide-sim-cli"
 version = "0.1.0"
 dependencies = [
  "oxide-core",
+ "oxide-log",
  "oxide-sim",
 ]
 
