@@ -33,6 +33,13 @@
 //! (also when the file ends in a cut), 1 on a difference or a gap, and 2 on a
 //! file it cannot replay. `--param` replays through a changed setting,
 //! `--continue` counts every tick that differs instead of stopping at the first.
+//! Every command exits 0 when it passed, 1 when a run it judged failed
+//! (`montecarlo`, `scenario`, `scenarios`, `replay`) and 2 on an error: a bad
+//! argument, an unreadable file, an output that cannot be written. An output
+//! (`--csv`, `--log`) is opened before the flight, and a command that fails
+//! before its flight leaves none behind; a write error after it names the file
+//! (`error: FILE: No space left on device (os error 28)`), and `scenario` has
+//! printed its summary and verdict by then.
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
@@ -66,7 +73,7 @@ use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
-use oxide_sim::flight_log::{Level, LogBuild};
+use oxide_sim::flight_log::{Level, LogBuild, LogError, LogWriter};
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
@@ -115,19 +122,147 @@ impl LogSpec {
             LogLevel::Replay => Level::Replay,
         }
     }
+}
 
-    /// Opens the file and starts the simulation's log into it.
+/// The error of a log that could not be written, with the file named: the
+/// writer's own message has no path in it.
+fn log_error(path: &str, e: LogError) -> Box<dyn std::error::Error> {
+    match e {
+        LogError::Io(e) => format!("{path}: {e}").into(),
+        other => other.into(),
+    }
+}
+
+/// The files a flight writes besides what the command prints: the CSV and the
+/// log. They are opened together, before the first is written to, and a
+/// command that fails before its flight removes what it created. A flight
+/// that ran keeps its files.
+struct Sinks {
+    /// The CSV: its path and the writer into it.
+    csv: Option<(String, Box<dyn Write + Send>)>,
+    /// The log's path, once its file is open.
+    log_path: Option<String>,
+    /// The log's level and writer until the log is started.
+    log_start: Option<(Level, LogWriter)>,
+    /// Paths of the files this command created, removed if the command fails
+    /// before its flight.
+    created: Vec<String>,
+    /// The first error of a CSV row, kept until the flight is over.
+    csv_error: Option<std::io::Error>,
+}
+
+impl Sinks {
+    /// No files.
+    fn none() -> Self {
+        Self {
+            csv: None,
+            log_path: None,
+            log_start: None,
+            created: Vec::new(),
+            csv_error: None,
+        }
+    }
+
+    /// Opens the CSV, then the log. When the second cannot be opened the
+    /// first is removed again, so a failed command leaves nothing.
+    fn open(csv_path: Option<&str>, log: Option<&LogSpec>) -> Result<Self, String> {
+        let mut sinks = Self::none();
+        if let Some(path) = csv_path {
+            let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
+            sinks.created.push(path.to_string());
+            sinks.csv = Some((
+                path.to_string(),
+                Box::new(std::io::BufWriter::new(file)) as Box<dyn Write + Send>,
+            ));
+        }
+        if let Some(spec) = log {
+            match std::fs::File::create(&spec.path) {
+                Ok(file) => {
+                    sinks.created.push(spec.path.clone());
+                    sinks.log_path = Some(spec.path.clone());
+                    sinks.log_start = Some((spec.level(), Box::new(std::io::BufWriter::new(file))));
+                }
+                Err(e) => {
+                    sinks.discard();
+                    return Err(format!("{}: {e}", spec.path));
+                }
+            }
+        }
+        Ok(sinks)
+    }
+
+    /// Removes the regular files this command created. A device such as
+    /// `/dev/full` is not one and stays.
+    fn discard(&mut self) {
+        self.csv = None;
+        self.log_start = None;
+        for path in self.created.drain(..) {
+            if std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// Writes the CSV header and starts the log: the last things that can
+    /// fail before the flight. On an error the files are removed.
     fn start<P: Pilot>(
-        &self,
+        &mut self,
         sim: &mut Simulation<P, 4>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let file = std::fs::File::create(&self.path).map_err(|e| format!("{}: {e}", self.path))?;
-        sim.start_log(
-            self.level(),
-            &LogBuild::sim(GIT_HASH),
-            Box::new(std::io::BufWriter::new(file)),
-        )?;
+        let result = self.start_inner(sim);
+        if result.is_err() {
+            self.discard();
+        }
+        result
+    }
+
+    fn start_inner<P: Pilot>(
+        &mut self,
+        sim: &mut Simulation<P, 4>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some((path, w)) = self.csv.as_mut() {
+            w.write_all(CSV_HEADER)
+                .map_err(|e| format!("{path}: {e}"))?;
+        }
+        if let (Some(path), Some((level, w))) = (self.log_path.as_ref(), self.log_start.take()) {
+            sim.start_log(level, &LogBuild::sim(GIT_HASH), w)
+                .map_err(|e| log_error(path, e))?;
+        }
         Ok(())
+    }
+
+    /// One CSV row of the flight. A failure is kept and ends the CSV.
+    fn row(&mut self, r: &StepRecord<4>) {
+        if self.csv_error.is_some() {
+            return;
+        }
+        if let Some((_, w)) = self.csv.as_mut()
+            && let Err(e) = w.write_all(csv_row(r).as_bytes())
+        {
+            self.csv_error = Some(e);
+        }
+    }
+
+    /// Ends the CSV and the log after the flight. Both are always finished
+    /// (the log keeps what was written); the first error is returned, with the
+    /// file's path in it.
+    fn finish<P: Pilot>(
+        &mut self,
+        sim: &mut Simulation<P, 4>,
+    ) -> Option<Box<dyn std::error::Error>> {
+        let mut first: Option<Box<dyn std::error::Error>> = None;
+        if let Some((path, mut w)) = self.csv.take() {
+            let err = self.csv_error.take().or_else(|| w.flush().err());
+            if let Some(e) = err {
+                first = Some(format!("{path}: {e}").into());
+            }
+        }
+        if let Some(path) = self.log_path.take()
+            && let Err(e) = sim.finish_log()
+        {
+            first.get_or_insert_with(|| log_error(&path, e));
+        }
+        first
     }
 }
 
@@ -546,40 +681,20 @@ fn execute<P: Pilot>(
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let duration_us = (job.duration_s * 1e6) as u64;
     let mut sim = Simulation::<_, 4>::with_options(airframe, profile, job.pilot, job.options)?;
-    if let Some(spec) = log {
-        spec.start(&mut sim)?;
-    }
-    let mut csv = match csv_path {
-        Some(p) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            f.write_all(CSV_HEADER)?;
-            Some(f)
-        }
-        None => None,
-    };
+    let mut sinks = Sinks::open(csv_path, log)?;
+    sinks.start(&mut sim)?;
     let mut max_tilt = 0.0_f64;
     let mut errors = EstimateErrors::default();
-    let mut io_error = None;
     let start = Instant::now();
     sim.run_until(Micros(duration_us), |r| {
         let e = r.attitude.to_euler();
         max_tilt = max_tilt.max(e.x.abs()).max(e.y.abs());
         errors.update(r);
-        if let Some(f) = csv.as_mut()
-            && let Err(err) = f.write_all(csv_row(r).as_bytes())
-        {
-            io_error.get_or_insert(err);
-        }
+        sinks.row(r);
     });
     let wall_s = start.elapsed().as_secs_f64();
-    if let Some(err) = io_error {
-        return Err(err.into());
-    }
-    if let Some(mut f) = csv {
-        f.flush()?;
-    }
-    if log.is_some() {
-        sim.finish_log()?;
+    if let Some(e) = sinks.finish(&mut sim) {
+        return Err(e);
     }
     let b = sim.body();
     Ok(Outcome {
@@ -932,60 +1047,70 @@ fn scenario_command(
     }
     let params = collect_params(params_file.as_deref(), param_flags)?;
     let log = LogSpec::from_options(log_path, log_level.as_deref())?;
-    let mut sim = scenario.build_with_params(profile, index, &params)?;
-    if let Some(spec) = &log {
-        spec.start(&mut sim)?;
+    let sim = scenario.build_with_params(profile, index, &params)?;
+    let sinks = Sinks::open(csv_path.as_deref(), log.as_ref())?;
+    let run = fly_scenario(&scenario, profile, index, sim, sinks)?;
+    for line in &run.lines {
+        println!("{line}");
     }
-    let mut csv = match &csv_path {
-        Some(p) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            f.write_all(CSV_HEADER)?;
-            Some(f)
-        }
-        None => None,
-    };
-    let mut checker = Checker::new(&scenario);
-    let mut io_error = None;
+    match run.write_error {
+        Some(e) => Err(e),
+        None => Ok(run.passed),
+    }
+}
+
+/// What a flown scenario reports.
+struct ScenarioRun {
+    /// The summary, the timeline and the verdict, as the command prints them.
+    lines: Vec<String>,
+    /// Every expectation held.
+    passed: bool,
+    /// A CSV or log file that could not be written, found after the flight:
+    /// the command prints `lines` and then fails with this (exit 2).
+    write_error: Option<Box<dyn std::error::Error>>,
+}
+
+/// Flies `scenario` on `sim` into `sinks` and judges it. An error here is one
+/// before the flight (the files are removed); a write error after it is in
+/// the result, so that the verdict is still shown.
+fn fly_scenario<P: Pilot>(
+    scenario: &ScenarioFile,
+    profile: Profile,
+    index: u64,
+    mut sim: Simulation<P, 4>,
+    mut sinks: Sinks,
+) -> Result<ScenarioRun, Box<dyn std::error::Error>> {
+    sinks.start(&mut sim)?;
+    let mut checker = Checker::new(scenario);
     sim.run_until(scenario.end(), |r| {
         checker.add(r);
-        if let Some(f) = csv.as_mut()
-            && let Err(err) = f.write_all(csv_row(r).as_bytes())
-        {
-            io_error.get_or_insert(err);
-        }
+        sinks.row(r);
     });
-    if let Some(err) = io_error {
-        return Err(err.into());
-    }
-    if let Some(mut f) = csv {
-        f.flush()?;
-    }
-    if log.is_some() {
-        sim.finish_log()?;
-    }
+    let write_error = sinks.finish(&mut sim);
     let verdict = checker.finish();
     let outcome = &verdict.outcome;
-    println!(
+    let mut lines = Vec::new();
+    lines.push(format!(
         "scenario   {} (run {index}, profile {})",
         scenario.name, profile.name
-    );
-    println!("about      {}", scenario.about);
-    println!("timeline");
+    ));
+    lines.push(format!("about      {}", scenario.about));
+    lines.push("timeline".to_string());
     for e in &outcome.events {
-        println!("  {}", oxide_sim::outcome::event_line(e));
+        lines.push(format!("  {}", oxide_sim::outcome::event_line(e)));
     }
     let p = outcome.position_at_end;
-    println!("navigation {:?}", outcome.nav_sequence);
-    println!(
+    lines.push(format!("navigation {:?}", outcome.nav_sequence));
+    lines.push(format!(
         "reasons    {}   highest action {:?}",
         oxide_sim::outcome::reason_names(outcome.reasons_seen),
         outcome.max_action
-    );
-    println!(
+    ));
+    lines.push(format!(
         "end        t {:.2} s, N {:.2} E {:.2} D {:.2} m, armed {}, {:?}",
         outcome.end_s, p.x, p.y, p.z, outcome.armed_at_end, outcome.nav_at_end
-    );
-    println!(
+    ));
+    lines.push(format!(
         "limits     max height {:.2} m, max distance from home {:.2} m, max tilt {:.1} deg, touchdown {}",
         outcome.max_height_m,
         outcome.max_distance_from_home_m,
@@ -993,8 +1118,8 @@ fn scenario_command(
         outcome
             .touchdown_speed_mps
             .map_or("none".into(), |v| format!("{v:.2} m/s"))
-    );
-    println!(
+    ));
+    lines.push(format!(
         "disarmed   {} at {}",
         outcome
             .disarm_reason
@@ -1002,18 +1127,20 @@ fn scenario_command(
         outcome
             .disarmed_at_s
             .map_or("-".into(), |t| format!("{t:.2} s"))
-    );
+    ));
     if let Some(h) = &verdict.hold {
-        println!(
+        lines.push(format!(
             "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {:.3} m",
             h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m, h.est_max_h_error_m
-        );
+        ));
     }
-    println!("trace hash {:016x}", sim.trace_hash());
-    for line in result_lines(&scenario, &verdict.violations) {
-        println!("{line}");
-    }
-    Ok(verdict.violations.is_empty())
+    lines.push(format!("trace hash {:016x}", sim.trace_hash()));
+    lines.extend(result_lines(scenario, &verdict.violations));
+    Ok(ScenarioRun {
+        lines,
+        passed: verdict.violations.is_empty(),
+        write_error,
+    })
 }
 
 /// Replays the log at `path` with the parameter overrides given, and returns
@@ -1134,22 +1261,9 @@ fn main() -> ExitCode {
         }
     };
     if args.command == "montecarlo" {
-        return match montecarlo(&args) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        };
+        return finish(montecarlo(&args));
     }
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    finish(run(&args).map(|()| true))
 }
 
 #[cfg(test)]
@@ -1682,6 +1796,87 @@ mod tests {
         let bad = temp_path("no-such-dir/x.ulg");
         let r = scenario_command(args(&["gcs-loss", "--log", &bad]).into_iter());
         assert!(r.is_err());
+    }
+
+    /// A writer that takes `left` bytes and then fails like a full disk.
+    struct FailsAfter {
+        left: usize,
+    }
+
+    impl Write for FailsAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The simulation of `gcs-loss`, seed 1, and its scenario.
+    macro_rules! gcs_loss {
+        () => {{
+            let scenario = fault_scenarios::by_name("gcs-loss").expect("embedded");
+            let sim = scenario
+                .build_with_params(F405_LEAN, 1, &[])
+                .expect("builds");
+            (scenario, sim)
+        }};
+    }
+
+    #[test]
+    fn a_log_that_fails_after_the_flight_started_still_prints_the_verdict() {
+        let (scenario, sim) = gcs_loss!();
+        let mut sinks = Sinks::none();
+        sinks.log_path = Some("disk.ulg".to_string());
+        // The header goes in; the disk fills up during the flight.
+        sinks.log_start = Some((Level::Normal, Box::new(FailsAfter { left: 40_000 })));
+        let run = fly_scenario(&scenario, F405_LEAN, 1, sim, sinks).expect("the flight ran");
+        assert!(run.passed);
+        assert!(
+            run.lines.iter().any(|l| l == "result     PASS"),
+            "{:?}",
+            run.lines
+        );
+        assert!(run.lines.iter().any(|l| l.starts_with("trace hash ")));
+        let e = run.write_error.expect("the write error");
+        assert_eq!(e.to_string(), "disk.ulg: disk full");
+    }
+
+    #[test]
+    fn a_csv_that_fails_during_the_flight_is_named_and_the_log_is_still_finished() {
+        let (scenario, sim) = gcs_loss!();
+        let buffer = oxide_sim::flight_log::SharedBuffer::new();
+        let mut sinks = Sinks::none();
+        sinks.csv = Some(("rows.csv".to_string(), Box::new(FailsAfter { left: 1000 })));
+        sinks.log_path = Some("ok.ulg".to_string());
+        sinks.log_start = Some((Level::Normal, Box::new(buffer.clone())));
+        let run = fly_scenario(&scenario, F405_LEAN, 1, sim, sinks).expect("the flight ran");
+        assert_eq!(
+            run.write_error.expect("the csv error").to_string(),
+            "rows.csv: disk full"
+        );
+        // The log of the flight that ran is complete.
+        let bytes = buffer.bytes();
+        let file = oxide_log::reader::UlogFile::parse(&bytes).expect("parses");
+        assert!(file.records("vehicle_attitude").count() > 100);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_started_is_an_error_before_the_flight() {
+        let (scenario, sim) = gcs_loss!();
+        let mut sinks = Sinks::none();
+        sinks.log_path = Some("disk.ulg".to_string());
+        sinks.log_start = Some((Level::Normal, Box::new(FailsAfter { left: 100 })));
+        let e = fly_scenario(&scenario, F405_LEAN, 1, sim, sinks)
+            .err()
+            .expect("an error");
+        assert_eq!(e.to_string(), "disk.ulg: disk full");
     }
 
     #[test]
