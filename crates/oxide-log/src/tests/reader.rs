@@ -518,3 +518,197 @@ fn a_zero_message_after_the_data_is_corruption_as_pyulog_sees_it() {
     let t = f.truncated.expect("a size-0, type-0 message is reported");
     assert_eq!(t.offset, at);
 }
+
+// ---- damage is not a cut (task R) ----
+
+/// A message header with a size that the bytes after it do not honour.
+fn header(v: &mut Vec<u8>, size: u16, ty: u8) {
+    v.extend_from_slice(&size.to_le_bytes());
+    v.push(ty);
+}
+
+/// A log of `n` complete `small` records, then `tail`.
+fn small_then(n: u64, tail: &[u8]) -> (Vec<u8>, usize) {
+    let mut v = with_sub(&[&SMALL]);
+    for t in 0..n {
+        put_small(&mut v, 0, t);
+    }
+    let at = v.len();
+    v.extend_from_slice(tail);
+    (v, at)
+}
+
+#[test]
+fn a_zero_header_ends_the_data_only_when_everything_after_it_is_zero() {
+    // A preallocated tail: all zeros.
+    let (v, at) = small_then(3, &[0; 4096]);
+    let f = UlogFile::parse(&v).unwrap();
+    assert_eq!(f.items.len(), 3);
+    let t = f.truncated.expect("a zero-filled tail is reported");
+    assert_eq!((t.offset, t.needed, t.available), (at, 3, 4096));
+    // Followed by anything else it is damage, with the offset of the zero header.
+    for tail in [
+        &[0u8, 0, 0, 0, 0, 1][..],
+        &[0, 0, 0, 9][..],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7][..],
+    ] {
+        let (v, at) = small_then(3, tail);
+        let e = UlogFile::parse(&v).unwrap_err();
+        assert_eq!((e.offset, e.kind), (at, ReadErrorKind::ZeroHeaderInData));
+    }
+    // A zero header and then a whole message: damage too.
+    let mut tail = vec![0, 0, 0];
+    put_small(&mut tail, 0, 9);
+    let (v, at) = small_then(3, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert!(e.to_string().starts_with(&format!("at byte {at}: ")), "{e}");
+    assert_eq!((e.offset, e.kind), (at, ReadErrorKind::ZeroHeaderInData));
+}
+
+#[test]
+fn a_cut_message_whose_declared_size_is_not_the_size_its_kind_has_is_damage() {
+    // A data message of `small` has 2 + 16 bytes. Declared 19, cut after 3.
+    let mut tail = Vec::new();
+    header(&mut tail, 19, b'D');
+    tail.extend_from_slice(&[0, 0, 1, 2, 3]);
+    let (v, at) = small_then(1, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert_eq!(e.offset, at);
+    assert_eq!(
+        e.kind,
+        ReadErrorKind::RecordLength {
+            topic: "small".into(),
+            expected: 16,
+            got: 17
+        }
+    );
+    // The same, declared too small (17 bytes, and cut).
+    let mut tail = Vec::new();
+    header(&mut tail, 17, b'D');
+    tail.extend_from_slice(&[0, 0, 1]);
+    let (v, at) = small_then(1, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert_eq!(e.offset, at);
+    assert_eq!(
+        e.kind,
+        ReadErrorKind::RecordLength {
+            topic: "small".into(),
+            expected: 16,
+            got: 15
+        }
+    );
+    // An id nobody subscribed to.
+    let mut tail = Vec::new();
+    header(&mut tail, 300, b'D');
+    tail.extend_from_slice(&[9, 0]);
+    let (v, at) = small_then(1, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert_eq!((e.offset, e.kind), (at, ReadErrorKind::UnknownMessageId(9)));
+    // A data message declared shorter than its id.
+    let mut tail = Vec::new();
+    header(&mut tail, 1, b'D');
+    let (v, at) = small_then(1, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert_eq!(e.offset, at);
+    assert!(matches!(
+        e.kind,
+        ReadErrorKind::BadMessage { msg_type: b'D', .. }
+    ));
+    // A synchronisation message is 8 bytes, a dropout 2.
+    let mut tail = Vec::new();
+    header(&mut tail, 9, b'S');
+    tail.extend_from_slice(&[0x2F, 0x73]);
+    let (v, at) = small_then(1, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert_eq!((e.offset, e.kind), (at, ReadErrorKind::BadSync));
+    let mut tail = Vec::new();
+    header(&mut tail, 3, b'O');
+    tail.push(1);
+    let (v, at) = small_then(1, &tail);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert_eq!(e.offset, at);
+    assert!(matches!(
+        e.kind,
+        ReadErrorKind::BadMessage { msg_type: b'O', .. }
+    ));
+}
+
+#[test]
+fn a_cut_message_that_could_be_whole_is_still_a_cut() {
+    // Right size for its kind, or no way to tell: a cut, with what it needs.
+    let mut cases: Vec<(Vec<u8>, usize)> = Vec::new();
+    // Data message of the right size, cut inside its record.
+    let mut t = Vec::new();
+    header(&mut t, 18, b'D');
+    t.extend_from_slice(&[0, 0, 7, 7]);
+    cases.push((t, 21));
+    // Data message with its header, and not yet its id (or half of it).
+    let mut t = Vec::new();
+    header(&mut t, 18, b'D');
+    cases.push((t.clone(), 21));
+    t.push(0);
+    cases.push((t, 21));
+    // A data message of an unknown size cannot be judged before its id is there.
+    let mut t = Vec::new();
+    header(&mut t, 500, b'D');
+    t.push(9);
+    cases.push((t, 503));
+    // Synchronisation and dropout of the right size.
+    let mut t = Vec::new();
+    header(&mut t, 8, b'S');
+    t.extend_from_slice(&[0x2F, 0x73]);
+    cases.push((t, 11));
+    let mut t = Vec::new();
+    header(&mut t, 2, b'O');
+    t.push(1);
+    cases.push((t, 5));
+    // A logged string has no size the file fixes.
+    let mut t = Vec::new();
+    header(&mut t, 70, b'L');
+    t.extend_from_slice(b"6abc");
+    cases.push((t, 73));
+    // Part of a header.
+    cases.push((vec![5], 3));
+    cases.push((vec![5, 0], 3));
+    for (tail, needed) in cases {
+        let (v, at) = small_then(2, &tail);
+        let f = UlogFile::parse(&v).unwrap_or_else(|e| panic!("{tail:?}: {e}"));
+        let t = f.truncated.expect("a cut");
+        assert_eq!(
+            (t.offset, t.needed, t.available),
+            (at, needed, tail.len()),
+            "{tail:?}"
+        );
+        assert_eq!(f.items.len(), 2);
+    }
+}
+
+#[test]
+fn the_reader_reports_the_largest_message_the_file_can_hold() {
+    let (v, _) = small_then(3, &[]);
+    let f = UlogFile::parse(&v).unwrap();
+    assert_eq!(f.largest_data_message, 18);
+    // The definitions do not count, a long logged string does, a cut one does not.
+    let mut v = v;
+    raw(
+        &mut v,
+        b'L',
+        &[&b"6"[..], &[0; 8], &[b'x'; 40][..]].concat(),
+    );
+    header(&mut v, 900, b'L');
+    v.extend_from_slice(b"6");
+    let f = UlogFile::parse(&v).unwrap();
+    assert_eq!(f.largest_data_message, 49);
+    assert_eq!(f.truncated.unwrap().needed, 903);
+    // No data message yet: the one a subscribed topic would write (2 + 16).
+    let f = UlogFile::parse(&with_sub(&[&SMALL])).unwrap();
+    assert_eq!(f.largest_data_message, 18);
+    // A topic whose first record is not written yet counts too.
+    const BIG: Topic = Topic {
+        name: "big",
+        format: "uint64_t timestamp;uint8_t[100] data;",
+        record_len: 108,
+    };
+    let f = UlogFile::parse(&with_sub(&[&SMALL, &BIG])).unwrap();
+    assert_eq!(f.largest_data_message, 110);
+}

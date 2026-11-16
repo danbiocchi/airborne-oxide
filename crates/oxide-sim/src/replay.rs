@@ -176,6 +176,13 @@ pub enum Stop {
         /// The number that did.
         found: u64,
     },
+    /// The file is damaged where a cut was expected: its last message declares
+    /// a size no message of the file has, so the end of the file is not a power
+    /// loss. The ticks before it were replayed.
+    Damaged {
+        /// What is wrong.
+        why: String,
+    },
     /// A tick's records contradict each other or are damaged.
     Malformed {
         /// The tick record's sequence number, if it could be read.
@@ -210,9 +217,8 @@ impl ReplayReport {
 
     /// The command's exit code: 0 when every tick replayed is identical and
     /// the walk ended at the end of the file or in a cut, and at least one tick
-    /// was replayed; 1 on a difference
-    /// or a gap, a missing sequence number or a malformed tick (nothing after
-    /// those can be proven).
+    /// was replayed; 1 on a difference, a gap, a missing sequence number, a
+    /// malformed tick or a damaged end (nothing after those can be proven).
     pub fn exit_code(&self) -> u8 {
         match (&self.stop, self.identical()) {
             // A replay of no tick shows nothing.
@@ -257,6 +263,9 @@ impl ReplayReport {
                 "a tick record is missing {after}: expected number {expected}, found {found}: \
                  nothing after it can be shown"
             )),
+            Stop::Damaged { why } => {
+                lines.push(format!("the file is damaged {after}: {why}"));
+            }
             Stop::Malformed { seq: Some(s), why } => {
                 lines.push(format!("tick {s} is malformed: {why}"));
             }
@@ -452,7 +461,7 @@ impl Walk {
         }
         if ticks.is_empty() {
             self.report.stop = if file.truncated.is_some() {
-                Stop::Cut
+                cut_stop(file)
             } else {
                 Stop::Malformed {
                     seq: None,
@@ -513,7 +522,7 @@ impl Walk {
                 Group::Incomplete => {
                     self.report.stop = match dropout_ms {
                         Some(ms) => Stop::Dropout { ms },
-                        None if last => Stop::Cut,
+                        None if last => cut_stop(file),
                         None => Stop::Malformed {
                             seq: Some(expected),
                             why: "records of the tick are missing".to_string(),
@@ -532,7 +541,7 @@ impl Walk {
             }
         }
         if file.truncated.is_some() {
-            self.report.stop = Stop::Cut;
+            self.report.stop = cut_stop(file);
         }
     }
 
@@ -556,6 +565,29 @@ impl Walk {
                 self.report.first_difference = Some(d);
             }
         }
+    }
+}
+
+/// How the walk ends when the file ends in the middle of something: a cut,
+/// as a power loss leaves it, **if** the message the end of the file cuts could
+/// be one this file holds. A message that declares more bytes than any
+/// complete message of the data section is not a cut but a damaged size (a
+/// flipped bit in a size makes the reader lose its place and run into the
+/// end), so the replay says so and exits 1.
+fn cut_stop(file: &UlogFile) -> Stop {
+    match file.truncated {
+        Some(t) if t.needed > 3 && t.needed - 3 > file.largest_data_message => Stop::Damaged {
+            why: format!(
+                "the last message, at byte {}, declares {} bytes but the file ends {} bytes \
+                 into it, and no complete message of the file has more than {}: damage, \
+                 not a cut",
+                t.offset,
+                t.needed - 3,
+                t.available,
+                file.largest_data_message
+            ),
+        },
+        _ => Stop::Cut,
     }
 }
 

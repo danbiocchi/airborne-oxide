@@ -6,8 +6,14 @@
 //! the first subscription, or a truncated definition is an error that carries
 //! the byte offset. A truncated **last** message in the data section (a file
 //! cut by power loss) is not an error: everything before it is returned and the
-//! cut is reported in [`UlogFile::truncated`]. Every item of the data section is
-//! kept, in file order, because replay needs the order.
+//! cut is reported in [`UlogFile::truncated`]. Two things are **not** a cut,
+//! because a damaged size makes the parse lose its place and run into them:
+//! a cut message whose header declares a size its kind does not have (a data
+//! message is 2 plus its record, a synchronisation message 8, a dropout 2) is
+//! the error a whole message of that kind would give, and a zero message header
+//! is the end of the data (a zero-filled tail, as `pyulog` takes it) only when
+//! every byte after it is zero too. Every item of the data section is kept, in
+//! file order, because replay needs the order.
 
 use crate::format::{self, FormatError, Layout, Scalar};
 use crate::msg::ParamValue;
@@ -72,8 +78,11 @@ pub enum ReadErrorKind {
         /// The record's bytes.
         got: usize,
     },
-    /// A synchronisation message with the wrong magic.
+    /// A synchronisation message with the wrong magic (or the wrong size).
     BadSync,
+    /// A message header of size 0 and type 0 in the data section that is not
+    /// the start of a zero-filled tail: a byte after it is not zero.
+    ZeroHeaderInData,
 }
 
 impl fmt::Display for ReadError {
@@ -120,6 +129,10 @@ impl fmt::Display for ReadError {
                 )
             }
             ReadErrorKind::BadSync => write!(f, "synchronisation message with the wrong magic"),
+            ReadErrorKind::ZeroHeaderInData => write!(
+                f,
+                "a message header of size 0 and type 0 in the data that is not followed by zeros only (damage, not a zero-filled tail)"
+            ),
         }
     }
 }
@@ -325,8 +338,17 @@ pub struct UlogFile {
     pub subscriptions: Vec<Subscription>,
     /// Every item of the data section, in file order.
     pub items: Vec<Item>,
-    /// Set when the last message is cut by the end of the file.
+    /// Set when the last message is cut by the end of the file, or when the
+    /// data section ends in a zero-filled tail (a message header of size 0 and
+    /// type 0 and nothing but zeros after it).
     pub truncated: Option<Truncated>,
+    /// The largest size field (payload bytes, the 3-byte header not counted) a
+    /// message of this file can have: the largest of the complete messages of
+    /// the data section whose type the reader knows (subscriptions included),
+    /// and of a data message of any subscribed topic (2 plus its record without
+    /// trailing padding), which the file may not have written yet. A cut
+    /// message that declares more than this cannot be one this file holds.
+    pub largest_data_message: usize,
 }
 
 struct Cursor {
@@ -401,6 +423,7 @@ impl UlogFile {
             subscriptions: Vec::new(),
             items: Vec::new(),
             truncated: None,
+            largest_data_message: 0,
         };
         let mut pending: Vec<(String, String, usize)> = Vec::new();
         let mut pending_names: std::collections::BTreeSet<String> = Default::default();
@@ -420,41 +443,54 @@ impl UlogFile {
                 available: avail,
             };
             let (size, ty) = match (u16_at(bytes, at), bytes.get(at + 2)) {
-                // As pyulog: a size-0, type-0 message in the data is corruption
-                // (a zero-filled tail); keep everything before it.
+                // As pyulog: a size-0, type-0 message in the data is a
+                // zero-filled tail, and ends the data **if nothing but zeros
+                // follows**. Anything else after it is damage: a size that is
+                // off by a little makes the parse land on zeros mid-file.
                 (Some(0), Some(0)) if in_data => {
+                    if bytes
+                        .get(at..)
+                        .is_some_and(|rest| rest.iter().any(|b| *b != 0))
+                    {
+                        return Err(err(at, ReadErrorKind::ZeroHeaderInData));
+                    }
                     file.truncated = Some(truncated(3));
                     break;
                 }
                 (Some(s), Some(t)) => (usize::from(s), *t),
+                _ if in_data => {
+                    file.truncated = Some(truncated(3));
+                    break;
+                }
                 _ => {
-                    return if in_data {
-                        file.truncated = Some(truncated(3));
-                        break;
-                    } else {
-                        Err(err(
-                            at,
-                            ReadErrorKind::Truncated {
-                                needed: 3,
-                                available: avail,
-                            },
-                        ))
-                    };
+                    return Err(err(
+                        at,
+                        ReadErrorKind::Truncated {
+                            needed: 3,
+                            available: avail,
+                        },
+                    ));
                 }
             };
             let Some(p) = bytes.get(at + 3..at + 3 + size) else {
-                return if in_data {
-                    file.truncated = Some(truncated(3 + size));
-                    break;
-                } else {
-                    Err(err(
+                if !in_data {
+                    return Err(err(
                         at,
                         ReadErrorKind::Truncated {
                             needed: 3 + size,
                             available: avail,
                         },
-                    ))
-                };
+                    ));
+                }
+                // A message cut by the end of the file is a cut, unless its
+                // kind has a size the file fixes and the header declares
+                // another: then it is damage, as a whole message would be.
+                let have = bytes.get(at + 3..).unwrap_or(&[]);
+                if let Some(k) = cut_is_damage(&file, &by_id, ty, size, have) {
+                    return Err(err(at, k));
+                }
+                file.truncated = Some(truncated(3 + size));
+                break;
             };
             cur.at = at + 3 + size;
 
@@ -467,6 +503,12 @@ impl UlogFile {
             {
                 in_data = true;
                 end_definitions(&mut file, &pending).map_err(|(off, k)| err(off, k))?;
+            }
+            // Only messages of a type the reader knows count: a damaged size
+            // that makes the parse land inside the file's own bytes can end on
+            // an "unknown" message of any size, and those are skipped silently.
+            if in_data && is_known_type(ty) {
+                file.largest_data_message = file.largest_data_message.max(size);
             }
 
             let r: Result<(), ReadErrorKind> = (|| {
@@ -675,7 +717,70 @@ impl UlogFile {
         if !in_data {
             end_definitions(&mut file, &pending).map_err(|(off, k)| err(off, k))?;
         }
+        // A data message of a subscribed topic may be larger than any the
+        // file holds so far (its first one is the one a cut can end in).
+        for sub in &file.subscriptions {
+            if let Some(f) = file.formats.get(sub.format) {
+                let size = 2 + f.layout.size_no_trailing_padding;
+                file.largest_data_message = file.largest_data_message.max(size);
+            }
+        }
         Ok(file)
+    }
+}
+
+/// The message types this reader understands in the data section.
+fn is_known_type(ty: u8) -> bool {
+    matches!(
+        ty,
+        kind::DATA
+            | kind::LOGGED_STRING
+            | kind::TAGGED_STRING
+            | kind::SYNC
+            | kind::DROPOUT
+            | kind::ADD_LOGGED
+            | kind::REMOVE_LOGGED
+            | kind::INFO
+            | kind::MULTI_INFO
+            | kind::PARAMETER
+            | kind::DEFAULT_PARAMETER
+    )
+}
+
+/// Whether a message of type `ty` that declares `size` payload bytes and is cut
+/// by the end of the file (`have` is what is there of its payload) cannot be
+/// what its header says: a data message is 2 plus the record size of its
+/// subscription, a synchronisation message 8 bytes, a dropout 2. The error is
+/// the one a whole message of that kind would give. `None`: it could be a cut,
+/// or its kind has no size the file fixes.
+fn cut_is_damage(
+    file: &UlogFile,
+    by_id: &BTreeMap<u16, usize>,
+    ty: u8,
+    size: usize,
+    have: &[u8],
+) -> Option<ReadErrorKind> {
+    match ty {
+        kind::DATA => {
+            if size < 2 {
+                return Some(bad(ty, "shorter than 2 bytes"));
+            }
+            // Until the id is there nothing can be judged.
+            let id = u16_at(have, 0)?;
+            let Some(&sub) = by_id.get(&id) else {
+                return Some(ReadErrorKind::UnknownMessageId(id));
+            };
+            let s = file.subscriptions.get(sub)?;
+            let expected = file.formats.get(s.format)?.layout.size_no_trailing_padding;
+            (size - 2 != expected).then(|| ReadErrorKind::RecordLength {
+                topic: s.name.clone(),
+                expected,
+                got: size - 2,
+            })
+        }
+        kind::SYNC => (size != SYNC_MAGIC.len()).then_some(ReadErrorKind::BadSync),
+        kind::DROPOUT => (size != 2).then(|| bad(ty, "payload is not 2 bytes")),
+        _ => None,
     }
 }
 
