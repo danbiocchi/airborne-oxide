@@ -33,6 +33,8 @@
 pub mod format;
 pub mod logger;
 pub mod msg;
+#[cfg(any(test, feature = "std"))]
+pub mod reader;
 pub mod record;
 
 pub use msg::{Error, Sink};

@@ -2,4 +2,5 @@
 mod format;
 mod logger;
 mod msg;
+mod reader;
 mod record;
