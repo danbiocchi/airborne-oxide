@@ -2071,3 +2071,187 @@ fn telemetry_before_the_first_tick_is_empty() {
     assert!(!t.ground_contact && !t.landed);
     assert_eq!(t.events_dropped, 0);
 }
+
+/// The velocity setpoint of a report, as an option (the report keeps one
+/// only where a velocity loop runs).
+fn vel_of(s: &Setpoints) -> Option<Vec3<f32>> {
+    Some(s.velocity)
+}
+
+fn flown(rig: &Rig) -> Setpoints {
+    rig.core.telemetry().setpoints.expect("guidance is flying")
+}
+
+#[test]
+fn stabilized_reports_the_attitude_forms_and_no_velocity_setpoint() {
+    use crate::control::{HorizontalForm, VerticalForm, YawForm};
+    // Fly Position first, so that the last position-control report is a
+    // Position/Position/Heading one with a velocity setpoint, then switch to
+    // Stabilized: what is reported must be what Stabilized flies.
+    let mut rig = Rig::external(1);
+    rig.arm();
+    rig.world = true;
+    rig.rc.pitch = 0.5;
+    rig.rc.throttle = 0.8;
+    rig.run(1.0);
+    assert_eq!(rig.nav(), NavState::Position);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (
+            HorizontalForm::Position,
+            VerticalForm::Position,
+            YawForm::Heading
+        )
+    );
+    assert!(vel_of(&s).is_some());
+    rig.rc.mode_switch = 0;
+    rig.run(1.0);
+    assert_eq!(rig.nav(), NavState::Stabilized);
+    let s = flown(&rig);
+    assert_eq!(s.horizontal, HorizontalForm::Tilt);
+    assert_eq!(s.vertical, VerticalForm::Thrust);
+    assert_eq!(s.yaw_form, YawForm::Free);
+    assert_eq!(vel_of(&s), None);
+    // A fresh core in Stabilized too (the report was never written).
+    let mut fresh = Rig::external(0);
+    fresh.arm();
+    fresh.run(0.5);
+    assert_eq!(fresh.nav(), NavState::Stabilized);
+    let s = flown(&fresh);
+    assert_eq!(s.horizontal, HorizontalForm::Tilt);
+    assert_eq!(s.vertical, VerticalForm::Thrust);
+    assert_eq!(s.yaw_form, YawForm::Free);
+    assert_eq!(vel_of(&s), None);
+}
+
+#[test]
+fn every_navigation_state_reports_the_forms_it_flies() {
+    use crate::control::{HorizontalForm as H, VerticalForm as V, YawForm as Y};
+    // Position: sticks give position control with a velocity feed-forward.
+    let mut rig = Rig::external(1);
+    rig.arm();
+    rig.world = true;
+    rig.rc.pitch = 0.5;
+    rig.run(1.0);
+    assert_eq!(rig.nav(), NavState::Position);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Position, Y::Heading)
+    );
+    let v = vel_of(&s).expect("velocity loop");
+    assert!(
+        v.x > 0.5,
+        "pitch stick forward gives a northward velocity setpoint: {v:?}"
+    );
+    assert_eq!(s.position, rig.core.guide_state.position_sp);
+
+    // Altitude (Position after a GPS loss): tilt from the sticks, height held,
+    // then a vertical speed when the throttle leaves the centre.
+    let mut rig = Rig::ekf(1);
+    rig.arm();
+    rig.gps_on = false;
+    assert!(rig.run_until(4.0, |r| r.nav() == NavState::Altitude));
+    rig.rc.throttle = 0.5;
+    rig.run(0.5);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Tilt, V::Position, Y::Heading)
+    );
+    rig.rc.throttle = 0.9;
+    rig.run(0.3);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Tilt, V::Velocity, Y::Heading)
+    );
+    let v = vel_of(&s).expect("velocity loop");
+    assert!(v.z < -0.5, "a climb is a negative down speed: {v:?}");
+
+    // Offboard: position control to the setpoint.
+    let mut rig = Rig::external(2);
+    rig.arm();
+    rig.run(0.5);
+    assert_eq!(rig.nav(), NavState::Offboard);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Position, Y::Heading)
+    );
+    assert!(vel_of(&s).is_some());
+
+    // Hold (RC lost): position control at the held point.
+    let mut rig = Rig::external(1);
+    rig.arm();
+    rig.world = true;
+    rig.rc_on = false;
+    assert!(rig.run_until(0.9, |r| r.nav() == NavState::Hold));
+    rig.run(0.1);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Position, Y::Heading)
+    );
+    assert!(vel_of(&s).is_some());
+
+    // LandNow (critical battery): horizontal position, a descent speed.
+    let mut c = cfg();
+    c.failsafe.battery_low_v = c.failsafe.battery_critical_v;
+    let mut rig = Rig::external(1).with_cfg(c);
+    rig.arm();
+    rig.world = true;
+    rig.battery = Some(BatterySample {
+        voltage_v: 19.0,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(10.0, |r| r.nav() == NavState::LandNow));
+    rig.run(0.2);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Velocity, Y::Heading)
+    );
+    let v = vel_of(&s).expect("velocity loop");
+    assert!(v.z > 0.1, "a descent is a positive down speed: {v:?}");
+}
+
+#[test]
+fn the_rate_command_torque_is_the_inertia_times_the_rate_loops_demand() {
+    // The vehicle is held at an attitude that is not the target (rolled,
+    // pitched and yawed), so the attitude loop asks for body rates and the
+    // rate loop for torque on every axis.
+    let mut rig = hovering(1, cfg());
+    rig.state = Some(StateSample {
+        attitude: Quat::from_euler(0.15, -0.1, 0.5),
+        ..at_height(5.0)
+    });
+    let mut seen = [false; 3];
+    let mut checked = 0_u32;
+    for _ in 0..300 {
+        let mut replay = rig.core.rate_ctrl;
+        rig.step();
+        let t = rig.core.telemetry();
+        let c = &rig.core;
+        let target = c.attitude.visible;
+        let airborne_ish = target.thrust_n >= 0.5 * c.cfg.weight_n();
+        let alpha = replay.update(
+            target.rate,
+            c.gyro_filtered,
+            1.0e-3,
+            &c.cfg.gains,
+            &c.cfg.limits,
+            airborne_ish,
+        );
+        let want = c.cfg.inertia.hadamard(alpha);
+        assert_eq!(t.rate_command.torque_nm, want);
+        let tq = t.rate_command.torque_nm;
+        seen[0] |= tq.x.abs() > 1.0e-4;
+        seen[1] |= tq.y.abs() > 1.0e-4;
+        seen[2] |= tq.z.abs() > 1.0e-4;
+        checked += 1;
+    }
+    assert_eq!(checked, 300);
+    assert_eq!(seen, [true; 3], "torque on every axis");
+}
