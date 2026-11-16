@@ -118,6 +118,23 @@ fn a_log_write_error_names_the_file_and_exits_2() {
     assert!(std::path::Path::new("/dev/full").exists());
 }
 
+/// A CSV that fails after the flight (the header fits in the buffer): the
+/// summary and the verdict are still printed, then the error, exit 2.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_csv_write_error_after_the_flight_still_prints_the_summary() {
+    let o = run(&["scenario", "gcs-loss", "--csv", "/dev/full"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("trace hash "), "{out}");
+    assert!(out.contains("result     PASS"), "{out}");
+    assert_eq!(
+        stderr(&o),
+        "error: /dev/full: No space left on device (os error 28)\n"
+    );
+    assert!(std::path::Path::new("/dev/full").exists());
+}
+
 #[test]
 fn an_error_exits_2_for_every_command_and_a_failing_run_exits_1() {
     let csv = bad_csv();
