@@ -39,8 +39,8 @@ This flies the scripted hover-and-step scenario in real time and opens the viewe
 | Option | Effect |
 |---|---|
 | `--joystick` | You fly it with a USB joystick instead of the script |
-| `--scenario NAME` | Fly a scripted scenario instead of the default `hover-step`: `gust-hold` (realistic sensors, wind, EKF), or any fault scenario or pairing, such as `rc-loss-position` or `pair-rc-loss+gps-loss`. An unknown name lists the available ones |
-| `--seed 3` | Run index for `gust-hold` and the fault scenarios (default 0) |
+| `--scenario NAME\|PATH` | Fly a scripted scenario instead of the default `hover-step`: `gust-hold` (realistic sensors, wind, EKF), any other scenario embedded in the simulator (the fault scenarios and pairings, such as `rc-loss-position` or `pair-rc-loss+gps-loss`), or a scenario file given by its path (an argument ending in `.toml` or containing a path separator is a path; see `scenarios/` and the repository README). An unknown name lists the available ones |
+| `--seed 3` | Run index for `gust-hold` and every other scenario (default 0) |
 | `--profile h743` | Use the H743 task schedule instead of the F405 one |
 | `--speed 4` | Run at 4× real time (`0` = as fast as possible) |
 | `--save flight.rrd` | Write a recording file instead of opening the viewer (open it later with `rerun flight.rrd`) |

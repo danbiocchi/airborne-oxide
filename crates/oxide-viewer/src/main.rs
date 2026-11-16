@@ -2,13 +2,15 @@
 //! `oxide-viewer`: fly the simulator in real time and watch it in Rerun.
 //!
 //! ```text
-//! oxide-viewer [--profile f405|h743] [--scenario NAME] [--seed N]
+//! oxide-viewer [--profile f405|h743] [--scenario NAME|PATH] [--seed N]
 //!              [--joystick] [--speed X] [--save FILE.rrd]
 //! ```
 //! Without `--joystick` it flies a scripted scenario: `hover-step` (default,
-//! ideal sensors, calm air), `gust-hold` (realistic sensors, wind, EKF) or
-//! any fault scenario or pairing of `oxide_sim::fault_scenarios`
-//! (`--seed` picks the run index). The flight core's events are shown as a
+//! ideal sensors, calm air), `gust-hold` (realistic sensors, wind, EKF), any
+//! other scenario embedded in the simulator (the fault scenarios and
+//! pairings: `oxide-sim scenario list`) or a scenario file given by its path
+//! (an argument ending in `.toml` or holding a path separator is a path;
+//! `--seed` picks the run index). The flight core's events are shown as a
 //! text log and printed, and the failsafe action and validity as plots. With `--joystick` a USB joystick (the
 //! Taranis in USB-joystick mode) is the pilot.
 //! Rerun is a visualiser only; it never feeds back into the simulation.
@@ -27,6 +29,7 @@ use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
+use oxide_sim::scenario_file::{self, ScenarioFile};
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
 
 /// Rerun is updated at this rate, Hz.
@@ -36,20 +39,35 @@ const VIEW_RATE_HZ: u64 = 50;
 enum Scenario {
     HoverStep,
     GustHold,
-    /// A fault scenario or pairing, by name.
-    Fault(Box<fault_scenarios::FaultScenario>),
+    /// Any other scenario: an embedded one by name, or a file by path.
+    File(Box<ScenarioFile>),
 }
 
 /// Every scenario name `--scenario` accepts.
 fn scenario_names() -> Vec<&'static str> {
-    let mut names = vec!["hover-step", "gust-hold"];
-    names.extend(
-        fault_scenarios::all()
-            .iter()
-            .chain(fault_scenarios::pairs().iter())
-            .map(|s| s.name),
-    );
-    names
+    fault_scenarios::EMBEDDED.iter().map(|(n, _)| *n).collect()
+}
+
+/// The scenario `--scenario` names: a path when it ends in `.toml` or has a
+/// path separator, else an embedded one.
+fn resolve_scenario(arg: &str) -> Result<Scenario, String> {
+    match arg {
+        "hover-step" => return Ok(Scenario::HoverStep),
+        "gust-hold" => return Ok(Scenario::GustHold),
+        _ => {}
+    }
+    if arg.ends_with(".toml") || arg.contains('/') || arg.contains('\\') {
+        return scenario_file::load_path(arg)
+            .map(|s| Scenario::File(Box::new(s)))
+            .map_err(|e| e.to_string());
+    }
+    match fault_scenarios::by_name(arg) {
+        Some(s) => Ok(Scenario::File(Box::new(s))),
+        None => Err(format!(
+            "unknown scenario {arg}; a file is given by its path\navailable scenarios:\n  {}",
+            scenario_names().join("\n  ")
+        )),
+    }
 }
 
 struct Args {
@@ -81,21 +99,7 @@ fn parse() -> Result<Args, String> {
                     other => return Err(format!("unknown profile {other}")),
                 }
             }
-            "--scenario" => {
-                args.scenario = match value()?.as_str() {
-                    "hover-step" => Scenario::HoverStep,
-                    "gust-hold" => Scenario::GustHold,
-                    other => match fault_scenarios::by_name(other) {
-                        Some(s) => Scenario::Fault(Box::new(s)),
-                        None => {
-                            return Err(format!(
-                                "unknown scenario {other}\navailable scenarios:\n  {}",
-                                scenario_names().join("\n  ")
-                            ));
-                        }
-                    },
-                }
-            }
+            "--scenario" => args.scenario = resolve_scenario(&value()?)?,
             "--seed" => {
                 args.seed = value()?
                     .parse()
@@ -234,6 +238,13 @@ fn reason_names(r: Reasons) -> String {
     }
 }
 
+/// The name of a parameter, or its number if the table has no such entry.
+fn param_name(id: oxide_core::params::ParamId) -> String {
+    oxide_core::params::PARAMS
+        .get(id.index())
+        .map_or_else(|| format!("parameter #{}", id.0), |d| d.name.to_string())
+}
+
 /// A readable line for an event of the flight core.
 fn describe(kind: EventKind) -> String {
     match kind {
@@ -258,6 +269,22 @@ fn describe(kind: EventKind) -> String {
         EventKind::PilotOverride(r) => format!("Pilot override of {}", reason_names(r)),
         EventKind::Touchdown => "Touchdown".to_string(),
         EventKind::HomeSet => "Home set".to_string(),
+        EventKind::ParamChanged(id) => format!("{} changed", param_name(id)),
+        EventKind::ParamRefused { id, why } => {
+            format!("{} change refused: {why:?}", param_name(id))
+        }
+        EventKind::ParamLoadFault(r) => format!(
+            "Stored parameters not fully loaded ({} unknown, {} dropped{}{})",
+            r.unknown,
+            r.dropped,
+            if r.invalid { ", broke a rule" } else { "" },
+            if r.unreadable { ", unreadable" } else { "" },
+        ),
+        EventKind::ParamLoadRecovered(r) => format!(
+            "Stored parameters loaded; {} damaged records skipped",
+            r.torn
+        ),
+        EventKind::ParamFaultAcked => "Parameter fault acknowledged".to_string(),
     }
 }
 
@@ -460,10 +487,9 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
                 Simulation::<_, 4>::with_options(&airframe, profile, AnyPilot::GustHold(s), o)?;
             drive(args, sim, Some(d))
         }
-        Scenario::Fault(f) => {
-            let sim = fault_scenarios::build(f, profile, args.seed)?;
-            let d = Micros((f.script.duration_s * 1e6).round() as u64);
-            drive(args, sim, Some(d))
+        Scenario::File(f) => {
+            let sim = f.build(profile, args.seed)?;
+            drive(args, sim, Some(f.end()))
         }
     }
 }
@@ -545,7 +571,7 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!(
-                "usage: oxide-viewer [--profile f405|h743] [--scenario NAME] [--seed N] [--joystick] [--speed X] [--save FILE.rrd]"
+                "usage: oxide-viewer [--profile f405|h743] [--scenario NAME|PATH] [--seed N] [--joystick] [--speed X] [--save FILE.rrd]"
             );
             return std::process::ExitCode::from(2);
         }

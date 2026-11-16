@@ -4,6 +4,7 @@
 //! ADR-0001).
 
 use crate::math::{Quat, Vec3};
+use crate::params::{LoadReport, ParamError, ParamId, ParamValue};
 use crate::time::Micros;
 
 /// A sample with when it was measured and when the core received it.
@@ -140,6 +141,13 @@ pub struct TrajectorySetpoint {
     pub yaw: f32,
 }
 
+/// A request to change one parameter (ADR-0004 §4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamSet {
+    pub id: ParamId,
+    pub value: ParamValue,
+}
+
 /// Everything that arrived since the previous tick. `None` means no new
 /// sample; the core keeps the last one and judges staleness itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -154,6 +162,13 @@ pub struct Inputs {
     pub mag: Option<Stamped<MagSample>>,
     pub gcs_heartbeat: Option<Stamped<GcsHeartbeat>>,
     pub brain_heartbeat: Option<Stamped<BrainHeartbeat>>,
+    /// A parameter change, applied on the tick it arrives; at most one per
+    /// tick (ADR-0004 §4).
+    pub param_set: Option<ParamSet>,
+    /// An operator acknowledges a parameter fault (`Core::params_fault`). It
+    /// counts only on a tick where the fault is held and the vehicle is
+    /// disarmed (ADR-0004 §6).
+    pub param_ack: bool,
 }
 
 /// Flight mode.
@@ -333,7 +348,9 @@ bitset! {
         POSITION = 5;
         /// No battery reading, an implausible voltage, or battery low.
         BATTERY = 6;
-        /// The configuration failed validation.
+        /// A parameter fault is held: what the store held was not fully
+        /// understood or could not be read, until an operator acknowledges
+        /// it (`Inputs::param_ack`).
         CONFIG = 7;
         /// Offboard is selected and the brain or its setpoints are not live.
         LINK = 8;
@@ -381,6 +398,25 @@ pub enum EventKind {
     PilotOverride(Reasons),
     Touchdown,
     HomeSet,
+    /// A parameter was changed (`Core::param` has the new value).
+    ParamChanged(ParamId),
+    /// A parameter change was refused; nothing changed.
+    ParamRefused {
+        id: ParamId,
+        why: ParamError,
+    },
+    /// Loading the stored parameters was not clean (`Core::report_param_load`):
+    /// the report. Emitted once, on the first tick; arming is refused until
+    /// an operator acknowledges.
+    ParamLoadFault(LoadReport),
+    /// Loading the stored parameters was clean but the store skipped damaged
+    /// or half-written records (`LoadReport::torn`): the values taken may be
+    /// older than the last save. Emitted once, on the first tick; no fault is
+    /// held and arming is not refused.
+    ParamLoadRecovered(LoadReport),
+    /// An operator acknowledged the parameter fault; the store must now be
+    /// rewritten from the values in use (`Status::params_unsaved`).
+    ParamFaultAcked,
 }
 
 /// An event with the tick time it happened at.
@@ -466,6 +502,9 @@ pub struct Status {
     pub prearm: PrearmFlags,
     /// Home was set at arming.
     pub home_set: bool,
+    /// A parameter has changed since the store last had the values
+    /// (`Core::clear_unsaved`).
+    pub params_unsaved: bool,
 }
 
 /// Actuator commands and status. `motors` are normalised commands in

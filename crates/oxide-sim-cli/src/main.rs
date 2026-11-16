@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `oxide-sim`: run a scenario headless.
 //!
+//! `oxide-sim help` (also `--help` and `-h`) prints the usage of every command.
+//!
 //! ```text
 //! oxide-sim run  [--profile f405|h743] [--airframe FILE] [--csv FILE]
 //!                [--scenario hover-step|gust-hold] [--seed N]
@@ -8,8 +10,15 @@
 //! oxide-sim hash [same options]
 //! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
 //! oxide-sim scenario list
-//! oxide-sim scenario NAME [--profile f405|h743] [--seed N] [--csv FILE]
+//! oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE]
+//! oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
+//! oxide-sim params list | json | doc
 //! ```
+//! `run`, `hash`, `montecarlo` and `scenario` also take `--params FILE.toml`
+//! (a `[params]` table) and `--param NAME=VALUE` (repeatable): parameter
+//! overrides applied through the checked `set`, the file first, then the flags
+//! in order (ADR-0004). `params list` prints the table, `params json` the
+//! ground-station metadata and `params doc` the text of `docs/PARAMETERS.md`.
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
@@ -17,9 +26,18 @@
 //! (run 0, `<profile> <name>#0 <hash>`), so that it also covers ground contact,
 //! landings, failsafes and a crash. `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
-//! with 1 if any run fails. `scenario` flies a fault scenario (ADR-0003),
-//! prints its event timeline, a summary and every violated expectation, and
-//! exits with 1 if there are any; `--seed` is the run index.
+//! with 1 if any run fails. `scenario` flies a scenario (ADR-0003, ADR-0004
+//! §7): a name among the embedded ones (`scenario list`), or the path of a
+//! scenario file (an argument ending in `.toml` or containing a path
+//! separator is a path). It prints its event timeline, a summary and every
+//! violated expectation, and exits with 1 if there are any; `--seed` is the
+//! run index. `scenarios DIR` flies every `*.toml` of a directory in
+//! parallel, on the profiles given (default: each file's `[run] profiles`)
+//! and `--seeds` runs (default: each file's `[run] seeds`), prints one line
+//! per scenario and profile and exits with 1 if any run fails.
+
+mod params_cmd;
+mod scenarios_cmd;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -30,12 +48,71 @@ use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
-use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold};
+use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
 use oxide_sim::montecarlo::run_indexed;
-use oxide_sim::outcome::FlightOutcome;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
+use oxide_sim::scenario_file::{self, Checker, ScenarioFile};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimError, SimOptions, Simulation, StepRecord};
+
+/// The commands, as `main` dispatches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Run,
+    Hash,
+    Montecarlo,
+    Scenario,
+    Scenarios,
+    Params,
+}
+
+impl Command {
+    /// Every command, in the order the usage text lists them.
+    const ALL: [Command; 6] = [
+        Command::Run,
+        Command::Hash,
+        Command::Montecarlo,
+        Command::Scenario,
+        Command::Scenarios,
+        Command::Params,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Command::Run => "run",
+            Command::Hash => "hash",
+            Command::Montecarlo => "montecarlo",
+            Command::Scenario => "scenario",
+            Command::Scenarios => "scenarios",
+            Command::Params => "params",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Command> {
+        Command::ALL.into_iter().find(|c| c.name() == name)
+    }
+}
+
+/// The names of all commands, for the error messages: `run | hash | ...`.
+fn command_list() -> String {
+    let names: Vec<&str> = Command::ALL.iter().map(|c| c.name()).collect();
+    names.join(" | ")
+}
+
+/// What `oxide-sim help`, `--help` and `-h` print: every command with its
+/// options. A line that starts a command begins with `  oxide-sim NAME`.
+const USAGE: &str = "usage:
+  oxide-sim run [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold]
+                [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]
+                [--params FILE.toml] [--param NAME=VALUE]
+  oxide-sim hash [same options as run]
+  oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T] [--params FILE.toml] [--param NAME=VALUE]
+  oxide-sim scenario list
+  oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--params FILE.toml] [--param NAME=VALUE]
+  oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
+  oxide-sim params list|json|doc
+  oxide-sim help | --help | -h
+";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScenarioKind {
@@ -60,6 +137,35 @@ struct Args {
     sensors: Option<SensorChoice>,
     seeds: usize,
     threads: usize,
+    /// `--params FILE` then every `--param NAME=VALUE`, in that order.
+    params: Vec<(String, f64)>,
+}
+
+/// `NAME=VALUE` as given to `--param`.
+fn parse_param_flag(text: &str) -> Result<(String, f64), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("--param needs NAME=VALUE, got {text}"))?;
+    let v: f64 = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("--param {name}: {value} is not a number"))?;
+    Ok((name.trim().to_string(), v))
+}
+
+/// The overrides of `--params FILE` (if given) followed by those of the
+/// `--param` flags, in order.
+fn collect_params(
+    file: Option<&str>,
+    flags: Vec<(String, f64)>,
+) -> Result<Vec<(String, f64)>, String> {
+    let mut out = Vec::new();
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        out = oxide_sim::airframe::parse_params_file(&text).map_err(|e| format!("{path}: {e}"))?;
+    }
+    out.extend(flags);
+    Ok(out)
 }
 
 fn parse() -> Result<Args, String> {
@@ -67,12 +173,12 @@ fn parse() -> Result<Args, String> {
 }
 
 /// Options `montecarlo` honours; any other would be silently ignored.
-const MONTECARLO_OPTIONS: &[&str] = &["--profile", "--seeds", "--threads"];
+const MONTECARLO_OPTIONS: &[&str] = &["--profile", "--seeds", "--threads", "--param", "--params"];
 
 fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let command = it
         .next()
-        .ok_or("missing command: run | hash | montecarlo")?;
+        .ok_or_else(|| format!("missing command: {} (try: oxide-sim help)", command_list()))?;
     let mut args = Args {
         command,
         profile: F405_LEAN,
@@ -84,7 +190,10 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         sensors: None,
         seeds: 200,
         threads: 0,
+        params: Vec::new(),
     };
+    let mut params_file: Option<String> = None;
+    let mut param_flags: Vec<(String, f64)> = Vec::new();
     let mut given: Vec<String> = Vec::new();
     while let Some(flag) = it.next() {
         given.push(flag.clone());
@@ -143,13 +252,20 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("--threads needs a non-negative integer, got {v}"))?;
             }
+            "--params" => params_file = Some(value()?),
+            "--param" => param_flags.push(parse_param_flag(&value()?)?),
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if !matches!(args.command.as_str(), "run" | "hash" | "montecarlo") {
+    args.params = collect_params(params_file.as_deref(), param_flags)?;
+    if !matches!(
+        Command::from_name(&args.command),
+        Some(Command::Run | Command::Hash | Command::Montecarlo)
+    ) {
         return Err(format!(
-            "unknown command {} (run | hash | montecarlo)",
-            args.command
+            "unknown command {} ({}; try: oxide-sim help)",
+            args.command,
+            command_list()
         ));
     }
     if args.command == "montecarlo"
@@ -158,7 +274,7 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             .find(|g| g.starts_with("--") && !MONTECARLO_OPTIONS.contains(&g.as_str()))
     {
         return Err(format!(
-            "option {bad} does not apply to montecarlo (only --profile, --seeds, --threads)"
+            "option {bad} does not apply to montecarlo (only --profile, --seeds, --threads, --param, --params)"
         ));
     }
     Ok(args)
@@ -180,6 +296,7 @@ fn overridden(mut options: SimOptions, args: &Args) -> SimOptions {
     if let Some(e) = args.estimator {
         options.estimator = e;
     }
+    options.params.clone_from(&args.params);
     match args.sensors {
         Some(SensorChoice::Ideal) => options.sensors = SensorConfig::ideal(),
         Some(SensorChoice::Realistic) => options.sensors = SensorConfig::realistic(),
@@ -386,16 +503,22 @@ const HASHED_FAULT_SCENARIOS: [&str; 3] =
     ["rc-loss-position", "pair-gps-loss+baro-loss", "motor-loss"];
 
 /// `<profile> <name>#0 <hash>` for each of `HASHED_FAULT_SCENARIOS`.
+#[cfg(test)]
 fn fault_hash_lines(profile: Profile) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fault_hash_lines_with(profile, &[])
+}
+
+/// Like [`fault_hash_lines`], with parameter overrides.
+fn fault_hash_lines_with(
+    profile: Profile,
+    params: &[(String, f64)],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut lines = Vec::new();
     for name in HASHED_FAULT_SCENARIOS {
         let scenario = fault_scenarios::by_name(name)
             .ok_or_else(|| format!("hashed fault scenario {name} does not exist"))?;
-        let mut sim = fault_scenarios::build(&scenario, profile, 0)?;
-        sim.run_until(
-            Micros((scenario.script.duration_s * 1e6).round() as u64),
-            |_| {},
-        );
+        let mut sim = scenario.build_with_params(profile, 0, params)?;
+        sim.run_until(Micros((scenario.duration_s * 1e6).round() as u64), |_| {});
         lines.push(format!(
             "{} {}#0 {:016x}",
             profile.name,
@@ -426,7 +549,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("{} {} {:016x}", profile.name, o.label, o.hash);
         }
         if args.scenario.is_none() {
-            for line in fault_hash_lines(profile)? {
+            for line in fault_hash_lines_with(profile, &args.params)? {
                 println!("{line}");
             }
         }
@@ -479,7 +602,7 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     let profile = args.profile;
     let start = Instant::now();
     let results = run_indexed(args.seeds, args.threads, |i| {
-        fly_gust_hold(profile, i as u64, &c)
+        fly_gust_hold_with_params(profile, i as u64, &c, &args.params)
     });
     let wall_s = start.elapsed().as_secs_f64();
     let mut runs: Vec<HoldMetrics> = Vec::with_capacity(results.len());
@@ -521,23 +644,57 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(passed == runs.len())
 }
 
-/// `oxide-sim scenario list | NAME [--profile P] [--seed N] [--csv FILE]`.
+/// `oxide-sim params list | json | doc`.
+fn params_command(mut it: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
+    let what = it.next().ok_or("params needs list, json or doc")?;
+    if let Some(extra) = it.next() {
+        return Err(format!("unexpected argument {extra}").into());
+    }
+    let text = match what.as_str() {
+        "list" => params_cmd::list()?,
+        "json" => params_cmd::json(),
+        "doc" => params_cmd::doc(),
+        other => return Err(format!("unknown params command {other} (list | json | doc)").into()),
+    };
+    std::io::stdout().write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// The scenario `arg` names: a path when it ends in `.toml` or has a path
+/// separator, else one of the embedded scenarios.
+fn resolve_scenario(arg: &str) -> Result<ScenarioFile, Box<dyn std::error::Error>> {
+    if arg.ends_with(".toml") || arg.contains('/') || arg.contains('\\') {
+        return Ok(scenario_file::load_path(arg)?);
+    }
+    fault_scenarios::by_name(arg).ok_or_else(|| {
+        format!(
+            "unknown scenario {arg} (try: oxide-sim scenario list; a file is given by its path, e.g. ./{arg}.toml)"
+        )
+        .into()
+    })
+}
+
+/// `oxide-sim scenario list | NAME|PATH [--profile P] [--seed N] [--csv FILE]
+/// [--params FILE] [--param NAME=VALUE]`.
 fn scenario_command(
     mut it: impl Iterator<Item = String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let first = it.next().ok_or("scenario needs list or a scenario name")?;
+    let first = it
+        .next()
+        .ok_or("scenario needs list, a scenario name or the path of a scenario file")?;
     if first == "list" {
-        for s in fault_scenarios::all()
-            .into_iter()
-            .chain(fault_scenarios::pairs())
-        {
+        if let Some(extra) = it.next() {
+            return Err(format!("unexpected argument {extra} after list").into());
+        }
+        for s in fault_scenarios::embedded() {
             println!("{:<34} {}", s.name, s.about);
         }
         return Ok(true);
     }
-    let scenario = fault_scenarios::by_name(&first)
-        .ok_or_else(|| format!("unknown scenario {first} (try: oxide-sim scenario list)"))?;
+    let scenario = resolve_scenario(&first)?;
     let (mut profile, mut index, mut csv_path) = (F405_LEAN, 0_u64, None);
+    let mut params_file: Option<String> = None;
+    let mut param_flags: Vec<(String, f64)> = Vec::new();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -555,10 +712,13 @@ fn scenario_command(
                     .map_err(|_| format!("--seed needs a non-negative integer, got {v}"))?;
             }
             "--csv" => csv_path = Some(value()?),
+            "--params" => params_file = Some(value()?),
+            "--param" => param_flags.push(parse_param_flag(&value()?)?),
             other => return Err(format!("unknown option {other}").into()),
         }
     }
-    let mut sim = fault_scenarios::build(&scenario, profile, index)?;
+    let params = collect_params(params_file.as_deref(), param_flags)?;
+    let mut sim = scenario.build_with_params(profile, index, &params)?;
     let mut csv = match &csv_path {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
@@ -567,11 +727,10 @@ fn scenario_command(
         }
         None => None,
     };
-    let mut outcome = FlightOutcome::new();
+    let mut checker = Checker::new(&scenario);
     let mut io_error = None;
-    let end = Micros((scenario.script.duration_s * 1e6).round() as u64);
-    sim.run_until(end, |r| {
-        outcome.add(r);
+    sim.run_until(scenario.end(), |r| {
+        checker.add(r);
         if let Some(f) = csv.as_mut()
             && let Err(err) = f.write_all(csv_row(r).as_bytes())
         {
@@ -584,6 +743,8 @@ fn scenario_command(
     if let Some(mut f) = csv {
         f.flush()?;
     }
+    let verdict = checker.finish();
+    let outcome = &verdict.outcome;
     println!(
         "scenario   {} (run {index}, profile {})",
         scenario.name, profile.name
@@ -622,37 +783,73 @@ fn scenario_command(
             .disarmed_at_s
             .map_or("-".into(), |t| format!("{t:.2} s"))
     );
+    if let Some(h) = &verdict.hold {
+        println!(
+            "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {:.3} m",
+            h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m, h.est_max_h_error_m
+        );
+    }
     println!("trace hash {:016x}", sim.trace_hash());
-    let violations = scenario.expect.check(&outcome);
-    if violations.is_empty() {
-        println!("result     PASS");
+    for line in result_lines(&scenario, &verdict.violations) {
+        println!("{line}");
+    }
+    Ok(verdict.violations.is_empty())
+}
+
+/// The `result` line of `scenario` and the violations under it. A file that
+/// states no expectations is judged by the invariants, and says so.
+fn result_lines(scenario: &ScenarioFile, violations: &[String]) -> Vec<String> {
+    let note = if scenario.states_expectations() {
+        ""
     } else {
-        println!("result     FAIL");
-        for v in &violations {
-            println!("  violated: {v}");
+        " (invariants only: the file states no expectations)"
+    };
+    let mut out = Vec::new();
+    if violations.is_empty() {
+        out.push(format!("result     PASS{note}"));
+    } else {
+        out.push(format!("result     FAIL{note}"));
+        out.extend(violations.iter().map(|v| format!("  violated: {v}")));
+    }
+    out
+}
+
+/// Maps a command's result to the exit status: 0 passed, 1 a failing run, 2 an
+/// error.
+fn finish(r: Result<bool, Box<dyn std::error::Error>>) -> ExitCode {
+    match r {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
         }
     }
-    Ok(violations.is_empty())
 }
 
 fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("scenario") {
-        return match scenario_command(std::env::args().skip(2)) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        };
+    let first = std::env::args().nth(1);
+    if matches!(first.as_deref(), Some("help" | "--help" | "-h")) {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    match first.as_deref().and_then(Command::from_name) {
+        Some(Command::Params) => {
+            return finish(params_command(std::env::args().skip(2)).map(|()| true));
+        }
+        Some(Command::Scenarios) => {
+            return finish(scenarios_cmd::run(std::env::args().skip(2)));
+        }
+        Some(Command::Scenario) => {
+            return finish(scenario_command(std::env::args().skip(2)));
+        }
+        Some(Command::Run | Command::Hash | Command::Montecarlo) | None => {}
     }
     let args = match parse() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!(
-                "usage: oxide-sim run|hash|montecarlo|scenario [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic] [--seeds N] [--threads T]"
-            );
+            eprint!("{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -681,6 +878,38 @@ mod tests {
 
     fn p(args: &[&str]) -> Result<Args, String> {
         parse_from(args.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn the_usage_names_exactly_the_commands_main_dispatches() {
+        let mut in_usage: Vec<&str> = USAGE
+            .lines()
+            .filter_map(|l| l.strip_prefix("  oxide-sim "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        in_usage.sort_unstable();
+        in_usage.dedup();
+        // `help` is the usage itself, not a command with options.
+        in_usage.retain(|c| *c != "help");
+        let mut dispatched: Vec<&str> = Command::ALL.iter().map(|c| c.name()).collect();
+        dispatched.sort_unstable();
+        assert_eq!(in_usage, dispatched);
+        for c in Command::ALL {
+            assert_eq!(Command::from_name(c.name()), Some(c));
+        }
+        assert_eq!(Command::from_name("help"), None);
+        assert!(USAGE.contains("--help") && USAGE.contains(" -h"));
+    }
+
+    #[test]
+    fn missing_and_unknown_command_messages_list_all_six() {
+        let missing = p(&[]).err().expect("error");
+        let unknown = p(&["frobnicate"]).err().expect("error");
+        for c in Command::ALL {
+            assert!(missing.contains(c.name()), "{missing}");
+            assert!(unknown.contains(c.name()), "{unknown}");
+        }
+        assert!(unknown.contains("frobnicate"), "{unknown}");
     }
 
     #[test]
@@ -724,6 +953,17 @@ mod tests {
     fn scenario_command_lists_and_rejects_unknown_names() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert!(scenario_command(args(&["list"]).into_iter()).is_ok());
+        // Nothing may follow `list`.
+        for extra in [
+            &["list", "--seed", "3"][..],
+            &["list", "x"],
+            &["list", "--bogus"],
+        ] {
+            assert!(
+                scenario_command(args(extra).into_iter()).is_err(),
+                "{extra:?}"
+            );
+        }
         assert!(scenario_command(args(&["no-such-scenario"]).into_iter()).is_err());
         assert!(scenario_command(args(&["gcs-loss", "--bogus"]).into_iter()).is_err());
         assert!(scenario_command(args(&["gcs-loss", "--seed", "x"]).into_iter()).is_err());
@@ -750,9 +990,204 @@ mod tests {
         }
     }
 
+    fn temp_file(name: &str, text: &str) -> String {
+        let path = std::env::temp_dir().join(format!("oxide-sim-{}-{name}", std::process::id()));
+        std::fs::write(&path, text).expect("write temp file");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn hover_hash(a: &[&str]) -> Result<u64, String> {
+        let mut v = vec!["hash"];
+        v.extend_from_slice(a);
+        let args = p(&v)?;
+        let airframe = Airframe::reference_quad().map_err(|e| e.to_string())?;
+        execute(&airframe, args.profile, hover_step_job(&args), None)
+            .map(|o| o.hash)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn param_flags_parse_and_reject_bad_text() {
+        let a = p(&["run", "--param", "POS_X_P=1.2", "--param", "RTL_ALT=12"]).expect("valid");
+        assert_eq!(
+            a.params,
+            vec![("POS_X_P".to_string(), 1.2), ("RTL_ALT".to_string(), 12.0)]
+        );
+        assert!(p(&["run", "--param", "POS_X_P"]).is_err());
+        assert!(p(&["run", "--param", "POS_X_P=fast"]).is_err());
+        assert!(p(&["run", "--param"]).is_err());
+        assert!(p(&["run", "--params", "/no/such/file.toml"]).is_err());
+    }
+
+    #[test]
+    fn montecarlo_accepts_param_options() {
+        assert!(p(&["montecarlo", "--seeds", "2", "--param", "POS_X_P=1.2"]).is_ok());
+    }
+
+    #[test]
+    fn an_override_changes_the_hash_and_none_does_not() {
+        let base = hover_hash(&[]).expect("base");
+        let one = hover_hash(&["--param", "POS_X_P=1.2"]).expect("override");
+        assert_ne!(base, one);
+        assert_eq!(one, hover_hash(&["--param", "POS_X_P=1.2"]).expect("again"));
+        // The default value of a parameter is the default flight.
+        assert_eq!(
+            base,
+            hover_hash(&["--param", "POS_X_P=1.5"]).expect("default value")
+        );
+    }
+
+    #[test]
+    fn a_pair_valid_only_together_is_accepted_from_flags_in_either_order() {
+        let crit_first = hover_hash(&["--param", "BAT_CRIT_V=3.6", "--param", "BAT_LOW_V=3.8"])
+            .expect("critical first");
+        let low_first = hover_hash(&["--param", "BAT_LOW_V=3.8", "--param", "BAT_CRIT_V=3.6"])
+            .expect("low first");
+        // A hover-step never reaches either threshold, so the flight is the
+        // default one: what matters is that the run starts.
+        assert_eq!(crit_first, low_first);
+        assert_eq!(crit_first, hover_hash(&[]).expect("base"));
+        // A file and a flag form one change as well.
+        let file = temp_file("pair.toml", "[params]\nBAT_CRIT_V = 3.6\n");
+        assert!(hover_hash(&["--params", &file, "--param", "BAT_LOW_V=3.8"]).is_ok());
+        let _ = std::fs::remove_file(&file);
+        // Together they must still hold. (3.45 and 3.4 are each fine against
+        // the defaults; a critical level of 3.9 breaks the rule alone and is
+        // blamed by name instead, see `a_single_bad_value_is_blamed_alone`.)
+        let e = hover_hash(&["--param", "BAT_LOW_V=3.4", "--param", "BAT_CRIT_V=3.45"])
+            .expect_err("critical above low");
+        assert!(e.contains("BAT_CRIT_V") && e.contains("together"), "{e}");
+    }
+
+    #[test]
+    fn a_single_bad_value_is_blamed_alone() {
+        let e = hover_hash(&["--param", "BAT_LOW_V=3.8", "--param", "BAT_CRIT_V=3.9"])
+            .expect_err("critical above the default low level");
+        assert!(e.contains("BAT_CRIT_V") && e.contains("value 3.9"), "{e}");
+        assert!(!e.contains("BAT_LOW_V") && !e.contains("together"), "{e}");
+    }
+
+    #[test]
+    fn each_error_case_prints_its_message() {
+        for (flag, name, why) in [
+            ("NOPE=1", "NOPE", "no such parameter"),
+            ("EKF_SOURCE=0.5", "EKF_SOURCE", "whole number"),
+            ("POS_X_P=1e9", "POS_X_P", "range"),
+            ("BAT_CRIT_V=3.9", "BAT_CRIT_V", "rule"),
+        ] {
+            let e = hover_hash(&["--param", flag]).expect_err(flag);
+            assert!(e.contains(name) && e.contains(why), "{flag}: {e}");
+        }
+    }
+
+    #[test]
+    fn params_file_comes_first_and_the_flag_wins() {
+        let file = temp_file("order.toml", "[params]\nPOS_X_P = 1.2\nRTL_ALT = 12\n");
+        let a = p(&["run", "--param", "POS_X_P=1.0", "--params", &file]).expect("valid");
+        // File entries first (whatever the position of --params), then flags.
+        assert_eq!(
+            a.params,
+            vec![
+                ("POS_X_P".to_string(), 1.2),
+                ("RTL_ALT".to_string(), 12.0),
+                ("POS_X_P".to_string(), 1.0)
+            ]
+        );
+        // The flag wins: the flight equals the one with POS_X_P = 1.0 alone
+        // (plus the file's RTL_ALT, which a hover-step never reaches).
+        let both = hover_hash(&["--param", "POS_X_P=1.0", "--params", &file]).expect("both");
+        let flag_only = hover_hash(&["--param", "POS_X_P=1.0"]).expect("flag");
+        let file_only = hover_hash(&["--params", &file]).expect("file");
+        assert_eq!(both, flag_only);
+        assert_ne!(both, file_only);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_params_file_with_other_tables_or_keys_is_refused() {
+        let file = temp_file("bad.toml", "[param]\nPOS_X_P = 1.2\n");
+        assert!(p(&["run", "--params", &file]).is_err());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn params_command_rejects_unknown_input() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(params_command(args(&["bogus"]).into_iter()).is_err());
+        assert!(params_command(args(&["list", "extra"]).into_iter()).is_err());
+        assert!(params_command(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn scenario_command_takes_overrides() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let ok = ["gcs-loss", "--seed", "1", "--param", "RTL_ALT=12"];
+        assert!(matches!(scenario_command(args(&ok).into_iter()), Ok(true)));
+        let bad = ["gcs-loss", "--param", "NOPE=1"];
+        assert!(scenario_command(args(&bad).into_iter()).is_err());
+    }
+
+    #[test]
+    fn parameters_doc_is_up_to_date() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/PARAMETERS.md");
+        let on_disk = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!("{path}: {e}; regenerate with `oxide-sim params doc > docs/PARAMETERS.md`")
+        });
+        let norm = |t: &str| t.replace("\r\n", "\n");
+        assert!(
+            norm(&on_disk) == norm(&params_cmd::doc()),
+            "docs/PARAMETERS.md is out of date; regenerate with `cargo run -p oxide-sim-cli -- params doc > docs/PARAMETERS.md`"
+        );
+    }
+
     #[test]
     fn scenario_command_flies_a_passing_scenario() {
         let a = ["gcs-loss", "--profile", "h743", "--seed", "1"];
+        let r = scenario_command(a.iter().map(|s| (*s).to_string()));
+        assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    #[test]
+    fn scenario_command_flies_a_file_by_path_and_names_the_ways_to_name_one() {
+        let path = temp_file(
+            "mine.toml",
+            "name = \"mine\"\nduration_s = 2.0\n[expect]\nmin_height_m = 4.0\n[expect.ending]\nkind = \"down\"\n",
+        );
+        let r = scenario_command([path.clone()].into_iter());
+        assert!(
+            matches!(r, Ok(false)),
+            "a path flies, and its expectation fails: {r:?}"
+        );
+        let r = scenario_command(["hover-step".to_string()].into_iter());
+        assert!(
+            matches!(r, Ok(true)),
+            "an embedded scenario without [expect]: {r:?}"
+        );
+        let e = scenario_command(["nope".to_string()].into_iter()).expect_err("unknown");
+        assert!(e.to_string().contains("path"), "{e}");
+        let e = scenario_command(["./no-such-file.toml".to_string()].into_iter())
+            .expect_err("missing file");
+        assert!(e.to_string().contains("no-such-file.toml"), "{e}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_result_line_says_when_only_the_invariants_were_judged() {
+        let bare = scenario_file::load_str("name = \"bare\"\nduration_s = 2.0\n").expect("loads");
+        assert_eq!(
+            result_lines(&bare, &[]),
+            vec!["result     PASS (invariants only: the file states no expectations)"]
+        );
+        let broken = result_lines(&bare, &["2 timing faults".to_string()]);
+        assert!(broken[0].starts_with("result     FAIL"), "{broken:?}");
+        assert_eq!(broken[1], "  violated: 2 timing faults");
+        let judged = fault_scenarios::by_name("gcs-loss").expect("embedded");
+        assert_eq!(result_lines(&judged, &[]), vec!["result     PASS"]);
+    }
+
+    #[test]
+    fn scenario_command_judges_a_hold_scenario() {
+        let a = ["gust-hold", "--seed", "1"];
         let r = scenario_command(a.iter().map(|s| (*s).to_string()));
         assert!(matches!(r, Ok(true)), "{r:?}");
     }

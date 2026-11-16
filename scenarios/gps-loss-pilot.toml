@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name = "gps-loss-pilot"
+about = "GPS lost while the pilot hovers in Position: drops to Altitude with an event, no failsafe, pilot stays in control."
+airframe = "quad-x-5in"
+duration_s = 45.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "random"
+steady_speed_mps = [0.0, 2.0]
+sigma_h_mps = [0.1, 0.4]
+sigma_v_ratio = 0.5
+tau_s = 2.0
+
+[[fault]]
+kind = "gps-loss"
+start_s = 20.0
+
+[pilot]
+arm_at_s = 3.0
+
+[[pilot.mode]]
+t = 0.0
+switch = "position"
+
+[[pilot.sticks]]
+t = 0.0
+roll = 0.0
+pitch = 0.0
+yaw = 0.0
+throttle = 0.0
+
+[[pilot.sticks]]
+t = 3.5
+roll = 0.0
+pitch = 0.0
+yaw = 0.0
+throttle = 1.0
+
+[[pilot.sticks]]
+t = 5.2
+roll = 0.0
+pitch = 0.0
+yaw = 0.0
+throttle = 0.5
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, 0.0]
+yaw = 0.0
+
+[expect]
+nav_contains = ["position", "altitude"]
+nav_never = ["hold", "rtl", "land", "land-now", "terminated"]
+reasons_never = ["RC_LOST", "NO_HUMAN_LINK", "BRAIN_LOST", "SETPOINT_STALE", "BATTERY_LOW", "BATTERY_CRITICAL", "GPS_LOST", "ESTIMATOR_UNHEALTHY", "IMU_FAILURE", "GEOFENCE", "LOSS_OF_CONTROL"]
+events = ["mode-degraded"]
+by_s = 45.0
+max_touchdown_mps = 1.5
+max_tilt_deg = 40.0
+min_height_m = 4.0
+
+[expect.ending]
+kind = "flying-at-height"
+height_m = 5.0
+tolerance_m = 3.0
+
+[run]
+seeds = 10
+profiles = ["f405", "h743"]

@@ -316,22 +316,25 @@ impl Default for Expect {
     }
 }
 
+/// Every failsafe reason with its name, in bit order. The names are the ones
+/// scenario files use.
+pub const REASON_NAMES: [(Reasons, &str); 11] = [
+    (Reasons::RC_LOST, "RC_LOST"),
+    (Reasons::NO_HUMAN_LINK, "NO_HUMAN_LINK"),
+    (Reasons::BRAIN_LOST, "BRAIN_LOST"),
+    (Reasons::SETPOINT_STALE, "SETPOINT_STALE"),
+    (Reasons::BATTERY_LOW, "BATTERY_LOW"),
+    (Reasons::BATTERY_CRITICAL, "BATTERY_CRITICAL"),
+    (Reasons::GPS_LOST, "GPS_LOST"),
+    (Reasons::ESTIMATOR_UNHEALTHY, "ESTIMATOR_UNHEALTHY"),
+    (Reasons::IMU_FAILURE, "IMU_FAILURE"),
+    (Reasons::GEOFENCE, "GEOFENCE"),
+    (Reasons::LOSS_OF_CONTROL, "LOSS_OF_CONTROL"),
+];
+
 /// Names of the bits set in `r`, e.g. "RC_LOST|GPS_LOST".
 pub fn reason_names(r: Reasons) -> String {
-    const NAMES: [(Reasons, &str); 11] = [
-        (Reasons::RC_LOST, "RC_LOST"),
-        (Reasons::NO_HUMAN_LINK, "NO_HUMAN_LINK"),
-        (Reasons::BRAIN_LOST, "BRAIN_LOST"),
-        (Reasons::SETPOINT_STALE, "SETPOINT_STALE"),
-        (Reasons::BATTERY_LOW, "BATTERY_LOW"),
-        (Reasons::BATTERY_CRITICAL, "BATTERY_CRITICAL"),
-        (Reasons::GPS_LOST, "GPS_LOST"),
-        (Reasons::ESTIMATOR_UNHEALTHY, "ESTIMATOR_UNHEALTHY"),
-        (Reasons::IMU_FAILURE, "IMU_FAILURE"),
-        (Reasons::GEOFENCE, "GEOFENCE"),
-        (Reasons::LOSS_OF_CONTROL, "LOSS_OF_CONTROL"),
-    ];
-    let v: Vec<&str> = NAMES
+    let v: Vec<&str> = REASON_NAMES
         .iter()
         .filter(|(bit, _)| r.contains(*bit))
         .map(|(_, n)| *n)
@@ -354,13 +357,14 @@ pub fn event_line(e: &Event) -> String {
     format!("{:8.3} s  {what}", e.t.as_secs_f64())
 }
 
-impl Expect {
-    /// One line per violation; empty when the outcome is as required.
-    /// Always also: no non-finite values, no physics or timing faults, the
-    /// action never decreased, and no motor command while disarmed.
-    pub fn check(&self, o: &FlightOutcome) -> Vec<String> {
+impl FlightOutcome {
+    /// The checks every flight gets, whether or not its file states an
+    /// `[expect]`: no non-finite truth, no physics or timing faults, the
+    /// action never decreased while armed, no motor command while disarmed.
+    /// One line per violation; empty when the flight kept them all.
+    pub fn invariant_violations(&self) -> Vec<String> {
+        let o = self;
         let mut v: Vec<String> = Vec::new();
-
         if o.non_finite {
             v.push("non-finite value in truth".into());
         }
@@ -379,6 +383,16 @@ impl Expect {
                 o.motor_ticks_while_disarmed
             ));
         }
+        v
+    }
+}
+
+impl Expect {
+    /// One line per violation; empty when the outcome is as required.
+    /// Always also the flight's invariants
+    /// ([`FlightOutcome::invariant_violations`]), listed first.
+    pub fn check(&self, o: &FlightOutcome) -> Vec<String> {
+        let mut v: Vec<String> = o.invariant_violations();
 
         // Navigation states, in order.
         let mut seq = o.nav_sequence.iter();

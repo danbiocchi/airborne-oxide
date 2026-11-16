@@ -15,12 +15,14 @@ pub mod montecarlo;
 pub mod outcome;
 pub mod rng;
 pub mod scenario;
+pub mod scenario_file;
 pub mod sensors;
 pub mod sim;
 pub mod vehicle;
 pub mod wind;
 
 pub use airframe::Airframe;
+pub use scenario_file::{ScenarioError, ScenarioFile};
 pub use sim::{SimOptions, Simulation, StepRecord};
 
 use core::fmt;
@@ -35,6 +37,10 @@ pub enum SimError {
     TimeBase(u64),
     /// Fault number `index` of the options can never happen as written.
     Fault { index: usize, reason: String },
+    /// A parameter override was refused (ADR-0004).
+    Param { name: String, reason: String },
+    /// A scenario file is malformed or asks for something that cannot be.
+    Scenario(ScenarioError),
 }
 
 impl fmt::Display for SimError {
@@ -47,8 +53,16 @@ impl fmt::Display for SimError {
                 "periods must be whole multiples of the {us} µs base tick"
             ),
             SimError::Fault { index, reason } => write!(f, "fault {index}: {reason}"),
+            SimError::Param { name, reason } => write!(f, "parameter {name}: {reason}"),
+            SimError::Scenario(e) => write!(f, "scenario: {e}"),
         }
     }
 }
 
 impl std::error::Error for SimError {}
+
+impl From<ScenarioError> for SimError {
+    fn from(e: ScenarioError) -> Self {
+        SimError::Scenario(e)
+    }
+}

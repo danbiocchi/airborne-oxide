@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name = "imu-loss"
+about = "IMU lost: the flight is terminated within 0.3 s and the motors stay off."
+airframe = "quad-x-5in"
+duration_s = 25.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "random"
+steady_speed_mps = [0.0, 2.0]
+sigma_h_mps = [0.1, 0.4]
+sigma_v_ratio = 0.5
+tau_s = 2.0
+
+[[fault]]
+kind = "imu-loss"
+start_s = 15.0
+
+[pilot]
+arm_at_s = 3.0
+
+[[pilot.mode]]
+t = 0.0
+switch = "offboard"
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, 0.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 4.0
+position = [0.0, 0.0, 5.0]
+yaw = 0.0
+
+[expect]
+nav_contains = ["terminated"]
+reasons = ["IMU_FAILURE"]
+by_s = 15.3
+max_touchdown_mps = 1.5
+max_tilt_deg = 40.0
+min_height_m = 4.0
+
+[expect.ending]
+kind = "terminated"
+
+[run]
+seeds = 10
+profiles = ["f405", "h743"]

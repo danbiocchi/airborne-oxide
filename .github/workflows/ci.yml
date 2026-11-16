@@ -30,6 +30,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Flight core builds for the STM32 target (no_std, no alloc)
         run: cargo build -p oxide-core --target thumbv7em-none-eabihf --release --locked
+      - name: Parameter store builds for the STM32 target (no_std, no alloc)
+        run: cargo build -p oxide-store --target thumbv7em-none-eabihf --release --locked
 
   test:
     name: Test (${{ matrix.os }})
@@ -55,15 +57,23 @@ jobs:
           path: hashes.txt
 
   monte-carlo:
-    name: Gust hold 200 seeds, fault scenarios (release)
+    name: Scenario files, Monte-Carlo (release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install "$TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --locked -p oxide-sim --test gust_hold -- --ignored --nocapture
-      - name: Fault scenarios and pairings, 10 runs each on both profiles (ADR-0003)
-        run: cargo test --release --locked -p oxide-sim --test fault_scenarios -- --ignored --nocapture
+      - name: Every scenario file on the seeds and profiles its [run] names (ADR-0004)
+        # The 41 fault scenarios and pairings on 10 seeds, gust-hold on 200
+        # (the M1b criteria), hover-step on 1, each on both profiles: 1222
+        # flights, in parallel. Fails if any run fails.
+        run: cargo run --release --locked -p oxide-sim-cli -- scenarios scenarios
+      - name: The 129 pinned flights have not moved (ADR-0004 section 7)
+        # The workspace tests check 43 of them; this is the full table. The
+        # test is named so that the table's regenerator is not run.
+        run: cargo test --release --locked -p oxide-sim --test scenario_files -- --ignored every_scenario_file_still_flies_its_pinned_flight_full
+      - name: Every parameter flies at both ends of its range (no panic, no runaway)
+        run: cargo test --release --locked -p oxide-sim --test param_bounds -- --ignored every_bound_flies
 
   determinism:
     name: Linux and Windows traces are bit-identical

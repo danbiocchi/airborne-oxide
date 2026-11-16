@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Every text file is LF in the working tree on every platform. Scenario files
+# and generated documents are compared and embedded byte for byte.
+* text=auto eol=lf

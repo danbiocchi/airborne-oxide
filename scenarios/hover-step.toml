@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name = "hover-step"
+about = "Arms on the ground, takes off to 2 m, then steps in x, yaw and xyz with ideal sensors and the true state: the M1a flight."
+airframe = "quad-x-5in"
+duration_s = 20.0
+
+[sim]
+sensors = "ideal"
+estimator = "external"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "calm"
+
+[pilot]
+arm_at_s = 1.5
+
+[[pilot.mode]]
+t = 0.0
+switch = "offboard"
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, -0.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 1.0
+position = [0.0, 0.0, 2.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 6.0
+position = [1.0, 0.0, 2.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 11.0
+position = [1.0, 0.0, 2.0]
+yaw = 1.5707964
+
+[[pilot.setpoint]]
+t = 15.0
+position = [1.0, 1.0, 3.0]
+yaw = 1.5707964
+
+[run]
+seeds = 1
+profiles = ["f405", "h743"]

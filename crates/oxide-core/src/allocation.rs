@@ -223,6 +223,14 @@ impl<const N: usize> Mixer<N> {
     }
 }
 
+/// The thrust fraction a motor command `u` gives: `(1 − e)·u + e·u²`, the
+/// curve [`command_for_fraction`] inverts. Both are in `[0, 1]`.
+pub fn fraction_for_command(command: f32, expo: f32) -> f32 {
+    let u = command.finite_or(0.0).clamp(0.0, 1.0);
+    let e = expo.finite_or(1.0).clamp(0.0, 1.0);
+    ((1.0 - e) * u + e * u * u).clamp(0.0, 1.0)
+}
+
 /// Inverts the thrust curve `f = (1 − e)·u + e·u²` to get the command `u`
 /// for thrust fraction `f`. Both are in `[0, 1]`.
 pub fn command_for_fraction(fraction: f32, expo: f32) -> f32 {

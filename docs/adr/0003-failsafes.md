@@ -6,7 +6,7 @@
 
 DESIGN §4.9–§4.11 say *what* the vehicle does when something fails: a table of events and default actions, a ranking, the pilot-override rules and the arming checks. This ADR turns that into a specification precise enough to implement and test, and records the places where the table had to be interpreted. It is also the specification for the failsafe state machine's proofs (DESIGN §9).
 
-M1c is delivered in three parts. This ADR covers the first: failsafes and fault scenarios. Parameters and scenario files, then logging and replay, follow.
+M1c is delivered in three parts. This ADR covers the first: failsafes and fault scenarios. The second, parameters and scenario files, is [ADR-0004](0004-parameters-and-scenario-files.md). Logging and replay follow.
 
 ## Decision
 
@@ -119,24 +119,32 @@ Arming needs a rising edge of the arm switch with no pre-arm check failing. Each
 | `POSITION` | The selected mode is Position or Offboard and `position` is invalid |
 | `LINK` | The selected mode is Offboard and the brain heartbeat or the tier-2 setpoints are not live |
 | `BATTERY` | No fresh battery reading, cell voltage outside 3.0–4.35 V, or `BATTERY_LOW` latched |
-| `CONFIG` | The configuration failed validation |
+| `CONFIG` | A parameter fault is held: the stored parameters were not fully understood at start-up, and no operator has acknowledged it (ADR-0004 §6) |
 
 **Switch confirmation.** The kill switch and the arm switch take effect only after three distinct valid frames in a row show the new position. The supervisor examines each frame once, by its arrival time; it runs at 50 Hz and sees the newest frame of each run. A valid frame showing the other position starts the count again. A frame flagged failsafe or frame-lost is no evidence either way. With no fresh frame at all the counts start again. So one corrupted frame can neither stop the motors in flight, nor disarm, nor arm on the bench, at a cost of about 40 to 60 ms. Arming is the rising edge of the confirmed arm position, and the switch disarms when the confirmed position goes low. Releasing the kill latch or the termination latch needs only one valid frame with both switches off: that can only make arming possible again, and arming still needs its own confirmed edge.
 
-**Configuration.** The core refuses to start with an invalid configuration (`Core::new` returns the error), so `CONFIG` cannot be seen failing on a running core; the bit is reserved for parameters changed at run time (part two). Validation covers every failsafe parameter, because a bad one silently disables a protection or makes a landing that never ends:
+**Configuration.** The core refuses to start with an invalid configuration (`Core::new` returns the error), so an invalid configuration never runs. A parameter change at run time goes through the same validation: one that would break a rule is refused and reported by an event, and the configuration stays as it was (ADR-0004 §3 and §4). The `CONFIG` bit is set only while a parameter fault is held (ADR-0004 §6). Validation covers every failsafe parameter, because a bad one silently disables a protection or makes a landing that never ends:
 - every value finite;
 - link timeouts between 50 ms and an hour, and delays at most an hour;
 - battery thresholds within 3.0 to 4.0 V per cell (the range in which the monitor can act and its latch can clear on a full pack), with critical not above low;
-- loss-of-control angles within (0, π], fence limits not negative (0 turns the fence off);
-- return speed at least 0.1 m/s, landing speed at least twice the touchdown speed;
+- fence limits not negative (0 turns the fence off);
+- loss of control above what the controller itself commands, or a normal manoeuvre switches the motors off: the tilt threshold at least 10° above both tilt limits, the attitude-error threshold at least 20°, and the two timers at least 0.1 s and 0.05 s;
+- return speed at least 0.1 m/s, landing speed at least twice the touchdown speed, and the descent limit at least twice the touchdown speed too, because it clamps the landing descent (a slower descent reads as standing on the ground);
+- touchdown speed at least 0.1 m/s, because the estimated vertical speed of a landed vehicle is noisy (up to 0.09 m/s in the simulator) and a lower threshold never detects the ground; touchdown time between 0.1 s and 10 s;
 - the minimum thrust below the touchdown thrust, or a vehicle on the ground could never read as landed; the blind-landing thrust above it, or a blind landing would read as landed in the air;
-- thrust fractions within their range, at least one battery cell, resistance not negative.
+- thrust fractions within their range, at least one battery cell, resistance not negative;
+- the rotors together can lift the vehicle (this catches a mass in grams);
+- the idle motor command gives at most half the hover thrust of a rotor: it is a floor on every motor at all times, so a higher one makes the vehicle climb away;
+- the estimator's output time constant at least 0.15 s and not below its delay horizon (measured: below about 0.7 of the horizon the estimate oscillates and the flight is lost);
+- the gyro filter's cut-off below 0.45 of the rate-loop frequency, where the filter would otherwise switch itself off.
+
+The rules from the loss-of-control line onwards were added in part two, after a review flew every parameter at both ends of its range. No limit in the core is applied with a clamp that can panic when its bounds are crossed.
 
 A refused attempt logs the failing bits. Arming is edge-triggered: an attempt that is refused is not retried by holding the switch. On arming, home is set to the current position when `position` is valid. A vehicle armed without a position (Stabilized or Altitude, GPS not yet locked) gets its home at the first run where `position` becomes valid while armed; until then `Rtl` behaves as `Hold`. Home is never overwritten in flight and is cleared on disarm. After `Terminated`, arming stays blocked (the `KILL` bit) until the arm switch is released. DESIGN §4.11's remaining checks (HDOP and satellite count, log storage, RC calibration) arrive with the hardware that reports them.
 
 ### 7. Events
 
-The core reports discrete events through its outputs: armed, disarmed and why, arming refused, navigation state changed, mode degraded, failsafe reason raised or cleared, failsafe action changed, pilot override, touchdown, home set. They carry the tick time. The simulator collects them, and the log will store them (M1c part three). "Logged" in DESIGN §4.10 means one of these events.
+The core reports discrete events through its outputs: armed, disarmed and why, arming refused, navigation state changed, mode degraded, failsafe reason raised or cleared, failsafe action changed, pilot override, touchdown, home set. Part two added the parameter events: a parameter changed or refused, a load of stored parameters that was not fully understood, and its acknowledgement (ADR-0004). They carry the tick time. The simulator collects them, and the log will store them (M1c part three). "Logged" in DESIGN §4.10 means one of these events.
 
 ## Consequences
 
@@ -153,4 +161,3 @@ The core reports discrete events through its outputs: armed, disarmed and why, a
 - The energy-to-home check for Rtl.
 - IMU and estimator lanes on the H743.
 - Switch confirmation on every link frame. The supervisor samples the newest frame at 50 Hz, so on a faster link the frames between two runs are not examined. Counting in the input path would examine all of them.
-- Ranges for the gains and limits, which arrive with the parameter system (part two).

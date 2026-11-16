@@ -207,7 +207,8 @@ impl<const N: usize> Core<N> {
         let mut descent_cmd = 0.0_f32;
         let mut target = match (sup.nav, rc) {
             (NavState::Stabilized, Some(rc)) => {
-                g.yaw_sp = wrap_pi(g.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
+                g.yaw_sp =
+                    wrap_pi(g.yaw_sp + deadband(rc.yaw, l.stick_deadband) * l.max_yaw_rate * dt);
                 g.position_sp = state.position;
                 let roll = rc.roll.clamp(-1.0, 1.0) * l.max_tilt_stabilized_rad;
                 let pitch = -rc.pitch.clamp(-1.0, 1.0) * l.max_tilt_stabilized_rad;
@@ -220,13 +221,15 @@ impl<const N: usize> Core<N> {
                 let roll = rc.roll.clamp(-1.0, 1.0) * l.max_tilt_rad;
                 let pitch = -rc.pitch.clamp(-1.0, 1.0) * l.max_tilt_rad;
                 let yaw = if v.heading {
-                    g.yaw_sp = wrap_pi(g.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
+                    g.yaw_sp = wrap_pi(
+                        g.yaw_sp + deadband(rc.yaw, l.stick_deadband) * l.max_yaw_rate * dt,
+                    );
                     Yaw::Heading(g.yaw_sp)
                 } else {
                     g.yaw_sp = yaw_now;
                     Yaw::Free
                 };
-                let climb = deadband((rc.throttle - 0.5) * 2.0);
+                let climb = deadband((rc.throttle - 0.5) * 2.0, l.stick_deadband);
                 descent_cmd = (-climb * l.max_speed_down).max(0.0);
                 let want = if climb != 0.0 {
                     // The height setpoint follows the vehicle.
@@ -256,7 +259,9 @@ impl<const N: usize> Core<N> {
                 let vel = self.stick_velocity(&rc, yaw_now);
                 descent_cmd = vel.z.max(0.0);
                 if v.heading {
-                    g.yaw_sp = wrap_pi(g.yaw_sp + deadband(rc.yaw) * l.max_yaw_rate * dt);
+                    g.yaw_sp = wrap_pi(
+                        g.yaw_sp + deadband(rc.yaw, l.stick_deadband) * l.max_yaw_rate * dt,
+                    );
                 } else {
                     g.yaw_sp = yaw_now;
                 }
@@ -550,10 +555,10 @@ impl<const N: usize> Core<N> {
     /// Stick velocity demand in NED for position mode.
     fn stick_velocity(&self, rc: &RcSample, yaw: f32) -> Vec3<f32> {
         let l = &self.cfg.limits;
-        let fwd = deadband(rc.pitch) * l.max_speed_xy;
-        let right = deadband(rc.roll) * l.max_speed_xy;
+        let fwd = deadband(rc.pitch, l.stick_deadband) * l.max_speed_xy;
+        let right = deadband(rc.roll, l.stick_deadband) * l.max_speed_xy;
         let (s, c) = (Real::sin(yaw), Real::cos(yaw));
-        let climb = deadband((rc.throttle - 0.5) * 2.0);
+        let climb = deadband((rc.throttle - 0.5) * 2.0, l.stick_deadband);
         let vz = if climb > 0.0 {
             -climb * l.max_speed_up
         } else {

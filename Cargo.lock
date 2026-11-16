@@ -209,6 +209,7 @@ name = "oxide-sim"
 version = "0.1.0"
 dependencies = [
  "oxide-core",
+ "oxide-store",
  "serde",
  "toml",
 ]
@@ -219,6 +220,13 @@ version = "0.1.0"
 dependencies = [
  "oxide-core",
  "oxide-sim",
+]
+
+[[package]]
+name = "oxide-store"
+version = "0.1.0"
+dependencies = [
+ "oxide-core",
 ]
 
 [[package]]

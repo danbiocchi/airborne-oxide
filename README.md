@@ -8,7 +8,7 @@ Airborne Oxide is flight software for drones, written in Rust. It has three part
 2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that flies multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
 3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and will move onto smaller drones as AI hardware shrinks.
 
-> **Status: milestone M1c, part one.** The flight core flies a simulated 5" quad on its own state estimate and now handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. Each is a scenario flown across random seeds on both chip profiles, as is every pairing of the common ones. Parameters, scenario files, logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
+> **Status: milestone M1c, part two.** The flight core flies a simulated 5" quad on its own state estimate and handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. The 93 tuning parameters are named, range-checked and changeable in flight. A parameter store that survives a power cut at any moment is written and tested against simulated flash; it meets real flash at F405 bring-up. The scenarios are data files, flown across random seeds on both chip profiles. Logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
 
 ## Try it
 
@@ -38,11 +38,20 @@ Fly a failure and print what the flight core did about it, event by event (`scen
 cargo run --release -p oxide-sim-cli -- scenario rc-loss-position
 ```
 
-Fly 200 gust-hold seeds on every core and print the worst case of each pass criterion:
+Fly 200 gust-hold seeds, using every CPU core, and print the worst case of each pass criterion (`--profile h743` picks the other chip profile):
 
 ```bash
 cargo run --release -p oxide-sim-cli -- montecarlo --seeds 200
 ```
+
+List the tunable parameters, and fly with one changed (all of them are documented in [`docs/PARAMETERS.md`](docs/PARAMETERS.md); `--params FILE.toml` takes a `[params]` table):
+
+```bash
+cargo run --release -p oxide-sim-cli -- params list
+cargo run --release -p oxide-sim-cli -- run --param POS_X_P=1.2
+```
+
+`cargo run --release -p oxide-sim-cli -- help` lists every command and its options.
 
 Run the tests:
 
@@ -50,22 +59,85 @@ Run the tests:
 cargo test --workspace
 ```
 
-The full acceptance tests are separate, because they need a release build: 200 gust-hold seeds, and every fault scenario and pairing over 10 seeds, each on both chip profiles.
+The full acceptance run is separate, because it needs a release build. It flies every scenario file in `scenarios/` on the seeds and chip profiles its `[run]` table names (the fault scenarios and pairings over 10 seeds, gust-hold over 200), in parallel, and exits non-zero if any run fails:
 
 ```bash
-cargo test --release -p oxide-sim --test gust_hold -- --ignored --nocapture
+cargo run --release -p oxide-sim-cli -- scenarios scenarios
 ```
 
-```bash
-cargo test --release -p oxide-sim --test fault_scenarios -- --ignored --nocapture
+`--seeds N` and `--profile f405|h743|both` override the files; `--threads T` limits the cores. The same runs are available as ignored tests (`cargo test --release -p oxide-sim --test fault_scenarios -- --ignored --nocapture`, and `--test gust_hold`).
+
+## Write and fly a scenario file
+
+A scenario is one TOML file: the pilot, the faults, the wind, the parameter overrides, and what must happen. The 43 in [`scenarios/`](scenarios/) define those scenarios; they are compiled into the simulator, and any other file is flown by its path. (`hover-step` and `gust-hold` also keep a pilot written in Rust, which the `run`, `hash` and `montecarlo` commands and the viewer use; a test checks that both forms fly the same flight.) Unknown keys are errors, and heights are up-positive. The fully commented schema is in the documentation of [`scenario_file.rs`](crates/oxide-sim/src/scenario_file.rs).
+
+```toml
+name = "gps-loss-short"
+about = "GPS lost for 4 s in Offboard: the vehicle holds, then flies on."
+duration_s = 40.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[wind]
+kind = "random"
+steady_speed_mps = [0.0, 2.0]
+sigma_h_mps = [0.1, 0.4]
+tau_s = 2.0
+
+[params]
+FS_GPS_LAND = 10.0          # a parameter by name (docs/PARAMETERS.md)
+
+[[fault]]
+kind = "gps-loss"
+start_s = 15.0
+end_s = 19.0
+
+[pilot]
+arm_at_s = 3.0
+[[pilot.mode]]
+t = 0.0
+switch = "offboard"
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, 0.0]  # [north, east, up] m
+[[pilot.setpoint]]
+t = 4.0
+position = [0.0, 0.0, 5.0]
+
+[expect]
+nav_contains = ["hold", "offboard"]        # in this order
+nav_never = ["land", "land-now", "terminated"]
+reasons = ["GPS_LOST"]
+min_height_m = 4.0
+by_s = 40.0
+[expect.ending]
+kind = "flying"
+point = [0.0, 0.0, 5.0]
+tolerance_m = 2.0
+
+[run]
+seeds = 10
 ```
+
+Fly it (`--seed` is the run index; the exit code is 1 if an expectation is broken), or fly a whole directory:
+
+```bash
+cargo run --release -p oxide-sim-cli -- scenario gps-loss-short.toml --seed 3
+cargo run --release -p oxide-sim-cli -- scenarios my-scenarios --seeds 20
+```
+
+Putting a file in `scenarios/` adds it to the Monte-Carlo run. To embed it in the simulator (so it can be flown by name, in the viewer too), add it to the list in `crates/oxide-sim/src/fault_scenarios.rs`; a test fails until the list and the directory agree. The run seed is derived from `name`, so renaming a scenario changes its flights.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `crates/oxide-core` | Flight core library (`no_std`, no heap). Builds for `thumbv7em-none-eabihf`. |
-| `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, fault injection, scenarios, Monte-Carlo runner, lockstep loop |
+| `crates/oxide-store` | Parameter storage on flash (`no_std`): a two-sector log that survives power loss at any point |
+| `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, fault injection, scenario-file loader, Monte-Carlo runner, lockstep loop |
+| `scenarios/` | The scenario files: the 20 failures, the 21 pairings, `hover-step` and `gust-hold` |
 | `crates/oxide-sim-cli` | `oxide-sim` command-line runner |
 | `crates/oxide-viewer` | Optional Rerun viewer with joystick input (kept out of the default build) |
 | `airframes/` | Airframe data files |

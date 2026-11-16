@@ -19,10 +19,11 @@ use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
 use crate::io::{
     Action, BatterySample, BrainHeartbeat, EVENTS_PER_TICK, EstimatorStatus, Event, EventKind,
-    EventList, FlightMode, GcsHeartbeat, ImuSample, Inputs, NavState, Outputs, PrearmFlags,
-    RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
+    EventList, FlightMode, GcsHeartbeat, ImuSample, Inputs, NavState, Outputs, ParamSet,
+    PrearmFlags, RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
 };
 use crate::math::{Real, Vec3};
+use crate::params::{self, LoadReport, ParamError, ParamId, ParamValue};
 use crate::schedule::{Profile, TaskId};
 use crate::time::Micros;
 
@@ -39,8 +40,6 @@ const KILL_CONFIRMATIONS: u8 = 3;
 const ARM_MAX_THROTTLE: f32 = 0.1;
 /// Body rate must be below this to arm, rad/s.
 const ARM_MAX_RATE: f32 = 0.1;
-/// Stick deadband.
-const DEADBAND: f32 = 0.05;
 /// Position mode keeps its setpoint within this distance of the vehicle, m.
 const POSITION_LEASH_M: f32 = 2.0;
 /// Capacity of the event queue.
@@ -131,6 +130,20 @@ pub struct Core<const N: usize> {
 
     events: Ring<Option<Event>, EVENT_QUEUE>,
     events_dropped: u32,
+    /// A parameter changed and the store has not been told it is saved.
+    params_unsaved: bool,
+    /// What the store held was not fully understood (`report_param_load`),
+    /// and nobody has acknowledged it yet.
+    param_fault: Option<LoadReport>,
+    /// The `ParamLoadFault` event has not been emitted yet.
+    param_fault_event_due: bool,
+    /// A `ParamLoadFault` event has been emitted (once per core).
+    param_fault_event_sent: bool,
+    /// A clean report that skipped records, whose `ParamLoadRecovered` event
+    /// has not been emitted yet.
+    param_recovered_due: Option<LoadReport>,
+    /// A `ParamLoadRecovered` event has been emitted (once per core).
+    param_recovered_sent: bool,
 }
 
 impl<const N: usize> Core<N> {
@@ -138,6 +151,7 @@ impl<const N: usize> Core<N> {
     pub fn new(cfg: VehicleConfig<N>, profile: Profile) -> Result<Self, ConfigError> {
         cfg.validate()?;
         profile.validate()?;
+        cfg.gains.check_against(&profile)?;
         let mixer = Mixer::new(&cfg.rotors)?;
         let p = |id| {
             profile
@@ -182,6 +196,12 @@ impl<const N: usize> Core<N> {
             rate_ctrl: RateController::default(),
             events: Ring::new(),
             events_dropped: 0,
+            params_unsaved: false,
+            param_fault: None,
+            param_fault_event_due: false,
+            param_fault_event_sent: false,
+            param_recovered_due: None,
+            param_recovered_sent: false,
         })
     }
 
@@ -213,6 +233,63 @@ impl<const N: usize> Core<N> {
         self.supervision.visible.home
     }
 
+    /// The current value of a parameter; `None` for an unknown id.
+    pub fn param(&self, id: ParamId) -> Option<ParamValue> {
+        params::get(&self.cfg, id)
+    }
+
+    /// Whether a parameter changed since the store last had the values.
+    pub fn params_unsaved(&self) -> bool {
+        self.params_unsaved
+    }
+
+    /// Tells the core the current parameter values are stored. Does nothing
+    /// while armed: the store is never written in flight (ADR-0004 §6), so
+    /// nothing can have been saved.
+    pub fn clear_unsaved(&mut self) {
+        if !self.is_armed() {
+            self.params_unsaved = false;
+        }
+    }
+
+    /// Tells the core what loading the stored parameters did. Call once after
+    /// [`Core::new`], with the report of `params::load` (with `unreadable`
+    /// and `torn` set by the caller from what the store saw).
+    ///
+    /// - A report that is not clean puts the core in a parameter fault:
+    ///   arming is refused (pre-arm flag `CONFIG`), one `ParamLoadFault`
+    ///   event is emitted on the next tick, and the fault stays until an
+    ///   operator acknowledges it (`Inputs::param_ack`).
+    /// - A clean report with `torn > 0` holds no fault and does not refuse
+    ///   arming, but emits one `ParamLoadRecovered` event on the next tick:
+    ///   the values taken may be older than the last save.
+    /// - Any other clean report changes nothing.
+    ///
+    /// It is called once. A second unclean report replaces the fault the
+    /// first one set (it holds the later report) and emits no second
+    /// `ParamLoadFault` event; a second report with torn records emits no
+    /// second `ParamLoadRecovered` event.
+    pub fn report_param_load(&mut self, report: LoadReport) {
+        if !report.clean() {
+            self.param_fault = Some(report);
+            self.param_fault_event_due = !self.param_fault_event_sent;
+        } else if report.torn > 0 && !self.param_recovered_sent {
+            self.param_recovered_due = Some(report);
+        }
+    }
+
+    /// A parameter fault is held: the stored values were not fully
+    /// understood, and no operator has acknowledged it. The store must not be
+    /// written while it is held.
+    pub fn params_fault(&self) -> bool {
+        self.param_fault.is_some()
+    }
+
+    /// Armed now or as of the supervisor's latest decision.
+    pub fn is_armed(&self) -> bool {
+        self.supervision.visible.armed || self.supervision.pending.armed
+    }
+
     /// Events dropped because the queue (32 events) overflowed.
     pub fn events_dropped(&self) -> u32 {
         self.events_dropped
@@ -225,6 +302,25 @@ impl<const N: usize> Core<N> {
             && now.since(last) != base_us
         {
             self.timing_faults = self.timing_faults.saturating_add(1);
+        }
+        if let Some(report) = self.param_fault
+            && self.param_fault_event_due
+        {
+            self.param_fault_event_due = false;
+            self.param_fault_event_sent = true;
+            self.emit(now, EventKind::ParamLoadFault(report));
+        }
+        if let Some(report) = self.param_recovered_due.take() {
+            self.param_recovered_sent = true;
+            self.emit(now, EventKind::ParamLoadRecovered(report));
+        }
+        if inputs.param_ack && self.param_fault.is_some() && !self.is_armed() {
+            self.param_fault = None;
+            self.params_unsaved = true;
+            self.emit(now, EventKind::ParamFaultAcked);
+        }
+        if let Some(req) = inputs.param_set {
+            self.apply_param(now, req);
         }
         self.absorb(inputs);
 
@@ -271,6 +367,70 @@ impl<const N: usize> Core<N> {
         self.ticks = self.ticks.saturating_add(1);
         self.last_now = Some(now);
         out
+    }
+
+    /// Applies a parameter change (ADR-0004 §4) and reports the outcome.
+    fn apply_param(&mut self, now: Micros, req: ParamSet) {
+        let ParamSet { id, value } = req;
+        let Some(def) = params::PARAMS.get(id.index()) else {
+            self.emit(
+                now,
+                EventKind::ParamRefused {
+                    id,
+                    why: ParamError::Unknown,
+                },
+            );
+            return;
+        };
+        if !def.live && self.is_armed() {
+            self.emit(
+                now,
+                EventKind::ParamRefused {
+                    id,
+                    why: ParamError::Armed,
+                },
+            );
+            return;
+        }
+        let mut next = self.cfg;
+        if let Err(why) = params::set(&mut next, &self.profile, id, value) {
+            self.emit(now, EventKind::ParamRefused { id, why });
+            return;
+        }
+        // The estimator is rebuilt first: `set` has already checked it
+        // against the profile, so this cannot fail; if it somehow does,
+        // nothing is changed.
+        let restart = def.group == params::ParamGroup::Estimator;
+        let estimator = if restart {
+            match Estimator::new(&next.estimator.ekf, &self.profile) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    self.emit(
+                        now,
+                        EventKind::ParamRefused {
+                            id,
+                            why: ParamError::Invalid(e),
+                        },
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let new_cutoff = next.gains.gyro_cutoff_hz;
+        let cutoff_changed = new_cutoff.to_bits() != self.cfg.gains.gyro_cutoff_hz.to_bits();
+        self.cfg = next;
+        if let Some(e) = estimator {
+            self.estimator = e;
+            // The published estimate is gone until the new one aligns.
+            self.estimate = Let::default();
+        }
+        if cutoff_changed {
+            self.gyro_lpf = LowPass2::new(1.0 / self.profile.base_dt(), new_cutoff);
+        }
+        self.params_unsaved = true;
+        self.emit(now, EventKind::ParamChanged(id));
     }
 
     /// Keeps the newest sample of each kind.
@@ -444,6 +604,7 @@ impl<const N: usize> Core<N> {
             action: sup.action,
             prearm: sup.prearm,
             home_set: sup.home.is_some(),
+            params_unsaved: self.params_unsaved,
         };
         let mut events = EventList::new();
         for _ in 0..EVENTS_PER_TICK {
@@ -498,14 +659,16 @@ impl<const N: usize> Core<N> {
     }
 }
 
-fn deadband(v: f32) -> f32 {
+/// A stick position with the deadband `db` (`Limits::stick_deadband`) cut
+/// out and the rest rescaled to the full range.
+fn deadband(v: f32, db: f32) -> f32 {
     let v = v.finite_or(0.0).clamp(-1.0, 1.0);
-    if Real::abs(v) < DEADBAND {
+    if Real::abs(v) < db {
         0.0
     } else if v > 0.0 {
-        (v - DEADBAND) / (1.0 - DEADBAND)
+        (v - db) / (1.0 - db)
     } else {
-        (v + DEADBAND) / (1.0 - DEADBAND)
+        (v + db) / (1.0 - db)
     }
 }
 

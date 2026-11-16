@@ -2,7 +2,9 @@
 //! Vehicle configuration. On hardware this comes from parameters (§4.14);
 //! in the simulator it is built from the airframe file.
 
+use crate::estimator::IMU_BUFFER;
 use crate::math::Vec3;
+use crate::schedule::Profile;
 
 /// Propeller spin direction, seen from above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,8 +63,23 @@ pub struct Gains {
     pub position_p: Vec3<f32>,
 }
 
+impl Gains {
+    /// A gyro cut-off the profile's rate loop can realise: zero (off), or
+    /// below 0.45 times the base rate. `LowPass2::new` switches itself off at
+    /// or above that, which would make the parameter mean two things.
+    pub fn check_against(&self, profile: &Profile) -> Result<(), ConfigError> {
+        let base_hz = 1.0e6 / f64::from(profile.base_period_us.max(1));
+        let cutoff = f64::from(self.gyro_cutoff_hz);
+        if cutoff != 0.0 && cutoff >= 0.45 * base_hz {
+            return Err(ConfigError::FilterCutoffTooHigh);
+        }
+        Ok(())
+    }
+}
+
 impl Default for Gains {
     /// Starting gains for a small multirotor; auto-tuned per airframe later.
+    /// The values are the defaults in the parameter table.
     ///
     /// The outer loops were chosen on a reduced model (position P → velocity
     /// PI → acceleration with a 0.12 s lag, 50 Hz, one-period delay) for
@@ -70,18 +87,21 @@ impl Default for Gains {
     /// (0.95 / 1.8 / 0.4) leave a slow closed-loop pole near −0.2 rad/s that
     /// gives a 14 % overshoot and a 4 s tail without trajectory smoothing.
     fn default() -> Self {
-        Self {
-            rate_p: Vec3::new(28.0, 28.0, 12.0),
-            rate_i: Vec3::new(40.0, 40.0, 10.0),
-            rate_d: Vec3::new(0.3, 0.3, 0.0),
-            rate_d_cutoff_hz: 60.0,
-            gyro_cutoff_hz: 80.0,
-            attitude_p: Vec3::new(6.5, 6.5, 3.0),
-            velocity_p: Vec3::new(4.0, 4.0, 4.0),
-            velocity_i: Vec3::new(0.4, 0.4, 0.8),
-            velocity_d: Vec3::new(0.0, 0.0, 0.0),
-            position_p: Vec3::new(1.5, 1.5, 1.5),
-        }
+        let z = Vec3::new(0.0, 0.0, 0.0);
+        let mut g = Self {
+            rate_p: z,
+            rate_i: z,
+            rate_d: z,
+            rate_d_cutoff_hz: 0.0,
+            gyro_cutoff_hz: 0.0,
+            attitude_p: z,
+            velocity_p: z,
+            velocity_i: z,
+            velocity_d: z,
+            position_p: z,
+        };
+        crate::params::fill_defaults(&mut g);
+        g
     }
 }
 
@@ -106,25 +126,33 @@ pub struct Limits {
     pub velocity_integral_limit: f32,
     /// Minimum collective thrust while flying, as a fraction of hover.
     pub min_thrust_fraction_of_hover: f32,
-    /// Motor command while armed with no demand (keeps props spinning).
+    /// Lowest motor command on every motor while armed (a floor, not only a
+    /// command for no demand); at most half of the hover thrust of a rotor.
     pub idle_command: f32,
+    /// Stick deadband: a stick within this of centre reads as centred, and
+    /// the rest of the travel is rescaled to the full range.
+    pub stick_deadband: f32,
 }
 
 impl Default for Limits {
+    /// The defaults in the parameter table.
     fn default() -> Self {
-        Self {
-            max_tilt_rad: 35.0_f32.to_radians(),
-            max_tilt_stabilized_rad: 45.0_f32.to_radians(),
-            max_rate: Vec3::new(3.8, 3.8, 3.5),
-            max_speed_xy: 5.0,
-            max_speed_up: 3.0,
-            max_speed_down: 1.5,
-            max_yaw_rate: 2.0,
-            rate_integral_limit: 30.0,
-            velocity_integral_limit: 3.0,
-            min_thrust_fraction_of_hover: 0.1,
-            idle_command: 0.05,
-        }
+        let mut l = Self {
+            max_tilt_rad: 0.0,
+            max_tilt_stabilized_rad: 0.0,
+            max_rate: Vec3::new(0.0, 0.0, 0.0),
+            max_speed_xy: 0.0,
+            max_speed_up: 0.0,
+            max_speed_down: 0.0,
+            max_yaw_rate: 0.0,
+            rate_integral_limit: 0.0,
+            velocity_integral_limit: 0.0,
+            min_thrust_fraction_of_hover: 0.0,
+            idle_command: 0.0,
+            stick_deadband: 0.0,
+        };
+        crate::params::fill_defaults(&mut l);
+        l
     }
 }
 
@@ -200,42 +228,85 @@ pub struct EkfParams {
 }
 
 impl Default for EkfParams {
+    /// The defaults in the parameter table.
     fn default() -> Self {
-        Self {
-            delay_horizon_us: 200_000,
-            gyro_noise: 0.015,
-            accel_noise: 0.35,
-            gyro_bias_noise: 1.0e-3,
-            accel_bias_noise: 3.0e-3,
-            gps_pos_noise_m: 0.5,
-            gps_vel_noise_mps: 0.3,
-            baro_noise_m: 0.5,
-            yaw_noise_rad: 0.15,
-            gps_gate: 5.0,
-            baro_gate: 5.0,
-            yaw_gate: 3.0,
+        let mut e = Self {
+            delay_horizon_us: 0,
+            gyro_noise: 0.0,
+            accel_noise: 0.0,
+            gyro_bias_noise: 0.0,
+            accel_bias_noise: 0.0,
+            gps_pos_noise_m: 0.0,
+            gps_vel_noise_mps: 0.0,
+            baro_noise_m: 0.0,
+            yaw_noise_rad: 0.0,
+            gps_gate: 0.0,
+            baro_gate: 0.0,
+            yaw_gate: 0.0,
             mag_declination_rad: 0.0,
-            init_tilt_sigma_rad: 0.1,
-            init_yaw_sigma_rad: 0.3,
-            init_vel_sigma_mps: 0.5,
-            init_pos_sigma_m: 1.0,
-            init_gyro_bias_sigma: 0.02,
-            init_accel_bias_sigma: 0.1,
-            align_time_us: 1_000_000,
-            gps_timeout_us: 5_000_000,
-            pos_timeout_us: 1_500_000,
-            baro_timeout_us: 5_000_000,
-            mag_timeout_us: 30_000_000,
-            output_tau_s: 0.25,
+            init_tilt_sigma_rad: 0.0,
+            init_yaw_sigma_rad: 0.0,
+            init_vel_sigma_mps: 0.0,
+            init_pos_sigma_m: 0.0,
+            init_gyro_bias_sigma: 0.0,
+            init_accel_bias_sigma: 0.0,
+            align_time_us: 0,
+            gps_timeout_us: 0,
+            pos_timeout_us: 0,
+            baro_timeout_us: 0,
+            mag_timeout_us: 0,
+            output_tau_s: 0.0,
+        };
+        crate::params::fill_defaults(&mut e);
+        e
+    }
+}
+
+impl EkfParams {
+    /// The output predictor's time constant must be at least the delay
+    /// horizon, compared in whole microseconds. Flown on `gust-hold` with
+    /// both profiles, the hold fails below about 0.7 of the horizon (0.14 s
+    /// at the default 0.2 s, 0.17 s at 0.248 s); the rule keeps a margin of
+    /// 40 % or more over that.
+    pub fn output_tau_covers_horizon(&self) -> bool {
+        let tau_us = f64::from(self.output_tau_s) * 1_000_000.0 + 0.5;
+        tau_us >= f64::from(self.delay_horizon_us)
+    }
+
+    /// Checks the parameters against their table ranges and the delay
+    /// horizon against the profile: it must fit the IMU buffer,
+    /// `ceil(delay_horizon_us / filter period) + 2 <= IMU_BUFFER`. Fails
+    /// with [`ConfigError::BadEstimator`].
+    pub fn validate(&self, profile: &Profile) -> Result<(), ConfigError> {
+        if !crate::params::in_range(self) || !self.output_tau_covers_horizon() {
+            return Err(ConfigError::BadEstimator);
         }
+        let period_us = u64::from(profile.filter_period_ticks) * u64::from(profile.base_period_us);
+        let needed = u64::from(self.delay_horizon_us).div_ceil(period_us.max(1)) + 2;
+        if period_us == 0 || needed > IMU_BUFFER as u64 {
+            return Err(ConfigError::BadEstimator);
+        }
+        Ok(())
     }
 }
 
 /// Estimator selection and tuning.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EstimatorConfig {
     pub source: EstimatorSource,
     pub ekf: EkfParams,
+}
+
+impl Default for EstimatorConfig {
+    /// The defaults in the parameter table.
+    fn default() -> Self {
+        let mut c = Self {
+            source: EstimatorSource::External,
+            ekf: EkfParams::default(),
+        };
+        crate::params::fill_defaults(&mut c);
+        c
+    }
 }
 
 /// Failsafe timings, thresholds and flight-action settings (ADR-0003).
@@ -302,36 +373,39 @@ pub struct FailsafeParams {
 }
 
 impl Default for FailsafeParams {
+    /// The defaults in the parameter table.
     fn default() -> Self {
-        Self {
-            rc_timeout_us: 500_000,
-            rc_valid_min_s: 1.0,
-            rc_loss_hold_s: 3.0,
-            gcs_timeout_us: 3_000_000,
-            no_link_rtl_s: 60.0,
-            brain_timeout_us: 2_000_000,
-            brain_loss_rtl_s: 10.0,
-            setpoint_timeout_us: 500_000,
-            gps_loss_land_s: 30.0,
-            clear_hysteresis_s: 1.0,
-            battery_low_v: 3.5,
-            battery_critical_v: 3.3,
-            battery_debounce_s: 2.0,
-            battery_filter_tau_s: 2.0,
+        let mut f = Self {
+            rc_timeout_us: 0,
+            rc_valid_min_s: 0.0,
+            rc_loss_hold_s: 0.0,
+            gcs_timeout_us: 0,
+            no_link_rtl_s: 0.0,
+            brain_timeout_us: 0,
+            brain_loss_rtl_s: 0.0,
+            setpoint_timeout_us: 0,
+            gps_loss_land_s: 0.0,
+            clear_hysteresis_s: 0.0,
+            battery_low_v: 0.0,
+            battery_critical_v: 0.0,
+            battery_debounce_s: 0.0,
+            battery_filter_tau_s: 0.0,
             fence_radius_m: 0.0,
             fence_altitude_m: 0.0,
-            loc_error_rad: 45.0_f32.to_radians(),
-            loc_error_s: 0.5,
-            loc_tilt_rad: 75.0_f32.to_radians(),
-            loc_tilt_s: 0.25,
-            rtl_altitude_m: 10.0,
-            rtl_speed_mps: 3.0,
-            land_speed_mps: 0.7,
-            land_blind_thrust: 0.9,
-            touchdown_thrust: 0.3,
-            touchdown_speed_mps: 0.25,
-            touchdown_s: 1.0,
-        }
+            loc_error_rad: 0.0,
+            loc_error_s: 0.0,
+            loc_tilt_rad: 0.0,
+            loc_tilt_s: 0.0,
+            rtl_altitude_m: 0.0,
+            rtl_speed_mps: 0.0,
+            land_speed_mps: 0.0,
+            land_blind_thrust: 0.0,
+            touchdown_thrust: 0.0,
+            touchdown_speed_mps: 0.0,
+            touchdown_s: 0.0,
+        };
+        crate::params::fill_defaults(&mut f);
+        f
     }
 }
 
@@ -346,6 +420,10 @@ impl FailsafeParams {
     pub fn contact_descent_mps(&self) -> f32 {
         Self::CONTACT_DESCENT_RATIO * self.touchdown_speed_mps
     }
+
+    /// The loss-of-control tilt threshold must exceed the larger of the two
+    /// tilt limits by this much, rad (10 degrees).
+    pub const LOC_TILT_MARGIN_RAD: f32 = 0.175;
 
     /// Shortest accepted timeout, µs: below this a single late frame at
     /// the slowest supervisor rate would count as a loss.
@@ -364,82 +442,19 @@ impl FailsafeParams {
     pub const BATTERY_THRESHOLD_RANGE_V: (f32, f32) = (3.0, 4.0);
 
     /// Checks every parameter. Returns [`ConfigError::BadFailsafe`] for a
-    /// non-finite or out-of-range value, or for one that would disable a
-    /// protection or make a manoeuvre unable to finish (a zero return
-    /// speed, a landing too slow to tell from standing on the ground).
+    /// value outside its range in the parameter table (non-finite included),
+    /// or for one that would disable a protection or make a manoeuvre unable
+    /// to finish (a landing too slow to tell from standing on the ground).
+    /// The table holds the per-field ranges; the rules between two fields
+    /// are here.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let finite = |v: f32| v.is_finite();
-        let duration = |v: f32| (0.0..=Self::MAX_DURATION_S).contains(&v);
-        let positive_duration = |v: f32| v > 0.0 && v <= Self::MAX_DURATION_S;
-        let (v_min, v_max) = Self::BATTERY_THRESHOLD_RANGE_V;
-        let floats = [
-            self.rc_valid_min_s,
-            self.rc_loss_hold_s,
-            self.no_link_rtl_s,
-            self.brain_loss_rtl_s,
-            self.gps_loss_land_s,
-            self.clear_hysteresis_s,
-            self.battery_low_v,
-            self.battery_critical_v,
-            self.battery_debounce_s,
-            self.battery_filter_tau_s,
-            self.fence_radius_m,
-            self.fence_altitude_m,
-            self.loc_error_rad,
-            self.loc_error_s,
-            self.loc_tilt_rad,
-            self.loc_tilt_s,
-            self.rtl_altitude_m,
-            self.rtl_speed_mps,
-            self.land_speed_mps,
-            self.land_blind_thrust,
-            self.touchdown_thrust,
-            self.touchdown_speed_mps,
-            self.touchdown_s,
-        ];
-        let timeouts = [
-            self.rc_timeout_us,
-            self.gcs_timeout_us,
-            self.brain_timeout_us,
-            self.setpoint_timeout_us,
-        ];
-        let durations = [
-            self.rc_valid_min_s,
-            self.rc_loss_hold_s,
-            self.no_link_rtl_s,
-            self.brain_loss_rtl_s,
-            self.gps_loss_land_s,
-            self.clear_hysteresis_s,
-            self.battery_debounce_s,
-            self.loc_error_s,
-            self.loc_tilt_s,
-        ];
-        let angle = |v: f32| v > 0.0 && v <= core::f32::consts::PI;
-        let ok = floats.iter().all(|v| finite(*v))
-            && timeouts
-                .iter()
-                .all(|t| (Self::MIN_TIMEOUT_US..=Self::MAX_TIMEOUT_US).contains(t))
-            && durations.iter().all(|v| duration(*v))
-            && positive_duration(self.touchdown_s)
-            && positive_duration(self.battery_filter_tau_s)
-            && (v_min..=v_max).contains(&self.battery_low_v)
-            && (v_min..=v_max).contains(&self.battery_critical_v)
+        let ok = crate::params::in_range(self)
             && self.battery_critical_v <= self.battery_low_v
-            && self.fence_radius_m >= 0.0
-            && self.fence_altitude_m >= 0.0
-            && angle(self.loc_error_rad)
-            && angle(self.loc_tilt_rad)
-            && self.rtl_altitude_m >= 0.0
-            && self.rtl_speed_mps >= 0.1
-            && self.touchdown_speed_mps > 0.0
             && self.land_speed_mps >= self.contact_descent_mps()
-            && self.touchdown_thrust > 0.0
-            && self.touchdown_thrust < 1.0
             // A blind landing flies this fixed thrust with no vertical speed
             // known, where low thrust alone reads as landed: it must stay
             // above the touchdown thrust or the motors would stop in the air.
-            && self.land_blind_thrust > self.touchdown_thrust
-            && self.land_blind_thrust <= 1.0;
+            && self.land_blind_thrust > self.touchdown_thrust;
         if ok {
             Ok(())
         } else {
@@ -488,6 +503,29 @@ pub enum ConfigError {
     /// A failsafe parameter or the battery description is out of range, or
     /// the minimum thrust is not below the touchdown thrust.
     BadFailsafe,
+    /// A gain is outside its range in the parameter table.
+    BadGains,
+    /// A limit is outside its range in the parameter table.
+    BadLimits,
+    /// The rotors' total thrust at nominal voltage does not exceed the
+    /// weight: the vehicle could not climb (mass in grams, thrust in grams-
+    /// force, or a rotor that is far too small).
+    CannotLift,
+    /// The idle motor command gives more than half of the hover thrust per
+    /// rotor: it is a floor on every motor, so the vehicle could not be held
+    /// down or steered.
+    IdleTooHigh,
+    /// The descent speed limit is below the slowest commanded descent that
+    /// counts as a command to move (twice the touchdown speed): the landing
+    /// would be clamped below it and ground contact declared in mid-air.
+    DescentLimitTooLow,
+    /// The loss-of-control tilt threshold is not at least 10 degrees above
+    /// the larger tilt limit: normal commanded flight would switch the motors
+    /// off.
+    LossOfControlTooTight,
+    /// The gyro low-pass cut-off is at or above 0.45 times the rate-loop
+    /// frequency of the profile, where the filter would silently be off.
+    FilterCutoffTooHigh,
 }
 
 impl<const N: usize> VehicleConfig<N> {
@@ -514,6 +552,12 @@ impl<const N: usize> VehicleConfig<N> {
         if !pos(self.nominal_voltage_v) {
             return Err(ConfigError::BadMassProperties);
         }
+        // A multirotor must be able to lift itself. This also keeps the
+        // minimum thrust (a fraction below one of the hover thrust) below the
+        // maximum, which the controllers clamp between.
+        if self.total_max_thrust_n().is_nan() || self.total_max_thrust_n() <= self.weight_n() {
+            return Err(ConfigError::CannotLift);
+        }
         self.failsafe.validate()?;
         // On ground contact guidance commands the minimum thrust, and
         // touchdown needs the thrust below `touchdown_thrust`: at or above
@@ -528,6 +572,49 @@ impl<const N: usize> VehicleConfig<N> {
             || self.battery_resistance_ohm < 0.0
         {
             return Err(ConfigError::BadFailsafe);
+        }
+        if !crate::params::in_range(&self.gains) {
+            return Err(ConfigError::BadGains);
+        }
+        if !crate::params::in_range(&self.limits) {
+            return Err(ConfigError::BadLimits);
+        }
+        if !crate::params::in_range(&self.estimator.ekf)
+            || !crate::params::in_range(&self.estimator)
+            || !self.estimator.ekf.output_tau_covers_horizon()
+        {
+            return Err(ConfigError::BadEstimator);
+        }
+        // The velocity loop clamps the descent that `land_speed_mps` commands
+        // (landing, return, land-now, blind landing) to `max_speed_down`.
+        // Below the speed that counts as a command to move, the landing
+        // would read as standing on the ground, in mid-air. (A pilot's own
+        // descent is at most `max_speed_down`, and is judged on thrust.)
+        if self.limits.max_speed_down < self.failsafe.contact_descent_mps() {
+            return Err(ConfigError::DescentLimitTooLow);
+        }
+        // Loss of control switches the motors off. Its tilt threshold must sit
+        // above any tilt the controller itself commands, with a margin.
+        let widest_tilt = self
+            .limits
+            .max_tilt_rad
+            .max(self.limits.max_tilt_stabilized_rad);
+        if self.failsafe.loc_tilt_rad < widest_tilt + FailsafeParams::LOC_TILT_MARGIN_RAD {
+            return Err(ConfigError::LossOfControlTooTight);
+        }
+        // `idle_command` is a floor on every motor on every tick while armed.
+        // Above about hover it pins the thrust at or above the weight and
+        // overrides the differences that steer, so it must give at most half
+        // of the hover thrust of a rotor (through the thrust curve).
+        let hover_per_rotor_n = self.weight_n() / (N.max(1) as f32);
+        let idle_fraction =
+            crate::allocation::fraction_for_command(self.limits.idle_command, self.thrust_expo);
+        if self
+            .rotors
+            .iter()
+            .any(|r| idle_fraction * r.max_thrust_n > 0.5 * hover_per_rotor_n)
+        {
+            return Err(ConfigError::IdleTooHigh);
         }
         Ok(())
     }

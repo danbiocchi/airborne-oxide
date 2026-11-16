@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 [workspace]
 resolver = "3"
-members = ["crates/oxide-core", "crates/oxide-sim", "crates/oxide-sim-cli"]
+members = ["crates/oxide-core", "crates/oxide-sim", "crates/oxide-sim-cli", "crates/oxide-store"]
 # The viewer pulls in Rerun and a joystick library. It is kept out of the
 # default build so CI and the flight crates stay small; build it with
 # `cargo run --release --manifest-path crates/oxide-viewer/Cargo.toml`
