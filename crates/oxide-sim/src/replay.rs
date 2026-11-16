@@ -163,6 +163,8 @@ pub enum Stop {
     /// The file is cut short: a message is cut by its end, or the last tick's
     /// records are not all there. The ticks before it were replayed.
     Cut,
+    /// The file has no tick record: there is nothing to replay.
+    NoTick,
     /// The log has a dropout (records were lost): nothing after it can be
     /// shown.
     Dropout {
@@ -233,7 +235,6 @@ impl ReplayReport {
         let plural = if n == 1 { "tick" } else { "ticks" };
         let mut lines = Vec::new();
         let head = match (&self.first_difference, self.differing) {
-            (None, _) => format!("replayed {n} {plural} ({}): identical", self.profile),
             (Some(d), 1) => {
                 format!(
                     "replayed {n} {plural} ({}): first difference at {d}",
@@ -244,6 +245,22 @@ impl ReplayReport {
                 "replayed {n} {plural} ({}): {k} differ, the first at {d}",
                 self.profile
             ),
+            // Whatever stopped it, a replay of no tick compared nothing.
+            (None, _) if n == 0 => {
+                format!("replayed 0 ticks ({}): nothing was compared", self.profile)
+            }
+            (None, _) => match self.stop {
+                // The file was replayed to its end, or to the cut at its end.
+                Stop::End | Stop::Cut => {
+                    format!("replayed {n} {plural} ({}): identical", self.profile)
+                }
+                // Stopped short of the end of the file: what was compared
+                // showed no difference, and that is all that is claimed.
+                _ => format!(
+                    "replayed {n} {plural} ({}): no difference before the replay stopped",
+                    self.profile
+                ),
+            },
         };
         lines.push(head);
         let after = self.last_tick.map_or_else(
@@ -253,9 +270,13 @@ impl ReplayReport {
         match &self.stop {
             Stop::End => {}
             Stop::Difference => lines.push("stopped at the first difference".to_string()),
+            Stop::Cut if n == 0 => {
+                lines.push("the file ends in a cut before the first tick was complete".to_string())
+            }
             Stop::Cut => lines.push(format!(
                 "the file ends in a cut {after}: the ticks before it were replayed"
             )),
+            Stop::NoTick => lines.push("the file has no ticks".to_string()),
             Stop::Dropout { ms } => lines.push(format!(
                 "the log has a gap ({ms} ms dropout) {after}: nothing after it can be shown"
             )),
@@ -463,10 +484,7 @@ impl Walk {
             self.report.stop = if file.truncated.is_some() {
                 cut_stop(file)
             } else {
-                Stop::Malformed {
-                    seq: None,
-                    why: "the file has no ticks".to_string(),
-                }
+                Stop::NoTick
             };
             return;
         }
@@ -756,5 +774,88 @@ mod tests {
         assert_eq!(motor_zero(a, a), None);
         assert_eq!(motor_zero(0.25, 0.25), None);
         assert_eq!(motor_zero(-0.0, -0.0), None);
+    }
+
+    fn report(ticks: u64, stop: Stop) -> ReplayReport {
+        ReplayReport {
+            profile: "f405-lean",
+            ticks,
+            differing: 0,
+            first_difference: None,
+            last_tick: ticks.checked_sub(1).map(|s| (s, s * 1000)),
+            stop,
+        }
+    }
+
+    #[test]
+    fn the_first_line_says_identical_only_when_the_replay_reached_the_end_or_the_cut() {
+        let malformed = Stop::Malformed {
+            seq: Some(4),
+            why: "records of the tick are missing".into(),
+        };
+        let damaged = Stop::Damaged { why: "bad".into() };
+        let stops = [
+            Stop::End,
+            Stop::Cut,
+            Stop::NoTick,
+            Stop::Dropout { ms: 7 },
+            Stop::SequenceGap {
+                expected: 4,
+                found: 6,
+            },
+            malformed,
+            damaged,
+        ];
+        for stop in stops {
+            for n in [0, 1, 5] {
+                let r = report(n, stop.clone());
+                let lines = r.lines();
+                let plural = if n == 1 { "tick" } else { "ticks" };
+                let want = match (n, &stop) {
+                    (0, _) => "nothing was compared",
+                    (_, Stop::End | Stop::Cut) => "identical",
+                    _ => "no difference before the replay stopped",
+                };
+                assert_eq!(
+                    lines[0],
+                    format!("replayed {n} {plural} (f405-lean): {want}"),
+                    "{stop:?} after {n}"
+                );
+                // The reason line, and exit codes as before.
+                assert_eq!(lines.len(), if stop == Stop::End { 1 } else { 2 });
+                let code = u8::from(!(n > 0 && matches!(stop, Stop::End | Stop::Cut)));
+                assert_eq!(r.exit_code(), code, "{stop:?} after {n}");
+            }
+        }
+        assert_eq!(report(0, Stop::NoTick).lines()[1], "the file has no ticks");
+        assert_eq!(
+            report(5, Stop::Damaged { why: "bad".into() }).lines()[1],
+            "the file is damaged after tick 4: bad"
+        );
+        assert_eq!(
+            report(5, Stop::Cut).lines()[1],
+            "the file ends in a cut after tick 4: the ticks before it were replayed"
+        );
+        assert_eq!(
+            report(0, Stop::Cut).lines()[1],
+            "the file ends in a cut before the first tick was complete"
+        );
+        // A difference is a difference, whatever stopped the walk.
+        let mut r = report(5, Stop::Difference);
+        r.differing = 1;
+        r.first_difference = Some(Difference {
+            seq: 4,
+            t_us: 4000,
+            field: "armed".into(),
+            recorded: "false".into(),
+            replayed: "true".into(),
+            recorded_bits: None,
+            replayed_bits: None,
+        });
+        assert_eq!(
+            r.lines()[0],
+            "replayed 5 ticks (f405-lean): first difference at tick 4 (t = 4000 us): armed: \
+             recorded false, replayed true"
+        );
     }
 }

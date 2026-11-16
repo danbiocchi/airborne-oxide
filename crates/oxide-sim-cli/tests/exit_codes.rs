@@ -124,6 +124,24 @@ fn replay_exits_0_1_and_2_as_documented() {
         stdout(&o)
     );
 
+    // The first line does not say identical for a replay that stopped early.
+    assert!(
+        stdout(&o).starts_with(
+            "replayed 300 ticks (f405-lean): no difference before the replay stopped\n"
+        ),
+        "{}",
+        stdout(&o)
+    );
+
+    // 1: a message at the end that declares more than any message of the file
+    // is damage, not a cut (a flipped bit in a size looks like this).
+    let mut damaged = bytes.clone();
+    damaged.extend_from_slice(&[0xF0, 0xF0, b'L', b'6', 0, 0]);
+    let damaged = write("damaged.ulg", &damaged);
+    let o = run(&["replay", &damaged]);
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(stdout(&o).contains("damage, not a cut"), "{}", stdout(&o));
+
     // 2: a file it cannot replay, and arguments it cannot use.
     let junk = write("junk.ulg", b"not a log at all");
     let o = run(&["replay", &junk]);

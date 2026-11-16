@@ -675,6 +675,79 @@ fn a_log_with_no_tick_proves_nothing() {
 }
 
 #[test]
+fn the_first_line_says_identical_only_for_a_replay_that_reached_the_end() {
+    let flown = default_flight();
+    let lines = |bytes: &[u8]| replay(bytes, &ReplayOptions::default()).unwrap().lines();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let tick_at = |n: usize| f.records("oxide_in_tick").nth(n).unwrap().offset();
+    // The end of the file, and a cut: identical.
+    assert_eq!(
+        lines(&flown.bytes),
+        ["replayed 2500 ticks (f405-lean): identical"]
+    );
+    assert_eq!(
+        lines(&flown.bytes[..tick_at(100) + 2]),
+        [
+            "replayed 100 ticks (f405-lean): identical",
+            "the file ends in a cut after tick 99: the ticks before it were replayed"
+        ]
+    );
+    // No tick compared: nothing was compared, whatever the stop.
+    assert_eq!(
+        lines(&flown.bytes[..tick_at(0)]),
+        [
+            "replayed 0 ticks (f405-lean): nothing was compared",
+            "the file has no ticks"
+        ]
+    );
+    assert_eq!(
+        lines(&flown.bytes[..tick_at(0) + 2]),
+        [
+            "replayed 0 ticks (f405-lean): nothing was compared",
+            "the file ends in a cut before the first tick was complete"
+        ]
+    );
+    let stray = with_stray_before_first_tick(&flown.bytes, "oxide_out", 0);
+    let l = lines(&stray);
+    assert_eq!(l[0], "replayed 0 ticks (f405-lean): nothing was compared");
+    assert_eq!(
+        l[1],
+        "a tick record is malformed before the first tick: oxide_out record before the first tick"
+    );
+    // A stop before the end, with nothing different before it.
+    let stopped = "no difference before the replay stopped";
+    let gap = without(&flown.bytes, tick_at(300)..tick_at(301));
+    let l = lines(&gap);
+    assert_eq!(l[0], format!("replayed 300 ticks (f405-lean): {stopped}"));
+    assert!(
+        l[1].starts_with("a tick record is missing after tick 299"),
+        "{l:?}"
+    );
+    let imu = without(&flown.bytes, message_of(&flown.bytes, "oxide_in_imu", 1000));
+    assert_eq!(
+        lines(&imu),
+        [
+            format!("replayed 1000 ticks (f405-lean): {stopped}"),
+            "tick 1000 is malformed: records of the tick are missing".to_string()
+        ]
+    );
+    let small = fly::<2048>(2500, 25, LoadReport::default());
+    let l = lines(&small.bytes);
+    assert!(l[0].ends_with(&format!("(f405-lean): {stopped}")), "{l:?}");
+    assert!(!l[0].contains("identical"), "{l:?}");
+    assert!(l[1].starts_with("the log has a gap ("), "{l:?}");
+    // A difference is a difference.
+    let mut bytes = flown.bytes.clone();
+    let at = payload_of(&bytes, "oxide_out", 1700) + 16 + 8;
+    bytes[at] ^= 1;
+    let l = lines(&bytes);
+    assert!(
+        l[0].starts_with("replayed 1701 ticks (f405-lean): first difference at tick 1700 "),
+        "{l:?}"
+    );
+}
+
+#[test]
 fn every_recorded_output_field_is_named_when_it_differs() {
     let flown = default_flight();
     let tick = 1700;
