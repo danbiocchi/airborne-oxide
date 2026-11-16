@@ -7,6 +7,7 @@ use crate::header::{BuildInfo, Level};
 use crate::logger::{Class, Logger, MessageWriter, Stats};
 use crate::msg::{self, Error, ParamValue, Sink};
 use crate::record::{self, RecordWriter, Topic};
+use crate::replay;
 use crate::topics::{self, Scales, id};
 use oxide_core::codes::{px4_arming_state, px4_nav_state};
 use oxide_core::config::{EstimatorSource, VehicleConfig};
@@ -176,13 +177,77 @@ fn take(clock: &mut Clock, now: u64) -> bool {
     due
 }
 
+/// Message ids of the replay level's topics: they follow the normal level's
+/// (a topic's id is its position in [`topic_list`]), in the order of
+/// [`replay::TOPICS`].
+pub mod replay_id {
+    use crate::topics::NORMAL;
+
+    /// The id of the first replay topic: the number of normal topics.
+    pub const FIRST: u16 = NORMAL.len() as u16;
+    /// `oxide_vehicle`.
+    pub const VEHICLE: u16 = FIRST;
+    /// `oxide_param_us`.
+    pub const MICROS: u16 = FIRST + 1;
+    /// `oxide_boot`.
+    pub const BOOT: u16 = FIRST + 2;
+    /// `oxide_in_tick`.
+    pub const IN_TICK: u16 = FIRST + 3;
+    /// `oxide_in_imu`.
+    pub const IN_IMU: u16 = FIRST + 4;
+    /// `oxide_in_state`.
+    pub const IN_STATE: u16 = FIRST + 5;
+    /// `oxide_in_rc`.
+    pub const IN_RC: u16 = FIRST + 6;
+    /// `oxide_in_battery`.
+    pub const IN_BATTERY: u16 = FIRST + 7;
+    /// `oxide_in_setpoint`.
+    pub const IN_SETPOINT: u16 = FIRST + 8;
+    /// `oxide_in_gps`.
+    pub const IN_GPS: u16 = FIRST + 9;
+    /// `oxide_in_baro`.
+    pub const IN_BARO: u16 = FIRST + 10;
+    /// `oxide_in_mag`.
+    pub const IN_MAG: u16 = FIRST + 11;
+    /// `oxide_in_gcs`.
+    pub const IN_GCS: u16 = FIRST + 12;
+    /// `oxide_in_brain`.
+    pub const IN_BRAIN: u16 = FIRST + 13;
+    /// `oxide_in_param_set`.
+    pub const IN_PARAM_SET: u16 = FIRST + 14;
+    /// `oxide_out`.
+    pub const OUT: u16 = FIRST + 15;
+}
+
+const REPLAY_LEVEL_LEN: usize = topics::NORMAL.len() + replay::TOPICS.len();
+
+/// [`topics::NORMAL`] followed by [`replay::TOPICS`].
+#[allow(clippy::indexing_slicing)] // evaluated at compile time: a bad index fails the build
+const fn replay_level_topics() -> [Topic; REPLAY_LEVEL_LEN] {
+    let mut out = [replay::VEHICLE; REPLAY_LEVEL_LEN];
+    let mut i = 0;
+    while i < topics::NORMAL.len() {
+        out[i] = topics::NORMAL[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < replay::TOPICS.len() {
+        out[topics::NORMAL.len() + j] = replay::TOPICS[j];
+        j += 1;
+    }
+    out
+}
+
+const REPLAY_LEVEL: [Topic; REPLAY_LEVEL_LEN] = replay_level_topics();
+
 /// The topics a log of this level declares, in message-id order: a topic's id
-/// is its position. The replay level's records (ADR-0005 §5) will be appended
-/// here, after [`topics::NORMAL`], so the normal ids do not move; today the
-/// replay level declares the same list.
-fn topic_list(level: Level) -> &'static [Topic] {
+/// is its position. The replay level declares the normal topics, with the
+/// ids they have at the normal level, and then [`replay::TOPICS`]
+/// ([`replay_id`]).
+pub fn topic_list(level: Level) -> &'static [Topic] {
     match level {
-        Level::Normal | Level::Replay => topics::NORMAL,
+        Level::Normal => topics::NORMAL,
+        Level::Replay => &REPLAY_LEVEL,
     }
 }
 
@@ -207,11 +272,33 @@ impl<'a> Boot<'a> {
     }
 }
 
+/// Why a log could not be started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartError {
+    /// The sink refused the definitions.
+    Write(Error),
+    /// A replay-level log of this configuration could never replay: the
+    /// parameter does not survive being logged (`replay::check_exact`).
+    NotReplayable(crate::replay::RebuildError),
+    /// More rotors than an `oxide_out` record carries.
+    TooManyRotors(crate::replay::TooManyRotors),
+}
+
+impl From<Error> for StartError {
+    fn from(e: Error) -> Self {
+        Self::Write(e)
+    }
+}
+
 /// Records what the core did, tick by tick, into a [`Logger`] ring.
 #[derive(Debug)]
 pub struct Recorder<const CAP: usize> {
     logger: Logger<CAP>,
     level: Level,
+    /// Calls of `record` since `start`: the next tick's sequence number.
+    ticks: u64,
+    /// The store's saved call happened since the last tick.
+    saved: bool,
     scales: Option<Scales>,
     imu: Option<Stamped<ImuSample>>,
     imu_dt_us: u32,
@@ -282,6 +369,8 @@ impl<const CAP: usize> Recorder<CAP> {
         Self {
             logger: Logger::new(CAP / 4),
             level: Level::Normal,
+            ticks: 0,
+            saved: false,
             scales: None,
             imu: None,
             imu_dt_us: 0,
@@ -297,6 +386,13 @@ impl<const CAP: usize> Recorder<CAP> {
     }
 
     /// Writes the definitions to `sink` and makes the recorder ready.
+    ///
+    /// At the replay level it first checks that the log can be replayed
+    /// ([`StartError::TooManyRotors`] for more than [`replay::MAX_MOTORS`]
+    /// rotors, [`StartError::NotReplayable`] when `replay::check_exact`
+    /// refuses a parameter, which it names) and, right after the
+    /// subscriptions, writes the `oxide_vehicle` records, the `oxide_param_us`
+    /// records and the `oxide_boot` record straight to `sink`.
     pub fn start<S: Sink + ?Sized, const N: usize>(
         &mut self,
         sink: &mut S,
@@ -305,7 +401,16 @@ impl<const CAP: usize> Recorder<CAP> {
         boot: Boot<'_>,
         level: Level,
         cfg: &VehicleConfig<N>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), StartError> {
+        if level == Level::Replay {
+            if N > replay::MAX_MOTORS {
+                return Err(StartError::TooManyRotors(replay::TooManyRotors {
+                    got: N,
+                    max: replay::MAX_MOTORS,
+                }));
+            }
+            replay::check_exact(cfg, boot.profile).map_err(StartError::NotReplayable)?;
+        }
         let h = crate::header::Header {
             start_us: now.0,
             build,
@@ -314,9 +419,28 @@ impl<const CAP: usize> Recorder<CAP> {
             nested: topics::NESTED,
         };
         crate::header::write_definitions(sink, &h, cfg, topic_list(level))?;
+        if level == Level::Replay {
+            // What the core was built from, once: the vehicle, the exact
+            // microseconds of the duration parameters, the boot report.
+            replay::write_vehicle(sink, replay_id::VEHICLE, now, cfg)?;
+            replay::write_micros(sink, replay_id::MICROS, now, cfg)?;
+            record::data(sink, replay_id::BOOT, &replay::BOOT, |w| {
+                // N is at most 8 here: the rotor count always fits.
+                let _ = replay::fill_boot(w, now, &boot.report, N, boot.profile);
+            })?;
+        }
         self.level = level;
+        self.ticks = 0;
+        self.saved = false;
         self.scales = Some(Scales::new(cfg));
         Ok(())
+    }
+
+    /// Tells the recorder that the store's "saved" call
+    /// (`Core::clear_unsaved`) happened since the previous tick: the next
+    /// tick record carries the flag.
+    pub fn note_saved(&mut self) {
+        self.saved = true;
     }
 
     /// Writes what is due after a tick: streamed topics at their rates, on
@@ -333,9 +457,12 @@ impl<const CAP: usize> Recorder<CAP> {
         cfg: &VehicleConfig<N>,
     ) {
         let Some(scales) = self.scales else { return };
+        let seq = self.ticks;
+        self.ticks = seq.saturating_add(1);
+        let saved = core::mem::take(&mut self.saved);
         self.observe(inputs);
         if self.level == Level::Replay {
-            self.record_replay(now, inputs, outputs);
+            self.record_replay(now, seq, saved, inputs, outputs);
         }
         let t = now.0;
         let t_sample = self.t_sample(now);
@@ -572,17 +699,82 @@ impl<const CAP: usize> Recorder<CAP> {
         }
     }
 
-    /// The per-tick hook of the replay level: the tick record, one record per
-    /// input present and `oxide_out`, written before everything else of the
-    /// tick (the replay records of the next wave go here). Writes nothing yet.
-    #[allow(clippy::unused_self)]
+    /// The replay level's records of a tick, written before everything else
+    /// of the tick, in this order: `oxide_in_tick`, one record per input
+    /// present (in the order of [`replay::bit`]), `oxide_out`. All are
+    /// `Stream`: a ring that is too full drops them and the next record that
+    /// fits is preceded by a dropout.
     fn record_replay<const N: usize>(
         &mut self,
         now: Micros,
+        seq: u64,
+        saved: bool,
         inputs: &Inputs,
         outputs: &Outputs<N>,
     ) {
-        let _ = (now, inputs, outputs);
+        let t = now.0;
+        self.stream(t, replay_id::IN_TICK, &replay::IN_TICK, |w| {
+            replay::fill_tick(w, now, seq, inputs, saved);
+        });
+        if let Some(s) = &inputs.imu {
+            self.stream(t, replay_id::IN_IMU, &replay::IN_IMU, |w| {
+                replay::fill_imu(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.state {
+            self.stream(t, replay_id::IN_STATE, &replay::IN_STATE, |w| {
+                replay::fill_state(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.rc {
+            self.stream(t, replay_id::IN_RC, &replay::IN_RC, |w| {
+                replay::fill_rc(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.battery {
+            self.stream(t, replay_id::IN_BATTERY, &replay::IN_BATTERY, |w| {
+                replay::fill_battery(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.setpoint {
+            self.stream(t, replay_id::IN_SETPOINT, &replay::IN_SETPOINT, |w| {
+                replay::fill_setpoint(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.gps {
+            self.stream(t, replay_id::IN_GPS, &replay::IN_GPS, |w| {
+                replay::fill_gps(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.baro {
+            self.stream(t, replay_id::IN_BARO, &replay::IN_BARO, |w| {
+                replay::fill_baro(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.mag {
+            self.stream(t, replay_id::IN_MAG, &replay::IN_MAG, |w| {
+                replay::fill_mag(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.gcs_heartbeat {
+            self.stream(t, replay_id::IN_GCS, &replay::IN_GCS, |w| {
+                replay::fill_gcs(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.brain_heartbeat {
+            self.stream(t, replay_id::IN_BRAIN, &replay::IN_BRAIN, |w| {
+                replay::fill_brain(w, now, s);
+            });
+        }
+        if let Some(s) = &inputs.param_set {
+            self.stream(t, replay_id::IN_PARAM_SET, &replay::IN_PARAM_SET, |w| {
+                replay::fill_param_set(w, now, s);
+            });
+        }
+        self.stream(t, replay_id::OUT, &replay::OUT, |w| {
+            // `start` refused more than `MAX_MOTORS` rotors.
+            let _ = replay::fill_out(w, now, outputs);
+        });
     }
 
     /// One event: as a logged string, then as an `oxide_event` record, both

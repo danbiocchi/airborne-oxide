@@ -121,16 +121,24 @@ fn start_writes_the_header_for_the_normal_topics() {
 }
 
 #[test]
-fn the_replay_level_writes_what_the_normal_level_writes_with_its_own_level() {
+fn the_replay_level_declares_the_normal_topics_first_with_the_same_ids() {
     let (mut a, mut b) = (Vec::new(), Vec::new());
     started(&mut a, Level::Normal);
     started(&mut b, Level::Replay);
     let fa = UlogFile::parse(&a).unwrap();
     let fb = UlogFile::parse(&b).unwrap();
     assert_eq!(fb.info_str("oxide_log_level"), Some("replay"));
-    assert_eq!(fa.formats, fb.formats);
-    assert_eq!(fa.subscriptions, fb.subscriptions);
-    assert_eq!(a.len(), b.len());
+    // The normal topics keep their formats and ids (ADR-0005 §5); the replay
+    // topics follow (replay_level.rs).
+    assert_eq!(fa.formats, fb.formats[..fa.formats.len()]);
+    let ids = |f: &UlogFile| -> Vec<(u16, String)> {
+        f.subscriptions
+            .iter()
+            .map(|s| (s.msg_id, s.name.clone()))
+            .collect()
+    };
+    assert_eq!(ids(&fa), ids(&fb)[..fa.subscriptions.len()]);
+    assert!(fb.formats.len() > fa.formats.len());
 }
 
 #[test]
@@ -198,5 +206,6 @@ fn drain_passes_through_to_a_sink_that_takes_bytes_whole_or_not_at_all() {
 mod events;
 mod newest;
 mod rates;
+mod replay_level;
 mod text;
 mod whole;

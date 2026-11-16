@@ -21,7 +21,7 @@ use oxide_core::time::Micros;
 use oxide_log::header::BuildInfo;
 pub use oxide_log::header::Level;
 pub use oxide_log::logger::Stats;
-use oxide_log::recorder::{Boot, Recorder};
+use oxide_log::recorder::{Boot, Recorder, StartError};
 
 /// Bytes of the recorder's ring (about 66 kB, kept on the heap).
 pub const RING_BYTES: usize = 65_536;
@@ -59,6 +59,8 @@ pub enum LogError {
     NotStarted,
     /// The replay level is not available yet.
     ReplayNotBuilt,
+    /// The configuration could never replay (the text names the parameter).
+    NotReplayable(String),
     /// The header did not fit the recorder's format limits.
     Format(oxide_log::Error),
     /// The writer failed (the first error, kept).
@@ -74,6 +76,7 @@ impl fmt::Display for LogError {
             LogError::AlreadyStarted => write!(f, "the simulation already has a log"),
             LogError::NotStarted => write!(f, "the simulation has no log"),
             LogError::ReplayNotBuilt => write!(f, "the replay level is not built yet"),
+            LogError::NotReplayable(why) => write!(f, "cannot log at the replay level: {why}"),
             LogError::Format(e) => write!(f, "log header: {e:?}"),
             LogError::Io(e) => write!(f, "log: {e}"),
         }
@@ -154,7 +157,10 @@ impl FlightLog {
                 level,
                 cfg,
             )
-            .map_err(LogError::Format)?;
+            .map_err(|e| match e {
+                StartError::Write(e) => LogError::Format(e),
+                other => LogError::NotReplayable(describe_start(&other)),
+            })?;
         writer.write_all(&head).map_err(LogError::Io)?;
         Ok(Self {
             recorder,
@@ -197,5 +203,28 @@ impl FlightLog {
         }
         self.writer.flush().map_err(LogError::Io)?;
         Ok(self.writer)
+    }
+}
+
+/// Why a replay-level log of this configuration is refused, naming the
+/// parameter.
+fn describe_start(e: &StartError) -> String {
+    use oxide_core::params::{self, ParamId};
+    use oxide_log::replay::RebuildError;
+    let name = |id: ParamId| params::PARAMS.get(id.index()).map_or("?", |d| d.name);
+    match e {
+        StartError::Write(e) => format!("{e:?}"),
+        StartError::TooManyRotors(t) => {
+            format!("{} rotors, a record carries at most {}", t.got, t.max)
+        }
+        StartError::NotReplayable(RebuildError::NotExact(id)) => format!(
+            "parameter {} does not survive being logged (its value is not the exact f32 \
+             number of seconds it reads back as)",
+            name(*id)
+        ),
+        StartError::NotReplayable(RebuildError::Refused { id, why }) => {
+            format!("parameter {} is refused by the core: {why:?}", name(*id))
+        }
+        StartError::NotReplayable(other) => format!("{other:?}"),
     }
 }
