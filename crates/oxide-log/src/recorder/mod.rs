@@ -34,18 +34,18 @@ mod period {
 
 /// When a streamed topic is next due, on the tick clock.
 #[derive(Clone, Copy, Debug)]
-struct Clock {
+pub(crate) struct Clock {
     period: u64,
-    next: Option<u64>,
+    pub(crate) next: Option<u64>,
 }
 
 impl Clock {
-    const fn new(period: u64) -> Self {
+    pub(crate) const fn new(period: u64) -> Self {
         Self { period, next: None }
     }
 
     /// Due on the first look, then whenever `now` has reached the next time.
-    fn due(&self, now: u64) -> bool {
+    pub(crate) fn due(&self, now: u64) -> bool {
         match self.next {
             None => true,
             Some(n) => now >= n,
@@ -55,13 +55,21 @@ impl Clock {
     /// Sets the next time to the first on the period grid after `now`: a
     /// pause does not make the clock write a burst to catch up, and the
     /// phase of the grid is kept. The grid starts at the first record.
-    fn advance(&mut self, now: u64) {
+    ///
+    /// Less than a period late is the common case and takes no division
+    /// (a library call on the Cortex-M4F and M7).
+    pub(crate) fn advance(&mut self, now: u64) {
         let period = self.period.max(1);
         self.next = Some(match self.next {
             None => now.saturating_add(period),
             Some(n) => {
-                let late = now.saturating_sub(n) / period;
-                n.saturating_add(period.saturating_mul(late.saturating_add(1)))
+                let on_grid = n.saturating_add(period);
+                if now < on_grid {
+                    on_grid
+                } else {
+                    let late = (now - n) / period;
+                    n.saturating_add(period.saturating_mul(late.saturating_add(1)))
+                }
             }
         });
     }

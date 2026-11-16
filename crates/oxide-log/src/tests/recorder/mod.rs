@@ -203,6 +203,7 @@ fn drain_passes_through_to_a_sink_that_takes_bytes_whole_or_not_at_all() {
     assert!(held > 0);
 }
 
+mod clock;
 mod events;
 mod newest;
 mod rates;
