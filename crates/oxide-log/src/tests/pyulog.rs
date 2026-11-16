@@ -38,7 +38,7 @@ fn put_rich(w: &mut impl msg::Sink, id: u16, t: u64, k: u32) -> Result<(), msg::
             .u16(65_000)
             .i8(-5)
             .u8(250)
-            .bool(k % 2 == 0)
+            .bool(k.is_multiple_of(2))
             .char_array(3, "ab");
     })
 }
