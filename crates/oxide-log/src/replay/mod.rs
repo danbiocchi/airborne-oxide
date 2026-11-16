@@ -26,15 +26,18 @@
 
 use crate::msg::{Error, Sink};
 use crate::record::{RecordWriter, Topic};
-use oxide_core::config::VehicleConfig;
+use oxide_core::config::{NumbersError, VehicleConfig};
 use oxide_core::io::{
     BaroSample, BatterySample, BrainHeartbeat, GcsHeartbeat, GpsSample, ImuSample, Inputs,
     MagSample, Outputs, ParamSet, RcSample, Stamped, StateSample, TrajectorySetpoint,
 };
 use oxide_core::math::Vec3;
-use oxide_core::params::{self, LoadReport, ParamValue};
+use oxide_core::params::{self, LoadReport, ParamError, ParamId, ParamValue};
 use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
+
+#[cfg(any(test, feature = "std"))]
+pub mod decode;
 
 /// Most motor commands one `oxide_out` record carries.
 pub const MAX_MOTORS: usize = 8;
@@ -533,5 +536,144 @@ pub fn fill_out<const N: usize, S: Sink + ?Sized>(
         .bool(s.valid.position)
         .bool(s.home_set)
         .bool(s.params_unsaved);
+    Ok(())
+}
+
+// ---- rebuilding the configuration ----
+
+/// Why a configuration could not be rebuilt from a log, or does not survive
+/// being logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildError {
+    /// The vehicle numbers are not this vehicle's.
+    Numbers(NumbersError),
+    /// The parameter at this position in the list has a name this build does
+    /// not have; `key` is its stable key ([`params::key`] of the name).
+    UnknownParam {
+        /// Position in the list given.
+        position: usize,
+        /// The key of the name.
+        key: u32,
+    },
+    /// A parameter appears twice.
+    DuplicateParam(ParamId),
+    /// A parameter of this build is not in the list.
+    MissingParam(ParamId),
+    /// The core refused this parameter's value on its own (type, finite,
+    /// range).
+    Refused {
+        /// The parameter.
+        id: ParamId,
+        /// Why.
+        why: ParamError,
+    },
+    /// Every value is fine alone but together they break a rule.
+    Invalid(ParamError),
+    /// Setting the parameter to the value it reads back as does not give the
+    /// same configuration: it is held as whole microseconds and its seconds
+    /// as `f32` do not name that microsecond.
+    NotExact(ParamId),
+}
+
+fn same_param_bits(a: ParamValue, b: ParamValue) -> bool {
+    match (a, b) {
+        (ParamValue::F32(x), ParamValue::F32(y)) => x.to_bits() == y.to_bits(),
+        (ParamValue::I32(x), ParamValue::I32(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Rebuilds a configuration from the vehicle numbers (any order; names as in
+/// `VehicleConfig::vehicle_numbers`) and **all** the parameters by name (any
+/// order), checked against `profile` as `params::set_all` does. Every
+/// parameter of this build must appear exactly once. Each must read back from
+/// the result with the bits it was given, else [`RebuildError::NotExact`].
+///
+/// Equal hashes do not prove equal configurations when a parameter held in
+/// microseconds does not survive (`config_hash` reads seconds as `f32`): the
+/// recorder checks [`check_exact`] on the configuration before it logs it.
+pub fn rebuild_config<'a, const N: usize>(
+    numbers: impl IntoIterator<Item = (&'a str, f32)>,
+    parameters: impl IntoIterator<Item = (&'a str, ParamValue)>,
+    profile: &Profile,
+) -> Result<VehicleConfig<N>, RebuildError> {
+    let mut cfg =
+        VehicleConfig::<N>::from_vehicle_numbers(numbers).map_err(RebuildError::Numbers)?;
+    let mut given: [Option<ParamValue>; params::COUNT] = [None; params::COUNT];
+    for (position, (name, value)) in parameters.into_iter().enumerate() {
+        let id = params::find(name).ok_or(RebuildError::UnknownParam {
+            position,
+            key: params::key(name),
+        })?;
+        let slot = given
+            .get_mut(id.index())
+            .ok_or(RebuildError::UnknownParam {
+                position,
+                key: params::key(name),
+            })?;
+        if slot.is_some() {
+            return Err(RebuildError::DuplicateParam(id));
+        }
+        *slot = Some(value);
+    }
+    for (i, slot) in given.iter().enumerate() {
+        if slot.is_none() {
+            return Err(RebuildError::MissingParam(ParamId(
+                u16::try_from(i).unwrap_or(u16::MAX),
+            )));
+        }
+    }
+    let changes = given
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| Some((ParamId(u16::try_from(i).ok()?), (*v)?)));
+    params::set_all(&mut cfg, profile, changes).map_err(|(id, why)| match id {
+        Some(id) => RebuildError::Refused { id, why },
+        None => RebuildError::Invalid(why),
+    })?;
+    for (i, slot) in given.iter().enumerate() {
+        let id = ParamId(u16::try_from(i).unwrap_or(u16::MAX));
+        match (slot, params::get(&cfg, id)) {
+            (Some(want), Some(got)) if same_param_bits(*want, got) => {}
+            _ => return Err(RebuildError::NotExact(id)),
+        }
+    }
+    Ok(cfg)
+}
+
+/// Whether parameter `id` of `cfg` survives being logged as the value
+/// `params::get` reads and set again: setting it on a copy must give `cfg`
+/// back. A parameter held as whole microseconds reads as `f32` seconds, which
+/// names the microsecond exactly for every value up to 16 s (16,000,000 µs)
+/// and for round values above, but not for every value above (the first
+/// that fails is 16,000,001 µs).
+pub fn exact_param<const N: usize>(
+    cfg: &VehicleConfig<N>,
+    profile: &Profile,
+    id: ParamId,
+) -> Result<(), RebuildError> {
+    let value = params::get(cfg, id).ok_or(RebuildError::Refused {
+        id,
+        why: ParamError::Unknown,
+    })?;
+    let mut copy = *cfg;
+    params::set(&mut copy, profile, id, value).map_err(|why| RebuildError::Refused { id, why })?;
+    if copy == *cfg {
+        Ok(())
+    } else {
+        Err(RebuildError::NotExact(id))
+    }
+}
+
+/// [`exact_param`] for every parameter: the first that does not survive, or
+/// that the core refuses to set to its own value (an invalid configuration).
+pub fn check_exact<const N: usize>(
+    cfg: &VehicleConfig<N>,
+    profile: &Profile,
+) -> Result<(), RebuildError> {
+    for i in 0..params::COUNT {
+        let id = ParamId(u16::try_from(i).unwrap_or(u16::MAX));
+        exact_param(cfg, profile, id)?;
+    }
     Ok(())
 }
