@@ -2072,6 +2072,44 @@ fn telemetry_before_the_first_tick_is_empty() {
     assert_eq!(t.events_dropped, 0);
 }
 
+#[test]
+fn telemetry_reports_the_battery_latches_separately_and_the_cell_voltage() {
+    let mut c = cfg();
+    c.failsafe.battery_low_v = 3.5;
+    c.failsafe.battery_critical_v = 3.3;
+    let mut rig = Rig::external(0).with_cfg(c);
+    rig.arm();
+    rig.rc.throttle = 0.3;
+    // Healthy pack: no latch, 3.83 V per cell.
+    rig.run(1.0);
+    let t = rig.core.telemetry();
+    assert!(!t.battery_low && !t.battery_critical);
+    assert!((t.battery_cell_v.expect("cell voltage") - 23.0 / 6.0).abs() < 1e-3);
+    // Low but not critical: 3.4 V per cell.
+    rig.battery = Some(BatterySample {
+        voltage_v: 6.0 * 3.4,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(30.0, |r| r.core.telemetry().battery_low));
+    let t = rig.core.telemetry();
+    assert!(t.battery_low && !t.battery_critical, "{t:?}");
+    assert_eq!(t.battery_low, rig.core.sup_state.battery.low());
+    assert_eq!(t.battery_critical, rig.core.sup_state.battery.critical());
+    let v = t.battery_cell_v.expect("cell voltage");
+    assert!(v < 3.5 && v > 3.3, "cell voltage {v}");
+    assert_eq!(t.battery_voltage_v, Some(6.0 * 3.4));
+    // Critical: 3.1 V per cell; both latches are set.
+    rig.battery = Some(BatterySample {
+        voltage_v: 6.0 * 3.1,
+        current_a: 2.0,
+    });
+    assert!(rig.run_until(30.0, |r| r.core.telemetry().battery_critical));
+    let t = rig.core.telemetry();
+    assert!(t.battery_low && t.battery_critical, "{t:?}");
+    assert_eq!(t.battery_current_a, Some(2.0));
+    assert!(t.battery_cell_v.expect("cell voltage") < 3.3);
+}
+
 /// The velocity setpoint of a report, as an option (the report keeps one
 /// only where a velocity loop runs).
 fn vel_of(s: &Setpoints) -> Option<Vec3<f32>> {
