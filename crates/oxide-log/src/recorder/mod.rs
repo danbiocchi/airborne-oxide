@@ -300,6 +300,9 @@ pub enum StartError {
     NotReplayable(crate::replay::RebuildError),
     /// More rotors than an `oxide_out` record carries.
     TooManyRotors(crate::replay::TooManyRotors),
+    /// The recorder has already started. Nothing was written and nothing
+    /// changed: the first log goes on with its clocks, counters and ring.
+    AlreadyStarted,
 }
 
 impl From<Error> for StartError {
@@ -313,6 +316,8 @@ impl From<Error> for StartError {
 pub struct Recorder<const CAP: usize> {
     logger: Logger<CAP>,
     level: Level,
+    /// `start` has succeeded.
+    started: bool,
     /// Calls of `record` since `start`: the next tick's sequence number.
     ticks: u64,
     /// The store's saved call happened since the last tick.
@@ -387,6 +392,7 @@ impl<const CAP: usize> Recorder<CAP> {
         Self {
             logger: Logger::new(CAP / 4),
             level: Level::Normal,
+            started: false,
             ticks: 0,
             saved: false,
             scales: None,
@@ -405,6 +411,9 @@ impl<const CAP: usize> Recorder<CAP> {
 
     /// Writes the definitions to `sink` and makes the recorder ready.
     ///
+    /// A recorder starts once: a second call changes nothing, writes
+    /// nothing and returns [`StartError::AlreadyStarted`].
+    ///
     /// At the replay level it first checks that the log can be replayed
     /// ([`StartError::TooManyRotors`] for more than [`replay::MAX_MOTORS`]
     /// rotors, [`StartError::NotReplayable`] when `replay::check_exact`
@@ -420,6 +429,9 @@ impl<const CAP: usize> Recorder<CAP> {
         level: Level,
         cfg: &VehicleConfig<N>,
     ) -> Result<(), StartError> {
+        if self.started {
+            return Err(StartError::AlreadyStarted);
+        }
         if level == Level::Replay {
             if N > replay::MAX_MOTORS {
                 return Err(StartError::TooManyRotors(replay::TooManyRotors {
@@ -447,6 +459,7 @@ impl<const CAP: usize> Recorder<CAP> {
                 let _ = replay::fill_boot(w, now, &boot.report, N, boot.profile);
             })?;
         }
+        self.started = true;
         self.level = level;
         self.ticks = 0;
         self.saved = false;

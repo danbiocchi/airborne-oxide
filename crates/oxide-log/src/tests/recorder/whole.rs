@@ -393,7 +393,8 @@ fn the_recorder_is_the_ring_plus_a_small_state() {
     );
     assert_eq!(a, b);
     assert_eq!(b, c);
-    assert!(a < 2048, "{a}");
+    // ADR-0005 §7: "the recorder is the buffer plus under 1 kB of state".
+    assert!(a < 1024, "{a}");
 }
 
 #[test]
@@ -411,4 +412,116 @@ fn bytes_per_second_at_1_khz_and_8_khz() {
     // The same flight at either tick rate writes the same records.
     assert_eq!(rates[0], rates[1]);
     assert!(rates[0] > 40_000.0 && rates[0] < 41_000.0, "{rates:?}");
+}
+
+// ---- the promises of ADR-0005 §7, pinned ----
+
+/// Fills a `CAP`-byte ring that is never drained, with streams only (the
+/// status topics write once, on the first tick), then sends one event.
+/// Returns the bytes in the ring before the event and the stats after it.
+fn fill_and_send_an_event<const CAP: usize>() -> (u64, crate::logger::Stats, u64) {
+    let cfg = super::super::topics::quad();
+    let mut file = Vec::new();
+    let mut rec = Recorder::<CAP>::new();
+    rec.start(
+        &mut file,
+        Micros(0),
+        BUILD,
+        Boot::clean(&F405_LEAN),
+        Level::Normal,
+        &cfg,
+    )
+    .unwrap();
+    // 0.9 s: before the one-second timers of the status topics.
+    for i in 0..900u64 {
+        let t = i * 1000;
+        let tick = Tick::at(t);
+        rec.record(Micros(t), &tick.inputs, &tick.outputs, &tick.tel, &cfg);
+    }
+    let before = rec.stats();
+    assert!(before.dropped_stream > 0, "the ring never filled");
+    assert_eq!(before.dropped_must, 0);
+    // A must-keep message still fits in the quarter that streams leave.
+    let mut tick = Tick::at(900_000);
+    tick.outputs
+        .events
+        .push(ev(900_000, EventKind::ReasonRaised(Reasons::RC_LOST)));
+    rec.record(
+        Micros(900_000),
+        &tick.inputs,
+        &tick.outputs,
+        &tick.tel,
+        &cfg,
+    );
+    let after = rec.stats();
+    rec.drain(&mut file);
+    let f = UlogFile::parse(&file).unwrap();
+    let kept = f.records("oxide_event").count() as u64;
+    (before.bytes, after, kept)
+}
+
+fn streams_stop_at_a_quarter_and_events_still_fit<const CAP: usize>() {
+    let (bytes, after, kept) = fill_and_send_an_event::<CAP>();
+    let reserve = (CAP / 4) as u64;
+    // Free space is at or below CAP / 4: no stream message was let in
+    // beyond it, and the ring is full up to the largest message (about 200
+    // bytes: a status record or the largest stream).
+    assert!(
+        bytes <= CAP as u64 - reserve,
+        "CAP {CAP}: {bytes} bytes held"
+    );
+    assert!(
+        bytes + 400 > CAP as u64 - reserve,
+        "CAP {CAP}: streams stopped early, at {bytes} bytes"
+    );
+    // The event got in, whole, and nothing must-keep was dropped.
+    assert_eq!(after.dropped_must, 0, "CAP {CAP}");
+    assert_eq!(kept, 1, "CAP {CAP}");
+}
+
+#[test]
+fn a_stream_is_refused_at_a_quarter_free_while_a_must_keep_message_is_accepted() {
+    streams_stop_at_a_quarter_and_events_still_fit::<4096>();
+    streams_stop_at_a_quarter_and_events_still_fit::<16384>();
+}
+
+#[test]
+fn start_twice_changes_nothing_and_says_so() {
+    use crate::recorder::StartError;
+    let mut file = Vec::new();
+    let (mut rec, cfg) = started(&mut file, Level::Normal);
+    for i in 0..30u64 {
+        let t = i * 1000;
+        let tick = Tick::at(t);
+        rec.record(Micros(t), &tick.inputs, &tick.outputs, &tick.tel, &cfg);
+        rec.drain(&mut file);
+    }
+    let before = rec.stats();
+    let mut second = Vec::new();
+    let e = rec
+        .start(
+            &mut second,
+            Micros(99_000),
+            BUILD,
+            Boot::clean(&F405_LEAN),
+            Level::Replay,
+            &cfg,
+        )
+        .expect_err("a second start");
+    assert_eq!(e, StartError::AlreadyStarted);
+    assert!(second.is_empty(), "no second header");
+    assert_eq!(rec.stats(), before);
+    // The log goes on as if nothing had been asked: one header, the clocks
+    // and counters kept, the level the first start chose.
+    for i in 30..60u64 {
+        let t = i * 1000;
+        let tick = Tick::at(t);
+        rec.record(Micros(t), &tick.inputs, &tick.outputs, &tick.tel, &cfg);
+        rec.drain(&mut file);
+    }
+    let f = UlogFile::parse(&file).expect("one whole file");
+    assert_eq!(f.info_str("oxide_log_level"), Some("normal"));
+    let ts = times(&f, "sensor_combined");
+    assert_eq!(ts, [0, 10_000, 20_000, 30_000, 40_000, 50_000]);
+    assert_eq!(f.records("oxide_in_tick").count(), 0);
 }

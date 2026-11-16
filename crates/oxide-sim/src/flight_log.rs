@@ -157,6 +157,7 @@ impl FlightLog {
             )
             .map_err(|e| match e {
                 StartError::Write(e) => LogError::Format(e),
+                StartError::AlreadyStarted => LogError::AlreadyStarted,
                 other => LogError::NotReplayable(describe_start(&other)),
             })?;
         writer.write_all(&head).map_err(LogError::Io)?;
@@ -226,6 +227,7 @@ fn describe_start(e: &StartError) -> String {
     let name = |id: ParamId| params::PARAMS.get(id.index()).map_or("?", |d| d.name);
     match e {
         StartError::Write(e) => format!("{e:?}"),
+        StartError::AlreadyStarted => "the recorder has already started".to_string(),
         StartError::TooManyRotors(t) => {
             format!("{} rotors, a record carries at most {}", t.got, t.max)
         }

@@ -25,6 +25,16 @@ pub enum Class {
 }
 
 /// Counters, all since [`Logger::new`].
+///
+/// The `u32` counters (`written`, `dropped_stream`, `dropped_must`,
+/// `dropouts`, `syncs`) stop at their maximum: they do not wrap, so after
+/// that a reader sees a constant, and "written + dropped = attempted" no
+/// longer holds. At the message rates of the simulator's flights that takes
+/// about 63 days at the normal level (785 messages a second), about 12 days
+/// at the replay level on the F405 profile (4096 a second) and about 3.8
+/// days at the replay level on the H743 profile (13.1 thousand a second).
+/// A stalled sink counts failed attempts faster still (2.6 thousand a second
+/// in a 20 s stall with a 4 kB ring: about 19 days). `bytes` is a `u64`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Messages committed by [`Logger::write`] (dropouts and syncs the logger
