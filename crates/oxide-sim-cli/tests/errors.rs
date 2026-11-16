@@ -43,6 +43,14 @@ fn bad_csv() -> String {
     text(&temp("no-such-dir").join("x.csv"))
 }
 
+/// What this system says when a file is created in a directory that does not
+/// exist (the wording and the number differ between Linux and Windows).
+fn create_error(path: &str) -> String {
+    std::fs::File::create(path)
+        .expect_err("the directory does not exist")
+        .to_string()
+}
+
 #[test]
 fn a_command_that_fails_before_the_flight_leaves_no_log_file() {
     for args in [
@@ -66,7 +74,7 @@ fn a_command_that_fails_before_the_flight_leaves_no_log_file() {
         let o = run(&a);
         assert_eq!(code(&o), 2, "{a:?}: {}", stderr(&o));
         assert!(
-            stderr(&o).starts_with(&format!("error: {csv}: No such file or directory")),
+            stderr(&o).starts_with(&format!("error: {csv}: {}", create_error(&csv))),
             "{a:?}: {}",
             stderr(&o)
         );
@@ -84,7 +92,7 @@ fn an_unwritable_log_path_is_an_error_and_names_the_path() {
         let o = run(&args);
         assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
         assert!(
-            stderr(&o).starts_with(&format!("error: {log}: No such file or directory")),
+            stderr(&o).starts_with(&format!("error: {log}: {}", create_error(&log))),
             "{}",
             stderr(&o)
         );
