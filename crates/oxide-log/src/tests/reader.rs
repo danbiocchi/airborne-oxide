@@ -462,3 +462,59 @@ proptest! {
         }
     }
 }
+
+/// A raw message: size, type, payload.
+fn raw(v: &mut Vec<u8>, ty: u8, payload: &[u8]) {
+    v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    v.push(ty);
+    v.extend_from_slice(payload);
+}
+
+fn raw_header() -> Vec<u8> {
+    let mut v = Vec::new();
+    msg::file_header(&mut v, 0).unwrap();
+    v
+}
+
+#[test]
+fn nested_sizes_that_overflow_are_an_error_not_a_panic() {
+    let mut v = raw_header();
+    raw(&mut v, b'F', b"a0:uint8_t[65535] x;");
+    for i in 1..6 {
+        raw(
+            &mut v,
+            b'F',
+            format!("a{i}:a{}[65535] x;", i - 1).as_bytes(),
+        );
+    }
+    raw(&mut v, b'F', b"t:uint64_t timestamp;a5 z;");
+    raw(&mut v, b'A', &[0, 0, 0, b't']);
+    let e = UlogFile::parse(&v).unwrap_err();
+    assert!(matches!(e.kind, ReadErrorKind::BadFormat(_)), "{e}");
+}
+
+#[test]
+fn a_very_long_chain_of_nested_formats_does_not_overflow_the_stack() {
+    const N: usize = 60_000;
+    let mut v = raw_header();
+    for i in 0..N - 1 {
+        raw(&mut v, b'F', format!("a{i}:a{} x;", i + 1).as_bytes());
+    }
+    raw(&mut v, b'F', format!("a{}:uint8_t x;", N - 1).as_bytes());
+    // A small stack: recursion over the chain would not fit.
+    let h = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || UlogFile::parse(&v).map(|f| f.formats.len()))
+        .unwrap();
+    assert_eq!(h.join().unwrap().unwrap(), N);
+}
+
+#[test]
+fn a_zero_message_after_the_data_is_corruption_as_pyulog_sees_it() {
+    let mut v = with_sub(&[&SMALL]);
+    let at = v.len();
+    v.extend_from_slice(&[0, 0, 0]);
+    let f = UlogFile::parse(&v).unwrap();
+    let t = f.truncated.expect("a size-0, type-0 message is reported");
+    assert_eq!(t.offset, at);
+}

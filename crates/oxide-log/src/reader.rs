@@ -403,6 +403,8 @@ impl UlogFile {
             truncated: None,
         };
         let mut pending: Vec<(String, String, usize)> = Vec::new();
+        let mut pending_names: std::collections::BTreeSet<String> = Default::default();
+        let mut format_index: BTreeMap<String, usize> = BTreeMap::new();
         let mut by_id: BTreeMap<u16, usize> = BTreeMap::new();
         let mut in_data = false;
         let mut cur = Cursor {
@@ -418,6 +420,12 @@ impl UlogFile {
                 available: avail,
             };
             let (size, ty) = match (u16_at(bytes, at), bytes.get(at + 2)) {
+                // As pyulog: a size-0, type-0 message in the data is corruption
+                // (a zero-filled tail); keep everything before it.
+                (Some(0), Some(0)) if in_data => {
+                    file.truncated = Some(truncated(3));
+                    break;
+                }
                 (Some(s), Some(t)) => (usize::from(s), *t),
                 _ => {
                     return if in_data {
@@ -492,7 +500,7 @@ impl UlogFile {
                         let (name, fields) = text
                             .split_once(':')
                             .ok_or(bad(ty, "no ':' after the name"))?;
-                        if pending.iter().any(|(n, _, _)| n == name) {
+                        if !pending_names.insert(name.to_string()) {
                             return Err(bad(ty, "format defined twice"));
                         }
                         pending.push((name.to_string(), fields.to_string(), at));
@@ -549,10 +557,14 @@ impl UlogFile {
                         let msg_id = u16_at(p, 1).unwrap_or(0);
                         let name = core::str::from_utf8(p.get(3..).unwrap_or(&[]))
                             .map_err(|_| bad(ty, "name is not text"))?;
-                        let format = file
-                            .formats
-                            .iter()
-                            .position(|f| f.name == name)
+                        if format_index.is_empty() {
+                            for (k, f) in file.formats.iter().enumerate() {
+                                format_index.insert(f.name.clone(), k);
+                            }
+                        }
+                        let format = format_index
+                            .get(name)
+                            .copied()
                             .ok_or_else(|| ReadErrorKind::UnknownTopic(name.to_string()))?;
                         if by_id.contains_key(&msg_id) {
                             return Err(ReadErrorKind::DuplicateMessageId(msg_id));

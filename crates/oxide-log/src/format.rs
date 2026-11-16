@@ -156,6 +156,11 @@ pub enum FormatError {
         /// The name.
         name: String,
     },
+    /// A layout larger than any message can carry.
+    TooLarge {
+        /// The format.
+        name: String,
+    },
     /// A format that contains itself.
     Cycle {
         /// A format on the cycle.
@@ -172,6 +177,7 @@ impl fmt::Display for FormatError {
             Self::BadName { name } => write!(f, "bad name {name:?}"),
             Self::UnknownType { name } => write!(f, "unknown type {name:?}"),
             Self::DuplicateField { name } => write!(f, "duplicate field {name:?}"),
+            Self::TooLarge { name } => write!(f, "format {name:?} is larger than 65535 bytes"),
             Self::Cycle { name } => write!(f, "format {name:?} contains itself"),
         }
     }
@@ -247,6 +253,9 @@ fn parse_fields(fields: &str) -> Result<Vec<RawField>, FormatError> {
     Ok(out)
 }
 
+/// The largest layout, in bytes: a message carries at most 65,535.
+const MAX_LAYOUT: usize = u16::MAX as usize;
+
 fn build(
     name: &str,
     fields: &str,
@@ -266,7 +275,13 @@ fn build(
                 None => return Err(FormatError::UnknownType { name: r.ty }),
             },
         };
-        let size = elem_size * r.array.unwrap_or(1);
+        let too_large = || FormatError::TooLarge {
+            name: name.to_string(),
+        };
+        let size = elem_size
+            .checked_mul(r.array.unwrap_or(1))
+            .filter(|s| *s <= MAX_LAYOUT)
+            .ok_or_else(too_large)?;
         out.push(Field {
             name: r.name,
             ty,
@@ -275,7 +290,10 @@ fn build(
             elem_size,
             size,
         });
-        offset += size;
+        offset = offset
+            .checked_add(size)
+            .filter(|o| *o <= MAX_LAYOUT)
+            .ok_or_else(too_large)?;
     }
     let trailing: usize = out
         .iter()
@@ -287,7 +305,7 @@ fn build(
         name: name.to_string(),
         fields: out,
         size: offset,
-        size_no_trailing_padding: offset - trailing,
+        size_no_trailing_padding: offset.saturating_sub(trailing),
     })
 }
 
@@ -299,54 +317,79 @@ pub fn layout(name: &str, fields: &str) -> Result<Layout, FormatError> {
 /// Resolves a set of `(name, fields)` definitions, nested types included, in
 /// any order. On error, returns the index of the definition at fault.
 pub fn resolve(defs: &[(&str, &str)]) -> Result<BTreeMap<String, Layout>, (usize, FormatError)> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum State {
-        Todo,
-        Doing,
-        Done,
-    }
-    fn visit(
+    struct Frame {
         i: usize,
-        defs: &[(&str, &str)],
-        state: &mut [State],
-        done: &mut BTreeMap<String, Layout>,
-    ) -> Result<(), (usize, FormatError)> {
-        let &(name, fields) = defs.get(i).ok_or((i, FormatError::NoFields))?;
-        let slot = state.get_mut(i).ok_or((i, FormatError::NoFields))?;
-        match *slot {
-            State::Done => return Ok(()),
-            State::Doing => {
-                return Err((
-                    i,
-                    FormatError::Cycle {
-                        name: name.to_string(),
-                    },
-                ));
-            }
-            State::Todo => {}
-        }
-        *slot = State::Doing;
-        for r in parse_fields(fields).map_err(|e| (i, e))? {
-            if Scalar::parse(&r.ty).is_none() {
-                match defs.iter().position(|(n, _)| *n == r.ty) {
-                    Some(j) => visit(j, defs, state, done)?,
-                    None => {
-                        return Err((i, FormatError::UnknownType { name: r.ty }));
-                    }
-                }
-            }
-        }
-        let l = build(name, fields, &|t| done.get(t).map(|l| l.size)).map_err(|e| (i, e))?;
-        done.insert(name.to_string(), l);
-        if let Some(slot) = state.get_mut(i) {
-            *slot = State::Done;
-        }
-        Ok(())
+        fields: Vec<RawField>,
+        next: usize,
     }
-    let mut state = std::vec![State::Todo; defs.len()];
-    let mut done = BTreeMap::new();
-    for i in 0..defs.len() {
-        visit(i, defs, &mut state, &mut done)?;
+    let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, (n, _)) in defs.iter().enumerate() {
+        by_name.entry(*n).or_insert(i);
+    }
+    // 0 = todo, 1 = on the stack, 2 = done. Iterative: the depth of the
+    // nesting is the file's choice, not ours.
+    let mut state = std::vec![0u8; defs.len()];
+    let mut done: BTreeMap<String, Layout> = BTreeMap::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    for root in 0..defs.len() {
+        if state.get(root) != Some(&0) {
+            continue;
+        }
+        let &(_, fields) = defs.get(root).ok_or((root, FormatError::NoFields))?;
+        let fields = parse_fields(fields).map_err(|e| (root, e))?;
+        if let Some(s) = state.get_mut(root) {
+            *s = 1;
+        }
+        stack.push(Frame {
+            i: root,
+            fields,
+            next: 0,
+        });
+        while let Some(top) = stack.last_mut() {
+            let i = top.i;
+            let &(name, fields) = defs.get(i).ok_or((i, FormatError::NoFields))?;
+            let Some(r) = top.fields.get(top.next) else {
+                let l =
+                    build(name, fields, &|t| done.get(t).map(|l| l.size)).map_err(|e| (i, e))?;
+                done.insert(name.to_string(), l);
+                if let Some(s) = state.get_mut(i) {
+                    *s = 2;
+                }
+                stack.pop();
+                continue;
+            };
+            top.next += 1;
+            if Scalar::parse(&r.ty).is_some() {
+                continue;
+            }
+            let Some(&j) = by_name.get(r.ty.as_str()) else {
+                return Err((i, FormatError::UnknownType { name: r.ty.clone() }));
+            };
+            match state.get(j) {
+                Some(1) => {
+                    let n = defs.get(j).map_or("", |d| d.0);
+                    return Err((
+                        j,
+                        FormatError::Cycle {
+                            name: n.to_string(),
+                        },
+                    ));
+                }
+                Some(0) => {
+                    let &(_, jf) = defs.get(j).ok_or((j, FormatError::NoFields))?;
+                    let jfields = parse_fields(jf).map_err(|e| (j, e))?;
+                    if let Some(s) = state.get_mut(j) {
+                        *s = 1;
+                    }
+                    stack.push(Frame {
+                        i: j,
+                        fields: jfields,
+                        next: 0,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
     Ok(done)
 }
