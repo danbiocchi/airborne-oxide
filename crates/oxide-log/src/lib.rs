@@ -31,6 +31,7 @@
 
 #[cfg(any(test, feature = "std"))]
 pub mod format;
+pub mod logger;
 pub mod msg;
 pub mod record;
 
