@@ -40,7 +40,9 @@
 //! (run 0, `<profile> <name>#0 <hash>`), so that it also covers ground contact,
 //! landings, failsafes and a crash, then one line per logged flight
 //! (`<profile> log-normal <name>#0 <FNV-1a 64 of the log's bytes>`, written with
-//! the fixed build information `hash`/`SIM`). `montecarlo` flies gust-hold indices 0..N (default 200) on
+//! the fixed build information `hash`/`SIM`) and one replay-level log of
+//! rc-loss-position (`<profile> log-replay rc-loss-position#0 <FNV-1a 64>`).
+//! `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
 //! with 1 if any run fails. `scenario` flies a scenario (ADR-0003, ADR-0004
 //! §7): a name among the embedded ones (`scenario list`), or the path of a
@@ -625,8 +627,11 @@ fn fault_hash_lines_with(
     Ok(lines)
 }
 
-/// The flights whose log `hash` hashes (run 0, normal level).
+/// The flights whose normal-level log `hash` hashes (run 0).
 const HASHED_LOGGED_FLIGHTS: [&str; 2] = ["rc-loss-position", "gust-hold"];
+
+/// The scenarios whose replay-level log `hash` also prints (`log-replay`).
+const HASHED_REPLAY_FLIGHTS: [&str; 1] = ["rc-loss-position"];
 
 /// What `hash` writes into the logs it hashes: the same bytes on every commit.
 const HASH_BUILD: &str = "hash";
@@ -639,11 +644,12 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     h.value()
 }
 
-/// The bytes of the normal-level log of scenario `name`, run `index`, flown to
+/// The bytes of the log at `level` of scenario `name`, run `index`, flown to
 /// its end with `params`, written with the fixed build information
 /// (`ver_sw` `hash`, `ver_hw` `SIM`).
-fn logged_flight_bytes(
+fn logged_flight_bytes_at(
     profile: Profile,
+    level: Level,
     name: &str,
     index: u64,
     params: &[(String, f64)],
@@ -652,14 +658,20 @@ fn logged_flight_bytes(
         .ok_or_else(|| format!("logged scenario {name} does not exist"))?;
     let mut sim = scenario.build_with_params(profile, index, params)?;
     let buffer = oxide_sim::flight_log::SharedBuffer::new();
-    sim.start_log(
-        Level::Normal,
-        &LogBuild::sim(HASH_BUILD),
-        Box::new(buffer.clone()),
-    )?;
+    sim.start_log(level, &LogBuild::sim(HASH_BUILD), Box::new(buffer.clone()))?;
     sim.run_until(scenario.end(), |_| {});
     sim.finish_log()?;
     Ok(buffer.bytes())
+}
+
+/// The bytes of the normal-level log of scenario `name`, run `index`.
+fn logged_flight_bytes(
+    profile: Profile,
+    name: &str,
+    index: u64,
+    params: &[(String, f64)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    logged_flight_bytes_at(profile, Level::Normal, name, index, params)
 }
 
 /// `<profile> log-normal <name>#0 <fnv-1a 64 of the file>` for each of
@@ -673,6 +685,26 @@ fn log_hash_lines(
         let bytes = logged_flight_bytes(profile, name, 0, params)?;
         lines.push(format!(
             "{} log-normal {}#0 {:016x}",
+            profile.name,
+            name,
+            fnv1a_64(&bytes)
+        ));
+    }
+    Ok(lines)
+}
+
+/// `<profile> log-replay <name>#0 <fnv-1a 64 of the file>` for each of
+/// `HASHED_REPLAY_FLIGHTS`: the replay-level log, whose bytes also pin the
+/// order and content of every replay record.
+fn log_replay_hash_lines(
+    profile: Profile,
+    params: &[(String, f64)],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut lines = Vec::new();
+    for name in HASHED_REPLAY_FLIGHTS {
+        let bytes = logged_flight_bytes_at(profile, Level::Replay, name, 0, params)?;
+        lines.push(format!(
+            "{} log-replay {}#0 {:016x}",
             profile.name,
             name,
             fnv1a_64(&bytes)
@@ -713,6 +745,7 @@ fn hash_lines(args: &Args, airframe: &Airframe) -> Result<Vec<String>, Box<dyn s
     if args.scenario.is_none() {
         lines.extend(fault_hash_lines_with(profile, &args.params)?);
         lines.extend(log_hash_lines(profile, &args.params)?);
+        lines.extend(log_replay_hash_lines(profile, &args.params)?);
     }
     Ok(lines)
 }
@@ -1684,7 +1717,7 @@ mod tests {
     fn hash_prints_its_five_lines_as_before_then_one_per_logged_flight() {
         for (profile, name) in [("f405", "f405-lean"), ("h743", "h743-full")] {
             let lines = hash_output(profile);
-            assert_eq!(lines.len(), 7, "{lines:#?}");
+            assert_eq!(lines.len(), 8, "{lines:#?}");
             let pinned: Vec<&str> = PINNED
                 .iter()
                 .copied()
@@ -1705,6 +1738,46 @@ mod tests {
                 );
             }
             assert_ne!(lines[5], lines[6]);
+            // Then the replay-level log of rc-loss-position.
+            let w: Vec<&str> = lines[7].split(' ').collect();
+            assert_eq!(w.len(), 4, "{}", lines[7]);
+            assert_eq!(&w[..3], &[name, "log-replay", "rc-loss-position#0"]);
+            assert_eq!(w[3].len(), 16, "{}", lines[7]);
+            assert!(
+                w[3].chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            );
+            assert_ne!(w[3], lines[5].rsplit(' ').next().expect("hash"));
+        }
+    }
+
+    #[test]
+    fn the_replay_level_log_hash_is_the_fnv_1a_of_a_file_that_replays() {
+        for profile in [F405_LEAN, H743_FULL] {
+            let a = logged_flight_bytes_at(profile, Level::Replay, "rc-loss-position", 0, &[])
+                .expect("first");
+            let b = logged_flight_bytes_at(profile, Level::Replay, "rc-loss-position", 0, &[])
+                .expect("second");
+            assert_eq!(a, b, "{}", profile.name);
+            let file = oxide_log::reader::UlogFile::parse(&a).expect("parses");
+            assert_eq!(file.info_str("oxide_log_level"), Some("replay"));
+            assert_eq!(file.info_str("ver_sw"), Some("hash"));
+            assert_eq!(file.info_str("ver_hw"), Some("SIM"));
+            let report =
+                oxide_sim::replay::replay(&a, &oxide_sim::replay::ReplayOptions::default())
+                    .expect("replays");
+            assert!(report.identical() && report.exit_code() == 0);
+            let line = log_replay_hash_lines(profile, &[])
+                .expect("lines")
+                .remove(0);
+            assert_eq!(
+                line,
+                format!(
+                    "{} log-replay rc-loss-position#0 {:016x}",
+                    profile.name,
+                    fnv1a_64(&a)
+                )
+            );
         }
     }
 

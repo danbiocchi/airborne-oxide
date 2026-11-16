@@ -76,6 +76,11 @@ jobs:
         run: cargo test --release --locked -p oxide-sim --test scenario_files -- --ignored every_scenario_file_still_flies_its_pinned_flight_full
       - name: Every parameter flies at both ends of its range (no panic, no runaway)
         run: cargo test --release --locked -p oxide-sim --test param_bounds -- --ignored every_bound_flies
+      - name: Every scenario file replays bit for bit on both profiles (ADR-0005 section 9)
+        # Flies each of the 43 files with a replay-level log in memory, replays
+        # it through a rebuilt core and fails on any tick that differs. Prints
+        # one summary line (flights, ticks, bytes, seconds).
+        run: cargo test --release --locked -p oxide-sim --test replay_sweep -- --ignored --nocapture every_scenario_file_replays_identically_on_both_profiles
 
   determinism:
     name: Linux and Windows traces are bit-identical
@@ -116,6 +121,13 @@ jobs:
         run: |
           cargo run --release --locked -q -p oxide-sim-cli -- scenario rc-loss-position --log "$LOG_FILE"
           python tools/ulog_check.py "$LOG_FILE" --expect-topics sensor_combined,vehicle_angular_velocity,vehicle_rates_setpoint,actuator_motors,vehicle_thrust_setpoint,vehicle_torque_setpoint,vehicle_attitude,vehicle_attitude_setpoint,vehicle_local_position,vehicle_local_position_setpoint,manual_control_setpoint,vehicle_magnetometer,vehicle_air_data,battery_status,vehicle_status,failsafe_flags,oxide_status,oxide_estimator,oxide_event,oxide_logger
+      - name: A replay-level log written by the command line, checked by pyulog and replayed
+        env:
+          LOG_FILE: ${{ runner.temp }}/rc-loss-position-replay.ulg
+        run: |
+          cargo run --release --locked -q -p oxide-sim-cli -- scenario rc-loss-position --log "$LOG_FILE" --log-level replay
+          python tools/ulog_check.py "$LOG_FILE" --expect-topics sensor_combined,actuator_motors,vehicle_attitude,vehicle_status,oxide_status,oxide_event,oxide_logger,oxide_vehicle,oxide_param_us,oxide_boot,oxide_in_tick,oxide_in_imu,oxide_in_rc,oxide_in_battery,oxide_in_setpoint,oxide_in_gps,oxide_in_baro,oxide_in_mag,oxide_in_brain,oxide_out
+          cargo run --release --locked -q -p oxide-sim-cli -- replay "$LOG_FILE"
 
   viewer:
     name: Viewer builds (Rerun + joystick)
