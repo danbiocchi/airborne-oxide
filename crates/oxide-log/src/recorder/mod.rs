@@ -175,6 +175,16 @@ fn take(clock: &mut Clock, now: u64) -> bool {
     due
 }
 
+/// The topics a log of this level declares, in message-id order: a topic's id
+/// is its position. The replay level's records (ADR-0005 §5) will be appended
+/// here, after [`topics::NORMAL`], so the normal ids do not move; today the
+/// replay level declares the same list.
+fn topic_list(level: Level) -> &'static [Topic] {
+    match level {
+        Level::Normal | Level::Replay => topics::NORMAL,
+    }
+}
+
 /// Records what the core did, tick by tick, into a [`Logger`] ring.
 #[derive(Debug)]
 pub struct Recorder<const CAP: usize> {
@@ -281,7 +291,7 @@ impl<const CAP: usize> Recorder<CAP> {
             level,
             nested: topics::NESTED,
         };
-        crate::header::write_definitions(sink, &h, cfg, topics::NORMAL)?;
+        crate::header::write_definitions(sink, &h, cfg, topic_list(level))?;
         self.level = level;
         self.scales = Some(Scales::new(cfg));
         Ok(())
@@ -302,6 +312,9 @@ impl<const CAP: usize> Recorder<CAP> {
     ) {
         let Some(scales) = self.scales else { return };
         self.observe(inputs);
+        if self.level == Level::Replay {
+            self.record_replay(now, inputs, outputs);
+        }
         let t = now.0;
         let t_sample = self.t_sample(now);
         let status = &outputs.status;
@@ -537,6 +550,19 @@ impl<const CAP: usize> Recorder<CAP> {
         }
     }
 
+    /// The per-tick hook of the replay level: the tick record, one record per
+    /// input present and `oxide_out`, written before everything else of the
+    /// tick (the replay records of the next wave go here). Writes nothing yet.
+    #[allow(clippy::unused_self)]
+    fn record_replay<const N: usize>(
+        &mut self,
+        now: Micros,
+        inputs: &Inputs,
+        outputs: &Outputs<N>,
+    ) {
+        let _ = (now, inputs, outputs);
+    }
+
     /// One event: as a logged string, then as an `oxide_event` record, both
     /// `Must`; a parameter change also writes the parameter's new value.
     fn event<const N: usize>(&mut self, now: Micros, e: &Event, cfg: &VehicleConfig<N>) {
@@ -620,6 +646,12 @@ impl<const CAP: usize> Recorder<CAP> {
             Ok(()) => chunk.len(),
             Err(_) => 0,
         })
+    }
+
+    /// Like [`drain`](Self::drain) for a sink that may take part of what it
+    /// is offered: `sink` returns how many bytes of its argument it took.
+    pub fn drain_with(&mut self, sink: impl FnMut(&[u8]) -> usize) -> usize {
+        self.logger.drain(sink)
     }
 
     /// The logger's counters.
