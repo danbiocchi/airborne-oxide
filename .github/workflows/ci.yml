@@ -95,8 +95,6 @@ jobs:
   pyulog:
     name: Logs are read by pyulog
     runs-on: ubuntu-latest
-    env:
-      LOG_FILE: ${{ runner.temp }}/rc-loss-position.ulg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -112,6 +110,9 @@ jobs:
           cargo test --locked -p oxide-log pyulog
           cargo test --locked -p oxide-sim --test log_values
       - name: A log written by the command line, checked by pyulog
+        # `runner` is a step-level context: not available in a job's `env:`.
+        env:
+          LOG_FILE: ${{ runner.temp }}/rc-loss-position.ulg
         run: |
           cargo run --release --locked -q -p oxide-sim-cli -- scenario rc-loss-position --log "$LOG_FILE"
           python tools/ulog_check.py "$LOG_FILE" --expect-topics sensor_combined,vehicle_angular_velocity,vehicle_rates_setpoint,actuator_motors,vehicle_thrust_setpoint,vehicle_torque_setpoint,vehicle_attitude,vehicle_attitude_setpoint,vehicle_local_position,vehicle_local_position_setpoint,manual_control_setpoint,vehicle_magnetometer,vehicle_air_data,battery_status,vehicle_status,failsafe_flags,oxide_status,oxide_estimator,oxide_event,oxide_logger

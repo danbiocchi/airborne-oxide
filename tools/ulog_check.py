@@ -73,10 +73,9 @@ def main():
         for d in ulog.data_list:
             have[d.name] = have.get(d.name, 0) + len(d.data["timestamp"])
         for name in [n.strip() for n in a.expect_topics.split(",") if n.strip()]:
-            if name not in have:
-                fail("expected topic %s is missing" % name)
-            if have[name] == 0:
-                fail("expected topic %s has no records" % name)
+            # pyulog lists only topics that have records: absent means both.
+            if have.get(name, 0) == 0:
+                fail("expected topic %s is missing or has no records" % name)
     PX4ULog(ulog).add_roll_pitch_yaw()
 
     if a.dump:

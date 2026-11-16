@@ -24,7 +24,8 @@
 //! `--log FILE.ulg` on `run` and `scenario` writes the flight's log (ADR-0005)
 //! in PX4's ULog format; `--log-level` (default `normal`) needs `--log`. The
 //! header's `ver_sw` is the git hash the binary was built from (`build.rs`),
-//! `ver_hw` is `SIM`.
+//! `-dirty` when the tree had changes the last time that script ran (edits made
+//! after it are not seen until it runs again), `ver_hw` is `SIM`.
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and

@@ -363,9 +363,19 @@ fn ulog_check_without_expect_topics_accepts_a_topic_with_no_record() {
     assert!(ok, "{err}\n{out}");
     let (ok, _, err) = run(&py, &[p, "--expect-topics", "no_such_topic"]);
     assert!(!ok);
-    assert!(err.contains("no_such_topic"), "{err}");
+    assert!(
+        err.contains("expected topic no_such_topic is missing or has no records"),
+        "{err}"
+    );
     // 300 ticks: vehicle_attitude waits for the estimate (1 s).
     let (ok, _, err) = run(&py, &[p, "--expect-topics", "vehicle_attitude"]);
     assert!(!ok, "{err}");
+    assert!(
+        err.contains("expected topic vehicle_attitude is missing or has no records"),
+        "{err}"
+    );
+    // A topic that has records passes.
+    let (ok, _, err) = run(&py, &[p, "--expect-topics", "sensor_combined"]);
+    assert!(ok, "{err}");
     let _ = std::fs::remove_file(path);
 }
