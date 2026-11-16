@@ -701,3 +701,60 @@ fn events_list(events: &[Event]) -> oxide_core::io::EventList {
     }
     list
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `compare` of a recorded motor command `a` in motor 0 against a replayed `b`.
+    fn motor_zero(a: f32, b: f32) -> Option<Difference> {
+        let mut recorded = Outputs::<ROTORS>::off(Micros(7_000));
+        recorded.motors[0] = a;
+        let mut replayed = recorded;
+        replayed.motors[0] = b;
+        let rec = OutRecord {
+            t: Micros(7_000),
+            t_valid: recorded.t_valid,
+            motors: recorded.motors,
+            status: recorded.status,
+            events: 0,
+        };
+        compare(7, Micros(7_000), &rec, &[], &replayed)
+    }
+
+    #[test]
+    fn exact_means_bits_a_negative_zero_and_a_nan_payload_are_differences() {
+        // +0.0 against -0.0: equal as numbers, different as bits.
+        let d = motor_zero(0.0, -0.0).expect("a difference");
+        assert_eq!((d.seq, d.t_us, d.field.as_str()), (7, 7_000, "motors[0]"));
+        assert_eq!(
+            (d.recorded_bits, d.replayed_bits),
+            (Some(0), Some(0x8000_0000))
+        );
+        assert_eq!((d.recorded.as_str(), d.replayed.as_str()), ("0.0", "-0.0"));
+        assert_eq!(
+            d.to_string(),
+            "tick 7 (t = 7000 us): motors[0]: recorded 0.0 (bits 0x00000000), \
+             replayed -0.0 (bits 0x80000000)"
+        );
+        // And the other way round.
+        let d = motor_zero(-0.0, 0.0).expect("a difference");
+        assert_eq!(
+            (d.recorded_bits, d.replayed_bits),
+            (Some(0x8000_0000), Some(0))
+        );
+        // A NaN against a NaN with another payload.
+        let (a, b) = (f32::from_bits(0x7fc0_0000), f32::from_bits(0x7fc0_0001));
+        assert!(a.is_nan() && b.is_nan());
+        let d = motor_zero(a, b).expect("a difference");
+        assert_eq!(d.field, "motors[0]");
+        assert_eq!(
+            (d.recorded_bits, d.replayed_bits),
+            (Some(0x7fc0_0000), Some(0x7fc0_0001))
+        );
+        // The same NaN bits are not a difference, nor are equal numbers.
+        assert_eq!(motor_zero(a, a), None);
+        assert_eq!(motor_zero(0.25, 0.25), None);
+        assert_eq!(motor_zero(-0.0, -0.0), None);
+    }
+}
