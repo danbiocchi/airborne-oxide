@@ -208,6 +208,7 @@ dependencies = [
 name = "oxide-log"
 version = "0.1.0"
 dependencies = [
+ "oxide-core",
  "proptest",
 ]
 

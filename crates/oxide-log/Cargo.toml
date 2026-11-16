@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 [package]
 name = "oxide-log"
-description = "Airborne Oxide log format layer: ULog writer, drop-and-count logger ring, reader"
+description = "Airborne Oxide logs: the ULog format layer, the flight core's topics, the recorder, the reader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,9 @@ publish.workspace = true
 std = []
 
 [dependencies]
+# Used only by the topic layer (`topics`, `header`, `recorder`, `replay`).
+# The format layer (`msg`, `record`, `logger`, `format`, `reader`) stays free of it.
+oxide-core = { path = "../oxide-core" }
 
 [dev-dependencies]
 proptest.workspace = true
