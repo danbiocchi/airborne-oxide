@@ -567,6 +567,24 @@ fn a_record_missing_in_the_middle_of_the_file_is_a_failure_and_at_the_end_a_cut(
 }
 
 #[test]
+fn a_changed_time_in_an_outputs_record_is_a_malformed_tick() {
+    let flown = default_flight();
+    for (tick, bit) in [(1700, 0), (1700, 9), (0, 3)] {
+        let mut bytes = flown.bytes.clone();
+        let at = field_at(&flown.bytes, "oxide_out", tick, "timestamp");
+        bytes[at + bit / 8] ^= 1 << (bit % 8);
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        let Stop::Malformed { seq, why } = &r.stop else {
+            panic!("tick {tick}: {:?}", r.stop)
+        };
+        assert_eq!(*seq, Some(tick as u64));
+        assert!(why.starts_with("oxide_out has time "), "{why}");
+        assert_eq!((r.ticks, r.exit_code()), (tick as u64, 1));
+        assert!(r.identical());
+    }
+}
+
+#[test]
 fn a_changed_timestamp_in_an_event_or_a_start_record_is_not_identical() {
     let flown = default_flight();
     let f = UlogFile::parse(&flown.bytes).unwrap();
