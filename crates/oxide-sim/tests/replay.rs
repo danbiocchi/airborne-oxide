@@ -482,6 +482,90 @@ fn a_record_before_the_first_tick_is_refused_not_ignored() {
     assert_eq!(r.stop, Stop::End);
 }
 
+/// `bytes` without the bytes in `range`.
+fn without(bytes: &[u8], range: std::ops::Range<usize>) -> Vec<u8> {
+    let mut out = bytes[..range.start].to_vec();
+    out.extend_from_slice(&bytes[range.end..]);
+    out
+}
+
+/// The tick (index) an `oxide_event` record belongs to.
+fn tick_of_event(bytes: &[u8], n: usize) -> usize {
+    let f = UlogFile::parse(bytes).unwrap();
+    let us = f
+        .records("oxide_event")
+        .nth(n)
+        .unwrap()
+        .u64("timestamp")
+        .unwrap();
+    usize::try_from(us / 1000).unwrap()
+}
+
+#[test]
+fn a_record_missing_in_the_middle_of_the_file_is_a_failure_and_at_the_end_a_cut() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let events = f.records("oxide_event").count();
+    drop(f);
+    // An event from the middle of the flight, and one from the last tick of a
+    // file that ends there.
+    let mid_event = (0..events)
+        .find(|&n| tick_of_event(&flown.bytes, n) > 1000)
+        .expect("an event after tick 1000");
+    let mid_tick = tick_of_event(&flown.bytes, mid_event);
+    assert!(mid_tick < 2499, "{mid_tick}");
+    for (topic, n, tick) in [
+        ("oxide_in_imu", 1000, 1000),
+        ("oxide_out", 1000, 1000),
+        ("oxide_event", mid_event, mid_tick),
+    ] {
+        let bytes = without(&flown.bytes, message_of(&flown.bytes, topic, n));
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop, Stop::Malformed { .. }),
+            "{topic}: {:?} after {} ticks",
+            r.stop,
+            r.ticks
+        );
+        assert_eq!((r.ticks, r.exit_code()), (tick as u64, 1), "{topic}");
+        assert!(r.identical(), "{topic}");
+    }
+    // The same deletion in the last tick of the file is what a cut looks like.
+    let last = 2499;
+    for topic in ["oxide_in_imu", "oxide_out"] {
+        let bytes = without(&flown.bytes, message_of(&flown.bytes, topic, last));
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert_eq!(
+            (r.ticks, &r.stop, r.exit_code()),
+            (last as u64, &Stop::Cut, 0),
+            "{topic}"
+        );
+    }
+    // An event: the file ends with the tick that holds it.
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let end = f
+        .records("oxide_in_tick")
+        .nth(mid_tick + 1)
+        .unwrap()
+        .offset();
+    drop(f);
+    let bytes = without(
+        &flown.bytes[..end],
+        message_of(&flown.bytes, "oxide_event", mid_event),
+    );
+    let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(
+        (r.ticks, &r.stop, r.exit_code()),
+        (mid_tick as u64, &Stop::Cut, 0)
+    );
+    // With the event there the tick replays and the file is whole.
+    let r = replay(&flown.bytes[..end], &ReplayOptions::default()).unwrap();
+    assert_eq!(
+        (r.ticks, &r.stop, r.exit_code()),
+        (mid_tick as u64 + 1, &Stop::End, 0)
+    );
+}
+
 #[test]
 fn a_changed_timestamp_in_an_event_or_a_start_record_is_not_identical() {
     let flown = default_flight();
