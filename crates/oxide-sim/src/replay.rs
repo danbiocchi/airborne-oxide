@@ -61,6 +61,9 @@ pub enum ReplayError {
     UnknownProfile(Option<String>),
     /// The boot record's rates are not the named profile's.
     ProfileMismatch(&'static str),
+    /// A start record (`oxide_vehicle`, `oxide_param_us`) is not stamped with
+    /// the time of the `oxide_boot` record.
+    StartTime(&'static str),
     /// The vehicle has another rotor count than this build flies.
     Rotors(u8),
     /// The vehicle numbers and parameters do not rebuild the configuration
@@ -96,6 +99,9 @@ impl fmt::Display for ReplayError {
                 f,
                 "the boot record's rates are not those of profile {p} in this build"
             ),
+            ReplayError::StartTime(topic) => {
+                write!(f, "{topic} has another timestamp than oxide_boot")
+            }
             ReplayError::Rotors(n) => write!(
                 f,
                 "the vehicle has {n} rotors; this build replays vehicles with {ROTORS}"
@@ -203,12 +209,14 @@ impl ReplayReport {
     }
 
     /// The command's exit code: 0 when every tick replayed is identical and
-    /// the walk ended at the end of the file or in a cut; 1 on a difference
+    /// the walk ended at the end of the file or in a cut, and at least one tick
+    /// was replayed; 1 on a difference
     /// or a gap, a missing sequence number or a malformed tick (nothing after
     /// those can be proven).
     pub fn exit_code(&self) -> u8 {
         match (&self.stop, self.identical()) {
-            (Stop::End | Stop::Cut, true) => 0,
+            // A replay of no tick shows nothing.
+            (Stop::End | Stop::Cut, true) if self.ticks > 0 => 0,
             _ => 1,
         }
     }
@@ -287,7 +295,13 @@ pub fn replay_file(file: &UlogFile, options: &ReplayOptions) -> Result<ReplayRep
     let (Some(boot), None) = (boots.next(), boots.next()) else {
         return Err(ReplayError::NoBoot(file.records("oxide_boot").count()));
     };
+    let boot_time = boot.u64("timestamp");
     let boot = decode::decode_boot(&boot).map_err(ReplayError::Boot)?;
+    for topic in ["oxide_vehicle", "oxide_param_us"] {
+        if file.records(topic).any(|r| r.u64("timestamp") != boot_time) {
+            return Err(ReplayError::StartTime(topic));
+        }
+    }
     let name = file.info_str("oxide_profile");
     let profile = name
         .and_then(profile_named)
@@ -376,6 +390,16 @@ fn read_group<'a>(tick: &RecordView<'a>, data: &[RecordView<'a>]) -> Group {
         }
     }
     let want = usize::from(out.events);
+    if data
+        .iter()
+        .filter(|r| r.topic() == "oxide_event")
+        .any(|r| r.u64("timestamp") != Some(tk.t.0))
+    {
+        return bad(format!(
+            "oxide_event has another time than the tick at {}",
+            tk.t.0
+        ));
+    }
     if events.len() < want {
         return Group::Incomplete;
     }
@@ -409,6 +433,32 @@ impl Walk {
         let first = ticks.first().copied().unwrap_or(file.items.len());
         if let Some(ms) = file.items.iter().take(first).find_map(dropout) {
             self.report.stop = Stop::Dropout { ms };
+            return;
+        }
+        // Replay records belong to a tick's group; before the first tick only
+        // the start records (vehicle, parameters, boot) may be.
+        for item in file.items.iter().take(first) {
+            if let Item::Data(r) = item {
+                let topic = file.view(r).topic();
+                if topic.starts_with("oxide_in_") || topic == "oxide_out" || topic == "oxide_event"
+                {
+                    self.report.stop = Stop::Malformed {
+                        seq: None,
+                        why: format!("{topic} record before the first tick"),
+                    };
+                    return;
+                }
+            }
+        }
+        if ticks.is_empty() {
+            self.report.stop = if file.truncated.is_some() {
+                Stop::Cut
+            } else {
+                Stop::Malformed {
+                    seq: None,
+                    why: "the file has no ticks".to_string(),
+                }
+            };
             return;
         }
         let mut expected: u64 = 0;

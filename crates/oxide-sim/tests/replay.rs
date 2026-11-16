@@ -436,6 +436,154 @@ fn a_ring_too_small_makes_a_gap_and_the_replay_stops_there() {
     );
 }
 
+/// The whole message (header, id, payload) of record `n` of `topic`.
+fn message_of(bytes: &[u8], topic: &str, n: usize) -> std::ops::Range<usize> {
+    let f = UlogFile::parse(bytes).unwrap();
+    let at = f.records(topic).nth(n).unwrap().offset();
+    let size = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    at..at + 3 + size
+}
+
+/// `bytes` with a copy of `topic`'s record `n` inserted before the first tick record.
+fn with_stray_before_first_tick(bytes: &[u8], topic: &str, n: usize) -> Vec<u8> {
+    let copy = bytes[message_of(bytes, topic, n)].to_vec();
+    let first = message_of(bytes, "oxide_in_tick", 0).start;
+    let mut out = bytes[..first].to_vec();
+    out.extend_from_slice(&copy);
+    out.extend_from_slice(&bytes[first..]);
+    out
+}
+
+/// The offset in the file of field `field` of record `n` of `topic`.
+fn field_at(bytes: &[u8], topic: &str, n: usize, field: &str) -> usize {
+    let f = UlogFile::parse(bytes).unwrap();
+    let r = f.records(topic).nth(n).unwrap();
+    let inner = r.field_bytes(field).unwrap().as_ptr() as usize - r.raw().as_ptr() as usize;
+    r.offset() + 5 + inner
+}
+
+#[test]
+fn a_record_before_the_first_tick_is_refused_not_ignored() {
+    let flown = default_flight();
+    for topic in ["oxide_event", "oxide_out", "oxide_in_imu", "oxide_in_state"] {
+        let bytes = with_stray_before_first_tick(&flown.bytes, topic, 0);
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop, Stop::Malformed { seq: None, .. }),
+            "{topic}: {:?} after {} ticks",
+            r.stop,
+            r.ticks
+        );
+        assert_eq!(r.exit_code(), 1, "{topic}");
+        assert_eq!(r.ticks, 0, "{topic}");
+    }
+    // The start records are the ones that belong there.
+    let r = replay(&flown.bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(r.stop, Stop::End);
+}
+
+#[test]
+fn a_changed_timestamp_in_an_event_or_a_start_record_is_not_identical() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    assert!(f.records("oxide_event").count() > 0);
+    drop(f);
+    for (topic, n) in [
+        ("oxide_event", 0),
+        ("oxide_boot", 0),
+        ("oxide_vehicle", 0),
+        ("oxide_param_us", 0),
+    ] {
+        let mut bytes = flown.bytes.clone();
+        bytes[field_at(&flown.bytes, topic, n, "timestamp")] ^= 1;
+        match replay(&bytes, &ReplayOptions::default()) {
+            Err(ReplayError::StartTime(_)) => assert_ne!(topic, "oxide_event"),
+            Ok(r) => {
+                assert_eq!(topic, "oxide_event");
+                assert!(matches!(r.stop, Stop::Malformed { .. }), "{:?}", r.stop);
+                assert_eq!(r.exit_code(), 1, "{topic}");
+            }
+            Err(e) => panic!("{topic}: {e}"),
+        }
+    }
+}
+
+#[test]
+fn a_log_with_no_tick_proves_nothing() {
+    let flown = default_flight();
+    let first = message_of(&flown.bytes, "oxide_in_tick", 0).start;
+    let r = replay(&flown.bytes[..first], &ReplayOptions::default()).unwrap();
+    assert_eq!(r.ticks, 0);
+    assert_ne!(r.exit_code(), 0);
+    assert!(
+        r.lines().iter().any(|l| l.contains("no ticks")),
+        "{:?}",
+        r.lines()
+    );
+}
+
+#[test]
+fn every_recorded_output_field_is_named_when_it_differs() {
+    let flown = default_flight();
+    let tick = 1700;
+    let fields = [
+        "t_valid",
+        "timing_faults",
+        "rejected",
+        "resets",
+        "reasons",
+        "prearm",
+        "armed",
+        "killed",
+        "saturated",
+        "no_estimate",
+        "aligned",
+        "gps_aiding",
+        "valid_attitude",
+        "valid_heading",
+        "valid_altitude",
+        "valid_velocity",
+        "valid_position",
+        "home_set",
+        "params_unsaved",
+        "mode",
+        "nav",
+        "action",
+    ];
+    for field in fields {
+        let mut bytes = flown.bytes.clone();
+        let at = field_at(&flown.bytes, "oxide_out", tick, field);
+        bytes[at] ^= 1;
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        let d = r
+            .first_difference
+            .unwrap_or_else(|| panic!("{field}: no difference, stop {:?}", r.stop));
+        assert_eq!((d.seq, d.field.as_str()), (tick as u64, field), "{d}");
+    }
+}
+
+#[test]
+fn a_changed_event_payload_is_named_events_n() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let r0 = f.records("oxide_event").next().unwrap();
+    let (start, len) = (r0.offset() + 5, r0.raw().len());
+    drop(f);
+    // Flip a bit in each byte after the timestamp: whichever decodes and
+    // differs is named events[..], never a generic "outputs".
+    let mut named = 0;
+    for k in 8..len {
+        let mut bytes = flown.bytes.clone();
+        bytes[start + k] ^= 1;
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        if let Some(d) = r.first_difference {
+            assert!(d.field.starts_with("events["), "byte {k}: {d}");
+            named += 1;
+        }
+    }
+    assert!(named > 0);
+}
+
 // ---- whole flights of the simulator ----
 
 mod flights {
