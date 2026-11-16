@@ -217,6 +217,7 @@ name = "oxide-sim"
 version = "0.1.0"
 dependencies = [
  "oxide-core",
+ "oxide-log",
  "oxide-store",
  "serde",
  "toml",

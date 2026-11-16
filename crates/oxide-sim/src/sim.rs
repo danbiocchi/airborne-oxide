@@ -25,6 +25,7 @@ use crate::battery::Battery;
 use crate::faults::{
     BRAIN_HEARTBEAT_PERIOD_US, Fault, FaultKind, GCS_HEARTBEAT_PERIOD_US, LinkConfig, active_at,
 };
+use crate::flight_log::{FlightLog, Level, LogBuild, LogError, LogWriter, Stats};
 use crate::hash::TraceHash;
 use crate::rng::{Rng, Stream};
 use crate::scenario::Pilot;
@@ -304,6 +305,10 @@ pub struct Simulation<P: Pilot, const N: usize> {
     next_param_set: Option<ParamSet>,
     /// An acknowledgement of a parameter fault for the next tick's inputs.
     next_param_ack: bool,
+    /// What the boot step's load of stored parameters reported.
+    load_report: LoadReport,
+    /// The log, once started.
+    log: Option<FlightLog>,
 }
 
 impl<P: Pilot, const N: usize> Simulation<P, N> {
@@ -398,6 +403,8 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             last_inputs: Inputs::default(),
             next_param_set: None,
             next_param_ack: false,
+            load_report: report,
+            log: None,
         })
     }
 
@@ -437,6 +444,51 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     pub fn queue_param_ack(&mut self) {
         self.next_param_ack = true;
     }
+    /// The report of the stored-parameter load that the boot step returned
+    /// (the value given to `Core::report_param_load` before the first tick).
+    pub fn load_report(&self) -> LoadReport {
+        self.load_report
+    }
+
+    /// Starts a log: writes its header to `writer` and, from then on, hands
+    /// every tick to the recorder and drains the ring to the writer. Only
+    /// before the first tick, and once. The replay level is refused until it
+    /// is built. A writer that fails later never changes the flight;
+    /// [`finish_log`](Self::finish_log) returns the first error.
+    pub fn start_log(
+        &mut self,
+        level: Level,
+        build: &LogBuild,
+        writer: LogWriter,
+    ) -> Result<(), LogError> {
+        if self.log.is_some() {
+            return Err(LogError::AlreadyStarted);
+        }
+        if self.tick != 0 {
+            return Err(LogError::AfterFirstTick);
+        }
+        let log = FlightLog::start(
+            level,
+            build,
+            self.core.profile().name,
+            self.core.config(),
+            writer,
+        )?;
+        self.log = Some(log);
+        Ok(())
+    }
+
+    /// The logger's counters, or `None` when there is no log.
+    pub fn log_stats(&self) -> Option<Stats> {
+        self.log.as_ref().map(FlightLog::stats)
+    }
+
+    /// Flushes the log and returns its writer, or the first I/O error. The
+    /// simulation has no log afterwards.
+    pub fn finish_log(&mut self) -> Result<LogWriter, LogError> {
+        self.log.take().ok_or(LogError::NotStarted)?.finish()
+    }
+
     pub fn sensors(&self) -> &SensorSuite<N> {
         &self.sensors
     }
@@ -505,6 +557,9 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
 
         // 2. Core tick.
         let out = self.core.tick(t, &inputs);
+        if let Some(log) = self.log.as_mut() {
+            log.record(t, &inputs, &out, &self.core.telemetry(), self.core.config());
+        }
 
         // 3. Physics over [t, t + base] with the command valid at t.
         if let Some(p) = self.pending.take() {
