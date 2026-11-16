@@ -57,3 +57,26 @@ fn the_hash_is_the_commit_and_dirty_is_marked() {
     assert_eq!(build_script::hash_of(&dir), format!("{h}-dirty"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Without git, or outside a repository, the hash is `unknown`, nothing is
+/// watched, and the build is not failed.
+#[test]
+fn outside_a_repository_the_hash_is_unknown_and_nothing_is_watched() {
+    let dir = std::env::temp_dir().join(format!("oxide-build-rs-none-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Not a repository, even if a parent directory were one.
+    let ok = !Command::new("git")
+        .current_dir(&dir)
+        .env("GIT_CEILING_DIRECTORIES", &dir)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(ok, "the test directory is inside a repository");
+    assert_eq!(build_script::hash_of(&dir), "unknown");
+    assert!(build_script::watched(&dir).is_empty());
+    // A repository without a commit has no hash either.
+    git(&dir, &["init", "-q"]);
+    assert_eq!(build_script::hash_of(&dir), "unknown");
+    let _ = std::fs::remove_dir_all(dir);
+}
