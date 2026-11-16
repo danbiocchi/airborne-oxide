@@ -451,6 +451,13 @@ mod decode {
         fn need<T>(v: Option<T>, name: &'static str) -> Result<T, EventError> {
             v.ok_or(EventError::Missing(name))
         }
+        // A flag is one byte, 0 or 1: any other value is not what we write.
+        let flag = |name: &'static str| match r.field_bytes(name).and_then(|b| b.first()) {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(_) => Err(EventError::NotCanonical),
+            None => Err(EventError::Missing(name)),
+        };
         Ok(EventFields {
             event_time: need(r.u64("event_time"), "event_time")?,
             param_key: need(r.u32("param_key"), "param_key")?,
@@ -465,8 +472,8 @@ mod decode {
             code_b: need(r.u8("code_b"), "code_b")?,
             why: need(r.u8("why"), "why")?,
             why_detail: need(r.u8("why_detail"), "why_detail")?,
-            invalid: need(r.bool("invalid"), "invalid")?,
-            unreadable: need(r.bool("unreadable"), "unreadable")?,
+            invalid: flag("invalid")?,
+            unreadable: flag("unreadable")?,
         })
     }
 

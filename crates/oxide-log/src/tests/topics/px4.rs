@@ -133,7 +133,7 @@ pub(super) fn all_samples() -> Vec<Vec<u8>> {
         current_a: 15.5,
     };
     put("battery_status", &mut |w| {
-        topics::battery_status(w, now, &bat, false, false, &sc)
+        topics::battery_status(w, now, &bat, None, false, false, &sc)
     });
     put("vehicle_status", &mut |w| {
         topics::vehicle_status(w, now, &status)
@@ -773,7 +773,7 @@ fn battery(low: bool, critical: bool) -> crate::reader::UlogFile {
         current_a: 15.5,
     };
     one_record(topic("battery_status"), |w| {
-        topics::battery_status(w, Micros(60_000), &s, low, critical, &scales())
+        topics::battery_status(w, Micros(60_000), &s, None, low, critical, &scales())
     })
 }
 
@@ -999,4 +999,78 @@ fn failsafe_flags_map_what_has_a_counterpart() {
         &r,
         &[("angular_velocity_invalid", 1), ("attitude_invalid", 1)],
     );
+}
+
+#[test]
+fn failsafe_flags_tell_velocity_from_position() {
+    let flags = |valid: Validity| {
+        let s = Status {
+            valid,
+            ..Status::default()
+        };
+        let f = one_record(topic("failsafe_flags"), |w| {
+            topics::failsafe_flags(w, Micros(80_000), &s)
+        });
+        let r = f.records("failsafe_flags").next().unwrap();
+        [
+            int(&r, "local_position_invalid"),
+            int(&r, "local_position_invalid_relaxed"),
+            int(&r, "local_velocity_invalid"),
+        ]
+    };
+    let velocity_only = Validity {
+        velocity: true,
+        position: false,
+        ..Validity::NONE
+    };
+    assert_eq!(flags(velocity_only), [1, 1, 0]);
+    let position_only = Validity {
+        velocity: false,
+        position: true,
+        ..Validity::NONE
+    };
+    assert_eq!(flags(position_only), [0, 0, 1]);
+}
+
+#[test]
+fn local_position_heading_follows_the_heading_validity_not_the_attitude() {
+    let heading = |valid: Validity| {
+        let f = local_position(valid, true);
+        let r = f.records("vehicle_local_position").next().unwrap();
+        int(&r, "heading_good_for_control")
+    };
+    let attitude_only = Validity {
+        attitude: true,
+        heading: false,
+        ..Validity::NONE
+    };
+    assert_eq!(heading(attitude_only), 0);
+    let heading_only = Validity {
+        attitude: false,
+        heading: true,
+        ..Validity::NONE
+    };
+    assert_eq!(heading(heading_only), 1);
+}
+
+#[test]
+fn battery_status_carries_the_filtered_cell_voltage_per_cell() {
+    let s = BatterySample {
+        voltage_v: 22.2,
+        current_a: 15.5,
+    };
+    let f = one_record(topic("battery_status"), |w| {
+        topics::battery_status(w, Micros(60_000), &s, Some(3.7), false, false, &scales())
+    });
+    let r = f.records("battery_status").next().unwrap();
+    floats(
+        &r,
+        &[
+            ("voltage_cell_v[0]", 3.7),
+            ("voltage_cell_v[5]", 3.7),
+            ("voltage_cell_v[6]", 0.0),
+            ("voltage_cell_v[13]", 0.0),
+        ],
+    );
+    assert_eq!(r.raw().len(), 166);
 }

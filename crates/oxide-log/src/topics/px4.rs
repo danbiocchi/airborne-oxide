@@ -554,7 +554,10 @@ const fn battery_warning(low: bool, critical: bool) -> u8 {
     }
 }
 
-/// `battery_status` from the battery sample and the monitor's two latches.
+/// `battery_status` from the battery sample, the core's filtered per-cell
+/// voltage (`Telemetry::battery_cell_v`, V) and the monitor's two latches.
+/// The core holds one per-cell value, so `voltage_cell_v[0..cell_count]` all
+/// carry it (0 when `cell_v` is `None`; cells beyond the count are 0).
 /// `nominal_voltage` is the configuration's, `cell_count` its cell count,
 /// `internal_resistance_estimate` the pack resistance per cell (Ω); `id` is 1
 /// (PX4 counts from 1), `connected` is true (a sample exists), `warning` is
@@ -562,8 +565,7 @@ const fn battery_warning(low: bool, critical: bool) -> u8 {
 ///
 /// Unknown, written as the `@invalid` value of PX4's message: −1 for
 /// `current_average_a`, `discharged_mah`, `remaining`, `scale`; NaN for
-/// `time_remaining_s`, `temperature`, `remaining_capacity_wh`; 0 for
-/// `voltage_cell_v`. Written 0: `max_cell_voltage_delta`,
+/// `time_remaining_s`, `temperature`, `remaining_capacity_wh`. Written 0: `max_cell_voltage_delta`,
 /// `full_charge_capacity_wh`, the `ocv_*`, `volt_based_soc_estimate`,
 /// `voltage_prediction`, `prediction_error`, `estimation_covariance_norm`,
 /// `capacity`, `cycle_count`, `average_time_to_empty`, `manufacture_date`,
@@ -574,6 +576,7 @@ pub fn battery_status<S: Sink + ?Sized>(
     w: &mut RecordWriter<'_, S>,
     now: Micros,
     b: &BatterySample,
+    cell_v: Option<f32>,
     low: bool,
     critical: bool,
     scales: &Scales,
@@ -581,7 +584,14 @@ pub fn battery_status<S: Sink + ?Sized>(
     w.u64(now.0).f32(b.voltage_v).f32(b.current_a);
     w.f32(-1.0).f32(-1.0).f32(-1.0).f32(-1.0); // current_average_a, discharged_mah, remaining, scale
     w.f32(f32::NAN).f32(f32::NAN); // time_remaining_s, temperature
-    w.pad(14 * 4); // voltage_cell_v
+    // voltage_cell_v: the filtered per-cell voltage, repeated for each cell.
+    let cells = usize::from(scales.battery_cells).min(14);
+    for i in 0..14 {
+        w.f32(match cell_v {
+            Some(v) if i < cells => v,
+            _ => 0.0,
+        });
+    }
     w.f32(0.0).f32(0.0); // max_cell_voltage_delta, full_charge_capacity_wh
     w.f32(f32::NAN); // remaining_capacity_wh
     w.f32(scales.nominal_voltage_v)

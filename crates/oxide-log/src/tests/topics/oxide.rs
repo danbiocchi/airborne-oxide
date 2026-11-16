@@ -904,3 +904,34 @@ fn the_quad_is_a_valid_configuration() {
     // The configuration the header tests use.
     assert!(quad().validate().is_ok());
 }
+
+#[test]
+fn a_flag_byte_other_than_zero_or_one_is_refused() {
+    let fields = base(EventKind::ParamLoadFault(LoadReport::default()));
+    for (invalid, unreadable) in [(2u8, 0u8), (0, 2), (255, 1)] {
+        let f = log_of(|out| {
+            record::data(out, 0, &OXIDE_EVENT, |w| {
+                w.u64(5).u64(fields.event_time).u32(fields.param_key);
+                w.u16(fields.param_index)
+                    .u16(fields.mask)
+                    .u16(fields.applied)
+                    .u16(fields.unknown)
+                    .u16(fields.dropped)
+                    .u16(fields.torn);
+                w.u8(fields.kind)
+                    .u8(fields.code_a)
+                    .u8(fields.code_b)
+                    .u8(fields.why)
+                    .u8(fields.why_detail);
+                w.u8(invalid).u8(unreadable);
+            })
+            .unwrap();
+        });
+        let r = f.records("oxide_event").next().unwrap();
+        assert_eq!(
+            decode_event(&r),
+            Err(EventError::NotCanonical),
+            "{invalid} {unreadable}"
+        );
+    }
+}
