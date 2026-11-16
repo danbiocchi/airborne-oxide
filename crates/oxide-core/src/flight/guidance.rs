@@ -2,7 +2,7 @@
 //! The guidance task: turns the navigation state, the sticks and the
 //! setpoints into an attitude and thrust target (ADR-0003 §2).
 
-use super::{Core, POSITION_LEASH_M, deadband, leash};
+use super::{Core, POSITION_LEASH_M, Setpoints, deadband, leash};
 use crate::control::{AttitudeTarget, Horizontal, Vertical, Yaw};
 use crate::io::{NavState, RcSample, Validity};
 use crate::math::{Quat, Real, Vec3, wrap_pi};
@@ -35,7 +35,7 @@ const RTL_LEASH_M: f32 = 3.0;
 /// demanding tilt and with it thrust, and the vertical loop's integral limit
 /// stops the thrust at about 40 %, so thrust says nothing about contact.
 /// How long the descent command must stand without motion, s.
-const LAND_CONTACT_S: f32 = 0.5;
+pub(super) const LAND_CONTACT_S: f32 = 0.5;
 /// A landing with neither height nor vertical speed first descends on the
 /// estimator's inertial vertical speed alone. The accelerometer's vertical
 /// bias was calibrated by the barometer before it failed, so that speed
@@ -67,7 +67,7 @@ pub(super) struct GuidanceState {
     last_nav: Option<NavState>,
     pub(super) rtl: RtlPhase,
     /// How long a commanded descent has been standing still, s.
-    contact_s: f32,
+    pub(super) contact_s: f32,
     /// How long a landing has been flying blind (no height, no vertical
     /// speed), s.
     blind_s: f32,
@@ -153,6 +153,7 @@ impl<const N: usize> Core<N> {
             self.position_ctrl.reset();
             self.guide_state.last_nav = None;
             self.guidance.pending = AttitudeTarget::default();
+            self.setpoints = None;
             return;
         };
         let v = est.valid;
@@ -175,6 +176,7 @@ impl<const N: usize> Core<N> {
                 attitude: state.attitude,
                 thrust_n: 0.0,
             };
+            self.setpoints = None;
             return;
         }
 
@@ -494,6 +496,15 @@ impl<const N: usize> Core<N> {
         g.prev_valid = v;
         g.prev_resets = est.resets;
         self.guide_state = g;
+        let flown = self.position_ctrl.report();
+        self.setpoints = Some(Setpoints {
+            position: g.position_sp,
+            velocity: flown.velocity_sp,
+            yaw: g.yaw_sp,
+            horizontal: flown.horizontal,
+            vertical: flown.vertical,
+            yaw_form: flown.yaw,
+        });
         self.guidance.pending = target;
     }
 

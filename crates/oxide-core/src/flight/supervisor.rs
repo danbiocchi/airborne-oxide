@@ -61,8 +61,8 @@ pub(super) struct SupervisorState {
     /// Set by a `Terminated` failsafe; cleared when the arm switch is
     /// released on a valid frame.
     terminated_latch: bool,
-    battery: BatteryMonitor,
-    land: LandDetector,
+    pub(super) battery: BatteryMonitor,
+    pub(super) land: LandDetector,
     control: ControlMonitor,
     failsafe: Failsafe,
     prev_reasons: Reasons,

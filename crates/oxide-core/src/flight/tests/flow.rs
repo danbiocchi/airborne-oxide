@@ -1934,3 +1934,145 @@ fn an_estimator_reset_re_bases_the_setpoints_even_if_the_flags_never_dropped() {
         assert!((g.position_sp.y - 6.0).abs() < 1e-6, "{nav:?}");
     }
 }
+
+// ---- read-only telemetry (M1c part three, K1) ----
+
+/// A climb and a landing in Position mode on the vertical world: arm on the
+/// ground, climb with the throttle stick, hold, command a descent until the
+/// vehicle is on the ground again, then disarm.
+/// `after_tick` runs after every tick.
+fn telemetry_flight(rig: &mut Rig, mut after_tick: impl FnMut(&mut Rig)) -> Vec<Outputs<4>> {
+    let mut outs = Vec::new();
+    let mut go = |rig: &mut Rig, ticks: u64, outs: &mut Vec<Outputs<4>>| {
+        for _ in 0..ticks {
+            rig.step();
+            after_tick(rig);
+            outs.push(rig.out);
+        }
+    };
+    rig.rc.arm_switch = false;
+    go(rig, 1200, &mut outs);
+    rig.rc.arm_switch = true;
+    go(rig, 300, &mut outs);
+    rig.rc.throttle = 0.75;
+    go(rig, 1500, &mut outs);
+    rig.rc.throttle = 0.5;
+    go(rig, 800, &mut outs);
+    rig.rc.throttle = 0.2;
+    go(rig, 3000, &mut outs);
+    // Sitting on the ground: the pilot disarms.
+    rig.rc.arm_switch = false;
+    rig.rc.throttle = 0.0;
+    go(rig, 300, &mut outs);
+    outs
+}
+
+fn telemetry_rig() -> Rig {
+    let mut rig = Rig::external(1);
+    rig.state = Some(StateSample::default());
+    rig.world = true;
+    rig
+}
+
+#[test]
+fn reading_telemetry_changes_nothing() {
+    let mut plain = telemetry_rig();
+    let mut watched = telemetry_rig();
+    let a = telemetry_flight(&mut plain, |_| {});
+    let mut seen = 0_u32;
+    let b = telemetry_flight(&mut watched, |r| {
+        let t = r.core.telemetry();
+        // Reading twice gives the same thing.
+        assert_eq!(t, r.core.telemetry());
+        seen += 1;
+    });
+    assert!(seen > 6000);
+    assert_eq!(a.len(), b.len());
+    // The flight must have armed, climbed and landed for the comparison to
+    // mean anything.
+    assert!(a.iter().any(|o| o.status.armed));
+    assert!(a.iter().any(|o| o.motors.iter().any(|m| *m > 0.5)));
+    for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert_eq!(x.t_valid, y.t_valid, "tick {k}");
+        for (m, n) in x.motors.iter().zip(y.motors.iter()) {
+            assert_eq!(m.to_bits(), n.to_bits(), "tick {k}");
+        }
+        assert_eq!(x.status, y.status, "tick {k}");
+        assert_eq!(x.events, y.events, "tick {k}");
+    }
+    assert_eq!(plain.core.ticks, watched.core.ticks);
+}
+
+#[test]
+fn telemetry_fields_equal_the_values_they_mirror() {
+    use crate::control::{HorizontalForm, VerticalForm, YawForm};
+    let mut rig = telemetry_rig();
+    let mut moments = 0_u32;
+    let mut saw_contact = false;
+    let mut saw_airborne = false;
+    let mut saw_forms = (false, false);
+    telemetry_flight(&mut rig, |r| {
+        let t = r.core.telemetry();
+        let c = &r.core;
+        // The published estimate and its validity.
+        assert_eq!(t.estimate, c.estimate.visible.state);
+        assert_eq!(t.valid, c.estimate.visible.valid);
+        if t.valid.attitude {
+            assert_eq!(t.estimate, c.estimate());
+        }
+        // The attitude target is the published guidance output, the rate
+        // target the published attitude output.
+        assert_eq!(t.attitude_target, c.guidance.visible.attitude);
+        assert_eq!(t.thrust_target_n, c.guidance.visible.thrust_n);
+        assert_eq!(t.rate_target, c.attitude.visible.rate);
+        // The rate loop's command: thrust is what the mixer was given, and
+        // the saturation flag is the one in the status.
+        assert_eq!(t.rate_command.saturated, r.out.status.saturated);
+        if r.out.status.armed {
+            assert_eq!(t.rate_command.thrust_n, c.attitude.visible.thrust_n);
+            assert!(t.rate_command.thrust_n.is_finite());
+        } else {
+            assert_eq!(t.rate_command, RateCommand::default());
+        }
+        // Landing flags and the filter.
+        assert_eq!(t.landed, c.sup_state.land.landed());
+        assert_eq!(t.gyro_filtered, c.gyro_filtered);
+        saw_contact |= t.ground_contact && r.out.status.armed;
+        saw_airborne |= !t.landed && r.out.status.armed;
+        // Battery: the monitor's values and the last sample.
+        assert_eq!(t.battery_cell_v, c.sup_state.battery.cell_voltage());
+        assert_eq!(t.battery_low, c.sup_state.battery.low());
+        assert_eq!(t.battery_critical, c.sup_state.battery.critical());
+        assert_eq!(t.battery_voltage_v, c.battery.map(|b| b.value.voltage_v));
+        assert_eq!(t.battery_current_a, c.battery.map(|b| b.value.current_a));
+        assert_eq!(t.events_dropped, c.events_dropped());
+        // Setpoints: present while guidance flies.
+        if let Some(s) = t.setpoints {
+            assert_eq!(s.position, c.guide_state.position_sp);
+            assert_eq!(s.yaw, c.guide_state.yaw_sp);
+            saw_forms.0 |= s.horizontal == HorizontalForm::Position;
+            saw_forms.1 |= s.vertical == VerticalForm::Position && s.yaw_form == YawForm::Heading;
+        }
+        moments += 1;
+    });
+    assert!(moments > 6000);
+    assert!(saw_contact, "the landing must reach ground contact");
+    assert!(saw_airborne, "armed and not landed while flying");
+    assert!(!rig.out.status.armed, "{:?}", rig.out.status);
+    assert!(rig.core.telemetry().landed);
+    assert!(saw_forms.0 && saw_forms.1, "forms seen: {saw_forms:?}");
+}
+
+#[test]
+fn telemetry_before_the_first_tick_is_empty() {
+    let core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    let t = core.telemetry();
+    assert_eq!(t.estimate, None);
+    assert_eq!(t.valid, Validity::NONE);
+    assert_eq!(t.setpoints, None);
+    assert_eq!(t.rate_command, RateCommand::default());
+    assert_eq!(t.battery_cell_v, None);
+    assert_eq!(t.battery_voltage_v, None);
+    assert!(!t.ground_contact && !t.landed);
+    assert_eq!(t.events_dropped, 0);
+}
