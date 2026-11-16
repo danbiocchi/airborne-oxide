@@ -62,7 +62,7 @@ What has no PX4 counterpart goes in our own topics: `oxide_status` (validity fla
   - Its level is emergency for a termination and for loss of control; warning for a raised reason, a refused arming, a refused parameter and a parameter-load fault; information for the rest.
   - The record carries the event exactly: its time, its kind by a fixed code, and its payload as numbers, with a parameter identified by its stable key.
   - A changed parameter is also written as a parameter message with its new value.
-- **Decimation is by time, on the tick clock**, so the same flight gives the same file. A topic's next time moves along its own period, so a pause gives one record, not a burst. The first record is written on the first tick that has the data.
+- **Decimation is by time, on the tick clock**, so the same flight gives the same file. A topic's next time moves along its own period, so a pause gives one record, not a burst. The first record is written on the first tick that has the data: the topics made from the estimate start with the first estimate, about one second after start-up.
 - **"On change" means a change in a field the topic carries.** A status topic is also written one second after its last record.
 
 The core gains one read-only accessor, `Core::telemetry()`, for values it computes and did not expose: the attitude and rate targets, the thrust and torque the rate loop commands, the position and velocity setpoints, the landed flag. Reading it changes nothing.
@@ -82,22 +82,26 @@ A replay log is a normal log plus an exact record of the core's boundary.
   - the exact microseconds of the ten duration parameters (`oxide_param_us`). A parameter message holds a duration as `f32` seconds, which names the microsecond only up to 16 s;
   - the profile's name and rates, and the report of the stored-parameter load.
 
-  With the 93 parameters that is the whole configuration. A file whose values do not rebuild exactly one configuration is refused, with the parameter named: a replay never runs against a configuration that is nearly the one flown.
-- **Every tick:** a tick record with the time, a sequence number and which inputs are present; then one record per input present, with both of its time stamps and its values as the exact bits; then the outputs record (motor commands, every status field, the number of events).
+  These are data records, written right after the subscriptions. With the 93 parameters that is the whole configuration. A file whose values do not rebuild exactly one configuration is refused, with the parameter named: a replay never runs against a configuration that is nearly the one flown. The same check runs when a replay-level log is started, so a configuration that could not be replayed is refused before the flight, not after it. A record carries at most eight motors.
+- **Every tick, in this order:** a tick record (`oxide_in_tick`) with the time, a sequence number and which inputs are present; one record per input present, with both of its time stamps and its values as the exact bits; the outputs record (`oxide_out`: motor commands, every status field, the number of events); then the tick's events and the normal level's records. The replay topics take the message ids after the normal level's twenty.
 - **Events:** the `oxide_event` records of the normal level already carry each event exactly, so the replay level has no second event topic. The outputs record says how many belong to its tick.
-- **Between ticks:** the store's "saved" call is recorded as a marker on the next tick.
+- **Between ticks:** the store's "saved" call is a marker on the next tick record. The logger does not intercept the call. It sees that the core's unsaved flag was set after one tick and is clear before the next, and nothing else clears it. A call that changes nothing (the flag already clear, or the vehicle armed) leaves no marker and needs none.
 - **Parameter changes** are recorded by the parameter's stable key, not its position in the table. A change to a parameter this build does not have is recorded as such, so the core's refusal replays too.
 - **A damaged record is refused, not read as something else:** a flag byte that is neither 0 nor 1, a code no table knows, a set bit no flag owns.
 
-`oxide-sim replay FILE.ulg` rebuilds the core from the header, feeds it the recorded ticks in order, and compares each output with the recorded one bit for bit. It reports the number of ticks replayed and that they were identical, or the first tick that differs, which value, and both versions. It exits non-zero on a difference.
+`oxide-sim replay FILE.ulg` rebuilds the core from the file, feeds it the recorded ticks in order, and compares each output with the recorded one bit for bit. It reports the number of ticks replayed and that they were identical, or the first tick that differs, which field, and both values.
 
 - **Exact means bits.** Floats are compared as bit patterns, so a negative zero or a NaN payload counts.
-- **A gap ends the proof.** A replay log with a dropout cannot be replayed past it: the tool replays up to the gap and says so.
-- **Replay through changed code is the point.** After a change to the core, a difference is the answer, and the tool shows where the behaviour first departs.
+- **A gap ends the proof.** The tool replays up to the gap, says what it found and exits with 1. A gap is a dropout, a missing sequence number, or a tick whose records are not all there or contradict each other. So is a replay record that belongs to no tick, and an event or start record stamped with another time than its tick or its start.
+- **A file cut short by a power loss is not a gap.** That is how the log of a crash ends. The ticks before the cut are replayed, and the output says the file ends in a cut.
+- **A file with no tick proves nothing** and is reported as such.
+- **Replay through changed code is the point.** After a change to the core, a difference is the answer, and the tool shows where the behaviour first departs. `--param NAME=VALUE` replays through a changed setting instead.
 
 ### 6. The configuration hash
 
 `oxide_config_hash` is a 64-bit FNV-1a over the whole configuration, the vehicle description included, in a fixed order. Two logs with the same hash and profile were flown with the same settings. A hash over the parameter table alone would miss the mass and the rotors.
+
+The ten durations enter the hash twice: as the seconds a parameter message shows, and as the exact microseconds the core holds. Which parameters are durations is stated once, in the core's parameter table, and the log's `oxide_param_us` records follow that list.
 
 ### 7. The logger never blocks the flight
 
@@ -109,26 +113,42 @@ Records go into a fixed ring buffer of whole messages; a lower-priority task dra
 - A message is in the buffer whole or not at all, and so are the dropout and synchronisation messages written ahead of it.
 - The recorder is the buffer plus under 1 kB of state, and a tick on which nothing is due costs a few comparisons.
 
-In the simulator the buffer is drained to a file after every tick, so nothing drops. The tests use a slow sink to make it drop.
+In the simulator the buffer is 64 kB and is drained to the file after every tick, so nothing drops at either level; a test holds that on both profiles. A gap in a log can therefore only come from a real logger, or from a test that drives the recorder with a slow sink. A write error ends the log and is reported when the flight is over. It never changes the flight.
 
 ### 8. Commands
 
-- `--log FILE.ulg` and `--log-level normal|replay` on `oxide-sim run` and `oxide-sim scenario`.
-- `oxide-sim replay FILE.ulg`.
+- **`--log FILE.ulg`** on `oxide-sim run` and `oxide-sim scenario NAME|PATH` writes the flight's log. `--log-level normal|replay` chooses the level (default `normal`) and is an error without `--log`. The file is created before the flight, so a path that cannot be written is an error before the first tick.
+- **`ver_sw`** is the git hash the binary was built from, with `-dirty` when the tree had changes, and `unknown` without git. The dirty mark is the state when the build script last ran.
+- **`oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]`** replays a replay-level log (§5). `--param` is applied to the rebuilt configuration before the first tick. `--continue` goes on after a difference and counts the ticks that differ.
+- **Exit codes of `replay`:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Every tick replayed is identical, and there was at least one. Also for a file that ends in a cut. |
+  | 1 | A difference, a gap (§5), or a file with no tick. |
+  | 2 | The file cannot be replayed: not a ULog file, a normal-level log, a configuration that does not rebuild to the logged hash, an unknown profile, a vehicle that does not have four rotors, a refused `--param`. |
+
+- **`oxide-sim hash`** prints, after the five trace hashes of a profile, the FNV-1a 64 of the bytes of three logs: `rc-loss-position` and `gust-hold` at the normal level and `rc-loss-position` at the replay level. They are written with a fixed `ver_sw`, so the value does not move with the commit. CI compares the whole output between Linux and Windows.
 
 ### 9. Proofs
 
-- **The format:** `pyulog` reads every file the simulator writes, with no corruption flag, and the values it reads equal the simulator's. CI runs that.
-- **Determinism:** the same flight gives the same bytes on every run and on Linux and Windows.
-- **Logging changes nothing:** a flight with the logger on has the same trace hash as with it off.
-- **Replay:** every scenario file, on both chip profiles, replays bit for bit. A flight replayed through a core with one gain changed is reported as different.
+- **The format:** `pyulog` reads the simulator's files at both levels with no corruption flag and finds every topic. For five topics (attitude, local position, motors, battery, vehicle status) the values it reads equal, bit for bit, the values the crate's own reader gives, and those equal the simulator's at the same ticks. A CI job runs this with `pyulog` 1.3.0, and also checks a log written by the command line.
+- **Determinism:** the same flight gives the same bytes on every run, and the hashes of three logs are compared between Linux and Windows (§8).
+- **Logging changes nothing:** a flight with a log has the same trace hash as one without, on three scenarios and both profiles. The ten trace hashes and the 129 pinned flights are what they were before this part.
+- **Replay, every scenario:** each of the 43 scenario files, on both chip profiles, is flown with a replay-level log and replayed: 86 flights and 17.5 million ticks, all identical. CI runs it in release (about 30 s).
+- **Replay, the boundary outside the inputs:** flights with a parameter change, a refused change, an unclean stored-parameter load with its acknowledgement, a refused arming, a recovered load and a store save all replay identically. With the "saved" marker or the load report edited out of the file, the replay differs: both are needed.
+- **Replay detects change:** a core with one gain changed first differs 24 ticks after arming, and the tool names the field. One flipped bit in a recorded gyro sample, or in any field of a recorded output, is found at its tick and named.
+- **Replay refuses damage:** a file cut anywhere, a dropout, a missing tick, a record out of place, a normal-level file, a file with another configuration hash. None replays as identical beyond what the file holds, and none panics.
 - **The buffer:** under any pattern of writes and drains the output is a valid sequence of whole messages, and every dropped message is counted.
 
 ## Consequences
 
 - A flight in the simulator or on the bench opens in PlotJuggler and Flight Review with the plots a PX4 user expects.
 - A bug seen in a flight can be reproduced on a desk from its log, and a fix can be shown to change the flight at the tick it should.
-- Replay logs are large. The tick record, an IMU sample and the outputs are 165 bytes, so about 165 kB/s on the F405 profile (1 kHz) and 660 kB/s on the H743 profile (4 kHz), before the other inputs and the normal level's records (about 40 kB/s in a scripted run with every input). Whether an SD card keeps up is measured at bring-up; the outputs record can be packed tighter if it does not.
+- A normal-level log is about 41 kB/s on either profile: 3.3 MB for the 80 s of `rc-loss-position`, of which 10 kB are the definitions.
+- Replay logs are large. The tick record, an IMU sample and the outputs are 165 bytes a tick. A whole replay-level file of the simulator, with every sensor and the normal level's records, is about 219 kB/s on the F405 profile (1 kHz) and 714 kB/s on the H743 profile (4 kHz): 17.5 MB and 57 MB for those 80 s. Whether an SD card keeps up is measured at bring-up; the outputs record can be packed tighter if it does not.
+- Replaying is fast: the 80 s flight replays in about 0.2 s on the F405 profile and 0.7 s on the H743 profile.
+- The replay tool flies four rotors, like the rest of this build. The records hold up to eight.
 - The codes of states, actions and events in a log are now a format. They are fixed in one table with a test, and a new variant gets a new code.
 
 ## Deferred
