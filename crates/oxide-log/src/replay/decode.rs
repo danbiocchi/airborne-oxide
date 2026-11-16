@@ -16,14 +16,14 @@ use crate::msg::ParamValue as MsgParam;
 use crate::reader::{RecordView, UlogFile};
 use crate::record::Topic;
 use core::fmt;
-use oxide_core::config::VehicleConfig;
+use oxide_core::config::{ConfigError, NumbersError, VehicleConfig};
 use oxide_core::io::{
     Action, BaroSample, BatterySample, BrainHeartbeat, EVENTS_PER_TICK, EstimatorStatus, EventList,
     FlightMode, GcsHeartbeat, GpsSample, ImuSample, Inputs, MagSample, NavState, Outputs, ParamSet,
     PrearmFlags, RcSample, Reasons, Stamped, StateSample, Status, TrajectorySetpoint, Validity,
 };
 use oxide_core::math::{Quat, Vec3};
-use oxide_core::params::{self, LoadReport, ParamId, ParamValue};
+use oxide_core::params::{self, LoadReport, ParamError, ParamId, ParamValue};
 use oxide_core::schedule::Profile;
 use oxide_core::time::Micros;
 use std::string::String;
@@ -740,6 +740,14 @@ pub enum FileConfigError {
     },
     /// The numbers and parameters do not make a configuration.
     Rebuild(RebuildError),
+    /// The file has a parameter this build does not have.
+    UnknownParam {
+        /// The name the file's own parameter message carries; `None` when the
+        /// key comes from an `oxide_param_us` record, which carries only the key.
+        name: Option<String>,
+        /// The stable key of the name ([`params::key`]).
+        key: u32,
+    },
     /// The file has no `oxide_config_hash` information.
     NoHash,
     /// The rebuilt configuration's hash is not the one the file states.
@@ -770,7 +778,18 @@ impl fmt::Display for FileConfigError {
             Self::IndexOutOfOrder { position, index } => {
                 write!(f, "oxide_vehicle record {position} has index {index}")
             }
-            Self::Rebuild(e) => write!(f, "cannot rebuild the configuration: {e:?}"),
+            Self::Rebuild(e) => write!(f, "{e}"),
+            Self::UnknownParam {
+                name: Some(name),
+                key,
+            } => write!(
+                f,
+                "the file has a parameter this build does not have: {name} (key {key:#010x})"
+            ),
+            Self::UnknownParam { name: None, key } => write!(
+                f,
+                "oxide_param_us has a duration this build does not have (key {key:#010x})"
+            ),
             Self::NoHash => write!(f, "the file has no oxide_config_hash"),
             Self::HashMismatch { logged, rebuilt } => write!(
                 f,
@@ -781,6 +800,116 @@ impl fmt::Display for FileConfigError {
 }
 
 impl std::error::Error for FileConfigError {}
+
+/// The name of parameter `id` in this build's table.
+fn param_name(id: ParamId) -> &'static str {
+    params::PARAMS.get(id.index()).map_or("?", |d| d.name)
+}
+
+fn config_error_text(e: ConfigError) -> &'static str {
+    match e {
+        ConfigError::BadMassProperties => "mass or inertia is not positive and finite",
+        ConfigError::BadRotor => "a rotor has a thrust or position that is not positive and finite",
+        ConfigError::UncontrollableLayout => {
+            "the rotor layout cannot control roll, pitch, yaw and thrust independently"
+        }
+        ConfigError::BadThrustExpo => "the thrust expo is outside 0 to 1",
+        ConfigError::BadProfile => "the scheduling profile is malformed",
+        ConfigError::BadEstimator => {
+            "an estimator setting is out of range, or its delay horizon does not fit the profile"
+        }
+        ConfigError::BadFailsafe => {
+            "a failsafe or battery setting is out of range, or the minimum thrust is not below the touchdown thrust"
+        }
+        ConfigError::BadGains => "a gain is outside its range",
+        ConfigError::BadLimits => "a limit is outside its range",
+        ConfigError::CannotLift => "the rotors cannot lift the vehicle's weight",
+        ConfigError::IdleTooHigh => "the idle motor command is too high",
+        ConfigError::DescentLimitTooLow => {
+            "the descent speed limit is below twice the touchdown speed"
+        }
+        ConfigError::LossOfControlTooTight => {
+            "the loss-of-control tilt is not 10 degrees above the tilt limit"
+        }
+        ConfigError::FilterCutoffTooHigh => {
+            "the gyro filter cut-off is at or above 0.45 times the rate-loop frequency"
+        }
+    }
+}
+
+fn param_error_text(e: ParamError) -> String {
+    match e {
+        ParamError::Unknown => "it is not a parameter of this build".into(),
+        ParamError::WrongType => "its value has the wrong type".into(),
+        ParamError::NotFinite => "its value is not a finite number".into(),
+        ParamError::OutOfRange => "its value is out of range".into(),
+        ParamError::Invalid(c) => {
+            format!(
+                "its value breaks a rule of the configuration: {}",
+                config_error_text(c)
+            )
+        }
+        ParamError::Armed => "it cannot be changed while armed".into(),
+    }
+}
+
+/// A sentence for each way a configuration cannot be rebuilt, naming the
+/// parameter (or the vehicle number) at fault.
+impl fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Numbers(NumbersError::Missing(n)) => {
+                write!(f, "the vehicle number {n} is missing")
+            }
+            Self::Numbers(NumbersError::Unknown) => {
+                write!(
+                    f,
+                    "the file has a vehicle number this vehicle does not have"
+                )
+            }
+            Self::Numbers(NumbersError::Duplicate(n)) => {
+                write!(f, "the vehicle number {n} appears twice")
+            }
+            Self::Numbers(NumbersError::BadValue(n)) => {
+                write!(
+                    f,
+                    "the vehicle number {n} has a value the vehicle cannot have"
+                )
+            }
+            Self::UnknownParam { position, key } => write!(
+                f,
+                "the file has a parameter this build does not have, at position {position} \
+                 (key {key:#010x})"
+            ),
+            Self::DuplicateParam(id) => {
+                write!(f, "parameter {} appears twice in the file", param_name(*id))
+            }
+            Self::MissingParam(id) => {
+                write!(f, "parameter {} is missing from the file", param_name(*id))
+            }
+            Self::Refused { id, why } => write!(
+                f,
+                "parameter {} is refused: {}",
+                param_name(*id),
+                param_error_text(*why)
+            ),
+            Self::Invalid(why) => write!(
+                f,
+                "every parameter is fine alone but together they break a rule: {}",
+                match why {
+                    ParamError::Invalid(c) => config_error_text(*c).to_string(),
+                    other => param_error_text(*other),
+                }
+            ),
+            Self::NotExact(id) => write!(
+                f,
+                "parameter {} does not survive being logged: its value is not the f32 number \
+                 of seconds of one whole microsecond",
+                param_name(*id)
+            ),
+        }
+    }
+}
 
 /// The `oxide_vehicle` records of a file in file order. Their indices must run
 /// 0, 1, 2, ...
@@ -827,7 +956,20 @@ pub fn config_of<const N: usize>(
             .map(|p| (p.name.as_str(), core_param(p.value))),
         micros,
         profile,
-    )?;
+    )
+    .map_err(|e| match e {
+        // The file's own parameter message names it; a duration record has
+        // only the key.
+        RebuildError::UnknownParam { position, key } => FileConfigError::UnknownParam {
+            name: file
+                .initial_params
+                .get(position)
+                .map(|p| p.name.clone())
+                .filter(|n| params::key(n) == key),
+            key,
+        },
+        other => FileConfigError::Rebuild(other),
+    })?;
     let logged = file
         .info("oxide_config_hash")
         .and_then(crate::reader::InfoEntry::as_u64)

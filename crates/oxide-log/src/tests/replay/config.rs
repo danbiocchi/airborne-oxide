@@ -540,3 +540,170 @@ fn write_micros_and_decode_micros_round_trip() {
     assert_eq!(got, micros_list(&c));
     assert_eq!(v.len(), params::micro_ids().count() * (3 + 2 + 16));
 }
+
+// ---- the text of a refused configuration (task R, a4) ----
+
+/// The text of the error a file with `edit` applied to its parameters gives.
+fn file_error_text(edit: impl FnOnce(&mut Vec<(String, MsgParam)>)) -> String {
+    let c = quad();
+    let mut b = log_of(&c, Some(c.config_hash()));
+    edit(&mut b.params);
+    decode::config_of::<4>(&b.file(), &F405_LEAN)
+        .unwrap_err()
+        .to_string()
+}
+
+fn set_param(params: &mut [(String, MsgParam)], name: &str, v: MsgParam) {
+    params.iter_mut().find(|(n, _)| n == name).unwrap().1 = v;
+}
+
+#[test]
+fn a_refused_configuration_names_the_parameter_in_a_sentence() {
+    // Out of range, not finite, the wrong type.
+    assert_eq!(
+        file_error_text(|p| set_param(p, "RATE_ROLL_P", MsgParam::F32(1e9))),
+        "parameter RATE_ROLL_P is refused: its value is out of range"
+    );
+    assert_eq!(
+        file_error_text(|p| set_param(p, "RATE_ROLL_P", MsgParam::F32(f32::NAN))),
+        "parameter RATE_ROLL_P is refused: its value is not a finite number"
+    );
+    assert_eq!(
+        file_error_text(|p| set_param(p, "RATE_ROLL_P", MsgParam::I32(3))),
+        "parameter RATE_ROLL_P is refused: its value has the wrong type"
+    );
+    // A parameter this build does not have: the name the file's own message
+    // carries, and the key in hex.
+    let key = params::key("NOT_A_PARAM");
+    assert_eq!(
+        file_error_text(|p| p.push(("NOT_A_PARAM".into(), MsgParam::F32(0.1)))),
+        format!("the file has a parameter this build does not have: NOT_A_PARAM (key {key:#010x})")
+    );
+    // Missing, twice.
+    assert_eq!(
+        file_error_text(|p| p.retain(|(n, _)| n != "RATE_ROLL_P")),
+        "parameter RATE_ROLL_P is missing from the file"
+    );
+    assert_eq!(
+        file_error_text(|p| p.push(("RATE_ROLL_P".into(), MsgParam::F32(0.1)))),
+        "parameter RATE_ROLL_P appears twice in the file"
+    );
+}
+
+#[test]
+fn a_duration_that_is_not_exact_and_a_hash_that_differs_are_sentences_too() {
+    // A duration whose seconds do not name the logged microsecond.
+    assert_eq!(
+        file_error_text(|p| set_param(p, "FS_RC_TIMEOUT", MsgParam::F32(1.000_000_4))),
+        "parameter FS_RC_TIMEOUT does not survive being logged: its value is not the f32 \
+         number of seconds of one whole microsecond"
+    );
+    // The hash.
+    let c = quad();
+    let f = log_of(&c, Some(c.config_hash() ^ 1)).file();
+    let e = decode::config_of::<4>(&f, &F405_LEAN).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "oxide_config_hash is {:#018x}, the rebuilt configuration's is {:#018x}",
+            c.config_hash() ^ 1,
+            c.config_hash()
+        )
+    );
+    // The key of a duration this build does not have has no name in the file.
+    let e = FileConfigError::UnknownParam {
+        name: None,
+        key: 0xDEAD_BEEF,
+    };
+    assert_eq!(
+        e.to_string(),
+        "oxide_param_us has a duration this build does not have (key 0xdeadbeef)"
+    );
+}
+
+#[test]
+fn every_way_a_configuration_cannot_be_rebuilt_is_a_sentence_without_debug_output() {
+    use oxide_core::config::ConfigError;
+    let roll = params::find("RATE_ROLL_P").unwrap();
+    let cases = [
+        (
+            RebuildError::Numbers(NumbersError::Missing("mass_kg")),
+            "the vehicle number mass_kg is missing",
+        ),
+        (
+            RebuildError::Numbers(NumbersError::Unknown),
+            "the file has a vehicle number this vehicle does not have",
+        ),
+        (
+            RebuildError::Numbers(NumbersError::Duplicate("mass_kg")),
+            "the vehicle number mass_kg appears twice",
+        ),
+        (
+            RebuildError::Numbers(NumbersError::BadValue("rotor1_spin")),
+            "the vehicle number rotor1_spin has a value the vehicle cannot have",
+        ),
+        (
+            RebuildError::UnknownParam {
+                position: 93,
+                key: 0x1234_5678,
+            },
+            "the file has a parameter this build does not have, at position 93 (key 0x12345678)",
+        ),
+        (
+            RebuildError::DuplicateParam(roll),
+            "parameter RATE_ROLL_P appears twice in the file",
+        ),
+        (
+            RebuildError::MissingParam(roll),
+            "parameter RATE_ROLL_P is missing from the file",
+        ),
+        (
+            RebuildError::Refused {
+                id: roll,
+                why: ParamError::Unknown,
+            },
+            "parameter RATE_ROLL_P is refused: it is not a parameter of this build",
+        ),
+        (
+            RebuildError::Refused {
+                id: roll,
+                why: ParamError::Armed,
+            },
+            "parameter RATE_ROLL_P is refused: it cannot be changed while armed",
+        ),
+        (
+            RebuildError::Refused {
+                id: roll,
+                why: ParamError::Invalid(ConfigError::BadGains),
+            },
+            "parameter RATE_ROLL_P is refused: its value breaks a rule of the configuration: \
+             a gain is outside its range",
+        ),
+        (
+            RebuildError::Invalid(ParamError::Invalid(ConfigError::CannotLift)),
+            "every parameter is fine alone but together they break a rule: the rotors cannot \
+             lift the vehicle's weight",
+        ),
+        (
+            RebuildError::Invalid(ParamError::OutOfRange),
+            "every parameter is fine alone but together they break a rule: its value is out \
+             of range",
+        ),
+        (
+            RebuildError::NotExact(roll),
+            "parameter RATE_ROLL_P does not survive being logged: its value is not the f32 \
+             number of seconds of one whole microsecond",
+        ),
+    ];
+    for (e, text) in cases {
+        let shown = e.to_string();
+        assert_eq!(shown, text);
+        // Not the derived Debug text, and not a doubled prefix.
+        for debug in ["ParamId", "Refused {", "Numbers(", "MissingParam(", "{ "] {
+            assert!(!shown.contains(debug), "{shown}");
+        }
+        assert!(!shown.contains("cannot rebuild"), "{shown}");
+        // As a file's error it is the same sentence.
+        assert_eq!(FileConfigError::Rebuild(e).to_string(), text);
+    }
+}

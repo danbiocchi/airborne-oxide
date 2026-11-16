@@ -258,6 +258,56 @@ fn payload_of(bytes: &[u8], topic: &str, n: usize) -> usize {
     f.records(topic).nth(n).unwrap().offset() + 5
 }
 
+/// The offset in `bytes` of the 4-byte value of the header parameter `name`.
+fn param_value_at(bytes: &[u8], name: &str) -> usize {
+    let key = format!("float {name}");
+    let at = bytes
+        .windows(key.len())
+        .position(|w| w == key.as_bytes())
+        .expect("the parameter is in the header");
+    at + key.len()
+}
+
+#[test]
+fn a_refused_configuration_names_the_parameter_once_in_a_sentence() {
+    let flown = default_flight();
+    let at = param_value_at(&flown.bytes, "RATE_ROLL_P");
+    let sentence = |bytes: &[u8]| {
+        let e = replay(bytes, &ReplayOptions::default()).unwrap_err();
+        assert!(matches!(e, ReplayError::Config(_)), "{e}");
+        e.to_string()
+    };
+    // Out of range.
+    let mut bytes = flown.bytes.clone();
+    bytes[at..at + 4].copy_from_slice(&1.0e9_f32.to_le_bytes());
+    assert_eq!(
+        sentence(&bytes),
+        "cannot rebuild the configuration: parameter RATE_ROLL_P is refused: its value is \
+         out of range"
+    );
+    // Not finite.
+    bytes[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert_eq!(
+        sentence(&bytes),
+        "cannot rebuild the configuration: parameter RATE_ROLL_P is refused: its value is \
+         not a finite number"
+    );
+    // A name this build does not have: the name the file carries, and the key.
+    let mut bytes = flown.bytes.clone();
+    let name_at = at - "RATE_ROLL_P".len();
+    assert_eq!(&bytes[name_at - 6..name_at], b"float ");
+    bytes[name_at + "RATE_ROLL_".len()] = b'Q';
+    let text = sentence(&bytes);
+    let key = oxide_core::params::key("RATE_ROLL_Q");
+    assert_eq!(
+        text,
+        format!(
+            "cannot rebuild the configuration: the file has a parameter this build does not \
+             have: RATE_ROLL_Q (key {key:#010x})"
+        )
+    );
+}
+
 #[test]
 fn a_boot_record_that_is_not_this_builds_profile_or_vehicle_is_refused() {
     let flown = default_flight();
