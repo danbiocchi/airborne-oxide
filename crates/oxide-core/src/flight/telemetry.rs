@@ -40,15 +40,18 @@ pub struct Setpoints {
     pub position: Vec3<f32>,
     /// The velocity setpoint the velocity loop tracked, m/s NED, after the
     /// speed limits. An axis without feedback holds the estimate's own
-    /// velocity (zero error).
-    pub velocity: Vec3<f32>,
+    /// velocity (zero error). `None` in `Stabilized`, which flies roll and
+    /// pitch angles and a thrust fraction with no velocity loop.
+    pub velocity: Option<Vec3<f32>>,
     /// Yaw setpoint, rad. Followed only where `yaw_form` is `Heading`.
     pub yaw: f32,
-    /// The horizontal controller form in force (ADR-0003 §2).
+    /// The horizontal controller form in force (ADR-0003 §2); `Tilt` in
+    /// `Stabilized`.
     pub horizontal: HorizontalForm,
-    /// The vertical controller form in force.
+    /// The vertical controller form in force; `Thrust` in `Stabilized`.
     pub vertical: VerticalForm,
-    /// The yaw form in force.
+    /// The yaw form in force; `Heading` in `Stabilized` (the stick turns the
+    /// yaw setpoint and the attitude target carries it).
     pub yaw_form: YawForm,
 }
 

@@ -2075,7 +2075,7 @@ fn telemetry_before_the_first_tick_is_empty() {
 /// The velocity setpoint of a report, as an option (the report keeps one
 /// only where a velocity loop runs).
 fn vel_of(s: &Setpoints) -> Option<Vec3<f32>> {
-    Some(s.velocity)
+    s.velocity
 }
 
 fn flown(rig: &Rig) -> Setpoints {
@@ -2111,7 +2111,7 @@ fn stabilized_reports_the_attitude_forms_and_no_velocity_setpoint() {
     let s = flown(&rig);
     assert_eq!(s.horizontal, HorizontalForm::Tilt);
     assert_eq!(s.vertical, VerticalForm::Thrust);
-    assert_eq!(s.yaw_form, YawForm::Free);
+    assert_eq!(s.yaw_form, YawForm::Heading);
     assert_eq!(vel_of(&s), None);
     // A fresh core in Stabilized too (the report was never written).
     let mut fresh = Rig::external(0);
@@ -2121,7 +2121,7 @@ fn stabilized_reports_the_attitude_forms_and_no_velocity_setpoint() {
     let s = flown(&fresh);
     assert_eq!(s.horizontal, HorizontalForm::Tilt);
     assert_eq!(s.vertical, VerticalForm::Thrust);
-    assert_eq!(s.yaw_form, YawForm::Free);
+    assert_eq!(s.yaw_form, YawForm::Heading);
     assert_eq!(vel_of(&s), None);
 }
 

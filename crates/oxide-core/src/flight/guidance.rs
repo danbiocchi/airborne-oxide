@@ -3,7 +3,9 @@
 //! setpoints into an attitude and thrust target (ADR-0003 §2).
 
 use super::{Core, POSITION_LEASH_M, Setpoints, deadband, leash};
-use crate::control::{AttitudeTarget, Horizontal, Vertical, Yaw};
+use crate::control::{
+    AttitudeTarget, Horizontal, HorizontalForm, Vertical, VerticalForm, Yaw, YawForm,
+};
 use crate::io::{NavState, RcSample, Validity};
 use crate::math::{Quat, Real, Vec3, wrap_pi};
 use crate::time::Micros;
@@ -205,10 +207,14 @@ impl<const N: usize> Core<N> {
         let rc = self.valid_rc(now);
 
         let mut landing_now = false;
+        // Stabilized flies angles and a thrust fraction: no position-control
+        // report applies (`Setpoints::velocity` is `None`).
+        let mut stabilized = false;
         // The descent rate a pilot state's stick commands, m/s (0 if none).
         let mut descent_cmd = 0.0_f32;
         let mut target = match (sup.nav, rc) {
             (NavState::Stabilized, Some(rc)) => {
+                stabilized = true;
                 g.yaw_sp =
                     wrap_pi(g.yaw_sp + deadband(rc.yaw, l.stick_deadband) * l.max_yaw_rate * dt);
                 g.position_sp = state.position;
@@ -496,14 +502,25 @@ impl<const N: usize> Core<N> {
         g.prev_valid = v;
         g.prev_resets = est.resets;
         self.guide_state = g;
-        let flown = self.position_ctrl.report();
-        self.setpoints = Some(Setpoints {
-            position: g.position_sp,
-            velocity: flown.velocity_sp,
-            yaw: g.yaw_sp,
-            horizontal: flown.horizontal,
-            vertical: flown.vertical,
-            yaw_form: flown.yaw,
+        self.setpoints = Some(if stabilized {
+            Setpoints {
+                position: g.position_sp,
+                velocity: None,
+                yaw: g.yaw_sp,
+                horizontal: HorizontalForm::Tilt,
+                vertical: VerticalForm::Thrust,
+                yaw_form: YawForm::Heading,
+            }
+        } else {
+            let flown = self.position_ctrl.report();
+            Setpoints {
+                position: g.position_sp,
+                velocity: Some(flown.velocity_sp),
+                yaw: g.yaw_sp,
+                horizontal: flown.horizontal,
+                vertical: flown.vertical,
+                yaw_form: flown.yaw,
+            }
         });
         self.guidance.pending = target;
     }
