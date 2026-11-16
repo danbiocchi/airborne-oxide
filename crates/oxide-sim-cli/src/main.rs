@@ -612,6 +612,98 @@ fn fault_hash_lines_with(
     Ok(lines)
 }
 
+/// The flights whose log `hash` hashes (run 0, normal level).
+const HASHED_LOGGED_FLIGHTS: [&str; 2] = ["rc-loss-position", "gust-hold"];
+
+/// What `hash` writes into the logs it hashes: the same bytes on every commit.
+const HASH_BUILD: &str = "hash";
+
+/// FNV-1a 64 of `bytes`: the hash of the trace hash's family
+/// (`oxide_sim::hash::TraceHash`).
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = oxide_sim::hash::TraceHash::default();
+    h.write_bytes(bytes);
+    h.value()
+}
+
+/// The bytes of the normal-level log of scenario `name`, run `index`, flown to
+/// its end with `params`, written with the fixed build information
+/// (`ver_sw` `hash`, `ver_hw` `SIM`).
+fn logged_flight_bytes(
+    profile: Profile,
+    name: &str,
+    index: u64,
+    params: &[(String, f64)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let scenario = fault_scenarios::by_name(name)
+        .ok_or_else(|| format!("logged scenario {name} does not exist"))?;
+    let mut sim = scenario.build_with_params(profile, index, params)?;
+    let buffer = oxide_sim::flight_log::SharedBuffer::new();
+    sim.start_log(
+        Level::Normal,
+        &LogBuild::sim(HASH_BUILD),
+        Box::new(buffer.clone()),
+    )?;
+    sim.run_until(scenario.end(), |_| {});
+    sim.finish_log()?;
+    Ok(buffer.bytes())
+}
+
+/// `<profile> log-normal <name>#0 <fnv-1a 64 of the file>` for each of
+/// `HASHED_LOGGED_FLIGHTS`.
+fn log_hash_lines(
+    profile: Profile,
+    params: &[(String, f64)],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut lines = Vec::new();
+    for name in HASHED_LOGGED_FLIGHTS {
+        let bytes = logged_flight_bytes(profile, name, 0, params)?;
+        lines.push(format!(
+            "{} log-normal {}#0 {:016x}",
+            profile.name,
+            name,
+            fnv1a_64(&bytes)
+        ));
+    }
+    Ok(lines)
+}
+
+/// Every line `hash` prints for the profile of `args`.
+fn hash_lines(args: &Args, airframe: &Airframe) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let profile = args.profile;
+    let kinds: &[ScenarioKind] = match args.scenario {
+        Some(ScenarioKind::HoverStep) => &[ScenarioKind::HoverStep],
+        Some(ScenarioKind::GustHold) => &[ScenarioKind::GustHold],
+        // Both, with default options: covers the RNG, noise and libm paths.
+        None => &[ScenarioKind::HoverStep, ScenarioKind::GustHold],
+    };
+    let mut lines = Vec::new();
+    for &kind in kinds {
+        let o = match kind {
+            ScenarioKind::HoverStep => execute(
+                airframe,
+                profile,
+                hover_step_job(args),
+                args.csv.as_deref(),
+                None,
+            ),
+            ScenarioKind::GustHold => execute(
+                airframe,
+                profile,
+                gust_hold_job(args),
+                args.csv.as_deref(),
+                None,
+            ),
+        }?;
+        lines.push(format!("{} {} {:016x}", profile.name, o.label, o.hash));
+    }
+    if args.scenario.is_none() {
+        lines.extend(fault_hash_lines_with(profile, &args.params)?);
+        lines.extend(log_hash_lines(profile, &args.params)?);
+    }
+    Ok(lines)
+}
+
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let airframe = load_airframe(args.airframe.as_deref())?;
     let profile = args.profile;
@@ -622,20 +714,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.command == "hash" {
-        let kinds: &[ScenarioKind] = match args.scenario {
-            Some(ScenarioKind::HoverStep) => &[ScenarioKind::HoverStep],
-            Some(ScenarioKind::GustHold) => &[ScenarioKind::GustHold],
-            // Both, with default options: covers the RNG, noise and libm paths.
-            None => &[ScenarioKind::HoverStep, ScenarioKind::GustHold],
-        };
-        for &kind in kinds {
-            let o = run_one(kind, args.csv.as_deref())?;
-            println!("{} {} {:016x}", profile.name, o.label, o.hash);
-        }
-        if args.scenario.is_none() {
-            for line in fault_hash_lines_with(profile, &args.params)? {
-                println!("{line}");
-            }
+        for line in hash_lines(args, &airframe)? {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -1390,5 +1470,81 @@ mod tests {
             .find(|l| l.starts_with("  oxide-sim scenario NAME"))
             .expect("scenario line");
         assert!(scenario.contains("--log FILE.ulg") && scenario.contains("--log-level"));
+    }
+
+    /// The five lines `hash` has always printed for a profile.
+    const PINNED: [&str; 10] = [
+        "f405-lean hover-step 3de16d7a9847deaf",
+        "f405-lean gust-hold#0 9712d37590a317dc",
+        "f405-lean rc-loss-position#0 927c415bcb82bfc8",
+        "f405-lean pair-gps-loss+baro-loss#0 c7ebc02674f19d3a",
+        "f405-lean motor-loss#0 86248bd7c7755d84",
+        "h743-full hover-step 9ff026845c342fbd",
+        "h743-full gust-hold#0 476abddf98142653",
+        "h743-full rc-loss-position#0 f28dc4abdee2eae9",
+        "h743-full pair-gps-loss+baro-loss#0 212288cff52a1846",
+        "h743-full motor-loss#0 dbc9b9c7c0c2f5d8",
+    ];
+
+    fn hash_output(profile: &str) -> Vec<String> {
+        let args = p(&["hash", "--profile", profile]).expect("valid");
+        let airframe = Airframe::reference_quad().expect("airframe");
+        hash_lines(&args, &airframe).expect("hash lines")
+    }
+
+    #[test]
+    fn hash_prints_its_five_lines_as_before_then_one_per_logged_flight() {
+        for (profile, name) in [("f405", "f405-lean"), ("h743", "h743-full")] {
+            let lines = hash_output(profile);
+            assert_eq!(lines.len(), 7, "{lines:#?}");
+            let pinned: Vec<&str> = PINNED
+                .iter()
+                .copied()
+                .filter(|l| l.starts_with(name))
+                .collect();
+            assert_eq!(
+                lines[..5].iter().map(String::as_str).collect::<Vec<_>>(),
+                pinned
+            );
+            for (line, flight) in lines[5..].iter().zip(["rc-loss-position", "gust-hold"]) {
+                let w: Vec<&str> = line.split(' ').collect();
+                assert_eq!(w.len(), 4, "{line}");
+                assert_eq!(&w[..3], &[name, "log-normal", &format!("{flight}#0")]);
+                assert_eq!(w[3].len(), 16, "{line}");
+                assert!(
+                    w[3].chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                );
+            }
+            assert_ne!(lines[5], lines[6]);
+        }
+    }
+
+    #[test]
+    fn the_same_flight_gives_the_same_log_bytes_and_they_hash_as_fnv_1a() {
+        for profile in [F405_LEAN, H743_FULL] {
+            let a = logged_flight_bytes(profile, "rc-loss-position", 0, &[]).expect("first");
+            let b = logged_flight_bytes(profile, "rc-loss-position", 0, &[]).expect("second");
+            assert_eq!(a, b, "{}", profile.name);
+            let file = oxide_log::reader::UlogFile::parse(&a).expect("parses");
+            // The build information the hash uses, whatever the commit.
+            assert_eq!(file.info_str("ver_sw"), Some("hash"));
+            assert_eq!(file.info_str("ver_hw"), Some("SIM"));
+            // FNV-1a 64, from the definition.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in &a {
+                h = (h ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            assert_eq!(fnv1a_64(&a), h);
+            let line = log_hash_lines(profile, &[]).expect("lines").remove(0);
+            assert_eq!(
+                line,
+                format!("{} log-normal rc-loss-position#0 {h:016x}", profile.name)
+            );
+        }
+        // Another seed or another parameter is another file.
+        let a = logged_flight_bytes(F405_LEAN, "motor-loss", 0, &[]).expect("a");
+        let b = logged_flight_bytes(F405_LEAN, "motor-loss", 1, &[]).expect("b");
+        assert_ne!(a, b);
     }
 }
