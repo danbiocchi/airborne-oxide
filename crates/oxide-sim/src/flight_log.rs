@@ -239,6 +239,6 @@ fn describe_start(e: &StartError) -> String {
         StartError::NotReplayable(RebuildError::Refused { id, why }) => {
             format!("parameter {} is refused by the core: {why:?}", name(*id))
         }
-        StartError::NotReplayable(other) => format!("{other:?}"),
+        StartError::NotReplayable(other) => other.to_string(),
     }
 }

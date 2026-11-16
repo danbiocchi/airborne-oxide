@@ -806,7 +806,9 @@ fn param_name(id: ParamId) -> &'static str {
     params::PARAMS.get(id.index()).map_or("?", |d| d.name)
 }
 
-fn config_error_text(e: ConfigError) -> &'static str {
+/// Why the core refuses a configuration, as a sentence part without a verb
+/// of its own ("the rotors cannot lift the vehicle's weight").
+pub fn config_error_text(e: ConfigError) -> &'static str {
     match e {
         ConfigError::BadMassProperties => "mass or inertia is not positive and finite",
         ConfigError::BadRotor => "a rotor has a thrust or position that is not positive and finite",

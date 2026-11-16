@@ -108,7 +108,11 @@ impl fmt::Display for ReplayError {
             ),
             ReplayError::Config(e) => write!(f, "cannot rebuild the configuration: {e}"),
             ReplayError::Override(e) => write!(f, "{e}"),
-            ReplayError::Core(e) => write!(f, "the flight core refused the configuration: {e:?}"),
+            ReplayError::Core(e) => write!(
+                f,
+                "the flight core refused the configuration: {}",
+                decode::config_error_text(*e)
+            ),
         }
     }
 }
@@ -723,6 +727,16 @@ fn events_list(events: &[Event]) -> oxide_core::io::EventList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configuration_the_core_refuses_is_a_sentence_not_a_variant_name() {
+        let text = ReplayError::Core(ConfigError::CannotLift).to_string();
+        assert_eq!(
+            text,
+            "the flight core refused the configuration: the rotors cannot lift the vehicle's weight"
+        );
+        assert!(!text.contains("CannotLift"), "{text}");
+    }
 
     /// `compare` of a recorded motor command `a` in motor 0 against a replayed `b`.
     fn motor_zero(a: f32, b: f32) -> Option<Difference> {

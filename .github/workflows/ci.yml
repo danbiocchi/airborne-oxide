@@ -81,6 +81,12 @@ jobs:
         # it through a rebuilt core and fails on any tick that differs. Prints
         # one summary line (flights, ticks, bytes, seconds).
         run: cargo test --release --locked -p oxide-sim --test replay_sweep -- --ignored --nocapture every_scenario_file_replays_identically_on_both_profiles
+      - name: No one-bit damage to a replay log replays as a clean, shorter flight (ADR-0005 section 9)
+        # Flips every bit of every byte of the data section of a 100-tick
+        # replay-level log (about 280,000 replays) and fails if one of them
+        # exits 0 with more than the last two ticks missing. Prints the count
+        # of each outcome.
+        run: cargo test --release --locked -p oxide-sim --test replay_damage -- --ignored --nocapture every_bit_of_the_data_section_is_refused_stopped_different_or_within_two_ticks
 
   determinism:
     name: Linux and Windows traces are bit-identical
