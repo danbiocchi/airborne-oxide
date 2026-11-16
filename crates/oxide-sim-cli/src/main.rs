@@ -8,7 +8,7 @@
 //!                [--log FILE.ulg] [--log-level normal|replay]
 //!                [--scenario hover-step|gust-hold] [--seed N]
 //!                [--estimator truth|ekf] [--sensors ideal|realistic]
-//! oxide-sim hash [same options]
+//! oxide-sim hash [same options as run, except --log and --log-level]
 //! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
 //! oxide-sim scenario list
 //! oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE]
@@ -184,7 +184,7 @@ const USAGE: &str = "usage:
   oxide-sim run [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold]
                 [--log FILE.ulg] [--log-level normal|replay] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]
                 [--params FILE.toml] [--param NAME=VALUE]
-  oxide-sim hash [same options as run]
+  oxide-sim hash [same options as run, except --log and --log-level]
   oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T] [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim scenario list
   oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--log FILE.ulg] [--log-level normal|replay]
@@ -1504,7 +1504,17 @@ mod tests {
         // hash and montecarlo do not write logs.
         let e = p(&["hash", "--log", "f.ulg"]).err().expect("error");
         assert!(e.contains("run and scenario"), "{e}");
+        assert!(p(&["hash", "--log-level", "replay"]).is_err());
         assert!(p(&["montecarlo", "--log", "f.ulg"]).is_err());
+        // The usage says so, where it names the options of hash.
+        let hash = USAGE
+            .lines()
+            .find(|l| l.starts_with("  oxide-sim hash"))
+            .expect("hash line");
+        assert_eq!(
+            hash,
+            "  oxide-sim hash [same options as run, except --log and --log-level]"
+        );
     }
 
     #[test]
