@@ -174,9 +174,11 @@ pub(crate) trait Section {
     fn store(s: &mut Self, id: ParamId, v: ParamValue) -> Result<bool, ParamError>;
 }
 
-/// Seconds to whole microseconds, rounded; `None` for a negative or
-/// non-finite value or one that does not fit `u32`.
-fn secs_to_us(v: f32) -> Option<u32> {
+/// Seconds to whole microseconds, rounded to the nearest (halves up): the
+/// rule by which the core stores a parameter held as microseconds
+/// ([`is_micros`]). `None` for a negative or non-finite value or one that
+/// does not fit `u32`.
+pub fn secs_to_micros(v: f32) -> Option<u32> {
     if !v.is_finite() || v < 0.0 {
         return None;
     }
@@ -195,7 +197,9 @@ fn us_to_secs(us: u32) -> f32 {
 /// The table's range of a parameter held as microseconds, as microseconds.
 fn range_us(def: &ParamDef) -> Option<(u32, u32)> {
     match (def.min, def.max) {
-        (ParamValue::F32(lo), ParamValue::F32(hi)) => Some((secs_to_us(lo)?, secs_to_us(hi)?)),
+        (ParamValue::F32(lo), ParamValue::F32(hi)) => {
+            Some((secs_to_micros(lo)?, secs_to_micros(hi)?))
+        }
         _ => None,
     }
 }
@@ -252,6 +256,18 @@ macro_rules! p_kind {
     };
 }
 
+macro_rules! p_is_micros {
+    (f32) => {
+        false
+    };
+    (secs) => {
+        true
+    };
+    (source) => {
+        false
+    };
+}
+
 macro_rules! p_val {
     (f32, $x:expr) => {
         ParamValue::F32($x)
@@ -291,7 +307,7 @@ macro_rules! p_store {
     };
     (secs, $s:ident, $v:ident, $($p:ident).+) => {
         match $v {
-            ParamValue::F32(x) => match secs_to_us(x) {
+            ParamValue::F32(x) => match secs_to_micros(x) {
                 Some(us) => {
                     $s.$($p).+ = us;
                     Ok(true)
@@ -362,6 +378,9 @@ macro_rules! declare_params {
                 },
             )* )*
         ];
+
+        /// Whether each parameter is held as whole microseconds (kind `secs`).
+        const MICROS_FLAGS: [bool; COUNT] = [$( $( p_is_micros!($kind), )* )*];
 
         /// The storage key of every parameter, in table order: `KEYS[id]` is
         /// `key(PARAMS[id].name)`, computed at compile time.
@@ -607,6 +626,33 @@ declare_params! {
 }
 
 // ---- access ----
+
+/// True if the core holds parameter `id` as whole microseconds (a duration
+/// declared `secs` in the table) and exposes it as `f32` seconds. False for
+/// any other parameter and for an unknown id.
+pub fn is_micros(id: ParamId) -> bool {
+    MICROS_FLAGS.get(id.index()).copied().unwrap_or(false)
+}
+
+/// Every parameter held as whole microseconds, in table order.
+pub fn micro_ids() -> impl Iterator<Item = ParamId> {
+    MICROS_FLAGS
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m)
+        .filter_map(|(i, _)| u16::try_from(i).ok().map(ParamId))
+}
+
+/// The exact stored value, in whole microseconds, of a parameter the core
+/// holds as microseconds ([`is_micros`]); `None` for any other parameter or
+/// an unknown id. [`get`] reads the same value as `f32` seconds, which names
+/// the microsecond only up to 16 s.
+pub fn micros<const N: usize>(cfg: &VehicleConfig<N>, id: ParamId) -> Option<u32> {
+    match load_cfg(cfg, id) {
+        Some(Stored::Us(us)) => Some(us),
+        _ => None,
+    }
+}
 
 fn load_cfg<const N: usize>(cfg: &VehicleConfig<N>, id: ParamId) -> Option<Stored> {
     Section::load(&cfg.gains, id)
@@ -944,11 +990,7 @@ mod tests {
 
     /// True if the parameter is held as whole microseconds.
     fn is_us(id: ParamId) -> bool {
-        matches!(
-            Section::load(&FailsafeParams::default(), id)
-                .or_else(|| Section::load(&EkfParams::default(), id)),
-            Some(Stored::Us(_))
-        )
+        is_micros(id)
     }
 
     /// The value just below `min` that must be refused.
@@ -965,9 +1007,9 @@ mod tests {
         match def.max {
             ParamValue::I32(v) => ParamValue::I32(v + 1),
             ParamValue::F32(hi) if is_us(id) => {
-                let hi_us = secs_to_us(hi).unwrap();
+                let hi_us = secs_to_micros(hi).unwrap();
                 let mut v = hi + 2.0e-6;
-                while secs_to_us(v).is_none_or(|u| u <= hi_us) {
+                while secs_to_micros(v).is_none_or(|u| u <= hi_us) {
                     v = next_up(v);
                 }
                 ParamValue::F32(v)
@@ -1047,7 +1089,7 @@ mod tests {
             assert_eq!(d.min.kind(), d.kind, "{}", d.name);
             assert_eq!(d.max.kind(), d.kind, "{}", d.name);
             let s = match d.default {
-                ParamValue::F32(v) if is_us(id) => Stored::Us(secs_to_us(v).unwrap()),
+                ParamValue::F32(v) if is_us(id) => Stored::Us(secs_to_micros(v).unwrap()),
                 ParamValue::F32(v) => Stored::F(v),
                 ParamValue::I32(v) => Stored::I(v),
             };
@@ -1074,8 +1116,8 @@ mod tests {
                             let got = get(&c, id).unwrap();
                             if is_us(id) {
                                 assert_eq!(
-                                    secs_to_us(f(got)),
-                                    secs_to_us(f(v)),
+                                    secs_to_micros(f(got)),
+                                    secs_to_micros(f(v)),
                                     "{} = {v:?}",
                                     d.name
                                 );
@@ -1695,6 +1737,85 @@ mod tests {
         assert_eq!(c.failsafe.rc_timeout_us, 50_000);
         assert_eq!(set(&mut c, &F405_LEAN, id, ParamValue::F32(3600.0)), Ok(()));
         assert_eq!(c.failsafe.rc_timeout_us, 3_600_000_000);
+    }
+
+    #[test]
+    fn the_microsecond_parameters_are_the_ones_the_core_quantizes() {
+        // Probe: a value that is no whole microsecond comes back quantized
+        // exactly for the parameters held as microseconds.
+        let mut probed = Vec::new();
+        for (id, d) in ids() {
+            if !matches!(d.default, ParamValue::F32(_)) || d.unit != "s" {
+                continue;
+            }
+            let mut c = cfg();
+            // 0.1 s and 0.4 us: no whole microsecond is this f32.
+            let off = 0.100_000_4_f32;
+            if set(&mut c, &F405_LEAN, id, ParamValue::F32(off)).is_ok()
+                && get(&c, id) != Some(ParamValue::F32(off))
+            {
+                probed.push(id);
+            }
+        }
+        let reported: Vec<ParamId> = micro_ids().collect();
+        assert_eq!(reported, probed);
+        assert_eq!(reported.len(), 10);
+        for (id, _) in ids() {
+            assert_eq!(is_micros(id), reported.contains(&id));
+            assert_eq!(micros(&cfg(), id).is_some(), is_micros(id));
+        }
+        assert!(!is_micros(ParamId(COUNT as u16)));
+        assert_eq!(micros(&cfg(), ParamId(COUNT as u16)), None);
+    }
+
+    #[test]
+    fn micros_is_the_field_the_parameter_writes() {
+        let mut c = cfg();
+        for (k, id) in micro_ids().enumerate() {
+            let us = 100_000 + 1000 * k as u32;
+            set(&mut c, &F405_LEAN, id, ParamValue::F32(us as f32 / 1e6)).unwrap();
+            assert_eq!(micros(&c, id), Some(us), "{}", PARAMS[id.index()].name);
+        }
+        let (e, f) = (&c.estimator.ekf, &c.failsafe);
+        let fields = [
+            e.delay_horizon_us,
+            e.align_time_us,
+            e.gps_timeout_us,
+            e.pos_timeout_us,
+            e.baro_timeout_us,
+            e.mag_timeout_us,
+            f.rc_timeout_us,
+            f.gcs_timeout_us,
+            f.brain_timeout_us,
+            f.setpoint_timeout_us,
+        ];
+        let got: Vec<u32> = micro_ids().map(|id| micros(&c, id).unwrap()).collect();
+        assert_eq!(got, fields);
+        // Above 16 s the f32 seconds no longer name the microsecond; micros does.
+        set(
+            &mut c,
+            &F405_LEAN,
+            ParamId::FS_RC_TIMEOUT,
+            ParamValue::F32(3600.0),
+        )
+        .unwrap();
+        c.failsafe.rc_timeout_us = 3_600_000_001;
+        assert_eq!(micros(&c, ParamId::FS_RC_TIMEOUT), Some(3_600_000_001));
+        // Not a duration.
+        assert_eq!(micros(&c, ParamId::RATE_ROLL_P), None);
+        assert_eq!(micros(&c, ParamId::EKF_SOURCE), None);
+    }
+
+    #[test]
+    fn the_seconds_to_microseconds_rule() {
+        assert_eq!(secs_to_micros(0.0), Some(0));
+        assert_eq!(secs_to_micros(0.1234567), Some(123_457));
+        assert_eq!(secs_to_micros(0.049_999), Some(49_999));
+        assert_eq!(secs_to_micros(3600.0), Some(3_600_000_000));
+        assert_eq!(secs_to_micros(-1.0e-9), None);
+        assert_eq!(secs_to_micros(f32::NAN), None);
+        assert_eq!(secs_to_micros(f32::INFINITY), None);
+        assert_eq!(secs_to_micros(5000.0), None);
     }
 
     #[test]
