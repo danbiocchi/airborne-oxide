@@ -529,7 +529,9 @@ fn write_micros_and_decode_micros_round_trip() {
                 .iter()
                 .find(|n| params::key_of(params::find(n).unwrap()) == Some(k))
                 .unwrap();
-            b.push(&replay::MICROS, |w| replay::fill_micros(w, Micros(77), name, us));
+            b.push(&replay::MICROS, |w| {
+                replay::fill_micros(w, Micros(77), name, us)
+            });
         }
         b.file()
     };

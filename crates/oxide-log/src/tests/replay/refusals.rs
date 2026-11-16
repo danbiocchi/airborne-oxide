@@ -187,3 +187,47 @@ fn a_vehicle_record_with_a_bad_name_is_refused() {
     r[14 + 10] = b'x'; // text after the terminator
     assert_eq!(dec(&r).unwrap_err().kind, K::BadName);
 }
+
+#[test]
+fn a_parameter_record_whose_id_disagrees_with_its_key_is_refused() {
+    let dec = |rec: &[u8]| {
+        let f = one_raw(&replay::IN_PARAM_SET, rec);
+        decode::decode_param_set(&f.records("oxide_in_param_set").next().unwrap())
+    };
+    let base = record_bytes(&replay::IN_PARAM_SET, |w| {
+        replay::fill_param_set(w, T, &set_f32());
+    });
+    let id = u16::from_le_bytes([base[16], base[17]]);
+    // known = true, the raw id is not the key's parameter: every other id.
+    for other in [id ^ 1, id ^ 0x100, id.wrapping_add(1), 0xFFFF] {
+        let mut r = base.clone();
+        r[16..18].copy_from_slice(&other.to_le_bytes());
+        let e = dec(&r).unwrap_err();
+        assert_eq!(
+            (e.topic, e.field, e.kind),
+            ("oxide_in_param_set", "id", K::IdDisagrees(other)),
+            "{other}"
+        );
+    }
+    // known = false carries no key.
+    let mut r = record_bytes(&replay::IN_PARAM_SET, |w| {
+        replay::fill_param_set(w, T, &set_unknown());
+    });
+    assert!(dec(&r).is_ok());
+    r[8] = 1;
+    let e = dec(&r).unwrap_err();
+    assert_eq!((e.topic, e.field), ("oxide_in_param_set", "key"));
+    assert!(matches!(e.kind, K::UnknownKey(_)));
+}
+
+#[test]
+fn a_motor_entry_beyond_the_rotor_count_must_be_zero() {
+    // oxide_out with N = 4: motors 4 to 7 are bytes 32..48.
+    for byte in 32..48 {
+        for bit in 0..8 {
+            let e = decode_out_with(|r| r[byte] ^= 1 << bit).unwrap_err();
+            assert_eq!((e.topic, e.field), ("oxide_out", "motors"), "{byte}:{bit}");
+            assert_eq!(e.kind, K::UnusedMotorNotZero(4 + ((byte - 32) / 4) as u8));
+        }
+    }
+}

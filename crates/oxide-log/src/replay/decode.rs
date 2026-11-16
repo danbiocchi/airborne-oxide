@@ -58,6 +58,11 @@ pub enum DecodeErrorKind {
     UnknownKey(u32),
     /// A parameter marked unknown whose id is in this build's table.
     UnknownId(u16),
+    /// A parameter record whose raw id is not the one its key names (or that
+    /// is marked unknown and carries a key).
+    IdDisagrees(u16),
+    /// A motor entry beyond the rotor count that is not all-zero bits.
+    UnusedMotorNotZero(u8),
     /// A name that is not UTF-8, or has text after its terminator.
     BadName,
 }
@@ -98,6 +103,12 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::UnknownKey(k) => write!(f, ": no parameter has key {k:#010x}"),
             DecodeErrorKind::UnknownId(i) => {
                 write!(f, ": id {i} is marked outside the table but is in it")
+            }
+            DecodeErrorKind::IdDisagrees(i) => {
+                write!(f, ": raw id {i} disagrees with the key")
+            }
+            DecodeErrorKind::UnusedMotorNotZero(i) => {
+                write!(f, ": motor {i} is beyond the rotor count and not zero")
             }
             DecodeErrorKind::BadName => write!(f, ": the name is damaged"),
         }
@@ -480,9 +491,16 @@ pub fn decode_param_set(r: &RecordView<'_>) -> Res<ParamSet> {
     let kind = d.u8("kind")?;
     let known = d.flag("known")?;
     let id = if known {
-        params::find_key(key).ok_or_else(|| d.err("key", DecodeErrorKind::UnknownKey(key)))?
+        let id =
+            params::find_key(key).ok_or_else(|| d.err("key", DecodeErrorKind::UnknownKey(key)))?;
+        if id.0 != raw_id {
+            return Err(d.err("id", DecodeErrorKind::IdDisagrees(raw_id)));
+        }
+        id
     } else if usize::from(raw_id) < params::COUNT {
         return Err(d.err("id", DecodeErrorKind::UnknownId(raw_id)));
+    } else if key != 0 {
+        return Err(d.err("key", DecodeErrorKind::UnknownKey(key)));
     } else {
         ParamId(raw_id)
     };
@@ -545,6 +563,12 @@ pub fn decode_out<const N: usize>(r: &RecordView<'_>) -> Res<OutRecord<N>> {
     let mut motors = [0.0_f32; N];
     for (m, v) in motors.iter_mut().zip(all) {
         *m = v;
+    }
+    for (i, v) in all.iter().enumerate().skip(N) {
+        if v.to_bits() != 0 {
+            let i = u8::try_from(i).unwrap_or(u8::MAX);
+            return Err(d.err("motors", DecodeErrorKind::UnusedMotorNotZero(i)));
+        }
     }
     let events = d.u8("events")?;
     if usize::from(events) > EVENTS_PER_TICK {
