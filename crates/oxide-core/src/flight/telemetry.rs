@@ -84,7 +84,8 @@ pub struct Telemetry {
     /// and while armed once thrust and vertical speed have stayed below the
     /// touchdown thresholds for `touchdown_s`.
     pub landed: bool,
-    /// Guidance has seen ground contact: a descent is commanded and the
+    /// Guidance has seen ground contact (false whenever `setpoints` is
+    /// `None`, so a stale count is never reported): a descent is commanded and the
     /// vehicle has not moved for 0.5 s (guidance task). The attitude and
     /// thrust targets are then overridden to level at minimum thrust.
     pub ground_contact: bool,
@@ -123,7 +124,8 @@ impl<const N: usize> Core<N> {
             rate_command: self.rate_command,
             setpoints: self.setpoints,
             landed: self.sup_state.land.landed(),
-            ground_contact: self.guide_state.contact_s >= LAND_CONTACT_S,
+            ground_contact: self.setpoints.is_some()
+                && self.guide_state.contact_s >= LAND_CONTACT_S,
             gyro_filtered: self.gyro_filtered,
             battery_cell_v: battery.cell_voltage(),
             battery_low: battery.low(),

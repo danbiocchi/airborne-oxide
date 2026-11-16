@@ -2110,6 +2110,19 @@ fn telemetry_reports_the_battery_latches_separately_and_the_cell_voltage() {
     assert!(t.battery_cell_v.expect("cell voltage") < 3.3);
 }
 
+#[test]
+fn ground_contact_is_not_reported_while_guidance_is_not_controlling() {
+    let mut rig = critical_battery_rig();
+    assert!(rig.run_until(5.0, |r| r.core.telemetry().ground_contact));
+    assert!(rig.core.telemetry().setpoints.is_some());
+    // The attitude estimate disappears while still armed.
+    rig.state = None;
+    assert!(rig.run_until(0.2, |r| r.core.telemetry().setpoints.is_none()));
+    let t = rig.core.telemetry();
+    assert!(t.setpoints.is_none());
+    assert!(!t.ground_contact, "stale contact flag: {t:?}");
+}
+
 /// The velocity setpoint of a report, as an option (the report keeps one
 /// only where a velocity loop runs).
 fn vel_of(s: &Setpoints) -> Option<Vec3<f32>> {
