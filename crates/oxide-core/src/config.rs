@@ -629,3 +629,313 @@ impl<const N: usize> VehicleConfig<N> {
         self.mass_kg * crate::GRAVITY
     }
 }
+
+// ---- the vehicle description as a list of numbers ----
+
+/// Rotors whose fields have names in [`VehicleConfig::vehicle_numbers`].
+pub const MAX_NUMBERED_ROTORS: usize = 16;
+/// Values per rotor: x, y, spin, max thrust, torque coefficient.
+const ROTOR_FIELDS: usize = 5;
+/// Values before the rotors.
+const SCALARS: usize = 8;
+const SCALAR_NAMES: [&str; SCALARS] = [
+    "mass_kg",
+    "inertia_x",
+    "inertia_y",
+    "inertia_z",
+    "thrust_expo",
+    "nominal_voltage_v",
+    "battery_cells",
+    "battery_resistance_ohm",
+];
+const ROTOR_NAMES: [[&str; ROTOR_FIELDS]; MAX_NUMBERED_ROTORS] = [
+    [
+        "rotor0_x",
+        "rotor0_y",
+        "rotor0_spin",
+        "rotor0_max_thrust_n",
+        "rotor0_torque_coeff_m",
+    ],
+    [
+        "rotor1_x",
+        "rotor1_y",
+        "rotor1_spin",
+        "rotor1_max_thrust_n",
+        "rotor1_torque_coeff_m",
+    ],
+    [
+        "rotor2_x",
+        "rotor2_y",
+        "rotor2_spin",
+        "rotor2_max_thrust_n",
+        "rotor2_torque_coeff_m",
+    ],
+    [
+        "rotor3_x",
+        "rotor3_y",
+        "rotor3_spin",
+        "rotor3_max_thrust_n",
+        "rotor3_torque_coeff_m",
+    ],
+    [
+        "rotor4_x",
+        "rotor4_y",
+        "rotor4_spin",
+        "rotor4_max_thrust_n",
+        "rotor4_torque_coeff_m",
+    ],
+    [
+        "rotor5_x",
+        "rotor5_y",
+        "rotor5_spin",
+        "rotor5_max_thrust_n",
+        "rotor5_torque_coeff_m",
+    ],
+    [
+        "rotor6_x",
+        "rotor6_y",
+        "rotor6_spin",
+        "rotor6_max_thrust_n",
+        "rotor6_torque_coeff_m",
+    ],
+    [
+        "rotor7_x",
+        "rotor7_y",
+        "rotor7_spin",
+        "rotor7_max_thrust_n",
+        "rotor7_torque_coeff_m",
+    ],
+    [
+        "rotor8_x",
+        "rotor8_y",
+        "rotor8_spin",
+        "rotor8_max_thrust_n",
+        "rotor8_torque_coeff_m",
+    ],
+    [
+        "rotor9_x",
+        "rotor9_y",
+        "rotor9_spin",
+        "rotor9_max_thrust_n",
+        "rotor9_torque_coeff_m",
+    ],
+    [
+        "rotor10_x",
+        "rotor10_y",
+        "rotor10_spin",
+        "rotor10_max_thrust_n",
+        "rotor10_torque_coeff_m",
+    ],
+    [
+        "rotor11_x",
+        "rotor11_y",
+        "rotor11_spin",
+        "rotor11_max_thrust_n",
+        "rotor11_torque_coeff_m",
+    ],
+    [
+        "rotor12_x",
+        "rotor12_y",
+        "rotor12_spin",
+        "rotor12_max_thrust_n",
+        "rotor12_torque_coeff_m",
+    ],
+    [
+        "rotor13_x",
+        "rotor13_y",
+        "rotor13_spin",
+        "rotor13_max_thrust_n",
+        "rotor13_torque_coeff_m",
+    ],
+    [
+        "rotor14_x",
+        "rotor14_y",
+        "rotor14_spin",
+        "rotor14_max_thrust_n",
+        "rotor14_torque_coeff_m",
+    ],
+    [
+        "rotor15_x",
+        "rotor15_y",
+        "rotor15_spin",
+        "rotor15_max_thrust_n",
+        "rotor15_torque_coeff_m",
+    ],
+];
+
+/// Why a list of vehicle numbers could not be turned into a configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumbersError {
+    /// A name the vehicle needs is not in the list.
+    Missing(&'static str),
+    /// A name that is not one of this vehicle's numbers.
+    Unknown,
+    /// A name appears twice.
+    Duplicate(&'static str),
+    /// The value cannot be this field: a spin other than 1 or -1, or a cell
+    /// count that is not a whole number from 0 to 255.
+    BadValue(&'static str),
+}
+
+/// 64-bit FNV-1a, one byte at a time.
+fn fnv1a_64(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+impl<const N: usize> VehicleConfig<N> {
+    /// Every value of the vehicle description that is not one of the
+    /// parameters, as `(name, value)` in a fixed order: [`SCALAR_NAMES`]
+    /// (mass, the three moments of inertia, thrust expo, nominal voltage,
+    /// battery cells and resistance), then for each rotor `rotor{k}_x`,
+    /// `_y` (m), `_spin` (1 for counter-clockwise, -1 for clockwise),
+    /// `_max_thrust_n`, `_torque_coeff_m`. Every value is exact in an `f32`
+    /// (the cell count is an integer below 256). At most
+    /// [`MAX_NUMBERED_ROTORS`] rotors: more does not compile.
+    ///
+    /// The 93 parameters are not here; they are `params::get` over the
+    /// table. Together they are the whole configuration.
+    pub fn vehicle_numbers(&self, mut f: impl FnMut(&'static str, f32)) {
+        const { assert!(N <= MAX_NUMBERED_ROTORS) };
+        let scalars = [
+            self.mass_kg,
+            self.inertia.x,
+            self.inertia.y,
+            self.inertia.z,
+            self.thrust_expo,
+            self.nominal_voltage_v,
+            f32::from(self.battery_cells),
+            self.battery_resistance_ohm,
+        ];
+        for (name, v) in SCALAR_NAMES.iter().zip(scalars) {
+            f(name, v);
+        }
+        for (names, r) in ROTOR_NAMES.iter().zip(self.rotors.iter()) {
+            let values = [r.x, r.y, r.spin.sign(), r.max_thrust_n, r.torque_coeff_m];
+            for (name, v) in names.iter().zip(values) {
+                f(name, v);
+            }
+        }
+    }
+
+    /// The inverse of [`Self::vehicle_numbers`]: builds the vehicle
+    /// description from named values (any order). Every name must appear
+    /// once; one that is not this vehicle's is [`NumbersError::Unknown`].
+    ///
+    /// The gains, limits, estimator and failsafe settings, which the 93
+    /// parameters hold, come out at the table defaults: apply the
+    /// parameters on top (`params::set_all`). The result is not validated.
+    pub fn from_vehicle_numbers<'a>(
+        numbers: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Result<Self, NumbersError> {
+        const { assert!(N <= MAX_NUMBERED_ROTORS) };
+        let mut scalars = [None::<f32>; SCALARS];
+        let mut rotors = [[None::<f32>; ROTOR_FIELDS]; N];
+        for (name, v) in numbers {
+            let slot =
+                match SCALAR_NAMES.iter().position(|n| *n == name) {
+                    Some(i) => scalars.get_mut(i).map(|s| (s, SCALAR_NAMES.get(i))),
+                    None => ROTOR_NAMES.iter().take(N).zip(rotors.iter_mut()).find_map(
+                        |(names, slots)| {
+                            let i = names.iter().position(|n| *n == name)?;
+                            Some((slots.get_mut(i)?, names.get(i)))
+                        },
+                    ),
+                };
+            let Some((slot, canonical)) = slot else {
+                return Err(NumbersError::Unknown);
+            };
+            if slot.is_some() {
+                return Err(NumbersError::Duplicate(canonical.copied().unwrap_or("")));
+            }
+            *slot = Some(v);
+        }
+        let need = |v: Option<f32>, name: &'static str| v.ok_or(NumbersError::Missing(name));
+        let mut s = [0.0_f32; SCALARS];
+        for ((out, v), name) in s.iter_mut().zip(scalars).zip(SCALAR_NAMES) {
+            *out = need(v, name)?;
+        }
+        let [mass, ix, iy, iz, expo, volts, cells, resistance] = s;
+        let cells_u8 = {
+            let c = cells as u8;
+            if f32::from(c) == cells {
+                c
+            } else {
+                return Err(NumbersError::BadValue("battery_cells"));
+            }
+        };
+        let mut out_rotors = [Rotor {
+            x: 0.0,
+            y: 0.0,
+            spin: Spin::Ccw,
+            max_thrust_n: 0.0,
+            torque_coeff_m: 0.0,
+        }; N];
+        for ((slots, names), rotor) in rotors
+            .iter()
+            .zip(ROTOR_NAMES.iter())
+            .zip(out_rotors.iter_mut())
+        {
+            let mut v = [0.0_f32; ROTOR_FIELDS];
+            for ((out, slot), name) in v.iter_mut().zip(slots).zip(names) {
+                *out = need(*slot, name)?;
+            }
+            let [x, y, spin, max_thrust_n, torque_coeff_m] = v;
+            let spin_name = names.get(2).copied().unwrap_or("");
+            let spin = if spin == 1.0 {
+                Spin::Ccw
+            } else if spin == -1.0 {
+                Spin::Cw
+            } else {
+                return Err(NumbersError::BadValue(spin_name));
+            };
+            *rotor = Rotor {
+                x,
+                y,
+                spin,
+                max_thrust_n,
+                torque_coeff_m,
+            };
+        }
+        Ok(Self {
+            mass_kg: mass,
+            inertia: Vec3::new(ix, iy, iz),
+            rotors: out_rotors,
+            thrust_expo: expo,
+            nominal_voltage_v: volts,
+            gains: Gains::default(),
+            limits: Limits::default(),
+            estimator: EstimatorConfig::default(),
+            failsafe: FailsafeParams::default(),
+            battery_cells: cells_u8,
+            battery_resistance_ohm: resistance,
+        })
+    }
+
+    /// A 64-bit hash of the whole configuration (ADR-0005 §6): FNV-1a over
+    /// the bits of every [`Self::vehicle_numbers`] value in their order
+    /// (each as its `f32` bits, little endian), then every parameter in table
+    /// order (an `f32` as its bits, an `i32` as its two's-complement bits,
+    /// little endian; parameters in seconds as `params::get` reads them).
+    /// Two logs with the same hash and profile were flown with the same
+    /// settings.
+    pub fn config_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        self.vehicle_numbers(|_, v| h = fnv1a_64(h, &v.to_bits().to_le_bytes()));
+        for i in 0..crate::params::COUNT {
+            let bits = match u16::try_from(i)
+                .ok()
+                .and_then(|i| crate::params::get(self, crate::params::ParamId(i)))
+            {
+                Some(crate::params::ParamValue::F32(x)) => x.to_bits(),
+                Some(crate::params::ParamValue::I32(x)) => x as u32,
+                None => 0,
+            };
+            h = fnv1a_64(h, &bits.to_le_bytes());
+        }
+        h
+    }
+}
