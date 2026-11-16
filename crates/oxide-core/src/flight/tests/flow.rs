@@ -1993,12 +1993,7 @@ fn reading_telemetry_changes_nothing() {
     assert!(a.iter().any(|o| o.status.armed));
     assert!(a.iter().any(|o| o.motors.iter().any(|m| *m > 0.5)));
     for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        assert_eq!(x.t_valid, y.t_valid, "tick {k}");
-        for (m, n) in x.motors.iter().zip(y.motors.iter()) {
-            assert_eq!(m.to_bits(), n.to_bits(), "tick {k}");
-        }
-        assert_eq!(x.status, y.status, "tick {k}");
-        assert_eq!(x.events, y.events, "tick {k}");
+        assert!(x.same_bits(y), "tick {k}: {x:?} against {y:?}");
     }
     assert_eq!(plain.core.ticks, watched.core.ticks);
 }
