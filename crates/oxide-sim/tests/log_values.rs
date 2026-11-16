@@ -1552,13 +1552,7 @@ fn pyulog_reads_every_topic_of_a_flight_and_the_same_values() {
                 );
             }
 
-            for topic in [
-                "vehicle_attitude",
-                "vehicle_local_position",
-                "actuator_motors",
-                "battery_status",
-                "vehicle_status",
-            ] {
+            for topic in NORMAL.iter().map(|t| t.name) {
                 let (ok, csv, err) = run(&py, &[p, "--dump", topic]);
                 assert!(ok, "{ctx}: {err}");
                 let sub = file.subscriptions.iter().find(|s| s.name == topic).unwrap();
@@ -1578,7 +1572,7 @@ fn pyulog_reads_every_topic_of_a_flight_and_the_same_values() {
                             .join(","),
                     );
                 }
-                assert!(want.len() > 3, "{ctx}: {topic} has {} lines", want.len());
+                assert!(want.len() >= 2, "{ctx}: {topic} has no record");
                 let got: Vec<&str> = csv.lines().collect();
                 assert_eq!(got.len(), want.len(), "{ctx} {topic}: record count");
                 for (i, (g, w)) in got.iter().zip(&want).enumerate() {
