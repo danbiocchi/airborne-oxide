@@ -4,6 +4,7 @@
 mod config;
 mod harness;
 mod mutation;
+mod pyulog;
 mod refusals;
 mod roundtrip;
 mod samples;
