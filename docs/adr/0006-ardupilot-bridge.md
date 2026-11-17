@@ -1,6 +1,6 @@
 # ADR-0006: The ArduPilot bridge
 
-Status: accepted as the design (M1d). Built so far: the seam of §2; the wind grid, the IMU grid and the pre-roll in the simulator; the exchange of §3, proven against a stand-in. Not built yet: the ArduCopter process, MAVLink, and the translation of pilots and faults. The measurements below come from a prototype that was thrown away.
+Status: accepted as the design (M1d). Built so far: the seam of §2; the wind grid, the IMU grid and the pre-roll in the simulator; the exchange of §3, proven against a stand-in; the ArduCopter process runner and the MAVLink client, proven by booting the pinned binary at rest. Not built yet: the autopilot that flies (it also moves the exchange's first time stamp from zero to one step, §3), and the translation of pilots and faults. The measurements below come from a prototype that was thrown away.
 
 ## Context
 
@@ -39,7 +39,7 @@ A flight is judged from the physics: where the vehicle went, how far it tilted, 
 
 - **Lockstep, and the simulator owns the clock.** One reply per motor packet. The physics never advances on a packet whose frame counter repeats.
 - **The step of a bridged flight is 500 µs.** ArduCopter's loop is 2500 µs, so it gets five steps per loop. Steps of 250, 500, 1000 and 1250 µs all flew with the same tilt and horizontal error; 2500 µs cannot arm, because ArduCopter demands an IMU rate of 1.8 times its loop rate. 500 µs divides the loop evenly at half the cost of 250 µs. Our core's own profiles keep their steps (1000 µs and 250 µs): no existing flight changes.
-- **Time stamps.** The reply's time stamp for step *k* is *k* × (step + 1 ns). SITL adds the differences into a whole number of microseconds and truncates, so exact steps make its clock run 0.04 % slow; the extra nanosecond makes it exact (measured).
+- **Time stamps.** The reply's time stamp for exchange *n*, counted from 0 at the program's start with the pre-roll included, is (*n* + 1) × (step + 1 ns). The first reply carries one step, not zero: SITL accepts a first stamp of zero, but such a run does not repeat. The instant its motor outputs come alive then moves by a few steps from run to run; started at one step, every run repeated (measured on the binary, re-run). SITL adds the differences into a whole number of microseconds and truncates, so exact steps make its clock run 0.04 % slow; the extra nanosecond makes it exact (measured).
 - **Framing.** Every reply starts and ends with a newline. SITL drops a first reply that does not start with one.
 - **A flight starts with a pre-roll.** For a fixed 45 simulated seconds the vehicle rests on the ground with no wind and no faults while ArduCopter starts its estimator. The simulator runs it (`Simulation::preroll`), and only our IMU model advances in it: ArduCopter sees the IMU's turn-on bias from its own start, as on a real vehicle, and the flight that follows has the wind and the other sensors of a flight with no pre-roll, bit for bit. Scenario time zero is the end of the pre-roll. A flight in which ArduCopter is not ready to arm by then has failed to start and is reported as that, not as a flight.
 - **Commands act at once.** The motor packet that answers the state at *t* drives the physics from *t*. This is how ArduPilot's own simulator and its JSON examples work, and it gives ArduCopter no handicap. Our core keeps its rule that a command acts one tick after the tick that computed it (DESIGN §4.2), so it flies with up to 1 ms more delay than ArduCopter.
@@ -71,6 +71,7 @@ ArduCopter's output *k* drives our rotor *k*. With `A = (pwm − 1000) / 1000`, 
 - **Stick flying** goes through the `rc` channels of the reply, clocked by our time stamps. The channels are numbered by our own choice (`oxide_bridge::bridge::rc_pulses`): 1 roll, 2 pitch, 3 throttle, 4 yaw (1000 to 2000, 1500 at the centre), 5 mode switch (positions 0, 1, 2 as 1000, 1500, 2000), 6 arm switch (1000 off, 2000 on), 7 kill switch (1000 off, 2000 on), 8 unused (1000). The part that runs the real program maps channels 5 to 8 to ArduCopter's own mode and auxiliary-function parameters; it must not assume other numbers. The pilot's modes map to ArduCopter's: Stabilized to STABILIZE, Altitude to ALT_HOLD, Position to LOITER.
 - **Offboard flying** goes over MAVLink in GUIDED: arm, take off, then position targets. Commands are sent from the physics thread at fixed simulated times, and the set of requested telemetry messages is fixed, because both change the instant ArduCopter acts and with it the whole flight.
 - **MAVLink is read all the time.** SITL stops when its send queue fills, which would hang both processes.
+- **ArduCopter says nothing on a link until it has heard a heartbeat there**: no status text and no parameter value (measured). The bridge's own client therefore sends a heartbeat every second at fixed simulated times, under a system id that is not the ground station's, so that it never counts as one. A scenario's ground station is a separate link that sends heartbeats under the ground station's id, and only when the scenario has one.
 - **Faults** reach ArduCopter by the route that works, observed in the spike:
 
 | Our fault | How it is applied | What ArduCopter did (defaults unless said) |
@@ -111,7 +112,7 @@ The runner can fly any bridged flight twice and compare the trace hashes, and th
 
 ### 10. Where the code lives
 
-A new crate, `oxide-bridge`, holds the JSON exchange, the SITL process runner, the MAVLink client and the translation of pilots and faults. It depends on `oxide-sim` and on the `mavlink` crate, version 0.21.0 with its default features off and `std`, `transport-tcp` and `dialect-ardupilotmega` on (16 new crates in the lock file; MIT or Apache-2.0). `oxide-core`, `oxide-log` and `oxide-sim` gain no dependency.
+A new crate, `oxide-bridge`, holds the JSON exchange, the SITL process runner, the MAVLink client and the translation of pilots and faults. It depends on `oxide-sim` and on the `mavlink` crate, version 0.21.0 with its default features off and `std`, `transport-tcp` and `dialect-ardupilotmega` on (11 new packages in the lock file, each under MIT, Apache-2.0 or the Unlicense). `oxide-core`, `oxide-log` and `oxide-sim` gain no dependency.
 
 ### 11. What is recorded for each bridged flight
 
