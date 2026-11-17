@@ -117,9 +117,15 @@ fn gust_hold_from_the_file_flies_the_same_flight_as_the_one_built_in_code() {
     let from_file = fly_scenario(&src, 0, &setup).unwrap_or_else(|e| panic!("{e}"));
     let (pilot, options) = gust_hold(0);
     let secs = pilot.duration_s;
-    let config = ArduCopterConfig::new(binary(), root.path().join("code"), lease.0);
+    let airframe = Airframe::reference_quad().expect("airframe");
+    let mut config = ArduCopterConfig::new(binary(), root.path().join("code"), lease.0);
+    // The same parameter list as every bridged flight of the runner: the
+    // committed files and the battery thresholds (the file has no fence).
+    let (files, extras) = oxide_bridge::runner::committed_params(&airframe);
+    config.param_files = files;
+    config.extra_params = extras;
     let from_code = fly(
-        &Airframe::reference_quad().expect("airframe"),
+        &airframe,
         pilot,
         options,
         config,
