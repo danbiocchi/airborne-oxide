@@ -657,6 +657,7 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             param_set,
             param_ack,
             faults: active,
+            rotor_scale: self.model.rotor_scale,
         };
         let out = match self.autopilot.tick(t, &input) {
             Ok(out) => out,

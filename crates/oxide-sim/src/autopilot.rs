@@ -77,6 +77,11 @@ pub struct AutopilotInput<'a, const N: usize> {
     pub param_ack: bool,
     /// Which fault kinds are active at `t`.
     pub faults: ActiveFaults,
+    /// How much of its thrust each rotor has at `t` (1 = healthy, 0 = lost):
+    /// the physics' own scale after the motor-loss faults, the worst of the
+    /// overlapping ones per rotor. [`ActiveFaults::motor_loss`] says which
+    /// rotors, this says how much.
+    pub rotor_scale: [f64; N],
 }
 
 /// What an autopilot returns from one tick.

@@ -49,6 +49,8 @@ struct Stub {
     /// The parameter changes and acknowledgements it was given.
     seen_sets: Vec<ParamSet>,
     seen_acks: u32,
+    /// The rotor scales it was given at each tick.
+    seen_scales: Vec<[f64; 4]>,
 }
 
 impl Stub {
@@ -64,6 +66,7 @@ impl Stub {
             valid_after_periods: 1,
             seen_sets: Vec::new(),
             seen_acks: 0,
+            seen_scales: Vec::new(),
         }
     }
 }
@@ -87,6 +90,7 @@ impl Autopilot<4> for Stub {
         }
         self.seen_sets.extend(input.param_set);
         self.seen_acks += u32::from(input.param_ack);
+        self.seen_scales.push(input.rotor_scale);
         let armed = t.as_secs_f64() >= self.arm_at_s;
         let height = -input.body.position.z;
         let climb = -input.body.velocity.z;
@@ -476,4 +480,53 @@ fn a_failing_tick_leaves_a_queued_parameter_change_and_ack_queued() {
     sim.try_step().expect("and the next");
     assert_eq!(sim.autopilot().seen_sets, vec![set]);
     assert_eq!(sim.autopilot().seen_acks, 1);
+}
+
+#[test]
+fn the_autopilot_is_told_how_much_thrust_each_rotor_has_left() {
+    use oxide_sim::faults::{Fault, FaultKind};
+    let options = SimOptions {
+        faults: vec![
+            Fault {
+                kind: FaultKind::MotorLoss {
+                    rotor: 1,
+                    scale: 0.4,
+                },
+                start_s: 0.01,
+                end_s: Some(0.02),
+            },
+            // Overlapping on one rotor: the worst applies.
+            Fault {
+                kind: FaultKind::MotorLoss {
+                    rotor: 1,
+                    scale: 0.7,
+                },
+                start_s: 0.015,
+                end_s: Some(0.03),
+            },
+            Fault {
+                kind: FaultKind::MotorLoss {
+                    rotor: 3,
+                    scale: 0.0,
+                },
+                start_s: 0.025,
+                end_s: None,
+            },
+        ],
+        ..SimOptions::default()
+    };
+    let mut sim =
+        Simulation::with_autopilot(&airframe(), Stub::new(500), NoPilot, options).expect("builds");
+    sim.try_run_until(Micros(40_000), |_| {})
+        .expect("cannot fail");
+    let seen = &sim.autopilot().seen_scales;
+    let at = |us: usize| seen[us / 500];
+    assert_eq!(at(0), [1.0; 4]);
+    assert_eq!(at(9_500), [1.0; 4]);
+    assert_eq!(at(10_000), [1.0, 0.4, 1.0, 1.0]);
+    assert_eq!(at(15_000), [1.0, 0.4, 1.0, 1.0], "the worst scale wins");
+    assert_eq!(at(20_000), [1.0, 0.7, 1.0, 1.0]);
+    assert_eq!(at(25_000), [1.0, 0.7, 1.0, 0.0]);
+    assert_eq!(at(30_000), [1.0, 1.0, 1.0, 0.0]);
+    assert_eq!(at(39_500), [1.0, 1.0, 1.0, 0.0]);
 }
