@@ -35,6 +35,20 @@
 //! - [`batch`]: many flights, each in a child process of its own.
 //! - [`cli`]: the command line of the binary `oxide-bridge` (`fly`, `batch`).
 //!
+//! # The binary
+//!
+//! `oxide-bridge fly --scenario FILE` flies one run of a scenario file and
+//! `oxide-bridge batch --scenario FILE --indices A..B --out DIR` flies many,
+//! each in a child process of its own. `--autopilot arducopter` goes through
+//! the bridge: the committed parameter files (`base.parm`,
+//! `starting-gains.parm`, `failsafes.parm`), our battery thresholds as the
+//! program's, the scenario's fence, and our faults as parameter writes
+//! ([`faults::FaultTranslator`]). `--autopilot core-f405` and `core-h743`
+//! fly our own core on the same file. Both write the same row
+//! ([`record::COLUMNS`]) and the same record (`audit.txt`, `row.csv`), judged
+//! by the same checker and classed by the same code. A scenario that needs
+//! the pilot's sticks is refused with a sentence ([`scenario::translate`]).
+//!
 //! # A bridged flight repeats bit for bit
 //!
 //! Nothing read from MAVLink influences anything sent to the program or to
