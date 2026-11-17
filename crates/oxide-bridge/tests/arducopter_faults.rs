@@ -851,6 +851,23 @@ fn motor_loss_is_not_answered_and_the_vehicle_tumbles_away_with_its_motors_on() 
         "MEASURED tilt at the end: {:.1} deg, height {:.3} m",
         last.tilt_deg, -last.position[2]
     );
+    let beyond_60 = run
+        .between(15.0, 1e9)
+        .find(|k| k.tilt_deg > 60.0)
+        .map(|k| k.t_s)
+        .expect("beyond 60 degrees");
+    let ground = run
+        .between(15.5, 1e9)
+        .find(|k| -k.position[2] < 0.05)
+        .map(|k| k.t_s)
+        .expect("ground contact");
+    near(
+        "time from the fault to a tilt beyond 60 degrees",
+        beyond_60 - 15.0,
+        0.22,
+        0.1,
+    );
+    near("time from the fault to the ground", ground - 15.0, 8.9, 0.5);
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
