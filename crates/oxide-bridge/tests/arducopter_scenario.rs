@@ -449,8 +449,14 @@ fn a_child_killed_in_mid_flight_is_reported_and_the_run_flown_again() {
                 .next()
                 .expect("pid")
                 .to_string();
-            // Mid-flight: the pre-roll alone takes several seconds.
-            std::thread::sleep(std::time::Duration::from_secs(4));
+            // Mid-flight: the program is running (it has written its pid)
+            // and has flown for a second of the few a flight takes.
+            let pid_file = out.join("run-0001").join("sitl").join("sitl.pid");
+            let waited = std::time::Instant::now();
+            while !pid_file.exists() && waited.elapsed().as_secs() < 30 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1200));
             let ok = Command::new("kill")
                 .args(["-KILL", &pid])
                 .status()
