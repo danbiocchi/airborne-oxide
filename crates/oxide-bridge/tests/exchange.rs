@@ -103,6 +103,18 @@ fn a_flight_of_5_s_against_the_stand_in_leaves_the_ground_and_holds_the_height()
         f.records.iter().take(900).all(|r| !r.armed),
         "disarmed before 0.5 s"
     );
+    // The command acts at once: the tick that first commands thrust shows the
+    // rotors turning in the very next record.
+    let first = f
+        .records
+        .iter()
+        .position(|r| r.motors[0] > 0.0)
+        .expect("a motor was commanded");
+    assert_eq!(f.records[first].rotor_speed[0], 0.0);
+    assert!(
+        f.records[first + 1].rotor_speed[0] > 0.0,
+        "the command of tick {first} acted over that step"
+    );
     // One reply per frame, each framed by newlines.
     assert_eq!(f.report.replies.len(), f.records.len());
     assert_eq!(f.report.resends, 0);

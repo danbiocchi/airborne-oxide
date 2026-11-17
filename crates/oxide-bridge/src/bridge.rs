@@ -488,4 +488,51 @@ mod tests {
         assert!(s.contains("step 3") && s.contains("gyro"), "{s}");
         assert!(std::error::Error::source(&e).is_some());
     }
+
+    /// A motor packet of 16 channels with these first four pulses.
+    fn packet(count: u32, pwm: [u16; 4]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&18458u16.to_le_bytes());
+        b.extend_from_slice(&2000u16.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        for k in 0..16 {
+            b.extend_from_slice(&pwm.get(k).copied().unwrap_or(0).to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn the_commands_act_at_the_tick_that_asked_and_armed_means_a_pulse_above_1000() {
+        let mut config = BridgeConfig::new(500);
+        config.reply_timeout = Duration::from_secs(5);
+        config.spin_min = 0.0;
+        config.spin_max = 1.0;
+        let mut b = bridge(config);
+        let to = std::net::SocketAddr::from(([127, 0, 0, 1], b.link().local_port()));
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        // The first packet, then the answers to the replies of three ticks.
+        for (count, pwm) in [
+            (1, [1000; 4]),
+            (2, [1000; 4]),
+            (3, [1000, 1000, 1000, 1001]),
+            (4, [1250, 1500, 1750, 2000]),
+        ] {
+            peer.send_to(&packet(count, pwm), to).expect("send");
+        }
+        let frame = SensorFrame::default();
+        let body = BodyState::<4>::default();
+        let i = none(&body, &frame);
+        let o = b.tick(Micros(1_500), &i).expect("tick");
+        assert_eq!(o.t_valid, Micros(1_500), "valid at the tick's own time");
+        assert_eq!(o.motors, [0.0; 4]);
+        assert!(!o.armed, "all four at 1000");
+        let o = b.tick(Micros(2_000), &i).expect("tick");
+        assert_eq!(o.t_valid, Micros(2_000));
+        assert!(o.armed, "one pulse at 1001 is armed");
+        let o = b.tick(Micros(2_500), &i).expect("tick");
+        assert_eq!(o.t_valid, Micros(2_500));
+        assert_eq!(o.motors, [0.25, 0.5, 0.75, 1.0], "output k drives rotor k");
+        assert!(o.core.is_none());
+        assert_eq!(b.frames(), 3);
+    }
 }
