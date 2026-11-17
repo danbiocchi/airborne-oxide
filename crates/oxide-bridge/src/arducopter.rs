@@ -143,45 +143,77 @@ pub struct TelemetryRequest {
 }
 
 /// The GPS lag of the program, µs: `SIM_GPS1_LAG_MS 150` in `base.parm` (a
-/// unit test of [`crate::parm`] pins that value).
+/// unit test of [`crate::parm`] pins that value, and building the
+/// configuration checks the files against [`GpsError::lag_us`]).
 pub const GPS_LAG_US: u64 = 150_000;
 
-/// The ratio of the standard deviation of the error ArduCopter's GPS reports
-/// to the standard deviation of the errors the bridge holds in its replies.
+/// How the bridge's held errors are turned into the error ArduCopter's GPS
+/// reports (ADR-0006 section 4).
 ///
-/// The program's GPS lag reads the position `GPS_LAG_US` back, between two
-/// stored samples one GPS period apart, so each fix is
-/// `w d(j-2) + (1 - w) d(j-1)` of the held errors `d`, with `w = lag /
-/// period`; for white `d` its standard deviation is `sqrt(w² + (1-w)²)` of
-/// theirs (0.7906 for 150 ms and 200 ms, measured on V4.7.2: the reported
-/// error is that blend of our draws to within 0.01 m rms) and successive
-/// fixes share a draw, so their correlation is `w (1-w) / (w² + (1-w)²)`
-/// (0.30). [`bridged_options`] divides our model's standard deviation by this
-/// ratio, so that ArduCopter's GPS has the horizontal error our model has.
-/// Only the 150 ms lag and 200 ms period are measured.
-pub fn gps_blend_sd_ratio(period_us: u64) -> f64 {
-    if period_us == 0 {
-        return 1.0;
-    }
-    let w = (GPS_LAG_US as f64 / period_us as f64).min(1.0);
-    Real::sqrt(w * w + (1.0 - w) * (1.0 - w))
+/// The program's GPS lag reads the position `lag` back, between two stored
+/// samples one GPS period apart, so each fix it reports is
+/// `a sent(j-2) + b sent(j-1)` of the errors the bridge sent, with `a = lag /
+/// period` and `b = 1 - a` (measured on V4.7.2 for 150 ms and 200 ms: 0.007 m
+/// rms residual). The bridge sends the sequence
+/// `sent(k) = (n(k) - lo sent(k-1)) / hi` of independent draws `n`, `hi` the
+/// larger and `lo` the smaller of `a` and `b`: the blend of that sequence is
+/// `n` through a filter that changes no frequency's size, so the reported
+/// error is white with the standard deviation of `n`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpsBlend {
+    /// The larger of the two weights.
+    pub hi: f64,
+    /// The smaller of the two weights.
+    pub lo: f64,
 }
+
+impl GpsBlend {
+    /// The standard deviation of `sent` over that of the reported error:
+    /// `1 / sqrt(hi² - lo²)` (1.414 for 150 ms and 200 ms).
+    pub fn sent_over_reported(&self) -> f64 {
+        1.0 / Real::sqrt(self.hi * self.hi - self.lo * self.lo)
+    }
+}
+
+/// A lag whose blend cannot be undone: within 5 % of half the period, the two
+/// weights are nearly equal and the pre-filter's pole is on the unit circle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpsLagUnusable {
+    pub lag_us: u64,
+    pub period_us: u64,
+}
+
+impl fmt::Display for GpsLagUnusable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the GPS lag of {} us is within 5 % of half the GPS period of {} us: the two \
+             samples the program blends then weigh alike and the blend cannot be undone; \
+             use another lag",
+            self.lag_us, self.period_us
+        )
+    }
+}
+
+impl std::error::Error for GpsLagUnusable {}
 
 /// The GPS horizontal error of ADR-0006 §4.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpsError {
     /// Switched off when false (the flight then has none).
     pub enabled: bool,
-    /// Standard deviation per axis of the errors the bridge draws and holds,
-    /// m. [`fly`] sets it to our GPS model's horizontal position noise
-    /// divided by [`gps_blend_sd_ratio`]: ArduCopter's own GPS lag blends two
-    /// successive draws, and the error its GPS then reports has our model's
-    /// standard deviation.
+    /// The standard deviation per axis of the error ArduCopter's GPS reports,
+    /// m: our GPS model's own value ([`bridged_options`] sets it to
+    /// `pos_sigma_h_m`, undivided). The errors the bridge sends have
+    /// [`GpsBlend::sent_over_reported`] times that.
     pub sigma_m: f64,
     /// A new draw every period, µs of flight time.
     pub period_us: u64,
     /// The draws are at `first_fix_us + k × period`.
     pub first_fix_us: u64,
+    /// The program's GPS lag, µs: `SIM_GPS1_LAG_MS` times 1000. It is checked
+    /// against the parameter files when the autopilot is built.
+    pub lag_us: u64,
 }
 
 impl GpsError {
@@ -192,7 +224,30 @@ impl GpsError {
             sigma_m: 0.3,
             period_us: 200_000,
             first_fix_us: 0,
+            lag_us: GPS_LAG_US,
         }
+    }
+
+    /// The blend to undo: `None` for a lag of 0 or of a whole period or more
+    /// (the program then reads one stored sample, and `sent = n`); an error
+    /// for a lag within 5 % of half the period.
+    pub fn blend(&self) -> Result<Option<GpsBlend>, GpsLagUnusable> {
+        if self.lag_us == 0 || self.period_us == 0 || self.lag_us >= self.period_us {
+            return Ok(None);
+        }
+        let a = self.lag_us as f64 / self.period_us as f64;
+        // |lag - period / 2| <= 5 % of period / 2, in whole microseconds.
+        if self.lag_us.abs_diff(self.period_us - self.lag_us) * 20 <= self.period_us {
+            return Err(GpsLagUnusable {
+                lag_us: self.lag_us,
+                period_us: self.period_us,
+            });
+        }
+        let b = 1.0 - a;
+        Ok(Some(GpsBlend {
+            hi: a.max(b),
+            lo: a.min(b),
+        }))
     }
 }
 
@@ -306,6 +361,16 @@ pub enum ArduCopterError {
     Config(ConfigError),
     /// The instance number is above 9.
     Instance(u8),
+    /// The GPS lag cannot be undone by the pre-filter.
+    GpsLag(GpsLagUnusable),
+    /// The lag the bridge assumes is not the one the parameter files set.
+    GpsLagMismatch {
+        /// `GpsError::lag_us`.
+        assumed_us: u64,
+        /// `SIM_GPS1_LAG_MS` of the files and extra parameters (last value
+        /// wins), `None` when none sets it.
+        program_ms: Option<f64>,
+    },
     /// A parameter file does not parse (its values are read for the motor
     /// map).
     ParamFile { path: PathBuf, source: ParmError },
@@ -348,6 +413,26 @@ impl fmt::Display for ArduCopterError {
         match self {
             Self::Config(e) => write!(f, "the ArduCopter configuration is not usable: {e}"),
             Self::Instance(i) => write!(f, "instance {i} is not between 0 and 9"),
+            Self::GpsLag(e) => write!(f, "the GPS error is not usable: {e}"),
+            Self::GpsLagMismatch {
+                assumed_us,
+                program_ms: Some(ms),
+            } => write!(
+                f,
+                "the bridge assumes a GPS lag of {assumed_us} us (GpsError::lag_us) but the \
+                 parameters set SIM_GPS1_LAG_MS {ms} ({} us): the GPS error is undone for \
+                 the lag it assumes, so the two must be the same",
+                ms * 1000.0
+            ),
+            Self::GpsLagMismatch {
+                assumed_us,
+                program_ms: None,
+            } => write!(
+                f,
+                "the bridge assumes a GPS lag of {assumed_us} us (GpsError::lag_us) but no \
+                 parameter file sets SIM_GPS1_LAG_MS: set it to {} so that the two are the same",
+                *assumed_us as f64 / 1000.0
+            ),
             Self::ParamFile { path, source } => {
                 write!(f, "start: {}: {source}", path.display())
             }
@@ -393,6 +478,7 @@ impl std::error::Error for ArduCopterError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Config(e) => Some(e),
+            Self::GpsLag(e) => Some(e),
             Self::ParamFile { source, .. } => Some(source),
             Self::Bind { source, .. } => Some(source),
             Self::Start(e) | Self::Finish(e) => Some(e),
@@ -601,25 +687,55 @@ impl fmt::Display for FlightAudit {
 }
 
 /// The GPS error's state: the held offset, redrawn every period.
+///
+/// Per axis, at each fix instant: `sent(k) = (n(k) - lo sent(k-1)) / hi` for
+/// the independent draw `n(k)` ([`GpsBlend`]), or `sent = n` without a blend.
+/// The draws come from `Stream::GpsError` in this order: first the two
+/// starting values `sent(-1)` (north, east; standard deviation
+/// `sigma / sqrt(hi² - lo²)`, so that the sequence is steady from its first
+/// fix), then at each fix instant north, then east.
 #[derive(Clone, Debug)]
 pub struct GpsErrorState {
     config: GpsError,
+    blend: Option<GpsBlend>,
     rng: Rng,
+    /// `sent(-1)`.
+    start: [f64; 2],
+    /// The last `sent`, held until the next fix instant.
     offset: [f64; 2],
+    /// A fix instant has passed.
+    started: bool,
 }
 
 impl GpsErrorState {
+    /// A lag that [`GpsError::blend`] refuses is treated as no blend here;
+    /// [`ArduCopter::start`] refuses it before.
     pub fn new(config: GpsError, seed: u64) -> Self {
+        let blend = config.blend().ok().flatten();
+        let mut rng = Rng::stream(seed, Stream::GpsError);
+        let mut start = [0.0; 2];
+        if config.enabled {
+            let sd = config.sigma_m * blend.map_or(1.0, |b| b.sent_over_reported());
+            start = [rng.gaussian(sd), rng.gaussian(sd)];
+        }
         Self {
             config,
-            rng: Rng::stream(seed, Stream::GpsError),
+            blend,
+            rng,
+            start,
             offset: [0.0; 2],
+            started: false,
         }
     }
 
-    /// The offset (north, east) in metres at flight time `t_us`: a new draw at
-    /// every sample instant of the GPS model, held between. Draws north, then
-    /// east, from the stream of its own. Zero when switched off.
+    /// The value `sent` had before the first fix instant (`sent(-1)`).
+    pub fn before_first_fix(&self) -> [f64; 2] {
+        self.start
+    }
+
+    /// The offset (north, east) in metres at flight time `t_us`: a new value
+    /// at every sample instant of the GPS model, held between. Zero when
+    /// switched off.
     pub fn at(&mut self, t_us: u64) -> [f64; 2] {
         let c = self.config;
         if !c.enabled || c.period_us == 0 {
@@ -628,7 +744,16 @@ impl GpsErrorState {
         if t_us >= c.first_fix_us && (t_us - c.first_fix_us).is_multiple_of(c.period_us) {
             let n = self.rng.gaussian(c.sigma_m);
             let e = self.rng.gaussian(c.sigma_m);
-            self.offset = [n, e];
+            let prev = if self.started {
+                self.offset
+            } else {
+                self.start
+            };
+            self.started = true;
+            self.offset = match self.blend {
+                None => [n, e],
+                Some(b) => [(n - b.lo * prev[0]) / b.hi, (e - b.lo * prev[1]) / b.hi],
+            };
         }
         self.offset
     }
@@ -780,25 +905,50 @@ impl MotorParams {
     /// files, then applies the extra parameters.
     pub fn of_config(config: &ArduCopterConfig) -> Result<Self, ArduCopterError> {
         let mut p = Self::default();
-        for path in &config.param_files {
-            let text = std::fs::read_to_string(path).map_err(|source| {
-                ArduCopterError::Start(SitlError::ParamFileUnreadable {
-                    path: path.clone(),
-                    source,
-                })
-            })?;
-            let values = parm::parse(&text).map_err(|source| ArduCopterError::ParamFile {
-                path: path.clone(),
-                source,
-            })?;
-            for (name, value) in values {
-                p.apply(&name, value);
-            }
-        }
-        for (name, value) in &config.extra_params {
-            p.apply(name, *value);
+        for (name, value) in all_params(config)? {
+            p.apply(&name, value);
         }
         Ok(p)
+    }
+}
+
+/// Every parameter the program is started with, in order: the files, then
+/// the extra parameters.
+pub fn all_params(config: &ArduCopterConfig) -> Result<Vec<(String, f64)>, ArduCopterError> {
+    let mut out = Vec::new();
+    for path in &config.param_files {
+        let text = std::fs::read_to_string(path).map_err(|source| {
+            ArduCopterError::Start(SitlError::ParamFileUnreadable {
+                path: path.clone(),
+                source,
+            })
+        })?;
+        let values = parm::parse(&text).map_err(|source| ArduCopterError::ParamFile {
+            path: path.clone(),
+            source,
+        })?;
+        out.extend(values);
+    }
+    out.extend(config.extra_params.iter().cloned());
+    Ok(out)
+}
+
+/// Refuses a GPS error whose lag cannot be undone, or whose lag is not the
+/// program's: `SIM_GPS1_LAG_MS` of the files and extra parameters (last
+/// value wins) times 1000 must equal [`GpsError::lag_us`].
+fn check_gps_lag(config: &ArduCopterConfig) -> Result<(), ArduCopterError> {
+    config.gps_error.blend().map_err(ArduCopterError::GpsLag)?;
+    let program_ms = all_params(config)?
+        .into_iter()
+        .rev()
+        .find(|(n, _)| n == "SIM_GPS1_LAG_MS")
+        .map(|(_, v)| v);
+    match program_ms {
+        Some(ms) if (ms * 1000.0 - config.gps_error.lag_us as f64).abs() < 0.5 => Ok(()),
+        program_ms => Err(ArduCopterError::GpsLagMismatch {
+            assumed_us: config.gps_error.lag_us,
+            program_ms,
+        }),
     }
 }
 
@@ -806,8 +956,10 @@ impl MotorParams {
 /// motor map's range, which is the program's own `MOT_SPIN_MIN` and
 /// `MOT_SPIN_MAX` ([`MotorParams`]), so that the map follows the parameter
 /// files and the extra parameters. A pulse range other than 1000 to 2000 µs
-/// is refused.
+/// is refused, and so is a GPS lag that is not the program's or cannot be
+/// undone ([`GpsError`]).
 pub fn bridge_config(config: &ArduCopterConfig) -> Result<BridgeConfig, ArduCopterError> {
+    check_gps_lag(config)?;
     let motor = MotorParams::of_config(config)?;
     if motor.pwm_min != 1000.0 || motor.pwm_max != 2000.0 {
         return Err(ArduCopterError::Config(ConfigError::PwmRange {
@@ -1392,16 +1544,15 @@ pub struct Flown {
 
 /// Sets what a bridged flight needs in the options (the IMU sampled every
 /// 1000 µs and the wind every 1000 µs, ADR-0006 §4 and §7) and in the
-/// configuration (the seed, the ground station, the GPS error's period from
-/// the options and its standard deviation: our GPS model's, divided by
-/// [`gps_blend_sd_ratio`]), and returns the options. Nothing else is changed.
+/// configuration (the seed, the ground station, the GPS error's period and
+/// its standard deviation: our GPS model's own, undivided), and returns the
+/// options. Nothing else is changed.
 pub fn bridged_options(mut options: SimOptions, config: &mut ArduCopterConfig) -> SimOptions {
     options.sensors.imu.period_us = 1000;
     options.wind_period_us = Some(1000);
     config.seed = options.seed;
     config.gcs = options.links.gcs;
-    config.gps_error.sigma_m =
-        options.sensors.gps.pos_sigma_h_m / gps_blend_sd_ratio(options.sensors.gps.period_us);
+    config.gps_error.sigma_m = options.sensors.gps.pos_sigma_h_m;
     config.gps_error.period_us = options.sensors.gps.period_us;
     config.gps_error.first_fix_us = options.sensors.gps.first_fix_us;
     options
@@ -1616,6 +1767,7 @@ mod tests {
             sigma_m: 0.3,
             period_us: 200_000,
             first_fix_us: 0,
+            lag_us: 150_000,
         };
         let mut g = GpsErrorState::new(on, 7);
         let a = g.at(0);
@@ -1642,30 +1794,262 @@ mod tests {
         assert_eq!(off.at(200_000), [0.0; 2]);
     }
 
-    #[test]
-    fn the_gps_error_has_the_standard_deviation_asked_per_axis_and_no_correlation() {
-        let on = GpsError {
-            enabled: true,
-            sigma_m: 0.3,
-            period_us: 200_000,
-            first_fix_us: 0,
-        };
-        let mut g = GpsErrorState::new(on, 11);
-        let draws: Vec<[f64; 2]> = (0..20_000).map(|k| g.at(k * 200_000)).collect();
-        for axis in 0..2 {
-            let v: Vec<f64> = draws.iter().map(|d| d[axis]).collect();
-            let mean = v.iter().sum::<f64>() / v.len() as f64;
-            let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / v.len() as f64;
-            let sd = Real::sqrt(var);
-            assert!((sd - 0.3).abs() < 0.01, "axis {axis}: {}", sd);
-            let lag1 = v
-                .windows(2)
-                .map(|w| (w[0] - mean) * (w[1] - mean))
-                .sum::<f64>()
-                / (v.len() - 1) as f64
-                / var;
-            assert!(lag1.abs() < 0.03, "axis {axis}: lag-1 {lag1}");
+    /// The error ArduCopter's GPS reports for the sent values of `state`:
+    /// fix `j` is `0.75 sent(j-2) + 0.25 sent(j-1)` (measured on the binary,
+    /// test 6 of `arducopter_fly`), from `j = 1`, which uses `sent(-1)`. Per
+    /// axis, `count` fixes.
+    fn reported_fixes(config: GpsError, seed: u64, count: usize) -> [Vec<f64>; 2] {
+        let mut g = GpsErrorState::new(config, seed);
+        let mut sent = vec![g.before_first_fix()];
+        for k in 0..count as u64 {
+            sent.push(g.at(k * config.period_us));
         }
+        // sent[i] is sent(i - 1); fix j (from 1) uses sent(j-2), sent(j-1),
+        // which are sent[j-1] and sent[j].
+        let fix = |axis: usize| -> Vec<f64> {
+            sent.windows(2)
+                .map(|w| 0.75 * w[0][axis] + 0.25 * w[1][axis])
+                .collect()
+        };
+        [fix(0), fix(1)]
+    }
+
+    fn sd_of(v: &[f64]) -> f64 {
+        let n = v.len() as f64;
+        let m = v.iter().sum::<f64>() / n;
+        Real::sqrt(v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n)
+    }
+
+    /// The correlation at `lag` of a series about its own mean.
+    fn corr(v: &[f64], lag: usize) -> f64 {
+        let n = v.len() as f64;
+        let m = v.iter().sum::<f64>() / n;
+        let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n;
+        let cov = v
+            .iter()
+            .zip(v.iter().skip(lag))
+            .map(|(a, b)| (a - m) * (b - m))
+            .sum::<f64>()
+            / (n - lag as f64);
+        cov / var
+    }
+
+    #[test]
+    fn the_error_arducopters_gps_reports_is_white_with_our_models_sd() {
+        let c = GpsError::ours();
+        for seed in [5, 6] {
+            let axes = reported_fixes(c, seed, 40_000);
+            for (axis, v) in axes.iter().enumerate() {
+                let sd = sd_of(v);
+                assert!(
+                    (sd / c.sigma_m - 1.0).abs() < 0.02,
+                    "seed {seed} axis {axis}: sd {sd}"
+                );
+                for lag in 1..=5 {
+                    let r = corr(v, lag);
+                    assert!(
+                        r.abs() < 0.03,
+                        "seed {seed} axis {axis}: lag {lag} corr {r}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sequence is steady from the first fix: 200 fixes, wider bounds
+    /// (the standard error of a standard deviation is `sigma / sqrt(2 n)` =
+    /// 5 %, of a correlation `1 / sqrt(n)` = 0.07; three of them).
+    #[test]
+    fn the_first_200_fixes_are_already_white_with_our_models_sd() {
+        let c = GpsError::ours();
+        for seed in 1..=6 {
+            let axes = reported_fixes(c, seed, 200);
+            for (axis, v) in axes.iter().enumerate() {
+                let sd = sd_of(v);
+                assert!(
+                    (sd / c.sigma_m - 1.0).abs() < 0.16,
+                    "seed {seed} axis {axis}: sd {sd}"
+                );
+                for lag in 1..=5 {
+                    let r = corr(v, lag);
+                    assert!(
+                        r.abs() < 0.22,
+                        "seed {seed} axis {axis}: lag {lag} corr {r}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What 200 fixes of one seed cannot show: the first fix of the flight
+    /// (`0.75 sent(-1) + 0.25 sent(0)`) over many seeds has our model's
+    /// standard deviation only when `sent(-1)` is a draw of the steady
+    /// sequence (left at zero it would be a ninth of the variance), and so
+    /// has the second.
+    #[test]
+    fn the_first_fixes_over_many_seeds_have_our_models_sd() {
+        let c = GpsError::ours();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for seed in 0..3000 {
+            let [n, e] = reported_fixes(c, seed, 2);
+            first.extend([n[0], e[0]]);
+            second.extend([n[1], e[1]]);
+        }
+        for (name, v) in [("first", &first), ("second", &second)] {
+            let sd = sd_of(v);
+            // 6000 values: a standard error of 0.9 %.
+            assert!((sd / c.sigma_m - 1.0).abs() < 0.04, "{name} fix: sd {sd}");
+        }
+    }
+
+    #[test]
+    fn what_is_sent_has_the_standard_deviation_sigma_over_sqrt_half() {
+        let c = GpsError::ours();
+        let mut g = GpsErrorState::new(c, 9);
+        let sent: Vec<[f64; 2]> = (0..40_000).map(|k| g.at(k * c.period_us)).collect();
+        let want = c.sigma_m / Real::sqrt(0.5);
+        assert!((want - 0.4243).abs() < 1e-4);
+        for axis in 0..2 {
+            let v: Vec<f64> = sent.iter().map(|s| s[axis]).collect();
+            let sd = sd_of(&v);
+            assert!((sd / want - 1.0).abs() < 0.03, "axis {axis}: sd {sd}");
+            // The pre-filter's own correlation: -lo/hi = -1/3 at lag 1.
+            assert!((corr(&v, 1) + 1.0 / 3.0).abs() < 0.03, "{}", corr(&v, 1));
+        }
+        // The start value is a draw of the same size.
+        let starts: Vec<f64> = (0..3000)
+            .flat_map(|seed| GpsErrorState::new(c, seed).before_first_fix())
+            .collect();
+        assert!(
+            (sd_of(&starts) / want - 1.0).abs() < 0.04,
+            "{}",
+            sd_of(&starts)
+        );
+    }
+
+    #[test]
+    fn the_draws_come_in_the_order_start_north_east_then_north_east_per_fix() {
+        let c = GpsError::ours();
+        let blend = c.blend().unwrap().unwrap();
+        assert_eq!((blend.hi, blend.lo), (0.75, 0.25));
+        let mut r = Rng::stream(21, Stream::GpsError);
+        let sd = c.sigma_m * blend.sent_over_reported();
+        let start = [r.gaussian(sd), r.gaussian(sd)];
+        let mut g = GpsErrorState::new(c, 21);
+        assert_eq!(g.before_first_fix(), start);
+        let (n0, e0) = (r.gaussian(c.sigma_m), r.gaussian(c.sigma_m));
+        let s0 = [(n0 - 0.25 * start[0]) / 0.75, (e0 - 0.25 * start[1]) / 0.75];
+        assert_eq!(g.at(0), s0);
+        let (n1, e1) = (r.gaussian(c.sigma_m), r.gaussian(c.sigma_m));
+        assert_eq!(
+            g.at(200_000),
+            [(n1 - 0.25 * s0[0]) / 0.75, (e1 - 0.25 * s0[1]) / 0.75]
+        );
+    }
+
+    #[test]
+    fn a_lag_that_is_zero_or_a_period_or_more_is_not_blended() {
+        for lag_us in [0, 200_000, 350_000] {
+            let c = GpsError {
+                lag_us,
+                ..GpsError::ours()
+            };
+            assert_eq!(c.blend(), Ok(None), "lag {lag_us}");
+            let mut g = GpsErrorState::new(c, 4);
+            let mut want = Rng::stream(4, Stream::GpsError);
+            let _ = (want.gaussian(0.3), want.gaussian(0.3));
+            for k in 0..5 {
+                let got = g.at(k * 200_000);
+                assert_eq!(
+                    got,
+                    [want.gaussian(0.3), want.gaussian(0.3)],
+                    "lag {lag_us}"
+                );
+            }
+        }
+        // A lag of a quarter of the period has weights 0.25 and 0.75.
+        let c = GpsError {
+            lag_us: 50_000,
+            ..GpsError::ours()
+        };
+        let b = c.blend().unwrap().unwrap();
+        assert_eq!((b.hi, b.lo), (0.75, 0.25));
+    }
+
+    #[test]
+    fn a_lag_within_5_percent_of_half_the_period_is_refused_with_a_sentence() {
+        for lag_us in [95_000, 100_000, 104_000] {
+            let c = GpsError {
+                lag_us,
+                ..GpsError::ours()
+            };
+            let e = c.blend().unwrap_err();
+            let s = e.to_string();
+            assert!(s.contains("half") && s.contains(&lag_us.to_string()), "{s}");
+        }
+        // Just outside the band both sides.
+        for lag_us in [94_000, 106_000] {
+            let c = GpsError {
+                lag_us,
+                ..GpsError::ours()
+            };
+            assert!(c.blend().unwrap().is_some(), "{lag_us}");
+        }
+        // The autopilot is refused at build, before anything starts.
+        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        c.gps_error.lag_us = 100_000;
+        let e = ArduCopter::start(c).unwrap_err();
+        assert!(matches!(e, ArduCopterError::GpsLag(_)), "{e}");
+        assert!(e.to_string().contains("half"), "{e}");
+    }
+
+    #[test]
+    fn the_lag_the_bridge_assumes_must_be_the_programs() {
+        // The committed files set 150 ms: the default configuration passes.
+        bridge_config(&config_with(Vec::new())).expect("the default lag");
+        // A later parameter wins, as in the program.
+        let e = bridge_config(&config_with(vec![("SIM_GPS1_LAG_MS".into(), 100.0)])).unwrap_err();
+        let s = e.to_string();
+        assert!(
+            matches!(e, ArduCopterError::GpsLagMismatch { .. })
+                && s.contains("150000")
+                && s.contains("SIM_GPS1_LAG_MS 100")
+                && s.contains("100000"),
+            "{s}"
+        );
+        // Unless the assumption follows.
+        let mut c = config_with(vec![("SIM_GPS1_LAG_MS".into(), 100.0)]);
+        c.gps_error.lag_us = 100_000;
+        let e = bridge_config(&c).unwrap_err();
+        assert!(
+            matches!(e, ArduCopterError::GpsLag(_)),
+            "100 ms is half: {e}"
+        );
+        let mut c = config_with(vec![("SIM_GPS1_LAG_MS".into(), 60.0)]);
+        c.gps_error.lag_us = 60_000;
+        bridge_config(&c).expect("60 ms assumed and set");
+        // The last value wins.
+        let c = config_with(vec![
+            ("SIM_GPS1_LAG_MS".into(), 100.0),
+            ("SIM_GPS1_LAG_MS".into(), 150.0),
+        ]);
+        bridge_config(&c).expect("last wins");
+        // A file with the other lag is refused.
+        let dir = std::env::temp_dir().join(format!("oxide-lag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lag.parm");
+        std::fs::write(&file, "SIM_GPS1_LAG_MS 100\n").unwrap();
+        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        c.param_files.push(file);
+        let e = bridge_config(&c).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(e, ArduCopterError::GpsLagMismatch { .. }), "{e}");
+        // Not set anywhere: the assumption cannot be checked.
+        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        c.param_files = vec![parm::starting_gains_path()];
+        let e = bridge_config(&c).unwrap_err();
+        assert!(e.to_string().contains("no parameter file sets"), "{e}");
     }
 
     #[test]
@@ -1725,10 +2109,10 @@ mod tests {
         assert_eq!(after.wind_period_us, Some(1000));
         assert_eq!(c.seed, 5);
         assert!(!c.gcs, "the default scenario has no ground station");
-        assert_eq!(
-            c.gps_error.sigma_m,
-            before.sensors.gps.pos_sigma_h_m / gps_blend_sd_ratio(200_000)
-        );
+        // Our model's own value, undivided.
+        assert_eq!(c.gps_error.sigma_m, before.sensors.gps.pos_sigma_h_m);
+        assert_eq!(c.gps_error.sigma_m, 0.3);
+        assert_eq!(c.gps_error.lag_us, 150_000);
         assert_eq!(c.gps_error.period_us, 200_000);
         let mut expected = before;
         expected.sensors.imu.period_us = 1000;
@@ -1738,50 +2122,6 @@ mod tests {
         with_gcs.links.gcs = true;
         let _ = bridged_options(with_gcs, &mut c);
         assert!(c.gcs);
-    }
-
-    #[test]
-    fn the_blend_ratio_is_sqrt_0_625_for_150_ms_of_lag_and_a_200_ms_period() {
-        let r = gps_blend_sd_ratio(200_000);
-        assert!((r - Real::sqrt(0.625)).abs() < 1e-12, "{r}");
-        assert!((r - 0.7906).abs() < 1e-4, "{r}");
-        // A period at or under the lag blends nothing; a zero period is not
-        // divided by.
-        assert_eq!(gps_blend_sd_ratio(150_000), 1.0);
-        assert_eq!(gps_blend_sd_ratio(100_000), 1.0);
-        assert_eq!(gps_blend_sd_ratio(0), 1.0);
-    }
-
-    /// The error ArduCopter's GPS reports is the blend of two successive
-    /// draws (measured on the binary, test 6 of `arducopter_fly`): with the
-    /// draws a bridged flight sets, it has our model's standard deviation
-    /// and a lag-1 correlation of 0.30.
-    #[test]
-    fn the_error_arducopters_gps_reports_has_our_models_sd_and_a_lag_1_of_0_3() {
-        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
-        let options = bridged_options(SimOptions::realistic(1), &mut c);
-        let model = options.sensors.gps.pos_sigma_h_m;
-        assert_eq!(model, 0.3);
-        let mut g = GpsErrorState::new(c.gps_error, 5);
-        let d: Vec<[f64; 2]> = (0..40_000).map(|k| g.at(k * 200_000)).collect();
-        for axis in 0..2 {
-            let fix: Vec<f64> = d
-                .windows(2)
-                .map(|w| 0.75 * w[0][axis] + 0.25 * w[1][axis])
-                .collect();
-            let n = fix.len() as f64;
-            let mean = fix.iter().sum::<f64>() / n;
-            let var = fix.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
-            let lag1 = fix
-                .windows(2)
-                .map(|w| (w[0] - mean) * (w[1] - mean))
-                .sum::<f64>()
-                / (n - 1.0)
-                / var;
-            let sd = Real::sqrt(var);
-            assert!((sd / model - 1.0).abs() < 0.02, "axis {axis}: sd {sd}");
-            assert!((lag1 - 0.30).abs() < 0.03, "axis {axis}: lag-1 {lag1}");
-        }
     }
 
     fn config_with(extra: Vec<(String, f64)>) -> ArduCopterConfig {
@@ -1857,6 +2197,10 @@ mod tests {
             (
                 "Brain",
                 between("impl Brain {", "/// Watches for a vehicle"),
+            ),
+            (
+                "GpsErrorState",
+                between("impl GpsErrorState {", "/// A command of the brain."),
             ),
             (
                 "send_instrument and send_flight",

@@ -9,13 +9,13 @@
 //! under the system's temporary directory, and leaves no process behind.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use oxide_bridge::arducopter::{
     ArduCopter, ArduCopterConfig, ArduCopterError, BrainLink, FlightAudit, Flown, FlyError,
     GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest, bridge_config,
-    bridged_options, fly, gps_blend_sd_ratio,
+    bridged_options, fly,
 };
 use oxide_bridge::mav::{MavEvent, id};
 use oxide_bridge::reply::timestamp_ns;
@@ -27,6 +27,10 @@ use oxide_sim::metrics::{HoldCriteria, HoldMetrics};
 use oxide_sim::outcome::FlightOutcome;
 use oxide_sim::scenario::{GustHold, HoverStep, NoPilot, Pilot, gust_hold};
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
+
+#[path = "support/pool.rs"]
+mod pool;
+use pool::Instance;
 
 /// The binary's path, or a failure that says what to set.
 fn binary() -> PathBuf {
@@ -59,36 +63,6 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The program's instance numbers, 0 to 9, leased one to a flight at a time so
-/// that tests that run side by side never share a port. A test holds its lease
-/// for all the flights it flies one after the other.
-static POOL: (Mutex<u16>, Condvar) = (Mutex::new(0), Condvar::new());
-
-struct Instance(u8);
-
-impl Instance {
-    /// The lowest free instance, waiting for one when all ten are taken.
-    fn lease() -> Self {
-        let mut taken = POOL.0.lock().expect("the pool");
-        loop {
-            if let Some(i) = (0..10u8).find(|i| *taken & (1 << i) == 0) {
-                *taken |= 1 << i;
-                return Self(i);
-            }
-            taken = POOL.1.wait(taken).expect("the pool");
-        }
-    }
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        if let Ok(mut taken) = POOL.0.lock() {
-            *taken &= !(1 << self.0);
-        }
-        POOL.1.notify_all();
     }
 }
 
@@ -855,6 +829,19 @@ fn pressures(a: &FlightAudit, from_us: u64) -> Vec<f64> {
         .collect()
 }
 
+/// `LOCAL_POSITION_NED` north and east (m) read at or after `from_us`.
+fn local_positions(a: &FlightAudit, from_us: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut n = Vec::new();
+    let mut e = Vec::new();
+    for h in a.heard.iter().filter(|h| h.at_us >= from_us) {
+        if let MavEvent::LocalPosition { n: pn, e: pe, .. } = h.event {
+            n.push(f64::from(pn));
+            e.push(f64::from(pe));
+        }
+    }
+    (n, e)
+}
+
 /// Mean and standard deviation of a message's field over the flight window.
 fn summary(v: &[f64]) -> (f64, f64) {
     (mean(v), std_dev(v))
@@ -869,11 +856,13 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
             telemetry(id::GPS_RAW_INT, 10.0, 4_000),
             telemetry(id::RAW_IMU, 50.0, 4_001),
             telemetry(id::SCALED_PRESSURE, 20.0, 4_002),
+            telemetry(id::LOCAL_POSITION_NED, 10.0, 4_003),
         ]
     };
     let lease = Instance::lease();
-    let with = rest_run(lease.0, "rest-with", 1, true, 30.0, tel());
-    let without = rest_run(lease.0, "rest-without", 1, false, 30.0, tel());
+    // 60 s of flight at rest: 295 fixes after the first second.
+    let with = rest_run(lease.0, "rest-with", 1, true, 60.0, tel());
+    let without = rest_run(lease.0, "rest-without", 1, false, 60.0, tel());
     let sigma = SimOptions::realistic(1).sensors.gps.pos_sigma_h_m;
     let window = with.flight_start_us + 1_000_000;
 
@@ -915,7 +904,7 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         n0.iter().chain(&e0).fold(0.0_f64, |m, x| m.max(x.abs()))
     );
     assert!(
-        n1.len() >= 140 && n0.len() >= 140,
+        n1.len() >= 290 && n0.len() >= 290,
         "{} {}",
         n1.len(),
         n0.len()
@@ -923,10 +912,11 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
     // What the real program does with the error (measured): its GPS lag reads
     // the position 150 ms back between two stored samples 200 ms apart, so each
     // fix is 0.75 of the error held before and 0.25 of the error held after.
-    // Fix j (j = 1 is the first of the flight) is 0.75 d(j-2) + 0.25 d(j-1) of
-    // the bridge's draws d(0), d(1), ... The bridge draws with our model's
-    // sigma over the blend's ratio (`gps_blend_sd_ratio`), so that the error
-    // ArduCopter's GPS reports has our model's standard deviation.
+    // Fix j (j = 1 is the first of the flight) is 0.75 sent(j-2) + 0.25
+    // sent(j-1) of the values the bridge sent, sent(0), sent(1), ...; the
+    // value held in the pre-roll is zero. The bridge sends the pre-filtered
+    // sequence of `GpsErrorState`, so that the blend is white with our model's
+    // standard deviation.
     let predicted = |j: usize, draws: &[[f64; 2]]| -> (f64, f64) {
         let d = |k: usize| -> [f64; 2] { draws.get(k).copied().unwrap_or([0.0; 2]) };
         let (a, b) = (
@@ -937,13 +927,13 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
     };
     let mut bridged = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
     let _ = bridged_options(SimOptions::realistic(1), &mut bridged);
-    let drawn_sigma = bridged.gps_error.sigma_m;
-    assert!(
-        (drawn_sigma * gps_blend_sd_ratio(200_000) - sigma).abs() < 1e-12,
-        "{drawn_sigma}"
+    assert_eq!(
+        bridged.gps_error.sigma_m, sigma,
+        "the bridge's sigma is our model's own"
     );
     let mut state = GpsErrorState::new(bridged.gps_error, 1);
-    let draws: Vec<[f64; 2]> = (0..200).map(|k| state.at(k * 200_000)).collect();
+    let draws: Vec<[f64; 2]> = (0..400).map(|k| state.at(k * 200_000)).collect();
+    let sent_sd = std_dev(&draws.iter().map(|d| d[0]).collect::<Vec<_>>());
     let all = fixes(&with.audit);
     let first_flight = all
         .iter()
@@ -957,7 +947,7 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
     let (mut sum_sq, mut count) = (0.0, 0);
     // The fixes are 200 ms apart on the program's own clock. The last fix of
     // the pre-roll is fix 0 and the flight's own are 1, 2, ...
-    for f in all.iter().skip(first_flight).take(140) {
+    for f in all.iter().skip(first_flight).take(290) {
         let j = ((f.time_usec - reference.time_usec) as f64 / 200_000.0).round() as usize;
         let (n, e) = north_east(f, &reference);
         let (pn, pe) = predicted(j, &draws);
@@ -966,15 +956,10 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
     }
     let rms = Real::sqrt(sum_sq / f64::from(count));
     println!(
-        "MEASURED GPS error: the reported error against 0.75 d(j-2) + 0.25 d(j-1) with the \
-         bridge drawing sd {drawn_sigma:.4} m: rms residual {rms:.4} m over {count} values; \
-         reported sd against our model's {sigma}: north {:+.1} %, east {:+.1} % (limit 20 %); \
-         lag-1 {:.3}, {:.3} (the blend's 0.30; the specification's limit 0.3 cannot be met \
-         through this blend)",
-        100.0 * (std_dev(&n1) / sigma - 1.0),
-        100.0 * (std_dev(&e1) / sigma - 1.0),
-        lag1(&n1),
-        lag1(&e1)
+        "MEASURED GPS error: the reported error against 0.75 sent(j-2) + 0.25 sent(j-1) of the \
+         values the bridge sent (sd {sent_sd:.3} m, our sigma {sigma} m over sqrt(0.5) = {:.3}): \
+         rms residual {rms:.4} m over {count} values",
+        sigma / Real::sqrt(0.5)
     );
     assert!(
         rms < 0.03,
@@ -1003,18 +988,38 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         );
     }
     for (name, v) in [("north", &n1), ("east", &e1)] {
-        // The decided numbers (ADR-0006 section 4): ArduCopter's GPS error has
-        // our model's standard deviation, within the specification's 20 %.
+        // The decided numbers (ADR-0006 section 4): the error ArduCopter's GPS
+        // reports is white with our model's standard deviation: sd within 20 %
+        // of it, fix-to-fix correlation within 0.25 of zero. The standard
+        // errors: sd / sqrt(2 n) for a standard deviation, 1 / sqrt(n) for a
+        // correlation.
+        let n = v.len() as f64;
         let sd = std_dev(v);
+        let r = lag1(v);
+        println!(
+            "MEASURED GPS error {name}: {} fixes, sd {sd:.4} +- {:.4} m (our model's {sigma}), \
+             fix-to-fix correlation {r:+.3} +- {:.3}",
+            v.len(),
+            sd / Real::sqrt(2.0 * n),
+            1.0 / Real::sqrt(n)
+        );
         assert!(
             (sd - sigma).abs() <= 0.2 * sigma,
             "{name}: sd {sd} against our model's {sigma}"
         );
-        // Successive fixes share a draw through the lag's blend: lag-1 0.30
-        // for white draws. With 145 fixes the estimate has a standard error of
-        // 0.08, so it is held to 0.30 within 0.15 (not to the white-noise
-        // limit of 0.3, which the blend cannot meet).
-        assert!((lag1(v) - 0.30).abs() <= 0.15, "{name}: lag-1 {}", lag1(v));
+        assert!(r.abs() <= 0.25, "{name}: fix-to-fix correlation {r}");
+    }
+    // ArduCopter's own position estimate at rest (LOCAL_POSITION_NED), with
+    // the error on and off: reported, not asserted.
+    for (name, run) in [("on", &with), ("off", &without)] {
+        let (n, e) = local_positions(&run.audit, window);
+        println!(
+            "MEASURED ArduCopter's position estimate at rest, GPS error {name}: {} messages, \
+             north sd {:.4} m, east sd {:.4} m",
+            n.len(),
+            std_dev(&n),
+            std_dev(&e)
+        );
     }
     for (name, v) in [("north", &n0), ("east", &e0)] {
         assert!(
