@@ -99,7 +99,7 @@ use crate::SimError;
 use crate::airframe::{Airframe, BatterySpec, ordered_params};
 use crate::faults::{Fault, FaultKind, LinkConfig, validate_faults};
 use crate::metrics::{HoldCriteria, HoldMetrics};
-use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, REASON_NAMES};
+use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, NotJudged, REASON_NAMES};
 use crate::rng::{Rng, Stream, run_seed};
 use crate::scenario::Script;
 use crate::sensors::SensorConfig;
@@ -349,6 +349,10 @@ pub struct Verdict {
     /// invariants every flight gets (finite truth, no timing faults, motors
     /// off while disarmed, the failsafe action never decreasing).
     pub violations: Vec<String>,
+    /// Expectations and invariants the outcome could not answer (they need
+    /// the flight core's status): neither passed nor violated. Empty for a
+    /// flight of our core.
+    pub not_judged: Vec<NotJudged>,
 }
 
 /// Collects a flight's outcome and hold statistics step by step, then judges
@@ -382,18 +386,21 @@ impl Checker {
     pub fn finish(self) -> Verdict {
         // `Expect::check` starts with the invariants every flight gets; a
         // file with no `[expect]` is still judged by those.
-        let mut violations = match &self.expect {
+        let mut judged = match &self.expect {
             Some(e) => e.check(&self.outcome),
-            None => self.outcome.invariant_violations(),
+            None => self.outcome.invariants(),
         };
         let hold = self.hold.map(|(m, c, _)| {
-            violations.extend(m.failures(&c));
+            let h = m.judge(&c);
+            judged.violations.extend(h.violations);
+            judged.not_judged.extend(h.not_judged);
             m
         });
         Verdict {
             outcome: self.outcome,
             hold,
-            violations,
+            violations: judged.violations,
+            not_judged: judged.not_judged,
         }
     }
 }

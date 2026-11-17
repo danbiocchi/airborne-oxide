@@ -53,7 +53,7 @@ fn profile_of(p: oxide_sim::scenario_file::RunProfile) -> Profile {
 fn violations(s: &ScenarioFile, profile: Profile, index: u64) -> (Vec<String>, FlightOutcome) {
     let o = s.fly(profile, index).expect("simulation setup");
     let expect = s.expect.as_ref().expect("a fault scenario has [expect]");
-    (expect.check(&o), o)
+    (expect.check(&o).violations, o)
 }
 
 /// What to print for a failed run.
@@ -65,8 +65,11 @@ fn report(s: &ScenarioFile, profile: Profile, index: u64, v: &[String], o: &Flig
     for line in v {
         eprintln!("  violated: {line}");
     }
-    eprintln!("  navigation: {:?}", o.nav_sequence);
-    for e in &o.events {
+    eprintln!(
+        "  navigation: {:?}",
+        o.core.as_ref().expect("core part").nav_sequence
+    );
+    for e in &o.core.as_ref().expect("core part").events {
         eprintln!("  {}", event_line(e));
     }
 }

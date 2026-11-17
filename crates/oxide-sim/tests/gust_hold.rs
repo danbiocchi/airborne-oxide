@@ -28,7 +28,7 @@ fn report_failures(results: &[(Profile, Vec<HoldMetrics>)]) -> usize {
     let mut failed = 0;
     for (p, runs) in results {
         for (i, m) in runs.iter().enumerate() {
-            let f = m.failures(&c);
+            let f = m.judge(&c).violations;
             if !f.is_empty() {
                 failed += 1;
                 eprintln!("FAIL index {i} profile {}: {}", p.name, f.join("; "));
@@ -62,12 +62,24 @@ fn gust_hold_200_seeds() {
         worst("rms horizontal error (m)", |m| m.rms_h_error_m);
         worst("max vertical error (m)", |m| m.max_v_error_m);
         worst("max tilt (deg)", |m| m.max_tilt_deg);
-        worst("estimate max horizontal (m)", |m| m.est_max_h_error_m);
-        worst("estimate max vertical (m)", |m| m.est_max_v_error_m);
-        worst("estimate max velocity (m/s)", |m| m.est_max_vel_error_mps);
-        worst("estimate max attitude (deg)", |m| m.est_max_att_error_deg);
-        worst("rejected measurements", |m| f64::from(m.rejected));
-        worst("estimator resets", |m| f64::from(m.resets));
+        worst("estimate max horizontal (m)", |m| {
+            m.core.expect("core part").est_max_h_error_m
+        });
+        worst("estimate max vertical (m)", |m| {
+            m.core.expect("core part").est_max_v_error_m
+        });
+        worst("estimate max velocity (m/s)", |m| {
+            m.core.expect("core part").est_max_vel_error_mps
+        });
+        worst("estimate max attitude (deg)", |m| {
+            m.core.expect("core part").est_max_att_error_deg
+        });
+        worst("rejected measurements", |m| {
+            f64::from(m.core.expect("core part").rejected)
+        });
+        worst("estimator resets", |m| {
+            f64::from(m.core.expect("core part").resets)
+        });
         let c = HoldCriteria::default();
         let passed = runs.iter().filter(|m| m.passed(&c)).count();
         println!("  passed {passed}/{}", runs.len());

@@ -76,7 +76,10 @@ fn rc_loss_position_with_the_largest_accepted_idle_still_lands_and_disarms() {
                 "{pname} seed {seed} LIM_IDLE {idle}: {:?}",
                 v.violations
             );
-            assert_eq!(v.outcome.disarm_reason, Some(DisarmReason::Touchdown));
+            assert_eq!(
+                v.outcome.core.as_ref().expect("core part").disarm_reason,
+                Some(DisarmReason::Touchdown)
+            );
             assert!(!v.outcome.armed_at_end);
         }
     }
@@ -144,7 +147,7 @@ fn rc_loss_position_at_the_smallest_touchdown_speed_lands_and_disarms_by_touchdo
                 v.violations
             );
             assert_eq!(
-                v.outcome.disarm_reason,
+                v.outcome.core.as_ref().expect("core part").disarm_reason,
                 Some(DisarmReason::Touchdown),
                 "{pname} seed {seed}"
             );
