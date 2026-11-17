@@ -470,8 +470,8 @@ The strategy (option "c+") is to build our own core and **measure** it against A
    - which sensors come from `oxide-sim` and which from the SITL's own models;
    - the achievable speed-up and repeatability.
 
-   Expected results:
-   - **ArduPilot JSON:** lockstep on the simulator timestamp. `oxide-sim` supplies IMU, position, velocity, attitude, rangefinder, airspeed, RC and battery, and SITL synthesises GPS, baro and mag from its own `SIM_*` parameters.
+   Results ([ADR-0006](adr/0006-ardupilot-bridge.md) for ArduPilot, measured on the released binary; PX4's are still expectations from its sources):
+   - **ArduPilot JSON:** lockstep on the simulator's time stamp, over UDP. `oxide-sim` supplies the IMU samples, position, velocity, attitude, RC and battery, and SITL synthesises GPS, baro and mag from them with its own `SIM_*` parameters. Rangefinder and airspeed are not supplied. A flight repeats bit for bit under stated conditions, and runs at about 10 times real time per process pair, about 20 when the pair is pinned to one core.
    - **PX4:** `HIL_SENSOR`/`HIL_GPS` timestamps. `oxide-sim` supplies all sensors.
 2. **Fairness.** Each autopilot gets sensors only through the channels its bridge supports. For each autopilot, every scenario lists whether each fault is applied natively, translated (e.g. `SIM_GPS_DISABLE`), or marked n/a and not scored.
 3. **Tuning parity.** Before each gate, every autopilot is tuned on the same simulated airframe by its own standard procedure, with the same effort budget:
