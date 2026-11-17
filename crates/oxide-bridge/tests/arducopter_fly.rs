@@ -9,6 +9,7 @@
 //! under the system's temporary directory, and leaves no process behind.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use oxide_bridge::arducopter::{
@@ -54,6 +55,36 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The program's instance numbers, 0 to 9, leased one to a flight at a time so
+/// that tests that run side by side never share a port. A test holds its lease
+/// for all the flights it flies one after the other.
+static POOL: (Mutex<u16>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct Instance(u8);
+
+impl Instance {
+    /// The lowest free instance, waiting for one when all ten are taken.
+    fn lease() -> Self {
+        let mut taken = POOL.0.lock().expect("the pool");
+        loop {
+            if let Some(i) = (0..10u8).find(|i| *taken & (1 << i) == 0) {
+                *taken |= 1 << i;
+                return Self(i);
+            }
+            taken = POOL.1.wait(taken).expect("the pool");
+        }
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if let Ok(mut taken) = POOL.0.lock() {
+            *taken &= !(1 << self.0);
+        }
+        POOL.1.notify_all();
     }
 }
 
@@ -148,8 +179,9 @@ fn texts(audit: &FlightAudit) -> String {
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_pre_roll_leaves_a_vehicle_that_is_ready_and_has_never_armed() {
     let root = TempDir::new("preroll");
+    let lease = Instance::lease();
     let mut sim = simulation(
-        0,
+        lease.0,
         &root,
         HoverStep::default(),
         SimOptions::realistic(1),
@@ -342,8 +374,9 @@ fn check_hover_step(log: &[StepRecord<4>], pilot: &HoverStep, label: &str) -> Ho
 fn the_hover_step_flies() {
     let pilot = HoverStep::default();
     let secs = pilot.duration_s;
+    let lease = Instance::lease();
     let (log, flown) = fly_logged(
-        1,
+        lease.0,
         "hover",
         pilot.clone(),
         SimOptions::realistic(1),
@@ -446,12 +479,13 @@ fn the_hover_step_flies() {
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_hover_step_repeats_bit_for_bit() {
     let mut results = Vec::new();
-    for (instance, speedup) in [(4, 100), (5, 100), (6, 10)] {
+    let lease = Instance::lease();
+    for (run, speedup) in [(0, 100), (1, 100), (2, 10)] {
         let pilot = HoverStep::default();
         let secs = pilot.duration_s;
         let (_, flown) = fly_logged(
-            instance,
-            &format!("repeat-{instance}"),
+            lease.0,
+            &format!("repeat-{run}"),
             pilot,
             SimOptions::realistic(1),
             secs,
@@ -492,7 +526,8 @@ fn a_vehicle_that_cannot_arm_ends_the_flight_with_an_error_within_5_s() {
     let root = TempDir::new("noarm");
     let pilot = HoverStep::default();
     let arm_at = pilot.arm_at_s;
-    let mut c = config(2, &root);
+    let lease = Instance::lease();
+    let mut c = config(lease.0, &root);
     c.extra_params.push(("FRAME_CLASS".into(), 0.0));
     let wall = Instant::now();
     let r = fly(
@@ -721,8 +756,9 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
             telemetry(id::SCALED_PRESSURE, 20.0, 4_002),
         ]
     };
-    let with = rest_run(3, "rest-with", 1, true, 30.0, tel());
-    let without = rest_run(4, "rest-without", 1, false, 30.0, tel());
+    let lease = Instance::lease();
+    let with = rest_run(lease.0, "rest-with", 1, true, 30.0, tel());
+    let without = rest_run(lease.0, "rest-without", 1, false, 30.0, tel());
     let sigma = SimOptions::realistic(1).sensors.gps.pos_sigma_h_m;
     let window = with.flight_start_us + 1_000_000;
 
@@ -935,7 +971,8 @@ fn the_imu_arducopter_reads_is_our_models() {
             vec![telemetry(id::RAW_IMU, 50.0, 4_000)],
         )
     };
-    let runs = [run(5, 1), run(6, 2)];
+    let lease = Instance::lease();
+    let runs = [run(lease.0, 1), run(lease.0, 2)];
     let mut reported_bias = Vec::new();
     let mut our_bias = Vec::new();
     for (run, seed) in runs.iter().zip([1, 2]) {
@@ -1034,7 +1071,14 @@ fn the_mode_switch_positions_are_stabilize_loiter_and_guided() {
         duration_s: 12.0,
         ..Script::default()
     };
-    let (_, flown) = fly_logged(7, "modes", script, SimOptions::realistic(1), 12.0, |_| {});
+    let (_, flown) = fly_logged(
+        Instance::lease().0,
+        "modes",
+        script,
+        SimOptions::realistic(1),
+        12.0,
+        |_| {},
+    );
     let a = &flown.audit;
     let start = a.preroll_steps * a.step_us;
     let modes: Vec<(f64, u32)> = a
@@ -1060,7 +1104,8 @@ fn the_mode_switch_positions_are_stabilize_loiter_and_guided() {
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn arming_from_the_radio_in_guided_needs_guid_options_bit_0() {
     let root = TempDir::new("guidopt");
-    let mut c = config(8, &root);
+    let lease = Instance::lease();
+    let mut c = config(lease.0, &root);
     c.extra_params.push(("GUID_OPTIONS".into(), 0.0));
     let r = fly(
         &airframe(),
@@ -1099,7 +1144,14 @@ fn the_kill_switch_stops_the_motors() {
         duration_s: 12.0,
         ..Script::default()
     };
-    let (log, flown) = fly_logged(9, "kill", script, SimOptions::realistic(1), 12.0, |_| {});
+    let (log, flown) = fly_logged(
+        Instance::lease().0,
+        "kill",
+        script,
+        SimOptions::realistic(1),
+        12.0,
+        |_| {},
+    );
     let before = log
         .iter()
         .rev()
@@ -1169,8 +1221,9 @@ fn a_position_target_during_the_climb_is_obeyed() {
         drop(sim);
         (at_height.expect("2 m reached"), end)
     };
-    let with = run(1, true);
-    let without = run(2, false);
+    let lease = Instance::lease();
+    let with = run(lease.0, true);
+    let without = run(lease.0, false);
     println!(
         "MEASURED early target: with it, at 1.9 m (time, x, vx) {:?}, at 9 s x = {:.3}; without it {:?}, x = {:.3}",
         with.0, with.1, without.0, without.1
