@@ -415,16 +415,6 @@ impl<P: Pilot, const N: usize> Simulation<P, N, CoreAutopilot<N>> {
     pub fn core_mut(&mut self) -> &mut Core<N> {
         self.autopilot.core_mut()
     }
-    /// Puts a parameter change into the next tick's inputs (at most one per
-    /// tick: a later call before the tick replaces it).
-    pub fn queue_param_set(&mut self, set: ParamSet) {
-        self.next_param_set = Some(set);
-    }
-    /// Puts an operator's acknowledgement of a parameter fault into the next
-    /// tick's inputs.
-    pub fn queue_param_ack(&mut self) {
-        self.next_param_ack = true;
-    }
     /// The report of the stored-parameter load that the boot step returned
     /// (the value given to `Core::report_param_load` before the first tick).
     pub fn load_report(&self) -> LoadReport {
@@ -550,6 +540,19 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             next_param_set: None,
             next_param_ack: false,
         })
+    }
+
+    /// Puts a parameter change into the next tick's inputs (at most one per
+    /// tick: a later call before the tick replaces it). Only an autopilot with
+    /// parameters of our kind (our core) does anything with it; it stays
+    /// queued if the tick fails.
+    pub fn queue_param_set(&mut self, set: ParamSet) {
+        self.next_param_set = Some(set);
+    }
+    /// Puts an operator's acknowledgement of a parameter fault into the next
+    /// tick's inputs.
+    pub fn queue_param_ack(&mut self) {
+        self.next_param_ack = true;
     }
 
     pub fn time(&self) -> Micros {

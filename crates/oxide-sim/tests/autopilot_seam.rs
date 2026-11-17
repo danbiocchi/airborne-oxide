@@ -6,7 +6,9 @@
 
 use core::fmt;
 
+use oxide_core::io::ParamSet;
 use oxide_core::math::Vec3;
+use oxide_core::params::ParamValue;
 use oxide_core::schedule::{F405_LEAN, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics};
@@ -44,6 +46,9 @@ struct Stub {
     /// The commands are valid this many periods after the tick's time (1 is
     /// the logical execution time of our core).
     valid_after_periods: u64,
+    /// The parameter changes and acknowledgements it was given.
+    seen_sets: Vec<ParamSet>,
+    seen_acks: u32,
 }
 
 impl Stub {
@@ -57,6 +62,8 @@ impl Stub {
             fail_at_call: None,
             calls: 0,
             valid_after_periods: 1,
+            seen_sets: Vec::new(),
+            seen_acks: 0,
         }
     }
 }
@@ -78,6 +85,8 @@ impl Autopilot<4> for Stub {
         if self.fail_at_call == Some(call) {
             return Err(StubError { tick: call });
         }
+        self.seen_sets.extend(input.param_set);
+        self.seen_acks += u32::from(input.param_ack);
         let armed = t.as_secs_f64() >= self.arm_at_s;
         let height = -input.body.position.z;
         let climb = -input.body.velocity.z;
@@ -439,4 +448,32 @@ fn the_hash_covers_the_commands_even_when_the_truth_is_the_same() {
     assert_eq!(full, over, "the truth is the same");
     assert!(full.last().is_some_and(|t| t.0.z < -0.1), "and it flew");
     assert_ne!(hash_full, hash_over, "the hash covers the commands");
+}
+
+#[test]
+fn a_failing_tick_leaves_a_queued_parameter_change_and_ack_queued() {
+    let set = ParamSet {
+        id: oxide_core::params::find("BAT_LOW_V").expect("a parameter"),
+        value: ParamValue::F32(14.0),
+    };
+    let mut stub = Stub::new(500);
+    stub.fail_at_call = Some(3);
+    let mut sim = stub_sim(stub);
+    for _ in 0..3 {
+        sim.try_step().expect("the first ticks succeed");
+    }
+    sim.queue_param_set(set);
+    sim.queue_param_ack();
+    sim.try_step().expect_err("the 4th tick fails");
+    assert!(
+        sim.autopilot().seen_sets.is_empty() && sim.autopilot().seen_acks == 0,
+        "the failing tick never delivered them"
+    );
+    // The next tick (the stub fails only once) gets both, exactly once.
+    sim.try_step().expect("the next tick succeeds");
+    assert_eq!(sim.autopilot().seen_sets, vec![set]);
+    assert_eq!(sim.autopilot().seen_acks, 1);
+    sim.try_step().expect("and the next");
+    assert_eq!(sim.autopilot().seen_sets, vec![set]);
+    assert_eq!(sim.autopilot().seen_acks, 1);
 }
