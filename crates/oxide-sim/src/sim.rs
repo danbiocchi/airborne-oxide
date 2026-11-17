@@ -383,6 +383,17 @@ impl<P: Pilot, const N: usize> Simulation<P, N, CoreAutopilot<N>> {
         options: SimOptions,
         boot: impl FnOnce(&mut VehicleConfig<N>) -> LoadReport,
     ) -> Result<Self, SimError> {
+        let imu_period = options.sensors.imu.period_us;
+        if imu_period != 0 && imu_period != u64::from(profile.base_period_us) {
+            return Err(SimError::Param {
+                name: "sensors.imu.period_us".into(),
+                reason: format!(
+                    "our flight core needs an IMU sample on every tick ({} us), \
+                     so the IMU period must be 0 or the tick; got {imu_period} us",
+                    profile.base_period_us
+                ),
+            });
+        }
         let mut airframe = airframe.clone();
         if let Some(b) = options.battery.clone() {
             airframe.battery = b;
