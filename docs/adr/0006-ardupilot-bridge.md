@@ -1,6 +1,6 @@
 # ADR-0006: The ArduPilot bridge
 
-Status: accepted as the design (M1d). The bridge is not built yet. The measurements below come from a prototype that was thrown away.
+Status: accepted as the design (M1d). The seam of §2 is built; the bridge is not built yet. The measurements below come from a prototype that was thrown away.
 
 ## Context
 
@@ -31,9 +31,9 @@ The bridge starts the SITL binary as a child process and talks to it over socket
 
 ### 2. One seam for every autopilot
 
-The simulator's loop calls an `Autopilot` (`crates/oxide-sim/src/autopilot.rs`): one `tick` that sees what the simulator knows at that instant and returns motor commands. Our flight core is one implementation, the bridge is another, and PX4's will be a third. The step record carries what every autopilot has (the motor commands and whether it is armed) and, as an optional part, what only our core reports (its status, events and estimate).
+The simulator's loop calls an `Autopilot` (`crates/oxide-sim/src/autopilot.rs`): one `tick` that sees what the simulator knows at that instant and returns motor commands, with the time from which they are valid. The simulator flies a command from that time on, so each autopilot states its own delay (§3). Our flight core is one implementation, the bridge is another, and PX4's will be a third. The step record carries what every autopilot has (the motor commands and whether it is armed) and, as an optional part, what only our core reports (its status, events and estimate).
 
-A flight is judged from the physics: where the vehicle went, how far it tilted, how hard it landed. Expectations that need our core's own states cannot be judged for another autopilot. They are reported as **not judged**, never as passed.
+A flight is judged from the physics: where the vehicle went, how far it tilted, how hard it landed. Expectations that need our core's own states cannot be judged for another autopilot. They are reported as **not judged**, never as passed, and a flight with an expectation that was not judged does not count as passed.
 
 ### 3. Time
 
