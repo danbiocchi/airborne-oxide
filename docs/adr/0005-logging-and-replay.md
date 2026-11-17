@@ -72,7 +72,10 @@ The core gains one read-only accessor, `Core::telemetry()`, for values it comput
 ### 4. What is not in the normal level yet
 
 - **`vehicle_gnss`.** PX4's topic is geodetic and the core's GPS sample is local. It waits for a geodetic origin, which arrives with a real GPS driver. Flight Review's map is therefore empty.
-- **`cpuload` and `estimator_status`' innovation ratios.** They need values only the firmware or a later estimator has.
+- **`cpuload`.** It needs the firmware's measurement.
+- **`estimator_status`.** PX4's topic carries a test ratio for each fused measurement, a reset counter for each axis and bits for specific faults. The estimator reports less: whether it is aligned and aided, how many measurements it rejected and how often it reset (`oxide_estimator`). A log must not carry a zero the core did not compute, so the topic waits for an estimator that reports these values. Flight Review's estimator-flags plot is therefore absent.
+- **Consumed charge and state of charge.** The battery monitor works on voltage and has no capacity, so `battery_status.discharged_mah` and `remaining` carry PX4's value for unknown, -1. Flight Review draws them as flat lines.
+- **Topics Flight Review can plot and the core has no data for:** `manual_control_switches`, `vehicle_imu_status`, `esc_status`, `vehicle_angular_acceleration`.
 - **PX4's event topic with its metadata.** Logged strings do the job.
 
 ### 5. The replay level: everything the core saw
@@ -160,7 +163,9 @@ In the simulator the buffer is 64 kB and is drained to the file after every tick
 
 ## Consequences
 
-- A flight in the simulator or on the bench is written for PlotJuggler and Flight Review: PX4's topic names, fields and units, and the fields Flight Review's source needs. `pyulog` reads the files in CI. Nobody has opened one in Flight Review or PlotJuggler yet (see Deferred).
+- A flight in the simulator or on the bench is written for PlotJuggler and Flight Review: PX4's topic names, fields and units, and the fields Flight Review's source needs. `pyulog` reads the files in CI.
+- Flight Review's plotting code draws these logs. It was run without its web server, at commit `80e0c0c`, on thirteen simulator logs: six scenarios on both profiles and one replay-level log. It ran to the end on each and drew the same 28 plots, with the flight modes as coloured bands and the events in its table of logged messages. On one log the plotted attitude, rates, position, velocity, battery and barometer values were compared with the log point by point, and they agree. The plots it could not draw are those whose topics §4 lists as absent. A replay-level log gives the same page as a normal one, because Flight Review reads only the topics it knows.
+- PlotJuggler has not been run on a log. The source of its ULog loader was read against these files, and nothing in them should stop it.
 - A bug seen in a flight can be reproduced on a desk from its log, and a fix can be shown to change the flight at the tick it should.
 - A normal-level log is about 41 kB/s on either profile: 3.2 MB for the 80 s of `rc-loss-position`, of which 10 kB are the definitions.
 - Replay logs are large. The tick record, an IMU sample and the outputs are 165 bytes a tick. A whole replay-level file of the simulator, with every sensor and the normal level's records, is about 219 kB/s on the F405 profile (1 kHz) and 714 kB/s on the H743 profile (4 kHz): 17.5 MB and 57 MB for those 80 s. Whether an SD card keeps up is measured at bring-up; the outputs record can be packed tighter if it does not.
@@ -173,10 +178,10 @@ In the simulator the buffer is 64 kB and is drained to the file after every tick
 
 - The SD-card side of the logger, and making the buffer lock-free between interrupt levels (bring-up).
 - Replay of a window that starts in flight. It needs the core's state to be saved and restored, which does not exist. DESIGN §4.15's "short triggered windows" on the F405 can be inspected but not replayed until then.
-- `vehicle_gnss`, `cpuload`, the estimator's innovation ratios, PX4's event metadata (§4).
+- `vehicle_gnss`, `cpuload`, `estimator_status`, consumed charge and state of charge in `battery_status`, PX4's event metadata (§4).
 - Reading ULog and DataFlash logs of real flights into the simulator for comparison (M2).
 - Log rates as parameters.
-- Opening a log in Flight Review and PlotJuggler. The automated check is `pyulog`, the strictest reader of the three.
+- Running PlotJuggler on a log, and looking at a log on Flight Review's own web page in a browser: only its plotting code has been run (see Consequences). The automated check stays `pyulog`, the strictest reader of the three.
 - Replaying up to damage in the middle of a file. A file damaged before its end is refused whole today; only a cut at the end and a counted dropout are replayed up to.
 - Reading a replay log as a stream, so that memory does not grow with the file.
 - Keeping a statically allocated recorder out of initialised data. The recorder holds its ring, and its clocks start non-zero, so a static one costs its size in flash and a copy at start-up. At bring-up the ring moves into its own section of DMA-reachable memory anyway.

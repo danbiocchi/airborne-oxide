@@ -51,7 +51,7 @@ cargo run --release -p oxide-sim-cli -- params list
 cargo run --release -p oxide-sim-cli -- run --param POS_X_P=1.2
 ```
 
-Write a log in PX4's ULog format, then a replay log, and run that flight through the flight core again. The log uses PX4's topic names and units so that PlotJuggler and Flight Review can show it; `pyulog` reads it in CI, and the other two have not been tried yet. `replay` compares every output of every tick bit for bit and names the first one that differs ([ADR-0005](docs/adr/0005-logging-and-replay.md)):
+Write a log in PX4's ULog format, then a replay log, and run that flight through the flight core again. The log uses PX4's topic names and units so that PlotJuggler and Flight Review can show it; `pyulog` reads it in CI, Flight Review's plotting code has drawn its plots from simulator logs, and PlotJuggler has not been tried yet. `replay` compares every output of every tick bit for bit and names the first one that differs ([ADR-0005](docs/adr/0005-logging-and-replay.md)):
 
 ```bash
 cargo run --release -p oxide-sim-cli -- scenario rc-loss-position --log flight.ulg
