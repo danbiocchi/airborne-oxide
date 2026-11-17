@@ -25,6 +25,8 @@ struct StubError {
     tick: u64,
 }
 
+impl std::error::Error for StubError {}
+
 impl fmt::Display for StubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "the stub's process died at its tick {}", self.tick)
@@ -529,4 +531,25 @@ fn the_autopilot_is_told_how_much_thrust_each_rotor_has_left() {
     assert_eq!(at(25_000), [1.0, 0.7, 1.0, 0.0]);
     assert_eq!(at(30_000), [1.0, 1.0, 1.0, 0.0]);
     assert_eq!(at(39_500), [1.0, 1.0, 1.0, 0.0]);
+}
+
+fn fly_with_question_mark(stub: Stub) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut sim = stub_sim(stub);
+    for _ in 0..20 {
+        sim.try_step()?;
+    }
+    Ok(sim.into_autopilot().calls)
+}
+
+#[test]
+fn an_autopilot_error_is_a_std_error_and_the_autopilot_can_be_taken_back() {
+    assert_eq!(fly_with_question_mark(Stub::new(500)).expect("flies"), 20);
+    let mut failing = Stub::new(500);
+    failing.fail_at_call = Some(5);
+    let e = fly_with_question_mark(failing).expect_err("the 6th tick fails");
+    assert_eq!(e.to_string(), "the stub's process died at its tick 5");
+    assert!(e.downcast_ref::<StubError>().is_some());
+    // Our own core's error is one too (it cannot happen).
+    fn is_std_error<E: std::error::Error + 'static>() {}
+    is_std_error::<<oxide_sim::CoreAutopilot<4> as Autopilot<4>>::Error>();
 }

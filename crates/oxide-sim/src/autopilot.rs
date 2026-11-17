@@ -33,9 +33,16 @@ use crate::vehicle::BodyState;
 
 /// Whatever flies the vehicle: our flight core, or another autopilot behind a
 /// bridge.
+///
+/// What the input carries per tick is what happened at that tick: `rc` and
+/// `setpoint` are `None` between the pilot's frames (every 20 ms), so an
+/// autopilot that needs a level (a bridge to a protocol where the last
+/// receiver value stands) must latch them itself.
 pub trait Autopilot<const N: usize> {
     /// Why a tick can fail (a bridge loses its process; our core cannot fail).
-    type Error: core::fmt::Debug + core::fmt::Display;
+    /// A [`std::error::Error`], so that `sim.try_step()?` converts into a
+    /// `Box<dyn Error>`.
+    type Error: std::error::Error + 'static;
     /// The tick period, which is also the physics step, in microseconds.
     fn period_us(&self) -> u64;
     /// One tick at `t`: sees what the simulator knows at `t`, returns the motor

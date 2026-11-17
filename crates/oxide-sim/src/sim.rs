@@ -579,6 +579,12 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
     pub fn autopilot_mut(&mut self) -> &mut A {
         &mut self.autopilot
     }
+    /// Ends the simulation and hands the autopilot back, so that a bridge can
+    /// shut its process down and report how it ended instead of doing it in
+    /// `Drop`.
+    pub fn into_autopilot(self) -> A {
+        self.autopilot
+    }
     pub fn sensors(&self) -> &SensorSuite<N> {
         &self.sensors
     }
