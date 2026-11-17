@@ -33,7 +33,7 @@ use crate::flight_log::{Level, LogBuild, LogError, LogWriter, Stats};
 use crate::hash::TraceHash;
 use crate::rng::{Rng, Stream};
 use crate::scenario::Pilot;
-use crate::sensors::{SensorConfig, SensorFrame, SensorSuite, Truth};
+use crate::sensors::{SensorConfig, SensorSuite, Truth};
 use crate::vehicle::{BodyState, GRAVITY, VehicleModel};
 use crate::wind::{Wind, WindConfig};
 
@@ -600,7 +600,7 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
 
         // 1. Wind and sensors at t.
         let wind = self.wind.sample(t);
-        let frame = self.sensors.sample(
+        let mut frame = self.sensors.sample(
             t,
             &Truth {
                 body: &self.body,
@@ -620,13 +620,19 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
         let rc = self.rc_frame(t);
         let (gcs_heartbeat, brain_heartbeat) = self.heartbeats(t);
         self.apply_motor_faults(t);
-        let frame = SensorFrame {
-            imu: frame.imu.filter(|_| !active.imu_loss),
-            gps: frame.gps.filter(|_| !active.gps_loss),
-            baro: frame.baro.filter(|_| !active.baro_loss),
-            mag: frame.mag.filter(|_| !active.mag_loss),
-            battery: frame.battery,
-        };
+        // Sensor faults: a lost sensor delivers nothing.
+        if active.imu_loss {
+            frame.imu = None;
+        }
+        if active.gps_loss {
+            frame.gps = None;
+        }
+        if active.baro_loss {
+            frame.baro = None;
+        }
+        if active.mag_loss {
+            frame.mag = None;
+        }
         let param_set = self.next_param_set.take();
         let param_ack = core::mem::take(&mut self.next_param_ack);
 
