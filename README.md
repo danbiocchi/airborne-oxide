@@ -8,7 +8,7 @@ Airborne Oxide is flight software for drones, written in Rust. It has three part
 2. **A flight core.** A small, hard-real-time, formally checked flight controller for STM32 chips that flies multirotors, fixed-wings and VTOLs. It stays safe whatever the AI does.
 3. **An AI brain.** Computer vision plus a small on-board language model that makes mission decisions. It runs on a companion computer today and will move onto smaller drones as AI hardware shrinks.
 
-> **Status: milestone M1c, part two.** The flight core flies a simulated 5" quad on its own state estimate and handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. The 93 tuning parameters are named, range-checked and changeable in flight. A parameter store that survives a power cut at any moment is written and tested against simulated flash; it meets real flash at F405 bring-up. The scenarios are data files, flown across random seeds on both chip profiles. Logging and replay come next. See the [roadmap](docs/DESIGN.md#13-roadmap).
+> **Status: milestone M1c, part three.** The flight core flies a simulated 5" quad on its own state estimate and handles failures: lost radio, lost GPS, a dead barometer, magnetometer or IMU, a crashed brain, a low battery, a geofence breach, a lost motor. The 93 tuning parameters are named, range-checked and changeable in flight. A parameter store that survives a power cut at any moment is written and tested against simulated flash; it meets real flash at F405 bring-up. The scenarios are data files, flown across random seeds on both chip profiles. A flight can be logged in PX4's ULog format, and a logged flight can be replayed through the flight core bit for bit. The SD-card side of the logger waits for F405 bring-up. See the [roadmap](docs/DESIGN.md#13-roadmap).
 
 ## Try it
 
@@ -50,6 +50,22 @@ List the tunable parameters, and fly with one changed (all of them are documente
 cargo run --release -p oxide-sim-cli -- params list
 cargo run --release -p oxide-sim-cli -- run --param POS_X_P=1.2
 ```
+
+Write a log in PX4's ULog format, then a replay log, and run that flight through the flight core again. The log uses PX4's topic names and units so that PlotJuggler and Flight Review can show it; `pyulog` reads it in CI, and the other two have not been tried yet. `replay` compares every output of every tick bit for bit and names the first one that differs ([ADR-0005](docs/adr/0005-logging-and-replay.md)):
+
+```bash
+cargo run --release -p oxide-sim-cli -- scenario rc-loss-position --log flight.ulg
+```
+
+```bash
+cargo run --release -p oxide-sim-cli -- scenario rc-loss-position --log replay.ulg --log-level replay
+```
+
+```bash
+cargo run --release -p oxide-sim-cli -- replay replay.ulg
+```
+
+Add `--param ATT_ROLL_P=5` to the last command to replay the same inputs through a changed setting and see where the flight first departs.
 
 `cargo run --release -p oxide-sim-cli -- help` lists every command and its options.
 
@@ -136,9 +152,11 @@ Putting a file in `scenarios/` adds it to the Monte-Carlo run. To embed it in th
 |---|---|
 | `crates/oxide-core` | Flight core library (`no_std`, no heap). Builds for `thumbv7em-none-eabihf`. |
 | `crates/oxide-store` | Parameter storage on flash (`no_std`): a two-sector log that survives power loss at any point |
+| `crates/oxide-log` | Flight logs in PX4's ULog format (`no_std`): the writer, the topics, the logger's ring buffer, the replay records, and a reader |
 | `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, fault injection, scenario-file loader, Monte-Carlo runner, lockstep loop |
 | `scenarios/` | The scenario files: the 20 failures, the 21 pairings, `hover-step` and `gust-hold` |
 | `crates/oxide-sim-cli` | `oxide-sim` command-line runner |
+| `tools/ulog_check.py` | Checks a log with `pyulog`, PX4's reference reader (used by CI) |
 | `crates/oxide-viewer` | Optional Rerun viewer with joystick input (kept out of the default build) |
 | `airframes/` | Airframe data files |
 | `docs/DESIGN.md` | Architecture, decisions and roadmap |

@@ -6,6 +6,7 @@
 
 mod guidance;
 mod supervisor;
+mod telemetry;
 #[cfg(test)]
 mod tests;
 
@@ -29,6 +30,7 @@ use crate::time::Micros;
 
 use guidance::GuidanceState;
 use supervisor::SupervisorState;
+pub use telemetry::{RateCommand, Setpoints, Telemetry};
 
 /// How old a sample may be before it is treated as missing, µs (the same
 /// 100 ms the estimator applies to the IMU).
@@ -127,6 +129,10 @@ pub struct Core<const N: usize> {
     guide_state: GuidanceState,
     position_ctrl: PositionController,
     rate_ctrl: RateController,
+    /// What the rate loop commanded on its last tick (for `telemetry`).
+    rate_command: RateCommand,
+    /// What guidance flew on its last run (for `telemetry`).
+    setpoints: Option<Setpoints>,
 
     events: Ring<Option<Event>, EVENT_QUEUE>,
     events_dropped: u32,
@@ -194,6 +200,8 @@ impl<const N: usize> Core<N> {
             guide_state: GuidanceState::default(),
             position_ctrl: PositionController::default(),
             rate_ctrl: RateController::default(),
+            rate_command: RateCommand::default(),
+            setpoints: None,
             events: Ring::new(),
             events_dropped: 0,
             params_unsaved: false,
@@ -624,6 +632,7 @@ impl<const N: usize> Core<N> {
         };
         if !sup.armed {
             self.rate_ctrl.reset();
+            self.rate_command = RateCommand::default();
             return out;
         }
         let target = self.attitude.visible;
@@ -641,6 +650,11 @@ impl<const N: usize> Core<N> {
         let torque = self.cfg.inertia.hadamard(alpha);
         let alloc = self.mixer.mix(torque, target.thrust_n);
         out.status.saturated = alloc.saturated;
+        self.rate_command = RateCommand {
+            torque_nm: torque,
+            thrust_n: target.thrust_n,
+            saturated: alloc.saturated,
+        };
 
         // Battery sag lowers motor speed for a given command; compensate.
         let comp = Self::fresh(self.battery, now, BATTERY_TIMEOUT_US)

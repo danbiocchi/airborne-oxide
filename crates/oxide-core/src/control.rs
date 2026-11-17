@@ -148,6 +148,56 @@ pub enum Yaw {
     Free,
 }
 
+/// The form the horizontal axes were flown in (the variant of [`Horizontal`]
+/// without its values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HorizontalForm {
+    /// A north/east position with velocity feed-forward.
+    #[default]
+    Position,
+    /// A north/east velocity.
+    Velocity,
+    /// Roll and pitch angles, no horizontal feedback.
+    Tilt,
+}
+
+/// The form the vertical axis was flown in (the variant of [`Vertical`]
+/// without its values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerticalForm {
+    /// A height with velocity feed-forward.
+    #[default]
+    Position,
+    /// A vertical speed.
+    Velocity,
+    /// A fixed collective thrust, no vertical feedback.
+    Thrust,
+}
+
+/// The form the yaw axis was flown in (the variant of [`Yaw`] without its
+/// value).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YawForm {
+    /// A heading.
+    #[default]
+    Heading,
+    /// The current estimated yaw, no correction.
+    Free,
+}
+
+/// What the last [`PositionController::update_axes`] call flew: the forms
+/// it was given and the velocity setpoint its velocity loop tracked. A
+/// record for logging; nothing reads it back.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PositionReport {
+    pub horizontal: HorizontalForm,
+    pub vertical: VerticalForm,
+    pub yaw: YawForm,
+    /// The velocity setpoint after the speed limits, m/s NED. An axis
+    /// without feedback holds the estimate's own velocity there (zero error).
+    pub velocity_sp: Vec3<f32>,
+}
+
 /// Position and velocity controller (one task).
 ///
 /// Horizontal and vertical control are chosen independently each call, so
@@ -157,11 +207,20 @@ pub struct PositionController {
     /// x, y: horizontal integrator; z: vertical integrator.
     velocity_integral: Vec3<f32>,
     prev_velocity: Option<Vec3<f32>>,
+    /// What the last `update_axes` flew. Not controller state: `reset`
+    /// leaves it alone.
+    report: PositionReport,
 }
 
 impl PositionController {
     pub fn reset(&mut self) {
-        *self = Self::default();
+        self.velocity_integral = Vec3::zero();
+        self.prev_velocity = None;
+    }
+
+    /// What the last [`Self::update_axes`] call flew.
+    pub const fn report(&self) -> PositionReport {
+        self.report
     }
 
     /// Tracks `position_sp` with velocity feedforward `velocity_ff`.
@@ -253,6 +312,23 @@ impl PositionController {
             z_speed_limited = vz != vel_sp.z;
             vel_sp.z = vz;
         }
+        self.report = PositionReport {
+            horizontal: match h {
+                Horizontal::Position { .. } => HorizontalForm::Position,
+                Horizontal::Velocity(_) => HorizontalForm::Velocity,
+                Horizontal::Tilt { .. } => HorizontalForm::Tilt,
+            },
+            vertical: match v {
+                Vertical::Position { .. } => VerticalForm::Position,
+                Vertical::Velocity(_) => VerticalForm::Velocity,
+                Vertical::Thrust(_) => VerticalForm::Thrust,
+            },
+            yaw: match yaw {
+                Yaw::Heading(_) => YawForm::Heading,
+                Yaw::Free => YawForm::Free,
+            },
+            velocity_sp: vel_sp,
+        };
 
         // Velocity → acceleration (integral applied after the limit checks).
         let err = vel_sp - est.velocity;

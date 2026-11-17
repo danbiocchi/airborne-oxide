@@ -22,6 +22,7 @@
 )]
 
 pub mod allocation;
+pub mod codes;
 pub mod config;
 pub mod control;
 pub mod estimator;

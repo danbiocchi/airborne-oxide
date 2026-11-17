@@ -1934,3 +1934,375 @@ fn an_estimator_reset_re_bases_the_setpoints_even_if_the_flags_never_dropped() {
         assert!((g.position_sp.y - 6.0).abs() < 1e-6, "{nav:?}");
     }
 }
+
+// ---- read-only telemetry (M1c part three, K1) ----
+
+/// A climb and a landing in Position mode on the vertical world: arm on the
+/// ground, climb with the throttle stick, hold, command a descent until the
+/// vehicle is on the ground again, then disarm.
+/// `after_tick` runs after every tick.
+fn telemetry_flight(rig: &mut Rig, mut after_tick: impl FnMut(&mut Rig)) -> Vec<Outputs<4>> {
+    let mut outs = Vec::new();
+    let mut go = |rig: &mut Rig, ticks: u64, outs: &mut Vec<Outputs<4>>| {
+        for _ in 0..ticks {
+            rig.step();
+            after_tick(rig);
+            outs.push(rig.out);
+        }
+    };
+    rig.rc.arm_switch = false;
+    go(rig, 1200, &mut outs);
+    rig.rc.arm_switch = true;
+    go(rig, 300, &mut outs);
+    rig.rc.throttle = 0.75;
+    go(rig, 1500, &mut outs);
+    rig.rc.throttle = 0.5;
+    go(rig, 800, &mut outs);
+    rig.rc.throttle = 0.2;
+    go(rig, 3000, &mut outs);
+    // Sitting on the ground: the pilot disarms.
+    rig.rc.arm_switch = false;
+    rig.rc.throttle = 0.0;
+    go(rig, 300, &mut outs);
+    outs
+}
+
+fn telemetry_rig() -> Rig {
+    let mut rig = Rig::external(1);
+    rig.state = Some(StateSample::default());
+    rig.world = true;
+    rig
+}
+
+#[test]
+fn reading_telemetry_changes_nothing() {
+    let mut plain = telemetry_rig();
+    let mut watched = telemetry_rig();
+    let a = telemetry_flight(&mut plain, |_| {});
+    let mut seen = 0_u32;
+    let b = telemetry_flight(&mut watched, |r| {
+        let t = r.core.telemetry();
+        // Reading twice gives the same thing.
+        assert_eq!(t, r.core.telemetry());
+        seen += 1;
+    });
+    assert!(seen > 6000);
+    assert_eq!(a.len(), b.len());
+    // The flight must have armed, climbed and landed for the comparison to
+    // mean anything.
+    assert!(a.iter().any(|o| o.status.armed));
+    assert!(a.iter().any(|o| o.motors.iter().any(|m| *m > 0.5)));
+    for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert!(x.same_bits(y), "tick {k}: {x:?} against {y:?}");
+    }
+    assert_eq!(plain.core.ticks, watched.core.ticks);
+}
+
+#[test]
+fn telemetry_fields_equal_the_values_they_mirror() {
+    use crate::control::{HorizontalForm, VerticalForm, YawForm};
+    let mut rig = telemetry_rig();
+    let mut moments = 0_u32;
+    let mut saw_contact = false;
+    let mut saw_airborne = false;
+    let mut saw_forms = (false, false);
+    telemetry_flight(&mut rig, |r| {
+        let t = r.core.telemetry();
+        let c = &r.core;
+        // The published estimate and its validity.
+        assert_eq!(t.estimate, c.estimate.visible.state);
+        assert_eq!(t.valid, c.estimate.visible.valid);
+        if t.valid.attitude {
+            assert_eq!(t.estimate, c.estimate());
+        }
+        // The attitude target is the published guidance output, the rate
+        // target the published attitude output.
+        assert_eq!(t.attitude_target, c.guidance.visible.attitude);
+        assert_eq!(t.thrust_target_n, c.guidance.visible.thrust_n);
+        assert_eq!(t.rate_target, c.attitude.visible.rate);
+        // The rate loop's command: thrust is what the mixer was given, and
+        // the saturation flag is the one in the status.
+        assert_eq!(t.rate_command.saturated, r.out.status.saturated);
+        if r.out.status.armed {
+            assert_eq!(t.rate_command.thrust_n, c.attitude.visible.thrust_n);
+            assert!(t.rate_command.thrust_n.is_finite());
+        } else {
+            assert_eq!(t.rate_command, RateCommand::default());
+        }
+        // Landing flags and the filter.
+        assert_eq!(t.landed, c.sup_state.land.landed());
+        assert_eq!(t.gyro_filtered, c.gyro_filtered);
+        saw_contact |= t.ground_contact && r.out.status.armed;
+        saw_airborne |= !t.landed && r.out.status.armed;
+        // Battery: the monitor's values and the last sample.
+        assert_eq!(t.battery_cell_v, c.sup_state.battery.cell_voltage());
+        assert_eq!(t.battery_low, c.sup_state.battery.low());
+        assert_eq!(t.battery_critical, c.sup_state.battery.critical());
+        assert_eq!(t.battery_voltage_v, c.battery.map(|b| b.value.voltage_v));
+        assert_eq!(t.battery_current_a, c.battery.map(|b| b.value.current_a));
+        assert_eq!(t.events_dropped, c.events_dropped());
+        // Setpoints: present while guidance flies.
+        if let Some(s) = t.setpoints {
+            assert_eq!(s.position, c.guide_state.position_sp);
+            assert_eq!(s.yaw, c.guide_state.yaw_sp);
+            saw_forms.0 |= s.horizontal == HorizontalForm::Position;
+            saw_forms.1 |= s.vertical == VerticalForm::Position && s.yaw_form == YawForm::Heading;
+        }
+        moments += 1;
+    });
+    assert!(moments > 6000);
+    assert!(saw_contact, "the landing must reach ground contact");
+    assert!(saw_airborne, "armed and not landed while flying");
+    assert!(!rig.out.status.armed, "{:?}", rig.out.status);
+    assert!(rig.core.telemetry().landed);
+    assert!(saw_forms.0 && saw_forms.1, "forms seen: {saw_forms:?}");
+}
+
+#[test]
+fn telemetry_before_the_first_tick_is_empty() {
+    let core = Core::new(cfg(), F405_LEAN).expect("valid config");
+    let t = core.telemetry();
+    assert_eq!(t.estimate, None);
+    assert_eq!(t.valid, Validity::NONE);
+    assert_eq!(t.setpoints, None);
+    assert_eq!(t.rate_command, RateCommand::default());
+    assert_eq!(t.battery_cell_v, None);
+    assert_eq!(t.battery_voltage_v, None);
+    assert!(!t.ground_contact && !t.landed);
+    assert_eq!(t.events_dropped, 0);
+}
+
+#[test]
+fn telemetry_reports_the_battery_latches_separately_and_the_cell_voltage() {
+    let mut c = cfg();
+    c.failsafe.battery_low_v = 3.5;
+    c.failsafe.battery_critical_v = 3.3;
+    let mut rig = Rig::external(0).with_cfg(c);
+    rig.arm();
+    rig.rc.throttle = 0.3;
+    // Healthy pack: no latch, 3.83 V per cell.
+    rig.run(1.0);
+    let t = rig.core.telemetry();
+    assert!(!t.battery_low && !t.battery_critical);
+    assert!((t.battery_cell_v.expect("cell voltage") - 23.0 / 6.0).abs() < 1e-3);
+    // Low but not critical: 3.4 V per cell.
+    rig.battery = Some(BatterySample {
+        voltage_v: 6.0 * 3.4,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(30.0, |r| r.core.telemetry().battery_low));
+    let t = rig.core.telemetry();
+    assert!(t.battery_low && !t.battery_critical, "{t:?}");
+    assert_eq!(t.battery_low, rig.core.sup_state.battery.low());
+    assert_eq!(t.battery_critical, rig.core.sup_state.battery.critical());
+    let v = t.battery_cell_v.expect("cell voltage");
+    assert!(v < 3.5 && v > 3.3, "cell voltage {v}");
+    assert_eq!(t.battery_voltage_v, Some(6.0 * 3.4));
+    // Critical: 3.1 V per cell; both latches are set.
+    rig.battery = Some(BatterySample {
+        voltage_v: 6.0 * 3.1,
+        current_a: 2.0,
+    });
+    assert!(rig.run_until(30.0, |r| r.core.telemetry().battery_critical));
+    let t = rig.core.telemetry();
+    assert!(t.battery_low && t.battery_critical, "{t:?}");
+    assert_eq!(t.battery_current_a, Some(2.0));
+    assert!(t.battery_cell_v.expect("cell voltage") < 3.3);
+}
+
+#[test]
+fn ground_contact_is_not_reported_while_guidance_is_not_controlling() {
+    let mut rig = critical_battery_rig();
+    assert!(rig.run_until(5.0, |r| r.core.telemetry().ground_contact));
+    assert!(rig.core.telemetry().setpoints.is_some());
+    // The attitude estimate disappears while still armed.
+    rig.state = None;
+    assert!(rig.run_until(0.2, |r| r.core.telemetry().setpoints.is_none()));
+    let t = rig.core.telemetry();
+    assert!(t.setpoints.is_none());
+    assert!(!t.ground_contact, "stale contact flag: {t:?}");
+}
+
+/// The velocity setpoint of a report, as an option (the report keeps one
+/// only where a velocity loop runs).
+fn vel_of(s: &Setpoints) -> Option<Vec3<f32>> {
+    s.velocity
+}
+
+fn flown(rig: &Rig) -> Setpoints {
+    rig.core.telemetry().setpoints.expect("guidance is flying")
+}
+
+#[test]
+fn stabilized_reports_the_attitude_forms_and_no_velocity_setpoint() {
+    use crate::control::{HorizontalForm, VerticalForm, YawForm};
+    // Fly Position first, so that the last position-control report is a
+    // Position/Position/Heading one with a velocity setpoint, then switch to
+    // Stabilized: what is reported must be what Stabilized flies.
+    let mut rig = Rig::external(1);
+    rig.arm();
+    rig.world = true;
+    rig.rc.pitch = 0.5;
+    rig.rc.throttle = 0.8;
+    rig.run(1.0);
+    assert_eq!(rig.nav(), NavState::Position);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (
+            HorizontalForm::Position,
+            VerticalForm::Position,
+            YawForm::Heading
+        )
+    );
+    assert!(vel_of(&s).is_some());
+    rig.rc.mode_switch = 0;
+    rig.run(1.0);
+    assert_eq!(rig.nav(), NavState::Stabilized);
+    let s = flown(&rig);
+    assert_eq!(s.horizontal, HorizontalForm::Tilt);
+    assert_eq!(s.vertical, VerticalForm::Thrust);
+    assert_eq!(s.yaw_form, YawForm::Heading);
+    assert_eq!(vel_of(&s), None);
+    // A fresh core in Stabilized too (the report was never written).
+    let mut fresh = Rig::external(0);
+    fresh.arm();
+    fresh.run(0.5);
+    assert_eq!(fresh.nav(), NavState::Stabilized);
+    let s = flown(&fresh);
+    assert_eq!(s.horizontal, HorizontalForm::Tilt);
+    assert_eq!(s.vertical, VerticalForm::Thrust);
+    assert_eq!(s.yaw_form, YawForm::Heading);
+    assert_eq!(vel_of(&s), None);
+}
+
+#[test]
+fn every_navigation_state_reports_the_forms_it_flies() {
+    use crate::control::{HorizontalForm as H, VerticalForm as V, YawForm as Y};
+    // Position: sticks give position control with a velocity feed-forward.
+    let mut rig = Rig::external(1);
+    rig.arm();
+    rig.world = true;
+    rig.rc.pitch = 0.5;
+    rig.run(1.0);
+    assert_eq!(rig.nav(), NavState::Position);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Position, Y::Heading)
+    );
+    let v = vel_of(&s).expect("velocity loop");
+    assert!(
+        v.x > 0.5,
+        "pitch stick forward gives a northward velocity setpoint: {v:?}"
+    );
+    assert_eq!(s.position, rig.core.guide_state.position_sp);
+
+    // Altitude (Position after a GPS loss): tilt from the sticks, height held,
+    // then a vertical speed when the throttle leaves the centre.
+    let mut rig = Rig::ekf(1);
+    rig.arm();
+    rig.gps_on = false;
+    assert!(rig.run_until(4.0, |r| r.nav() == NavState::Altitude));
+    rig.rc.throttle = 0.5;
+    rig.run(0.5);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Tilt, V::Position, Y::Heading)
+    );
+    rig.rc.throttle = 0.9;
+    rig.run(0.3);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Tilt, V::Velocity, Y::Heading)
+    );
+    let v = vel_of(&s).expect("velocity loop");
+    assert!(v.z < -0.5, "a climb is a negative down speed: {v:?}");
+
+    // Offboard: position control to the setpoint.
+    let mut rig = Rig::external(2);
+    rig.arm();
+    rig.run(0.5);
+    assert_eq!(rig.nav(), NavState::Offboard);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Position, Y::Heading)
+    );
+    assert!(vel_of(&s).is_some());
+
+    // Hold (RC lost): position control at the held point.
+    let mut rig = Rig::external(1);
+    rig.arm();
+    rig.world = true;
+    rig.rc_on = false;
+    assert!(rig.run_until(0.9, |r| r.nav() == NavState::Hold));
+    rig.run(0.1);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Position, Y::Heading)
+    );
+    assert!(vel_of(&s).is_some());
+
+    // LandNow (critical battery): horizontal position, a descent speed.
+    let mut c = cfg();
+    c.failsafe.battery_low_v = c.failsafe.battery_critical_v;
+    let mut rig = Rig::external(1).with_cfg(c);
+    rig.arm();
+    rig.world = true;
+    rig.battery = Some(BatterySample {
+        voltage_v: 19.0,
+        current_a: 0.0,
+    });
+    assert!(rig.run_until(10.0, |r| r.nav() == NavState::LandNow));
+    rig.run(0.2);
+    let s = flown(&rig);
+    assert_eq!(
+        (s.horizontal, s.vertical, s.yaw_form),
+        (H::Position, V::Velocity, Y::Heading)
+    );
+    let v = vel_of(&s).expect("velocity loop");
+    assert!(v.z > 0.1, "a descent is a positive down speed: {v:?}");
+}
+
+#[test]
+fn the_rate_command_torque_is_the_inertia_times_the_rate_loops_demand() {
+    // The vehicle is held at an attitude that is not the target (rolled,
+    // pitched and yawed), so the attitude loop asks for body rates and the
+    // rate loop for torque on every axis.
+    let mut rig = hovering(1, cfg());
+    rig.state = Some(StateSample {
+        attitude: Quat::from_euler(0.15, -0.1, 0.5),
+        ..at_height(5.0)
+    });
+    let mut seen = [false; 3];
+    let mut checked = 0_u32;
+    for _ in 0..300 {
+        let mut replay = rig.core.rate_ctrl;
+        rig.step();
+        let t = rig.core.telemetry();
+        let c = &rig.core;
+        let target = c.attitude.visible;
+        let airborne_ish = target.thrust_n >= 0.5 * c.cfg.weight_n();
+        let alpha = replay.update(
+            target.rate,
+            c.gyro_filtered,
+            1.0e-3,
+            &c.cfg.gains,
+            &c.cfg.limits,
+            airborne_ish,
+        );
+        let want = c.cfg.inertia.hadamard(alpha);
+        assert_eq!(t.rate_command.torque_nm, want);
+        let tq = t.rate_command.torque_nm;
+        seen[0] |= tq.x.abs() > 1.0e-4;
+        seen[1] |= tq.y.abs() > 1.0e-4;
+        seen[2] |= tq.z.abs() > 1.0e-4;
+        checked += 1;
+    }
+    assert_eq!(checked, 300);
+    assert_eq!(seen, [true; 3], "torque on every axis");
+}

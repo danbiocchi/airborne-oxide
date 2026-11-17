@@ -530,3 +530,176 @@ impl<const N: usize> Outputs<N> {
         }
     }
 }
+
+// ---- bit-exact comparison ----
+
+/// Equality where a float is its bit pattern: `-0.0` differs from `0.0`, and
+/// two NaNs are equal only if every bit is. For types with no float it is
+/// `==`. Private: callers use `Inputs::same_bits` and `Outputs::same_bits`.
+trait SameBits {
+    fn same_bits(&self, other: &Self) -> bool;
+}
+
+impl SameBits for f32 {
+    fn same_bits(&self, other: &Self) -> bool {
+        self.to_bits() == other.to_bits()
+    }
+}
+
+impl SameBits for Vec3<f32> {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.x.same_bits(&o.x) && self.y.same_bits(&o.y) && self.z.same_bits(&o.z)
+    }
+}
+
+impl SameBits for Quat<f32> {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.w.same_bits(&o.w)
+            && self.x.same_bits(&o.x)
+            && self.y.same_bits(&o.y)
+            && self.z.same_bits(&o.z)
+    }
+}
+
+impl<T: SameBits> SameBits for Option<T> {
+    fn same_bits(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Some(a), Some(b)) => a.same_bits(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T: SameBits> SameBits for Stamped<T> {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.t_sample == o.t_sample
+            && self.t_arrival == o.t_arrival
+            && self.value.same_bits(&o.value)
+    }
+}
+
+impl SameBits for ImuSample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.gyro.same_bits(&o.gyro) && self.accel.same_bits(&o.accel)
+    }
+}
+
+impl SameBits for StateSample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.position.same_bits(&o.position)
+            && self.velocity.same_bits(&o.velocity)
+            && self.attitude.same_bits(&o.attitude)
+            && self.rate.same_bits(&o.rate)
+    }
+}
+
+impl SameBits for RcSample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.roll.same_bits(&o.roll)
+            && self.pitch.same_bits(&o.pitch)
+            && self.yaw.same_bits(&o.yaw)
+            && self.throttle.same_bits(&o.throttle)
+            && self.arm_switch == o.arm_switch
+            && self.kill_switch == o.kill_switch
+            && self.mode_switch == o.mode_switch
+            && self.failsafe == o.failsafe
+            && self.frame_lost == o.frame_lost
+    }
+}
+
+impl SameBits for BatterySample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.voltage_v.same_bits(&o.voltage_v) && self.current_a.same_bits(&o.current_a)
+    }
+}
+
+impl SameBits for GpsSample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.position.same_bits(&o.position)
+            && self.velocity.same_bits(&o.velocity)
+            && self.h_acc_m.same_bits(&o.h_acc_m)
+            && self.v_acc_m.same_bits(&o.v_acc_m)
+            && self.s_acc_mps.same_bits(&o.s_acc_mps)
+            && self.fix_3d == o.fix_3d
+    }
+}
+
+impl SameBits for BaroSample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.altitude_m.same_bits(&o.altitude_m)
+    }
+}
+
+impl SameBits for MagSample {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.field_ut.same_bits(&o.field_ut)
+    }
+}
+
+impl SameBits for GcsHeartbeat {
+    fn same_bits(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl SameBits for BrainHeartbeat {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.progress == o.progress
+    }
+}
+
+impl SameBits for TrajectorySetpoint {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.position.same_bits(&o.position)
+            && self.velocity.same_bits(&o.velocity)
+            && self.yaw.same_bits(&o.yaw)
+    }
+}
+
+impl SameBits for ParamSet {
+    fn same_bits(&self, o: &Self) -> bool {
+        self.id == o.id
+            && match (self.value, o.value) {
+                (ParamValue::F32(a), ParamValue::F32(b)) => a.same_bits(&b),
+                (ParamValue::I32(a), ParamValue::I32(b)) => a == b,
+                _ => false,
+            }
+    }
+}
+
+impl Inputs {
+    /// Equal in every bit: floats compare by `to_bits`, so a NaN payload and
+    /// the sign of a zero count (where `==` sees neither), every `Option`
+    /// must match, and times, flags and counters are equal.
+    pub fn same_bits(&self, other: &Self) -> bool {
+        self.imu.same_bits(&other.imu)
+            && self.state.same_bits(&other.state)
+            && self.rc.same_bits(&other.rc)
+            && self.battery.same_bits(&other.battery)
+            && self.setpoint.same_bits(&other.setpoint)
+            && self.gps.same_bits(&other.gps)
+            && self.baro.same_bits(&other.baro)
+            && self.mag.same_bits(&other.mag)
+            && self.gcs_heartbeat.same_bits(&other.gcs_heartbeat)
+            && self.brain_heartbeat.same_bits(&other.brain_heartbeat)
+            && self.param_set.same_bits(&other.param_set)
+            && self.param_ack == other.param_ack
+    }
+}
+
+impl<const N: usize> Outputs<N> {
+    /// Equal in every bit: the motor commands compare by `to_bits`; the
+    /// time, the status (which holds no float) and the events (which hold
+    /// none either), in order, compare exactly.
+    pub fn same_bits(&self, other: &Self) -> bool {
+        self.t_valid == other.t_valid
+            && self
+                .motors
+                .iter()
+                .zip(other.motors.iter())
+                .all(|(a, b)| a.same_bits(b))
+            && self.status == other.status
+            && self.events == other.events
+    }
+}

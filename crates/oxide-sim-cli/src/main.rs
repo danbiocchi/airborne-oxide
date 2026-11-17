@@ -5,13 +5,16 @@
 //!
 //! ```text
 //! oxide-sim run  [--profile f405|h743] [--airframe FILE] [--csv FILE]
+//!                [--log FILE.ulg] [--log-level normal|replay]
 //!                [--scenario hover-step|gust-hold] [--seed N]
 //!                [--estimator truth|ekf] [--sensors ideal|realistic]
-//! oxide-sim hash [same options]
+//! oxide-sim hash [same options as run, except --log and --log-level]
 //! oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T]
 //! oxide-sim scenario list
 //! oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE]
+//!                [--log FILE.ulg] [--log-level normal|replay]
 //! oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
+//! oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]
 //! oxide-sim params list | json | doc
 //! ```
 //! `run`, `hash`, `montecarlo` and `scenario` also take `--params FILE.toml`
@@ -19,12 +22,35 @@
 //! overrides applied through the checked `set`, the file first, then the flags
 //! in order (ADR-0004). `params list` prints the table, `params json` the
 //! ground-station metadata and `params doc` the text of `docs/PARAMETERS.md`.
+//! `--log FILE.ulg` on `run` and `scenario` writes the flight's log (ADR-0005)
+//! in PX4's ULog format; `--log-level` (default `normal`) needs `--log`. The
+//! header's `ver_sw` is the git hash the binary was built from (`build.rs`),
+//! `-dirty` when the tree had changes the last time that script ran (edits made
+//! after it are not seen until it runs again), `ver_hw` is `SIM`.
+//! `replay FILE.ulg` rebuilds the flight core from a replay-level log
+//! (`--log-level replay`) and runs the recorded ticks through it, comparing
+//! every output bit for bit; it exits 0 when every tick replayed is identical
+//! (also when the file ends in a cut), 1 on a difference, a gap, a tick that is
+//! not whole, damage at the end of the file or a file with no tick, and 2 on a
+//! file it cannot replay. `--param` replays through a changed setting,
+//! `--continue` counts every tick that differs instead of stopping at the first.
+//! Every command exits 0 when it passed, 1 when a run it judged failed
+//! (`montecarlo`, `scenario`, `scenarios`, `replay`) and 2 on an error: a bad
+//! argument, an unreadable file, an output that cannot be written. An output
+//! (`--csv`, `--log`) is opened before the flight, and a command that fails
+//! before its flight leaves none behind; a write error after it names the file
+//! (`error: FILE: No space left on device (os error 28)`), and `scenario` has
+//! printed its summary and verdict by then.
 //! `hash` prints trace hashes, which CI compares between Linux and Windows
 //! (DESIGN §5.2). Without `--scenario` it prints one line for hover-step and
 //! one for gust-hold run 0, so the check covers the RNG, the noise models and
 //! the libm paths, then one line per fault scenario in `HASHED_FAULT_SCENARIOS`
 //! (run 0, `<profile> <name>#0 <hash>`), so that it also covers ground contact,
-//! landings, failsafes and a crash. `montecarlo` flies gust-hold indices 0..N (default 200) on
+//! landings, failsafes and a crash, then one line per logged flight
+//! (`<profile> log-normal <name>#0 <FNV-1a 64 of the log's bytes>`, written with
+//! the fixed build information `hash`/`SIM`) and one replay-level log of
+//! rc-loss-position (`<profile> log-replay rc-loss-position#0 <FNV-1a 64>`).
+//! `montecarlo` flies gust-hold indices 0..N (default 200) on
 //! all cores (or `--threads T`) against the M1b acceptance criteria and exits
 //! with 1 if any run fails. `scenario` flies a scenario (ADR-0003, ADR-0004
 //! §7): a name among the embedded ones (`scenario list`), or the path of a
@@ -48,12 +74,198 @@ use oxide_core::math::Vec3;
 use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
+use oxide_sim::flight_log::{Level, LogBuild, LogError, LogWriter};
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
 use oxide_sim::scenario_file::{self, Checker, ScenarioFile};
 use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimError, SimOptions, Simulation, StepRecord};
+
+/// The git hash this binary was built from, `-dirty` when the tree had
+/// changes, `unknown` without git (`build.rs`).
+const GIT_HASH: &str = env!("OXIDE_GIT_HASH");
+
+/// The level of a log (`--log-level`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogLevel {
+    Normal,
+    Replay,
+}
+
+/// `--log FILE.ulg` and `--log-level`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogSpec {
+    path: String,
+    level: LogLevel,
+}
+
+impl LogSpec {
+    /// The two options as given: a level needs a file.
+    fn from_options(path: Option<String>, level: Option<&str>) -> Result<Option<Self>, String> {
+        let Some(path) = path else {
+            return match level {
+                Some(_) => Err("--log-level needs --log FILE.ulg".into()),
+                None => Ok(None),
+            };
+        };
+        let level = match level {
+            None | Some("normal") => LogLevel::Normal,
+            Some("replay") => LogLevel::Replay,
+            Some(other) => return Err(format!("unknown log level {other} (normal | replay)")),
+        };
+        Ok(Some(Self { path, level }))
+    }
+
+    fn level(&self) -> Level {
+        match self.level {
+            LogLevel::Normal => Level::Normal,
+            LogLevel::Replay => Level::Replay,
+        }
+    }
+}
+
+/// The error of a log that could not be written, with the file named: the
+/// writer's own message has no path in it.
+fn log_error(path: &str, e: LogError) -> Box<dyn std::error::Error> {
+    match e {
+        LogError::Io(e) => format!("{path}: {e}").into(),
+        other => other.into(),
+    }
+}
+
+/// The files a flight writes besides what the command prints: the CSV and the
+/// log. They are opened together, before the first is written to, and a
+/// command that fails before its flight removes what it created. A flight
+/// that ran keeps its files.
+struct Sinks {
+    /// The CSV: its path and the writer into it.
+    csv: Option<(String, Box<dyn Write + Send>)>,
+    /// The log's path, once its file is open.
+    log_path: Option<String>,
+    /// The log's level and writer until the log is started.
+    log_start: Option<(Level, LogWriter)>,
+    /// Paths of the files this command created, removed if the command fails
+    /// before its flight.
+    created: Vec<String>,
+    /// The first error of a CSV row, kept until the flight is over.
+    csv_error: Option<std::io::Error>,
+}
+
+impl Sinks {
+    /// No files.
+    fn none() -> Self {
+        Self {
+            csv: None,
+            log_path: None,
+            log_start: None,
+            created: Vec::new(),
+            csv_error: None,
+        }
+    }
+
+    /// Opens the CSV, then the log. When the second cannot be opened the
+    /// first is removed again, so a failed command leaves nothing.
+    fn open(csv_path: Option<&str>, log: Option<&LogSpec>) -> Result<Self, String> {
+        let mut sinks = Self::none();
+        if let Some(path) = csv_path {
+            let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
+            sinks.created.push(path.to_string());
+            sinks.csv = Some((
+                path.to_string(),
+                Box::new(std::io::BufWriter::new(file)) as Box<dyn Write + Send>,
+            ));
+        }
+        if let Some(spec) = log {
+            match std::fs::File::create(&spec.path) {
+                Ok(file) => {
+                    sinks.created.push(spec.path.clone());
+                    sinks.log_path = Some(spec.path.clone());
+                    sinks.log_start = Some((spec.level(), Box::new(std::io::BufWriter::new(file))));
+                }
+                Err(e) => {
+                    sinks.discard();
+                    return Err(format!("{}: {e}", spec.path));
+                }
+            }
+        }
+        Ok(sinks)
+    }
+
+    /// Removes the regular files this command created. A device such as
+    /// `/dev/full` is not one and stays.
+    fn discard(&mut self) {
+        self.csv = None;
+        self.log_start = None;
+        for path in self.created.drain(..) {
+            if std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// Writes the CSV header and starts the log: the last things that can
+    /// fail before the flight. On an error the files are removed.
+    fn start<P: Pilot>(
+        &mut self,
+        sim: &mut Simulation<P, 4>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let result = self.start_inner(sim);
+        if result.is_err() {
+            self.discard();
+        }
+        result
+    }
+
+    fn start_inner<P: Pilot>(
+        &mut self,
+        sim: &mut Simulation<P, 4>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some((path, w)) = self.csv.as_mut() {
+            w.write_all(CSV_HEADER)
+                .map_err(|e| format!("{path}: {e}"))?;
+        }
+        if let (Some(path), Some((level, w))) = (self.log_path.as_ref(), self.log_start.take()) {
+            sim.start_log(level, &LogBuild::sim(GIT_HASH), w)
+                .map_err(|e| log_error(path, e))?;
+        }
+        Ok(())
+    }
+
+    /// One CSV row of the flight. A failure is kept and ends the CSV.
+    fn row(&mut self, r: &StepRecord<4>) {
+        if self.csv_error.is_some() {
+            return;
+        }
+        if let Some((_, w)) = self.csv.as_mut()
+            && let Err(e) = w.write_all(csv_row(r).as_bytes())
+        {
+            self.csv_error = Some(e);
+        }
+    }
+
+    /// Ends the CSV and the log after the flight. Both are always finished
+    /// (the log keeps what was written); the first error is returned, with the
+    /// file's path in it.
+    fn finish<P: Pilot>(
+        &mut self,
+        sim: &mut Simulation<P, 4>,
+    ) -> Option<Box<dyn std::error::Error>> {
+        let mut first: Option<Box<dyn std::error::Error>> = None;
+        if let Some((path, mut w)) = self.csv.take() {
+            let err = self.csv_error.take().or_else(|| w.flush().err());
+            if let Some(e) = err {
+                first = Some(format!("{path}: {e}").into());
+            }
+        }
+        if let Some(path) = self.log_path.take()
+            && let Err(e) = sim.finish_log()
+        {
+            first.get_or_insert_with(|| log_error(&path, e));
+        }
+        first
+    }
+}
 
 /// The commands, as `main` dispatches them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,17 +275,19 @@ enum Command {
     Montecarlo,
     Scenario,
     Scenarios,
+    Replay,
     Params,
 }
 
 impl Command {
     /// Every command, in the order the usage text lists them.
-    const ALL: [Command; 6] = [
+    const ALL: [Command; 7] = [
         Command::Run,
         Command::Hash,
         Command::Montecarlo,
         Command::Scenario,
         Command::Scenarios,
+        Command::Replay,
         Command::Params,
     ];
 
@@ -84,6 +298,7 @@ impl Command {
             Command::Montecarlo => "montecarlo",
             Command::Scenario => "scenario",
             Command::Scenarios => "scenarios",
+            Command::Replay => "replay",
             Command::Params => "params",
         }
     }
@@ -103,13 +318,15 @@ fn command_list() -> String {
 /// options. A line that starts a command begins with `  oxide-sim NAME`.
 const USAGE: &str = "usage:
   oxide-sim run [--profile f405|h743] [--airframe FILE] [--csv FILE] [--scenario hover-step|gust-hold]
-                [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]
+                [--log FILE.ulg] [--log-level normal|replay] [--seed N] [--estimator truth|ekf] [--sensors ideal|realistic]
                 [--params FILE.toml] [--param NAME=VALUE]
-  oxide-sim hash [same options as run]
+  oxide-sim hash [same options as run, except --log and --log-level]
   oxide-sim montecarlo [--profile f405|h743] [--seeds N] [--threads T] [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim scenario list
-  oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--params FILE.toml] [--param NAME=VALUE]
+  oxide-sim scenario NAME|PATH [--profile f405|h743] [--seed N] [--csv FILE] [--log FILE.ulg] [--log-level normal|replay]
+                [--params FILE.toml] [--param NAME=VALUE]
   oxide-sim scenarios DIR [--seeds N] [--profile f405|h743|both] [--threads T]
+  oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]
   oxide-sim params list|json|doc
   oxide-sim help | --help | -h
 ";
@@ -131,6 +348,7 @@ struct Args {
     profile: Profile,
     airframe: Option<String>,
     csv: Option<String>,
+    log: Option<LogSpec>,
     scenario: Option<ScenarioKind>,
     seed: u64,
     estimator: Option<EstimatorSource>,
@@ -184,6 +402,7 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         profile: F405_LEAN,
         airframe: None,
         csv: None,
+        log: None,
         scenario: None,
         seed: 0,
         estimator: None,
@@ -194,6 +413,8 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     };
     let mut params_file: Option<String> = None;
     let mut param_flags: Vec<(String, f64)> = Vec::new();
+    let mut log_path: Option<String> = None;
+    let mut log_level: Option<String> = None;
     let mut given: Vec<String> = Vec::new();
     while let Some(flag) = it.next() {
         given.push(flag.clone());
@@ -208,6 +429,8 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--airframe" => args.airframe = Some(value()?),
             "--csv" => args.csv = Some(value()?),
+            "--log" => log_path = Some(value()?),
+            "--log-level" => log_level = Some(value()?),
             "--scenario" => {
                 args.scenario = Some(match value()?.as_str() {
                     "hover-step" => ScenarioKind::HoverStep,
@@ -258,6 +481,7 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     args.params = collect_params(params_file.as_deref(), param_flags)?;
+    args.log = LogSpec::from_options(log_path, log_level.as_deref())?;
     if !matches!(
         Command::from_name(&args.command),
         Some(Command::Run | Command::Hash | Command::Montecarlo)
@@ -267,6 +491,9 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             args.command,
             command_list()
         ));
+    }
+    if args.command == "hash" && args.log.is_some() {
+        return Err("--log applies to run and scenario, not to hash".into());
     }
     if args.command == "montecarlo"
         && let Some(bad) = given
@@ -451,37 +678,24 @@ fn execute<P: Pilot>(
     profile: Profile,
     job: Job<P>,
     csv_path: Option<&str>,
+    log: Option<&LogSpec>,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let duration_us = (job.duration_s * 1e6) as u64;
     let mut sim = Simulation::<_, 4>::with_options(airframe, profile, job.pilot, job.options)?;
-    let mut csv = match csv_path {
-        Some(p) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            f.write_all(CSV_HEADER)?;
-            Some(f)
-        }
-        None => None,
-    };
+    let mut sinks = Sinks::open(csv_path, log)?;
+    sinks.start(&mut sim)?;
     let mut max_tilt = 0.0_f64;
     let mut errors = EstimateErrors::default();
-    let mut io_error = None;
     let start = Instant::now();
     sim.run_until(Micros(duration_us), |r| {
         let e = r.attitude.to_euler();
         max_tilt = max_tilt.max(e.x.abs()).max(e.y.abs());
         errors.update(r);
-        if let Some(f) = csv.as_mut()
-            && let Err(err) = f.write_all(csv_row(r).as_bytes())
-        {
-            io_error.get_or_insert(err);
-        }
+        sinks.row(r);
     });
     let wall_s = start.elapsed().as_secs_f64();
-    if let Some(err) = io_error {
-        return Err(err.into());
-    }
-    if let Some(mut f) = csv {
-        f.flush()?;
+    if let Some(e) = sinks.finish(&mut sim) {
+        return Err(e);
     }
     let b = sim.body();
     Ok(Outcome {
@@ -529,29 +743,141 @@ fn fault_hash_lines_with(
     Ok(lines)
 }
 
+/// The flights whose normal-level log `hash` hashes (run 0).
+const HASHED_LOGGED_FLIGHTS: [&str; 2] = ["rc-loss-position", "gust-hold"];
+
+/// The scenarios whose replay-level log `hash` also prints (`log-replay`).
+const HASHED_REPLAY_FLIGHTS: [&str; 1] = ["rc-loss-position"];
+
+/// What `hash` writes into the logs it hashes: the same bytes on every commit.
+const HASH_BUILD: &str = "hash";
+
+/// FNV-1a 64 of `bytes`: the hash of the trace hash's family
+/// (`oxide_sim::hash::TraceHash`).
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = oxide_sim::hash::TraceHash::default();
+    h.write_bytes(bytes);
+    h.value()
+}
+
+/// The bytes of the log at `level` of scenario `name`, run `index`, flown to
+/// its end with `params`, written with the fixed build information
+/// (`ver_sw` `hash`, `ver_hw` `SIM`).
+fn logged_flight_bytes_at(
+    profile: Profile,
+    level: Level,
+    name: &str,
+    index: u64,
+    params: &[(String, f64)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let scenario = fault_scenarios::by_name(name)
+        .ok_or_else(|| format!("logged scenario {name} does not exist"))?;
+    let mut sim = scenario.build_with_params(profile, index, params)?;
+    let buffer = oxide_sim::flight_log::SharedBuffer::new();
+    sim.start_log(level, &LogBuild::sim(HASH_BUILD), Box::new(buffer.clone()))?;
+    sim.run_until(scenario.end(), |_| {});
+    sim.finish_log()?;
+    Ok(buffer.bytes())
+}
+
+/// The bytes of the normal-level log of scenario `name`, run `index`.
+fn logged_flight_bytes(
+    profile: Profile,
+    name: &str,
+    index: u64,
+    params: &[(String, f64)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    logged_flight_bytes_at(profile, Level::Normal, name, index, params)
+}
+
+/// `<profile> log-normal <name>#0 <fnv-1a 64 of the file>` for each of
+/// `HASHED_LOGGED_FLIGHTS`.
+fn log_hash_lines(
+    profile: Profile,
+    params: &[(String, f64)],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut lines = Vec::new();
+    for name in HASHED_LOGGED_FLIGHTS {
+        let bytes = logged_flight_bytes(profile, name, 0, params)?;
+        lines.push(format!(
+            "{} log-normal {}#0 {:016x}",
+            profile.name,
+            name,
+            fnv1a_64(&bytes)
+        ));
+    }
+    Ok(lines)
+}
+
+/// `<profile> log-replay <name>#0 <fnv-1a 64 of the file>` for each of
+/// `HASHED_REPLAY_FLIGHTS`: the replay-level log, whose bytes also pin the
+/// order and content of every replay record.
+fn log_replay_hash_lines(
+    profile: Profile,
+    params: &[(String, f64)],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut lines = Vec::new();
+    for name in HASHED_REPLAY_FLIGHTS {
+        let bytes = logged_flight_bytes_at(profile, Level::Replay, name, 0, params)?;
+        lines.push(format!(
+            "{} log-replay {}#0 {:016x}",
+            profile.name,
+            name,
+            fnv1a_64(&bytes)
+        ));
+    }
+    Ok(lines)
+}
+
+/// Every line `hash` prints for the profile of `args`.
+fn hash_lines(args: &Args, airframe: &Airframe) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let profile = args.profile;
+    let kinds: &[ScenarioKind] = match args.scenario {
+        Some(ScenarioKind::HoverStep) => &[ScenarioKind::HoverStep],
+        Some(ScenarioKind::GustHold) => &[ScenarioKind::GustHold],
+        // Both, with default options: covers the RNG, noise and libm paths.
+        None => &[ScenarioKind::HoverStep, ScenarioKind::GustHold],
+    };
+    let mut lines = Vec::new();
+    for &kind in kinds {
+        let o = match kind {
+            ScenarioKind::HoverStep => execute(
+                airframe,
+                profile,
+                hover_step_job(args),
+                args.csv.as_deref(),
+                None,
+            ),
+            ScenarioKind::GustHold => execute(
+                airframe,
+                profile,
+                gust_hold_job(args),
+                args.csv.as_deref(),
+                None,
+            ),
+        }?;
+        lines.push(format!("{} {} {:016x}", profile.name, o.label, o.hash));
+    }
+    if args.scenario.is_none() {
+        lines.extend(fault_hash_lines_with(profile, &args.params)?);
+        lines.extend(log_hash_lines(profile, &args.params)?);
+        lines.extend(log_replay_hash_lines(profile, &args.params)?);
+    }
+    Ok(lines)
+}
+
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let airframe = load_airframe(args.airframe.as_deref())?;
     let profile = args.profile;
+    let log = args.log.as_ref();
     let run_one = |kind: ScenarioKind, csv: Option<&str>| match kind {
-        ScenarioKind::HoverStep => execute(&airframe, profile, hover_step_job(args), csv),
-        ScenarioKind::GustHold => execute(&airframe, profile, gust_hold_job(args), csv),
+        ScenarioKind::HoverStep => execute(&airframe, profile, hover_step_job(args), csv, log),
+        ScenarioKind::GustHold => execute(&airframe, profile, gust_hold_job(args), csv, log),
     };
 
     if args.command == "hash" {
-        let kinds: &[ScenarioKind] = match args.scenario {
-            Some(ScenarioKind::HoverStep) => &[ScenarioKind::HoverStep],
-            Some(ScenarioKind::GustHold) => &[ScenarioKind::GustHold],
-            // Both, with default options: covers the RNG, noise and libm paths.
-            None => &[ScenarioKind::HoverStep, ScenarioKind::GustHold],
-        };
-        for &kind in kinds {
-            let o = run_one(kind, args.csv.as_deref())?;
-            println!("{} {} {:016x}", profile.name, o.label, o.hash);
-        }
-        if args.scenario.is_none() {
-            for line in fault_hash_lines_with(profile, &args.params)? {
-                println!("{line}");
-            }
+        for line in hash_lines(args, &airframe)? {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -675,7 +1001,7 @@ fn resolve_scenario(arg: &str) -> Result<ScenarioFile, Box<dyn std::error::Error
 }
 
 /// `oxide-sim scenario list | NAME|PATH [--profile P] [--seed N] [--csv FILE]
-/// [--params FILE] [--param NAME=VALUE]`.
+/// [--log FILE.ulg] [--log-level normal|replay] [--params FILE] [--param NAME=VALUE]`.
 fn scenario_command(
     mut it: impl Iterator<Item = String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -693,6 +1019,7 @@ fn scenario_command(
     }
     let scenario = resolve_scenario(&first)?;
     let (mut profile, mut index, mut csv_path) = (F405_LEAN, 0_u64, None);
+    let (mut log_path, mut log_level): (Option<String>, Option<String>) = (None, None);
     let mut params_file: Option<String> = None;
     let mut param_flags: Vec<(String, f64)> = Vec::new();
     while let Some(flag) = it.next() {
@@ -712,60 +1039,79 @@ fn scenario_command(
                     .map_err(|_| format!("--seed needs a non-negative integer, got {v}"))?;
             }
             "--csv" => csv_path = Some(value()?),
+            "--log" => log_path = Some(value()?),
+            "--log-level" => log_level = Some(value()?),
             "--params" => params_file = Some(value()?),
             "--param" => param_flags.push(parse_param_flag(&value()?)?),
             other => return Err(format!("unknown option {other}").into()),
         }
     }
     let params = collect_params(params_file.as_deref(), param_flags)?;
-    let mut sim = scenario.build_with_params(profile, index, &params)?;
-    let mut csv = match &csv_path {
-        Some(p) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            f.write_all(CSV_HEADER)?;
-            Some(f)
-        }
-        None => None,
-    };
-    let mut checker = Checker::new(&scenario);
-    let mut io_error = None;
+    let log = LogSpec::from_options(log_path, log_level.as_deref())?;
+    let sim = scenario.build_with_params(profile, index, &params)?;
+    let sinks = Sinks::open(csv_path.as_deref(), log.as_ref())?;
+    let run = fly_scenario(&scenario, profile, index, sim, sinks)?;
+    for line in &run.lines {
+        println!("{line}");
+    }
+    match run.write_error {
+        Some(e) => Err(e),
+        None => Ok(run.passed),
+    }
+}
+
+/// What a flown scenario reports.
+struct ScenarioRun {
+    /// The summary, the timeline and the verdict, as the command prints them.
+    lines: Vec<String>,
+    /// Every expectation held.
+    passed: bool,
+    /// A CSV or log file that could not be written, found after the flight:
+    /// the command prints `lines` and then fails with this (exit 2).
+    write_error: Option<Box<dyn std::error::Error>>,
+}
+
+/// Flies `scenario` on `sim` into `sinks` and judges it. An error here is one
+/// before the flight (the files are removed); a write error after it is in
+/// the result, so that the verdict is still shown.
+fn fly_scenario<P: Pilot>(
+    scenario: &ScenarioFile,
+    profile: Profile,
+    index: u64,
+    mut sim: Simulation<P, 4>,
+    mut sinks: Sinks,
+) -> Result<ScenarioRun, Box<dyn std::error::Error>> {
+    sinks.start(&mut sim)?;
+    let mut checker = Checker::new(scenario);
     sim.run_until(scenario.end(), |r| {
         checker.add(r);
-        if let Some(f) = csv.as_mut()
-            && let Err(err) = f.write_all(csv_row(r).as_bytes())
-        {
-            io_error.get_or_insert(err);
-        }
+        sinks.row(r);
     });
-    if let Some(err) = io_error {
-        return Err(err.into());
-    }
-    if let Some(mut f) = csv {
-        f.flush()?;
-    }
+    let write_error = sinks.finish(&mut sim);
     let verdict = checker.finish();
     let outcome = &verdict.outcome;
-    println!(
+    let mut lines = Vec::new();
+    lines.push(format!(
         "scenario   {} (run {index}, profile {})",
         scenario.name, profile.name
-    );
-    println!("about      {}", scenario.about);
-    println!("timeline");
+    ));
+    lines.push(format!("about      {}", scenario.about));
+    lines.push("timeline".to_string());
     for e in &outcome.events {
-        println!("  {}", oxide_sim::outcome::event_line(e));
+        lines.push(format!("  {}", oxide_sim::outcome::event_line(e)));
     }
     let p = outcome.position_at_end;
-    println!("navigation {:?}", outcome.nav_sequence);
-    println!(
+    lines.push(format!("navigation {:?}", outcome.nav_sequence));
+    lines.push(format!(
         "reasons    {}   highest action {:?}",
         oxide_sim::outcome::reason_names(outcome.reasons_seen),
         outcome.max_action
-    );
-    println!(
+    ));
+    lines.push(format!(
         "end        t {:.2} s, N {:.2} E {:.2} D {:.2} m, armed {}, {:?}",
         outcome.end_s, p.x, p.y, p.z, outcome.armed_at_end, outcome.nav_at_end
-    );
-    println!(
+    ));
+    lines.push(format!(
         "limits     max height {:.2} m, max distance from home {:.2} m, max tilt {:.1} deg, touchdown {}",
         outcome.max_height_m,
         outcome.max_distance_from_home_m,
@@ -773,8 +1119,8 @@ fn scenario_command(
         outcome
             .touchdown_speed_mps
             .map_or("none".into(), |v| format!("{v:.2} m/s"))
-    );
-    println!(
+    ));
+    lines.push(format!(
         "disarmed   {} at {}",
         outcome
             .disarm_reason
@@ -782,18 +1128,78 @@ fn scenario_command(
         outcome
             .disarmed_at_s
             .map_or("-".into(), |t| format!("{t:.2} s"))
-    );
+    ));
     if let Some(h) = &verdict.hold {
-        println!(
+        lines.push(format!(
             "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {:.3} m",
             h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m, h.est_max_h_error_m
-        );
+        ));
     }
-    println!("trace hash {:016x}", sim.trace_hash());
-    for line in result_lines(&scenario, &verdict.violations) {
+    lines.push(format!("trace hash {:016x}", sim.trace_hash()));
+    lines.extend(result_lines(scenario, &verdict.violations));
+    Ok(ScenarioRun {
+        lines,
+        passed: verdict.violations.is_empty(),
+        write_error,
+    })
+}
+
+/// Replays the log at `path` with the parameter overrides given, and returns
+/// the report with the lines the command prints for it.
+fn replay_file_report(
+    path: &str,
+    params: &[(String, f64)],
+    keep_going: bool,
+) -> Result<(oxide_sim::replay::ReplayReport, Vec<String>), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let options = oxide_sim::replay::ReplayOptions {
+        params: params.to_vec(),
+        keep_going,
+    };
+    let report = oxide_sim::replay::replay(&bytes, &options).map_err(|e| format!("{path}: {e}"))?;
+    let lines = report.lines();
+    Ok((report, lines))
+}
+
+/// `oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]`: rebuilds
+/// the flight core from a replay-level log and flies the recorded ticks
+/// through it, comparing every output bit for bit (ADR-0005 §5). Prints the
+/// number of ticks replayed and `identical`, or the first difference (tick,
+/// field, recorded and replayed values); `--continue` goes on and counts the
+/// ticks that differ. The status is the command's exit code: `Ok(true)` (0)
+/// when every tick replayed is identical, also when the file ends in a cut;
+/// `Ok(false)` (1) on a difference, a gap, a missing tick or a malformed one,
+/// damage at the end of the file, or a file with no tick; an error (2) for a
+/// file that cannot be replayed.
+fn replay_command(
+    mut it: impl Iterator<Item = String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let path = it
+        .next()
+        .ok_or("replay needs the path of a replay-level log")?;
+    if path.starts_with("--") {
+        return Err(format!("replay needs the path of a log first, got {path}").into());
+    }
+    let mut params: Vec<(String, f64)> = Vec::new();
+    let mut keep_going = false;
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--param" => {
+                let v = it.next().ok_or("--param needs NAME=VALUE")?;
+                params.push(parse_param_flag(&v)?);
+            }
+            "--continue" => keep_going = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option {other}").into());
+            }
+            other => return Err(format!("unexpected argument {other}").into()),
+        }
+    }
+    let (report, lines) = replay_file_report(&path, &params, keep_going)?;
+    for line in lines {
         println!("{line}");
     }
-    Ok(verdict.violations.is_empty())
+    Ok(report.exit_code() == 0)
 }
 
 /// The `result` line of `scenario` and the violations under it. A file that
@@ -843,6 +1249,9 @@ fn main() -> ExitCode {
         Some(Command::Scenario) => {
             return finish(scenario_command(std::env::args().skip(2)));
         }
+        Some(Command::Replay) => {
+            return finish(replay_command(std::env::args().skip(2)));
+        }
         Some(Command::Run | Command::Hash | Command::Montecarlo) | None => {}
     }
     let args = match parse() {
@@ -854,22 +1263,9 @@ fn main() -> ExitCode {
         }
     };
     if args.command == "montecarlo" {
-        return match montecarlo(&args) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        };
+        return finish(montecarlo(&args));
     }
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    finish(run(&args).map(|()| true))
 }
 
 #[cfg(test)]
@@ -902,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_unknown_command_messages_list_all_six() {
+    fn missing_and_unknown_command_messages_list_every_command() {
         let missing = p(&[]).err().expect("error");
         let unknown = p(&["frobnicate"]).err().expect("error");
         for c in Command::ALL {
@@ -1001,7 +1397,7 @@ mod tests {
         v.extend_from_slice(a);
         let args = p(&v)?;
         let airframe = Airframe::reference_quad().map_err(|e| e.to_string())?;
-        execute(&airframe, args.profile, hover_step_job(&args), None)
+        execute(&airframe, args.profile, hover_step_job(&args), None, None)
             .map(|o| o.hash)
             .map_err(|e| e.to_string())
     }
@@ -1190,5 +1586,433 @@ mod tests {
         let a = ["gust-hold", "--seed", "1"];
         let r = scenario_command(a.iter().map(|s| (*s).to_string()));
         assert!(matches!(r, Ok(true)), "{r:?}");
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn temp_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("oxide-sim-{}-{name}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn log_options_parse_and_are_checked_together() {
+        let a = p(&["run", "--log", "f.ulg"]).expect("valid");
+        let spec = a.log.expect("a log");
+        assert_eq!(spec.path, "f.ulg");
+        assert_eq!(spec.level, LogLevel::Normal);
+        let a = p(&["run", "--log", "f.ulg", "--log-level", "normal"]).expect("valid");
+        assert_eq!(a.log.expect("a log").level, LogLevel::Normal);
+        assert!(p(&["run"]).expect("valid").log.is_none());
+        let e = p(&["run", "--log-level", "normal"]).err().expect("error");
+        assert_eq!(e, "--log-level needs --log FILE.ulg");
+        let e = p(&["run", "--log", "f.ulg", "--log-level", "loud"])
+            .err()
+            .expect("error");
+        assert!(e.contains("normal | replay"), "{e}");
+        let a = p(&["run", "--log", "f.ulg", "--log-level", "replay"]).expect("valid");
+        assert_eq!(a.log.expect("a log").level, LogLevel::Replay);
+        assert!(p(&["run", "--log"]).is_err());
+        // hash and montecarlo do not write logs.
+        let e = p(&["hash", "--log", "f.ulg"]).err().expect("error");
+        assert!(e.contains("run and scenario"), "{e}");
+        assert!(p(&["hash", "--log-level", "replay"]).is_err());
+        assert!(p(&["montecarlo", "--log", "f.ulg"]).is_err());
+        // The usage says so, where it names the options of hash.
+        let hash = USAGE
+            .lines()
+            .find(|l| l.starts_with("  oxide-sim hash"))
+            .expect("hash line");
+        assert_eq!(
+            hash,
+            "  oxide-sim hash [same options as run, except --log and --log-level]"
+        );
+    }
+
+    #[test]
+    fn scenario_command_takes_log_options() {
+        let path = temp_path("none.ulg");
+        let e = scenario_command(args(&["gcs-loss", "--log-level", "normal"]).into_iter())
+            .expect_err("level without a file");
+        assert_eq!(e.to_string(), "--log-level needs --log FILE.ulg");
+        let e = scenario_command(
+            args(&["gcs-loss", "--log", &path, "--log-level", "loud"]).into_iter(),
+        )
+        .expect_err("unknown level");
+        assert_eq!(e.to_string(), "unknown log level loud (normal | replay)");
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// A replay-level log of `gcs-loss` (seed 1), written by the command.
+    fn replay_log(name: &str) -> String {
+        let path = temp_path(name);
+        let r = scenario_command(
+            args(&[
+                "gcs-loss",
+                "--seed",
+                "1",
+                "--log",
+                &path,
+                "--log-level",
+                "replay",
+            ])
+            .into_iter(),
+        );
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        path
+    }
+
+    #[test]
+    fn scenario_writes_a_replay_level_log_and_replay_proves_it() {
+        let path = replay_log("replay-level.ulg");
+        let bytes = std::fs::read(&path).expect("the log");
+        let file = oxide_log::reader::UlogFile::parse(&bytes).expect("parses");
+        assert_eq!(file.info_str("oxide_log_level"), Some("replay"));
+        assert!(file.records("oxide_in_tick").count() > 1000);
+        assert!(file.records("vehicle_attitude").count() > 100);
+        // Identical: exit 0 (true).
+        let r = replay_command(args(&[&path]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let (report, lines) = replay_file_report(&path, &[], false).expect("replays");
+        assert!(report.identical());
+        assert_eq!(
+            lines[0],
+            format!("replayed {} ticks (f405-lean): identical", report.ticks)
+        );
+        // A changed gain: a difference, exit 1 (false).
+        let r = replay_command(args(&[&path, "--param", "RATE_ROLL_P=9"]).into_iter());
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        let (report, lines) =
+            replay_file_report(&path, &[("RATE_ROLL_P".to_string(), 9.0)], false).expect("replays");
+        let d = report.first_difference.as_ref().expect("a difference");
+        assert!(d.field.starts_with("motors["), "{d}");
+        assert!(
+            lines[0].contains(&format!("first difference at tick {}", d.seq)),
+            "{lines:?}"
+        );
+        // --continue counts the ticks that differ.
+        let (all, lines) =
+            replay_file_report(&path, &[("RATE_ROLL_P".to_string(), 9.0)], true).expect("replays");
+        assert!(all.differing > 1);
+        assert!(
+            lines[0].contains(" differ, the first at tick "),
+            "{lines:?}"
+        );
+        let r =
+            replay_command(args(&[&path, "--continue", "--param", "RATE_ROLL_P=9"]).into_iter());
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_exits_2_on_a_file_it_cannot_replay_and_on_bad_arguments() {
+        // A normal-level log, a missing file, bytes that are not a log.
+        let normal = temp_path("normal-for-replay.ulg");
+        let r = scenario_command(args(&["gcs-loss", "--log", &normal]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let e = replay_command(args(&[&normal]).into_iter()).expect_err("normal level");
+        assert!(e.to_string().contains("not a replay-level log"), "{e}");
+        let _ = std::fs::remove_file(&normal);
+        let missing = temp_path("no-such-file.ulg");
+        assert!(replay_command(args(&[&missing]).into_iter()).is_err());
+        let junk = temp_path("junk.ulg");
+        std::fs::write(&junk, b"not a log").expect("writes");
+        assert!(replay_command(args(&[&junk]).into_iter()).is_err());
+        let _ = std::fs::remove_file(&junk);
+        // Arguments.
+        assert!(replay_command(args(&[]).into_iter()).is_err());
+        let path = replay_log("replay-args.ulg");
+        for bad in [
+            vec![path.as_str(), "--param"],
+            vec![path.as_str(), "--param", "RATE_ROLL_P"],
+            vec![path.as_str(), "--param", "NO_SUCH=1"],
+            vec![path.as_str(), "--frobnicate"],
+            vec![path.as_str(), "other.ulg"],
+        ] {
+            assert!(replay_command(args(&bad).into_iter()).is_err(), "{bad:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cut_replay_log_still_exits_0_and_says_it_is_cut() {
+        let path = replay_log("replay-cut.ulg");
+        let bytes = std::fs::read(&path).expect("the log");
+        let cut = temp_path("replay-cut-short.ulg");
+        std::fs::write(&cut, &bytes[..bytes.len() - 7]).expect("writes");
+        let r = replay_command(args(&[&cut]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let (report, lines) = replay_file_report(&cut, &[], false).expect("replays");
+        assert!(report.identical());
+        assert!(
+            lines[1].starts_with("the file ends in a cut after tick "),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&cut);
+    }
+
+    #[test]
+    fn scenario_writes_a_log_the_reader_parses() {
+        let path = temp_path("scenario.ulg");
+        let r = scenario_command(args(&["gcs-loss", "--seed", "1", "--log", &path]).into_iter());
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        let bytes = std::fs::read(&path).expect("the log");
+        let file = oxide_log::reader::UlogFile::parse(&bytes).expect("parses");
+        assert_eq!(file.info_str("ver_hw"), Some("SIM"));
+        assert_eq!(file.info_str("ver_sw"), Some(GIT_HASH));
+        assert_eq!(file.info_str("oxide_log_level"), Some("normal"));
+        assert_eq!(file.info_str("oxide_profile"), Some("f405-lean"));
+        assert!(file.records("vehicle_attitude").count() > 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_writes_a_log_and_the_hash_is_the_same_without_it() {
+        let path = temp_path("run.ulg");
+        let airframe = Airframe::reference_quad().expect("airframe");
+        let with = p(&["run", "--log", &path]).expect("valid");
+        let plain = p(&["run"]).expect("valid");
+        let a = execute(
+            &airframe,
+            with.profile,
+            hover_step_job(&with),
+            None,
+            with.log.as_ref(),
+        )
+        .expect("flies with a log");
+        let b =
+            execute(&airframe, plain.profile, hover_step_job(&plain), None, None).expect("flies");
+        assert_eq!(a.hash, b.hash);
+        let bytes = std::fs::read(&path).expect("the log");
+        assert!(oxide_log::reader::UlogFile::parse(&bytes).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unwritable_log_path_is_an_error_before_the_flight() {
+        let bad = temp_path("no-such-dir/x.ulg");
+        let r = scenario_command(args(&["gcs-loss", "--log", &bad]).into_iter());
+        assert!(r.is_err());
+    }
+
+    /// A writer that takes `left` bytes and then fails like a full disk.
+    struct FailsAfter {
+        left: usize,
+    }
+
+    impl Write for FailsAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The simulation of `gcs-loss`, seed 1, and its scenario.
+    macro_rules! gcs_loss {
+        () => {{
+            let scenario = fault_scenarios::by_name("gcs-loss").expect("embedded");
+            let sim = scenario
+                .build_with_params(F405_LEAN, 1, &[])
+                .expect("builds");
+            (scenario, sim)
+        }};
+    }
+
+    #[test]
+    fn a_log_that_fails_after_the_flight_started_still_prints_the_verdict() {
+        let (scenario, sim) = gcs_loss!();
+        let mut sinks = Sinks::none();
+        sinks.log_path = Some("disk.ulg".to_string());
+        // The header goes in; the disk fills up during the flight.
+        sinks.log_start = Some((Level::Normal, Box::new(FailsAfter { left: 40_000 })));
+        let run = fly_scenario(&scenario, F405_LEAN, 1, sim, sinks).expect("the flight ran");
+        assert!(run.passed);
+        assert!(
+            run.lines.iter().any(|l| l == "result     PASS"),
+            "{:?}",
+            run.lines
+        );
+        assert!(run.lines.iter().any(|l| l.starts_with("trace hash ")));
+        let e = run.write_error.expect("the write error");
+        assert_eq!(e.to_string(), "disk.ulg: disk full");
+    }
+
+    #[test]
+    fn a_csv_that_fails_during_the_flight_is_named_and_the_log_is_still_finished() {
+        let (scenario, sim) = gcs_loss!();
+        let buffer = oxide_sim::flight_log::SharedBuffer::new();
+        let mut sinks = Sinks::none();
+        sinks.csv = Some(("rows.csv".to_string(), Box::new(FailsAfter { left: 1000 })));
+        sinks.log_path = Some("ok.ulg".to_string());
+        sinks.log_start = Some((Level::Normal, Box::new(buffer.clone())));
+        let run = fly_scenario(&scenario, F405_LEAN, 1, sim, sinks).expect("the flight ran");
+        assert_eq!(
+            run.write_error.expect("the csv error").to_string(),
+            "rows.csv: disk full"
+        );
+        // The log of the flight that ran is complete.
+        let bytes = buffer.bytes();
+        let file = oxide_log::reader::UlogFile::parse(&bytes).expect("parses");
+        assert!(file.records("vehicle_attitude").count() > 100);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_started_is_an_error_before_the_flight() {
+        let (scenario, sim) = gcs_loss!();
+        let mut sinks = Sinks::none();
+        sinks.log_path = Some("disk.ulg".to_string());
+        sinks.log_start = Some((Level::Normal, Box::new(FailsAfter { left: 100 })));
+        let e = fly_scenario(&scenario, F405_LEAN, 1, sim, sinks)
+            .err()
+            .expect("an error");
+        assert_eq!(e.to_string(), "disk.ulg: disk full");
+    }
+
+    #[test]
+    fn the_usage_names_the_log_options() {
+        let run = USAGE.split("  oxide-sim hash").next().expect("run part");
+        assert!(run.contains("--log FILE.ulg") && run.contains("--log-level normal|replay"));
+        let replay = USAGE
+            .lines()
+            .find(|l| l.starts_with("  oxide-sim replay"))
+            .expect("replay line");
+        assert_eq!(
+            replay,
+            "  oxide-sim replay FILE.ulg [--param NAME=VALUE ...] [--continue]"
+        );
+        let scenario = USAGE
+            .lines()
+            .find(|l| l.starts_with("  oxide-sim scenario NAME"))
+            .expect("scenario line");
+        assert!(scenario.contains("--log FILE.ulg") && scenario.contains("--log-level"));
+    }
+
+    /// The five lines `hash` has always printed for a profile.
+    const PINNED: [&str; 10] = [
+        "f405-lean hover-step 3de16d7a9847deaf",
+        "f405-lean gust-hold#0 9712d37590a317dc",
+        "f405-lean rc-loss-position#0 927c415bcb82bfc8",
+        "f405-lean pair-gps-loss+baro-loss#0 c7ebc02674f19d3a",
+        "f405-lean motor-loss#0 86248bd7c7755d84",
+        "h743-full hover-step 9ff026845c342fbd",
+        "h743-full gust-hold#0 476abddf98142653",
+        "h743-full rc-loss-position#0 f28dc4abdee2eae9",
+        "h743-full pair-gps-loss+baro-loss#0 212288cff52a1846",
+        "h743-full motor-loss#0 dbc9b9c7c0c2f5d8",
+    ];
+
+    fn hash_output(profile: &str) -> Vec<String> {
+        let args = p(&["hash", "--profile", profile]).expect("valid");
+        let airframe = Airframe::reference_quad().expect("airframe");
+        hash_lines(&args, &airframe).expect("hash lines")
+    }
+
+    #[test]
+    fn hash_prints_its_five_lines_as_before_then_one_per_logged_flight() {
+        for (profile, name) in [("f405", "f405-lean"), ("h743", "h743-full")] {
+            let lines = hash_output(profile);
+            assert_eq!(lines.len(), 8, "{lines:#?}");
+            let pinned: Vec<&str> = PINNED
+                .iter()
+                .copied()
+                .filter(|l| l.starts_with(name))
+                .collect();
+            assert_eq!(
+                lines[..5].iter().map(String::as_str).collect::<Vec<_>>(),
+                pinned
+            );
+            for (line, flight) in lines[5..].iter().zip(["rc-loss-position", "gust-hold"]) {
+                let w: Vec<&str> = line.split(' ').collect();
+                assert_eq!(w.len(), 4, "{line}");
+                assert_eq!(&w[..3], &[name, "log-normal", &format!("{flight}#0")]);
+                assert_eq!(w[3].len(), 16, "{line}");
+                assert!(
+                    w[3].chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                );
+            }
+            assert_ne!(lines[5], lines[6]);
+            // Then the replay-level log of rc-loss-position.
+            let w: Vec<&str> = lines[7].split(' ').collect();
+            assert_eq!(w.len(), 4, "{}", lines[7]);
+            assert_eq!(&w[..3], &[name, "log-replay", "rc-loss-position#0"]);
+            assert_eq!(w[3].len(), 16, "{}", lines[7]);
+            assert!(
+                w[3].chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            );
+            assert_ne!(w[3], lines[5].rsplit(' ').next().expect("hash"));
+        }
+    }
+
+    #[test]
+    fn the_replay_level_log_hash_is_the_fnv_1a_of_a_file_that_replays() {
+        for profile in [F405_LEAN, H743_FULL] {
+            let a = logged_flight_bytes_at(profile, Level::Replay, "rc-loss-position", 0, &[])
+                .expect("first");
+            let b = logged_flight_bytes_at(profile, Level::Replay, "rc-loss-position", 0, &[])
+                .expect("second");
+            assert_eq!(a, b, "{}", profile.name);
+            let file = oxide_log::reader::UlogFile::parse(&a).expect("parses");
+            assert_eq!(file.info_str("oxide_log_level"), Some("replay"));
+            assert_eq!(file.info_str("ver_sw"), Some("hash"));
+            assert_eq!(file.info_str("ver_hw"), Some("SIM"));
+            let report =
+                oxide_sim::replay::replay(&a, &oxide_sim::replay::ReplayOptions::default())
+                    .expect("replays");
+            assert!(report.identical() && report.exit_code() == 0);
+            let line = log_replay_hash_lines(profile, &[])
+                .expect("lines")
+                .remove(0);
+            assert_eq!(
+                line,
+                format!(
+                    "{} log-replay rc-loss-position#0 {:016x}",
+                    profile.name,
+                    fnv1a_64(&a)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_flight_gives_the_same_log_bytes_and_they_hash_as_fnv_1a() {
+        for profile in [F405_LEAN, H743_FULL] {
+            let a = logged_flight_bytes(profile, "rc-loss-position", 0, &[]).expect("first");
+            let b = logged_flight_bytes(profile, "rc-loss-position", 0, &[]).expect("second");
+            assert_eq!(a, b, "{}", profile.name);
+            let file = oxide_log::reader::UlogFile::parse(&a).expect("parses");
+            // The build information the hash uses, whatever the commit.
+            assert_eq!(file.info_str("ver_sw"), Some("hash"));
+            assert_eq!(file.info_str("ver_hw"), Some("SIM"));
+            // FNV-1a 64, from the definition.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in &a {
+                h = (h ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            assert_eq!(fnv1a_64(&a), h);
+            let line = log_hash_lines(profile, &[]).expect("lines").remove(0);
+            assert_eq!(
+                line,
+                format!("{} log-normal rc-loss-position#0 {h:016x}", profile.name)
+            );
+        }
+        // Another seed or another parameter is another file.
+        let a = logged_flight_bytes(F405_LEAN, "motor-loss", 0, &[]).expect("a");
+        let b = logged_flight_bytes(F405_LEAN, "motor-loss", 1, &[]).expect("b");
+        assert_ne!(a, b);
     }
 }

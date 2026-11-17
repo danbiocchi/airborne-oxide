@@ -2022,10 +2022,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-log"
+version = "0.1.0"
+dependencies = [
+ "oxide-core",
+]
+
+[[package]]
 name = "oxide-sim"
 version = "0.1.0"
 dependencies = [
  "oxide-core",
+ "oxide-log",
  "serde",
  "toml",
 ]

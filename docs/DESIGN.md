@@ -263,7 +263,7 @@ Auto-disarm follows detected touchdown.
 
 ### 4.15 Logging and replay (Q27)
 
-- **Format:** PX4's ULog. Where a PX4 counterpart exists, topics use **PX4's topic names, fields and units** (`sensor_combined`, `vehicle_attitude`, `vehicle_local_position`, `vehicle_rates_setpoint`, `actuator_outputs`, `battery_status`, `vehicle_status`), so PlotJuggler, PX4 Flight Review and PX4-ULog tools work. Oxide-specific data goes in `oxide_*` topics.
+- **Format:** PX4's ULog. Where a PX4 counterpart exists, topics use **PX4's topic names, fields and units** (`sensor_combined`, `vehicle_attitude`, `vehicle_local_position`, `vehicle_rates_setpoint`, `actuator_motors`, `battery_status`, `vehicle_status`), so PlotJuggler, PX4 Flight Review and PX4-ULog tools work. Oxide-specific data goes in `oxide_*` topics.
 - **Two levels:**
   - **Normal:** decimated state, control and event topics.
   - **Replay:** every raw sample, command and timestamp the core sees, so any real flight can be re-run bit for bit through new code. On the F405, replay logging of its one IMU at loop rate is used only if measured card throughput supports it; otherwise it records short triggered windows.
@@ -272,6 +272,8 @@ Auto-disarm follows detected touchdown.
   - **Overflow:** samples are dropped and counted, and a "dropped" record is written.
   - **Files:** preallocated, and synced at a fixed interval.
 - **Headers:** every log header carries the git hash, build profile and a parameter hash.
+
+**As built (M1c part three, [ADR-0005](adr/0005-logging-and-replay.md)).** The `oxide-log` crate writes ULog without allocation: the format, 16 PX4-named topics and four of our own, a recorder that decimates on the tick clock, and a ring buffer of whole messages that drops and counts. The simulator writes a log with `--log FILE.ulg`; `pyulog` reads the files in CI. Motor commands are in `actuator_motors`, PX4's current topic, not the older `actuator_outputs`. A sensor that stops leaves a gap in its topic, as in PX4. The hash in the header covers the whole configuration, the vehicle description included, not the parameters alone. At the replay level the log also holds the configuration, the stored-parameter load report, and every tick's inputs and outputs as exact bits. `oxide-sim replay FILE.ulg` rebuilds the core from the file and compares every output bit for bit; every scenario file replays identically on both profiles in CI, and a changed gain or one flipped bit is found at its tick. A damaged file is refused or reported, never replayed as a clean, shorter flight. A replay starts at start-up, because the core cannot be saved and restored, so the F405's "short triggered windows" can be inspected but not replayed yet. Not built yet: the SD-card side (preallocated files, the sync interval, the buffer's place in memory, a lock-free hand-over between interrupt levels), `vehicle_gnss`, and reading logs of real flights into the simulator.
 
 ### 4.16 MCU fault handling
 
@@ -599,7 +601,7 @@ Each step ends in something you can watch working.
 | **M0** | This design, the design review, the repository reset | The owner signs off |
 | **M1a** | Workspace and CI; the core interface (§4.2); rigid-body, motor and battery physics; ideal sensors; cascaded PID on true state; the cross-OS determinism hash test | A quad hovers and takes steps in Rerun, and flies with the joystick |
 | **M1b** | The S1 sensor models; the estimator (§4.7); wind | Position hold in gusts on noisy sensors over 200 seeds |
-| **M1c** | The scenario runner and Monte-Carlo CI job; fault injection; the failsafe state machine (§4.10); arming; parameters; ULog and replay. Delivered in three parts: (1) failsafes and fault scenarios ([ADR-0003](adr/0003-failsafes.md)), (2) parameters and scenario files ([ADR-0004](adr/0004-parameters-and-scenario-files.md)), (3) logging and replay. | The fault scenarios pass: sensor dropout, GPS loss, RC and link loss, brain crash. Quad motor loss has a defined, logged outcome. |
+| **M1c** | The scenario runner and Monte-Carlo CI job; fault injection; the failsafe state machine (§4.10); arming; parameters; ULog and replay. Delivered in three parts: (1) failsafes and fault scenarios ([ADR-0003](adr/0003-failsafes.md)), (2) parameters and scenario files ([ADR-0004](adr/0004-parameters-and-scenario-files.md)), (3) logging and replay ([ADR-0005](adr/0005-logging-and-replay.md)). | The fault scenarios pass: sensor dropout, GPS loss, RC and link loss, brain crash. Quad motor loss has a defined, logged outcome. |
 | **M1d** | Bridge-semantics spike; ArduPilot SITL bridge; tuning parity; the gate-criteria ADR | **Benchmark gate 1** |
 | **F405 bring-up** (after M1b; doesn't block S1) | RTIC 2 + Embassy spike; drivers for IMU, baro, PWM and plain DShot300, UART and SBUS; measured budgets. Bidirectional DShot is a separate later task with its own spike. | Real sensor data flowing through `oxide-core` on the F405, within budget |
 | **M2 (S2)** | S2 fidelity; airframe lab A1, scorecard and auto-tune; Python bindings; system identification; PX4 bridge; H743 bring-up | A1 reproduces the Viper manual's L/D and drag/power curves within stated bands; a sim-vs-real report (§5.9 metrics) on real multirotor hover logs. **Benchmark gate 2.** |

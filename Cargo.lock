@@ -205,10 +205,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-log"
+version = "0.1.0"
+dependencies = [
+ "oxide-core",
+ "proptest",
+]
+
+[[package]]
 name = "oxide-sim"
 version = "0.1.0"
 dependencies = [
  "oxide-core",
+ "oxide-log",
  "oxide-store",
  "serde",
  "toml",
@@ -219,6 +228,7 @@ name = "oxide-sim-cli"
 version = "0.1.0"
 dependencies = [
  "oxide-core",
+ "oxide-log",
  "oxide-sim",
 ]
 

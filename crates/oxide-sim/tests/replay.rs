@@ -1,0 +1,965 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Replay of a replay-level log (ADR-0005 §5, task P1).
+//!
+//! The first group drives a bare `Core` and a `Recorder` with a scripted
+//! sequence of inputs, so that the replay is tested without the simulator:
+//! identical replays, a changed gain, damaged files, gaps. The second group
+//! (below) flies whole scenarios.
+
+use oxide_core::Core;
+use oxide_core::io::{
+    BaroSample, BatterySample, BrainHeartbeat, GcsHeartbeat, ImuSample, Inputs, MagSample, Outputs,
+    ParamSet, RcSample, Stamped, StateSample,
+};
+use oxide_core::math::{Quat, Vec3};
+use oxide_core::params::{self, LoadReport, ParamValue};
+use oxide_core::schedule::F405_LEAN;
+use oxide_core::time::Micros;
+use oxide_log::header::{BuildInfo, Level};
+use oxide_log::reader::UlogFile;
+use oxide_log::recorder::{Boot, Recorder};
+use oxide_sim::Airframe;
+use oxide_sim::replay::{ReplayError, ReplayOptions, Stop, replay};
+
+const BUILD: BuildInfo<'static> = BuildInfo {
+    git_hash: "test",
+    board: "SIM",
+};
+
+/// What a scripted flight of a bare core gave.
+struct Flown {
+    bytes: Vec<u8>,
+    outputs: Vec<Outputs<4>>,
+}
+
+/// The scripted inputs of tick `k` (1 kHz): noise on the gyro, a state sample,
+/// the radio at 50 Hz (armed from tick 1200 to 2000, the one second of valid radio the core wants first), a parameter acknowledgement
+/// at 50, one parameter change while disarmed (100) and one while armed
+/// (1600), heartbeats, the barometer, the magnetometer and the battery.
+fn inputs_at(k: u64) -> Inputs {
+    let t = Micros(k * 1000);
+    let noise = |s: u64| ((k.wrapping_mul(s) % 101) as f32 - 50.0) * 1e-3;
+    let mut i = Inputs {
+        imu: Some(Stamped::ideal(
+            t,
+            ImuSample {
+                gyro: Vec3::new(noise(37), noise(53), noise(71)),
+                accel: Vec3::new(noise(11), noise(13), -9.81 + noise(17)),
+            },
+        )),
+        state: Some(Stamped::ideal(
+            t,
+            StateSample {
+                position: Vec3::new(0.0, 0.0, 0.0),
+                velocity: Vec3::new(0.0, 0.0, 0.0),
+                attitude: Quat::identity(),
+                rate: Vec3::new(0.0, 0.0, 0.0),
+            },
+        )),
+        ..Inputs::default()
+    };
+    if k.is_multiple_of(20) {
+        i.rc = Some(Stamped::ideal(
+            t,
+            RcSample {
+                throttle: if (1300..2000).contains(&k) { 0.55 } else { 0.0 },
+                arm_switch: (1200..2000).contains(&k),
+                mode_switch: 0,
+                ..RcSample::default()
+            },
+        ));
+    }
+    if k.is_multiple_of(100) {
+        i.battery = Some(Stamped::ideal(
+            t,
+            BatterySample {
+                voltage_v: 22.4,
+                current_a: 1.0,
+            },
+        ));
+        i.gcs_heartbeat = Some(Stamped::ideal(t, GcsHeartbeat));
+        i.brain_heartbeat = Some(Stamped::ideal(t, BrainHeartbeat { progress: k as u32 }));
+    }
+    if k.is_multiple_of(10) {
+        i.baro = Some(Stamped::ideal(t, BaroSample { altitude_m: 0.0 }));
+        i.mag = Some(Stamped::ideal(
+            t,
+            MagSample {
+                field_ut: Vec3::new(20.0, 0.0, 40.0),
+            },
+        ));
+    }
+    i.param_ack = k == 50;
+    if k == 100 || k == 1600 {
+        let id = params::find("RATE_ROLL_P").unwrap();
+        let ParamValue::F32(p) = params::PARAMS[id.index()].default else {
+            panic!("RATE_ROLL_P is an f32")
+        };
+        i.param_set = Some(ParamSet {
+            id,
+            value: ParamValue::F32(p * if k == 100 { 1.1 } else { 1.2 }),
+        });
+    }
+    i
+}
+
+/// Flies a bare core for `ticks` ticks of the script and logs it at the
+/// replay level into a ring of `C` bytes drained every `drain_every` ticks.
+/// The store's saved call is made at tick 2200 (disarmed, with a parameter
+/// unsaved) and noted the way the simulator notes it.
+fn fly<const C: usize>(ticks: u64, drain_every: u64, report: LoadReport) -> Flown {
+    let airframe = Airframe::reference_quad().unwrap();
+    let cfg = airframe.core_config::<4>().unwrap();
+    let mut core = Core::<4>::new(cfg, F405_LEAN).unwrap();
+    core.report_param_load(report);
+    let mut bytes = Vec::new();
+    let mut rec = Box::new(Recorder::<C>::new());
+    rec.start(
+        &mut bytes,
+        Micros::ZERO,
+        BUILD,
+        Boot {
+            profile: &F405_LEAN,
+            report,
+        },
+        Level::Replay,
+        core.config(),
+    )
+    .unwrap();
+    let mut outputs = Vec::new();
+    let mut was_unsaved = false;
+    for k in 0..ticks {
+        let t = Micros(k * 1000);
+        if k == 2200 {
+            core.clear_unsaved();
+        }
+        let unsaved_before = core.params_unsaved();
+        if was_unsaved && !unsaved_before {
+            rec.note_saved();
+        }
+        let inputs = inputs_at(k);
+        let out = core.tick(t, &inputs);
+        was_unsaved = out.status.params_unsaved;
+        rec.record(t, &inputs, &out, &core.telemetry(), core.config());
+        if k % drain_every == 0 {
+            rec.drain(&mut bytes);
+        }
+        outputs.push(out);
+    }
+    rec.drain(&mut bytes);
+    Flown { bytes, outputs }
+}
+
+fn default_flight() -> Flown {
+    fly::<65_536>(2500, 1, LoadReport::default())
+}
+
+#[test]
+fn a_scripted_flight_replays_identically_tick_for_tick() {
+    let flown = default_flight();
+    // The script is worth replaying: the vehicle armed and flew its motors,
+    // a parameter changed, the saved call happened.
+    assert!(
+        flown
+            .outputs
+            .iter()
+            .any(|o| o.motors.iter().any(|m| *m > 0.0))
+    );
+    let file = UlogFile::parse(&flown.bytes).unwrap();
+    assert!(
+        file.records("oxide_in_tick")
+            .any(|r| r.bool("saved") == Some(true))
+    );
+    let r = replay(&flown.bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(r.ticks, 2500);
+    assert!(r.identical(), "{:?}", r.first_difference);
+    assert_eq!(r.stop, Stop::End);
+    assert_eq!(r.last_tick, Some((2499, 2_499_000)));
+    assert_eq!(r.profile, "f405-lean");
+    assert_eq!(r.exit_code(), 0);
+    assert_eq!(
+        r.lines(),
+        ["replayed 2500 ticks (f405-lean): identical".to_string()]
+    );
+}
+
+#[test]
+fn an_unclean_boot_report_is_part_of_what_replays() {
+    let report = LoadReport {
+        applied: 80,
+        unknown: 2,
+        dropped: 1,
+        invalid: false,
+        unreadable: false,
+        torn: 0,
+    };
+    let flown = fly::<65_536>(400, 1, report);
+    let r = replay(&flown.bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(r.ticks, 400);
+    assert!(r.identical(), "{:?}", r.first_difference);
+}
+
+#[test]
+fn a_normal_level_log_is_refused() {
+    let airframe = Airframe::reference_quad().unwrap();
+    let cfg = airframe.core_config::<4>().unwrap();
+    let mut bytes = Vec::new();
+    let mut rec = Box::new(Recorder::<65_536>::new());
+    rec.start(
+        &mut bytes,
+        Micros::ZERO,
+        BUILD,
+        Boot::clean(&F405_LEAN),
+        Level::Normal,
+        &cfg,
+    )
+    .unwrap();
+    let e = replay(&bytes, &ReplayOptions::default()).unwrap_err();
+    assert!(matches!(e, ReplayError::NotReplayLevel(Some(ref l)) if l == "normal"));
+    assert_eq!(
+        e.to_string(),
+        "not a replay-level log: oxide_log_level is \"normal\" (record with --log-level replay)"
+    );
+}
+
+#[test]
+fn bytes_that_are_not_a_log_are_refused_without_panic() {
+    for bytes in [&b""[..], b"not a ulog file at all", &[0u8; 64]] {
+        let e = replay(bytes, &ReplayOptions::default()).unwrap_err();
+        assert!(matches!(e, ReplayError::Read(_)), "{e}");
+    }
+}
+
+#[test]
+fn a_header_with_another_configuration_hash_is_refused() {
+    let flown = default_flight();
+    let airframe = Airframe::reference_quad().unwrap();
+    let hash = airframe.core_config::<4>().unwrap().config_hash();
+    let mut bytes = flown.bytes.clone();
+    let at = bytes
+        .windows(8)
+        .position(|w| w == hash.to_le_bytes())
+        .expect("the hash is in the header");
+    bytes[at] ^= 1;
+    let e = replay(&bytes, &ReplayOptions::default()).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            ReplayError::Config(oxide_log::replay::decode::FileConfigError::HashMismatch { .. })
+        ),
+        "{e}"
+    );
+}
+
+/// The offset in `bytes` of record `n` of `topic`'s payload.
+fn payload_of(bytes: &[u8], topic: &str, n: usize) -> usize {
+    let f = UlogFile::parse(bytes).unwrap();
+    // 2 bytes of size, 1 of type, 2 of message id.
+    f.records(topic).nth(n).unwrap().offset() + 5
+}
+
+/// The offset in `bytes` of the 4-byte value of the header parameter `name`.
+fn param_value_at(bytes: &[u8], name: &str) -> usize {
+    let key = format!("float {name}");
+    let at = bytes
+        .windows(key.len())
+        .position(|w| w == key.as_bytes())
+        .expect("the parameter is in the header");
+    at + key.len()
+}
+
+#[test]
+fn a_refused_configuration_names_the_parameter_once_in_a_sentence() {
+    let flown = default_flight();
+    let at = param_value_at(&flown.bytes, "RATE_ROLL_P");
+    let sentence = |bytes: &[u8]| {
+        let e = replay(bytes, &ReplayOptions::default()).unwrap_err();
+        assert!(matches!(e, ReplayError::Config(_)), "{e}");
+        e.to_string()
+    };
+    // Out of range.
+    let mut bytes = flown.bytes.clone();
+    bytes[at..at + 4].copy_from_slice(&1.0e9_f32.to_le_bytes());
+    assert_eq!(
+        sentence(&bytes),
+        "cannot rebuild the configuration: parameter RATE_ROLL_P is refused: its value is \
+         out of range"
+    );
+    // Not finite.
+    bytes[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert_eq!(
+        sentence(&bytes),
+        "cannot rebuild the configuration: parameter RATE_ROLL_P is refused: its value is \
+         not a finite number"
+    );
+    // A name this build does not have: the name the file carries, and the key.
+    let mut bytes = flown.bytes.clone();
+    let name_at = at - "RATE_ROLL_P".len();
+    assert_eq!(&bytes[name_at - 6..name_at], b"float ");
+    bytes[name_at + "RATE_ROLL_".len()] = b'Q';
+    let text = sentence(&bytes);
+    let key = oxide_core::params::key("RATE_ROLL_Q");
+    assert_eq!(
+        text,
+        format!(
+            "cannot rebuild the configuration: the file has a parameter this build does not \
+             have: RATE_ROLL_Q (key {key:#010x})"
+        )
+    );
+}
+
+#[test]
+fn a_boot_record_that_is_not_this_builds_profile_or_vehicle_is_refused() {
+    let flown = default_flight();
+    // oxide_boot: timestamp 8, four u16 8, base_period_us 4 at 16, ...,
+    // rotors the last byte (index 46).
+    let at = payload_of(&flown.bytes, "oxide_boot", 0);
+    let mut six = flown.bytes.clone();
+    six[at + 46] = 6;
+    let e = replay(&six, &ReplayOptions::default()).unwrap_err();
+    assert!(matches!(e, ReplayError::Rotors(6)), "{e}");
+    assert_eq!(
+        e.to_string(),
+        "the vehicle has 6 rotors; this build replays vehicles with 4"
+    );
+    let mut rate = flown.bytes.clone();
+    rate[at + 16] ^= 1;
+    let e = replay(&rate, &ReplayOptions::default()).unwrap_err();
+    assert!(
+        matches!(e, ReplayError::ProfileMismatch("f405-lean")),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_changed_gain_is_a_difference_in_a_motor_command_after_arming() {
+    let flown = default_flight();
+    let opts = ReplayOptions {
+        params: vec![("RATE_PITCH_P".to_string(), 14.0)],
+        keep_going: false,
+    };
+    let r = replay(&flown.bytes, &opts).unwrap();
+    let d = r.first_difference.as_ref().expect("a difference");
+    assert!(d.field.starts_with("motors["), "{d}");
+    assert!(d.seq >= 1200, "{d}");
+    assert!(d.recorded_bits.is_some() && d.replayed_bits.is_some());
+    assert_eq!(r.differing, 1);
+    assert_eq!(r.stop, Stop::Difference);
+    assert_eq!(r.exit_code(), 1);
+    assert_eq!(r.ticks, d.seq + 1);
+    // Going on counts every tick that differs.
+    let all = replay(
+        &flown.bytes,
+        &ReplayOptions {
+            keep_going: true,
+            ..opts
+        },
+    )
+    .unwrap();
+    assert!(all.differing > 1, "{all:?}");
+    assert_eq!(all.ticks, 2500);
+    assert_eq!(all.first_difference, r.first_difference);
+    assert_eq!(all.stop, Stop::End);
+    assert!(all.lines()[0].contains(" differ, the first at tick "));
+}
+
+#[test]
+fn an_override_the_core_refuses_is_an_error_not_a_difference() {
+    let flown = default_flight();
+    let opts = ReplayOptions {
+        params: vec![("NO_SUCH_PARAM".to_string(), 1.0)],
+        keep_going: false,
+    };
+    let e = replay(&flown.bytes, &opts).unwrap_err();
+    assert!(matches!(e, ReplayError::Override(_)), "{e}");
+}
+
+#[test]
+fn one_flipped_bit_in_a_recorded_output_is_that_tick_and_that_field() {
+    let flown = default_flight();
+    let mut bytes = flown.bytes.clone();
+    // oxide_out: timestamp 0..8, t_valid 8..16, motors 16..48.
+    let at = payload_of(&bytes, "oxide_out", 1700) + 16 + 4 * 2;
+    bytes[at] ^= 1;
+    let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+    let d = r.first_difference.unwrap();
+    assert_eq!((d.seq, d.field.as_str()), (1700, "motors[2]"));
+    assert_eq!(
+        d.recorded_bits.unwrap() ^ d.replayed_bits.unwrap(),
+        1,
+        "{d}"
+    );
+    assert_eq!(r.ticks, 1701);
+}
+
+#[test]
+fn a_cut_file_replays_up_to_the_cut_and_says_so() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let start = f.records("oxide_in_tick").nth(100).unwrap().offset();
+    let mut cuts = vec![start + 1, start + 2, start + 7, start + 100, start + 12_345];
+    cuts.extend((0..40).map(|i| start + 3_000 + i * 997));
+    for cut in cuts {
+        let r = replay(&flown.bytes[..cut], &ReplayOptions::default()).unwrap();
+        assert!(r.identical(), "cut at {cut}: {:?}", r.first_difference);
+        assert!(
+            r.ticks >= 100 && r.ticks < 2500,
+            "cut at {cut}: {}",
+            r.ticks
+        );
+        assert!(matches!(r.stop, Stop::Cut | Stop::End), "{:?}", r.stop);
+        assert_eq!(r.exit_code(), 0);
+    }
+    // In the middle of a message the cut is seen by the reader.
+    let r = replay(&flown.bytes[..start + 2], &ReplayOptions::default()).unwrap();
+    assert_eq!((r.ticks, &r.stop), (100, &Stop::Cut));
+    assert_eq!(
+        r.lines()[1],
+        "the file ends in a cut after tick 99: the ticks before it were replayed"
+    );
+    // Cuts inside the definitions are not logs at all.
+    for cut in [0, 10, 100, 5_000] {
+        assert!(replay(&flown.bytes[..cut], &ReplayOptions::default()).is_err());
+    }
+}
+
+#[test]
+fn a_tick_whose_records_are_cut_off_at_the_end_is_not_replayed() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    // Keep tick 200's tick record and nothing after it.
+    let end = f.records("oxide_in_tick").nth(200).unwrap().offset();
+    let tick = f.records("oxide_in_tick").nth(200).unwrap();
+    let len = 5 + 20; // header and id, then the record (no trailing padding)
+    assert_eq!(tick.raw().len(), 20);
+    let r = replay(&flown.bytes[..end + len], &ReplayOptions::default()).unwrap();
+    assert_eq!((r.ticks, &r.stop), (200, &Stop::Cut));
+    assert!(r.identical());
+}
+
+#[test]
+fn a_missing_tick_stops_the_replay_at_the_gap() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let a = f.records("oxide_in_tick").nth(300).unwrap().offset();
+    let b = f.records("oxide_in_tick").nth(301).unwrap().offset();
+    let mut bytes = flown.bytes[..a].to_vec();
+    bytes.extend_from_slice(&flown.bytes[b..]);
+    let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(
+        r.stop,
+        Stop::SequenceGap {
+            expected: 300,
+            found: 301
+        }
+    );
+    assert_eq!(r.ticks, 300);
+    assert!(r.identical());
+    assert_eq!(r.exit_code(), 1);
+    assert!(
+        r.lines()[1]
+            .starts_with("a tick record is missing after tick 299: expected number 300, found 301"),
+        "{:?}",
+        r.lines()
+    );
+}
+
+#[test]
+fn a_ring_too_small_makes_a_gap_and_the_replay_stops_there() {
+    // 2 kB, drained every 25th tick: records are lost and a dropout written.
+    let flown = fly::<2048>(2500, 25, LoadReport::default());
+    let file = UlogFile::parse(&flown.bytes).unwrap();
+    assert!(
+        file.items
+            .iter()
+            .any(|i| matches!(i, oxide_log::reader::Item::Dropout { .. }))
+    );
+    let r = replay(&flown.bytes, &ReplayOptions::default()).unwrap();
+    assert!(matches!(r.stop, Stop::Dropout { .. }), "{:?}", r.stop);
+    assert!(r.identical(), "{:?}", r.first_difference);
+    assert!(r.ticks < 2500);
+    assert_eq!(r.exit_code(), 1);
+    assert!(
+        r.lines()[1].starts_with("the log has a gap ("),
+        "{:?}",
+        r.lines()
+    );
+}
+
+/// The whole message (header, id, payload) of record `n` of `topic`.
+fn message_of(bytes: &[u8], topic: &str, n: usize) -> std::ops::Range<usize> {
+    let f = UlogFile::parse(bytes).unwrap();
+    let at = f.records(topic).nth(n).unwrap().offset();
+    let size = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    at..at + 3 + size
+}
+
+/// `bytes` with a copy of `topic`'s record `n` inserted before the first tick record.
+fn with_stray_before_first_tick(bytes: &[u8], topic: &str, n: usize) -> Vec<u8> {
+    let copy = bytes[message_of(bytes, topic, n)].to_vec();
+    let first = message_of(bytes, "oxide_in_tick", 0).start;
+    let mut out = bytes[..first].to_vec();
+    out.extend_from_slice(&copy);
+    out.extend_from_slice(&bytes[first..]);
+    out
+}
+
+/// The offset in the file of field `field` of record `n` of `topic`.
+fn field_at(bytes: &[u8], topic: &str, n: usize, field: &str) -> usize {
+    let f = UlogFile::parse(bytes).unwrap();
+    let r = f.records(topic).nth(n).unwrap();
+    let inner = r.field_bytes(field).unwrap().as_ptr() as usize - r.raw().as_ptr() as usize;
+    r.offset() + 5 + inner
+}
+
+#[test]
+fn a_record_before_the_first_tick_is_refused_not_ignored() {
+    let flown = default_flight();
+    for topic in ["oxide_event", "oxide_out", "oxide_in_imu", "oxide_in_state"] {
+        let bytes = with_stray_before_first_tick(&flown.bytes, topic, 0);
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop, Stop::Malformed { seq: None, .. }),
+            "{topic}: {:?} after {} ticks",
+            r.stop,
+            r.ticks
+        );
+        assert_eq!(r.exit_code(), 1, "{topic}");
+        assert_eq!(r.ticks, 0, "{topic}");
+    }
+    // The start records are the ones that belong there.
+    let r = replay(&flown.bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(r.stop, Stop::End);
+}
+
+/// `bytes` without the bytes in `range`.
+fn without(bytes: &[u8], range: std::ops::Range<usize>) -> Vec<u8> {
+    let mut out = bytes[..range.start].to_vec();
+    out.extend_from_slice(&bytes[range.end..]);
+    out
+}
+
+/// The tick (index) an `oxide_event` record belongs to.
+fn tick_of_event(bytes: &[u8], n: usize) -> usize {
+    let f = UlogFile::parse(bytes).unwrap();
+    let us = f
+        .records("oxide_event")
+        .nth(n)
+        .unwrap()
+        .u64("timestamp")
+        .unwrap();
+    usize::try_from(us / 1000).unwrap()
+}
+
+#[test]
+fn a_record_missing_in_the_middle_of_the_file_is_a_failure_and_at_the_end_a_cut() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let events = f.records("oxide_event").count();
+    drop(f);
+    // An event from the middle of the flight, and one from the last tick of a
+    // file that ends there.
+    let mid_event = (0..events)
+        .find(|&n| tick_of_event(&flown.bytes, n) > 1000)
+        .expect("an event after tick 1000");
+    let mid_tick = tick_of_event(&flown.bytes, mid_event);
+    assert!(mid_tick < 2499, "{mid_tick}");
+    for (topic, n, tick) in [
+        ("oxide_in_imu", 1000, 1000),
+        ("oxide_out", 1000, 1000),
+        ("oxide_event", mid_event, mid_tick),
+    ] {
+        let bytes = without(&flown.bytes, message_of(&flown.bytes, topic, n));
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert!(
+            matches!(r.stop, Stop::Malformed { .. }),
+            "{topic}: {:?} after {} ticks",
+            r.stop,
+            r.ticks
+        );
+        assert_eq!((r.ticks, r.exit_code()), (tick as u64, 1), "{topic}");
+        assert!(r.identical(), "{topic}");
+    }
+    // The same deletion in the last tick of the file is what a cut looks like.
+    let last = 2499;
+    for topic in ["oxide_in_imu", "oxide_out"] {
+        let bytes = without(&flown.bytes, message_of(&flown.bytes, topic, last));
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert_eq!(
+            (r.ticks, &r.stop, r.exit_code()),
+            (last as u64, &Stop::Cut, 0),
+            "{topic}"
+        );
+    }
+    // An event: the file ends with the tick that holds it.
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let end = f
+        .records("oxide_in_tick")
+        .nth(mid_tick + 1)
+        .unwrap()
+        .offset();
+    drop(f);
+    let bytes = without(
+        &flown.bytes[..end],
+        message_of(&flown.bytes, "oxide_event", mid_event),
+    );
+    let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+    assert_eq!(
+        (r.ticks, &r.stop, r.exit_code()),
+        (mid_tick as u64, &Stop::Cut, 0)
+    );
+    // With the event there the tick replays and the file is whole.
+    let r = replay(&flown.bytes[..end], &ReplayOptions::default()).unwrap();
+    assert_eq!(
+        (r.ticks, &r.stop, r.exit_code()),
+        (mid_tick as u64 + 1, &Stop::End, 0)
+    );
+}
+
+#[test]
+fn a_changed_time_in_an_outputs_record_is_a_malformed_tick() {
+    let flown = default_flight();
+    for (tick, bit) in [(1700, 0), (1700, 9), (0, 3)] {
+        let mut bytes = flown.bytes.clone();
+        let at = field_at(&flown.bytes, "oxide_out", tick, "timestamp");
+        bytes[at + bit / 8] ^= 1 << (bit % 8);
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        let Stop::Malformed { seq, why } = &r.stop else {
+            panic!("tick {tick}: {:?}", r.stop)
+        };
+        assert_eq!(*seq, Some(tick as u64));
+        assert!(why.starts_with("oxide_out has time "), "{why}");
+        assert_eq!((r.ticks, r.exit_code()), (tick as u64, 1));
+        assert!(r.identical());
+    }
+}
+
+#[test]
+fn a_changed_timestamp_in_an_event_or_a_start_record_is_not_identical() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    assert!(f.records("oxide_event").count() > 0);
+    drop(f);
+    for (topic, n) in [
+        ("oxide_event", 0),
+        ("oxide_boot", 0),
+        ("oxide_vehicle", 0),
+        ("oxide_param_us", 0),
+    ] {
+        let mut bytes = flown.bytes.clone();
+        bytes[field_at(&flown.bytes, topic, n, "timestamp")] ^= 1;
+        match replay(&bytes, &ReplayOptions::default()) {
+            Err(ReplayError::StartTime(_)) => assert_ne!(topic, "oxide_event"),
+            Ok(r) => {
+                assert_eq!(topic, "oxide_event");
+                assert!(matches!(r.stop, Stop::Malformed { .. }), "{:?}", r.stop);
+                assert_eq!(r.exit_code(), 1, "{topic}");
+            }
+            Err(e) => panic!("{topic}: {e}"),
+        }
+    }
+}
+
+#[test]
+fn a_log_with_no_tick_proves_nothing() {
+    let flown = default_flight();
+    let first = message_of(&flown.bytes, "oxide_in_tick", 0).start;
+    let r = replay(&flown.bytes[..first], &ReplayOptions::default()).unwrap();
+    assert_eq!(r.ticks, 0);
+    assert_ne!(r.exit_code(), 0);
+    assert!(
+        r.lines().iter().any(|l| l.contains("no ticks")),
+        "{:?}",
+        r.lines()
+    );
+}
+
+#[test]
+fn the_first_line_says_identical_only_for_a_replay_that_reached_the_end() {
+    let flown = default_flight();
+    let lines = |bytes: &[u8]| replay(bytes, &ReplayOptions::default()).unwrap().lines();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let tick_at = |n: usize| f.records("oxide_in_tick").nth(n).unwrap().offset();
+    // The end of the file, and a cut: identical.
+    assert_eq!(
+        lines(&flown.bytes),
+        ["replayed 2500 ticks (f405-lean): identical"]
+    );
+    assert_eq!(
+        lines(&flown.bytes[..tick_at(100) + 2]),
+        [
+            "replayed 100 ticks (f405-lean): identical",
+            "the file ends in a cut after tick 99: the ticks before it were replayed"
+        ]
+    );
+    // No tick compared: nothing was compared, whatever the stop.
+    assert_eq!(
+        lines(&flown.bytes[..tick_at(0)]),
+        [
+            "replayed 0 ticks (f405-lean): nothing was compared",
+            "the file has no ticks"
+        ]
+    );
+    assert_eq!(
+        lines(&flown.bytes[..tick_at(0) + 2]),
+        [
+            "replayed 0 ticks (f405-lean): nothing was compared",
+            "the file ends in a cut before the first tick was complete"
+        ]
+    );
+    let stray = with_stray_before_first_tick(&flown.bytes, "oxide_out", 0);
+    let l = lines(&stray);
+    assert_eq!(l[0], "replayed 0 ticks (f405-lean): nothing was compared");
+    assert_eq!(
+        l[1],
+        "a tick record is malformed before the first tick: oxide_out record before the first tick"
+    );
+    // A stop before the end, with nothing different before it.
+    let stopped = "no difference before the replay stopped";
+    let gap = without(&flown.bytes, tick_at(300)..tick_at(301));
+    let l = lines(&gap);
+    assert_eq!(l[0], format!("replayed 300 ticks (f405-lean): {stopped}"));
+    assert!(
+        l[1].starts_with("a tick record is missing after tick 299"),
+        "{l:?}"
+    );
+    let imu = without(&flown.bytes, message_of(&flown.bytes, "oxide_in_imu", 1000));
+    assert_eq!(
+        lines(&imu),
+        [
+            format!("replayed 1000 ticks (f405-lean): {stopped}"),
+            "tick 1000 is malformed: records of the tick are missing".to_string()
+        ]
+    );
+    let small = fly::<2048>(2500, 25, LoadReport::default());
+    let l = lines(&small.bytes);
+    assert!(l[0].ends_with(&format!("(f405-lean): {stopped}")), "{l:?}");
+    assert!(!l[0].contains("identical"), "{l:?}");
+    assert!(l[1].starts_with("the log has a gap ("), "{l:?}");
+    // A difference is a difference.
+    let mut bytes = flown.bytes.clone();
+    let at = payload_of(&bytes, "oxide_out", 1700) + 16 + 8;
+    bytes[at] ^= 1;
+    let l = lines(&bytes);
+    assert!(
+        l[0].starts_with("replayed 1701 ticks (f405-lean): first difference at tick 1700 "),
+        "{l:?}"
+    );
+}
+
+#[test]
+fn every_recorded_output_field_is_named_when_it_differs() {
+    let flown = default_flight();
+    let tick = 1700;
+    let fields = [
+        "t_valid",
+        "timing_faults",
+        "rejected",
+        "resets",
+        "reasons",
+        "prearm",
+        "armed",
+        "killed",
+        "saturated",
+        "no_estimate",
+        "aligned",
+        "gps_aiding",
+        "valid_attitude",
+        "valid_heading",
+        "valid_altitude",
+        "valid_velocity",
+        "valid_position",
+        "home_set",
+        "params_unsaved",
+        "mode",
+        "nav",
+        "action",
+    ];
+    for field in fields {
+        let mut bytes = flown.bytes.clone();
+        let at = field_at(&flown.bytes, "oxide_out", tick, field);
+        bytes[at] ^= 1;
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        let d = r
+            .first_difference
+            .unwrap_or_else(|| panic!("{field}: no difference, stop {:?}", r.stop));
+        assert_eq!((d.seq, d.field.as_str()), (tick as u64, field), "{d}");
+    }
+}
+
+#[test]
+fn a_changed_event_payload_is_named_events_n() {
+    let flown = default_flight();
+    let f = UlogFile::parse(&flown.bytes).unwrap();
+    let r0 = f.records("oxide_event").next().unwrap();
+    let (start, len) = (r0.offset() + 5, r0.raw().len());
+    drop(f);
+    // Flip a bit in each byte after the timestamp: whichever decodes and
+    // differs is named events[..], never a generic "outputs".
+    let mut named = 0;
+    for k in 8..len {
+        let mut bytes = flown.bytes.clone();
+        bytes[start + k] ^= 1;
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        if let Some(d) = r.first_difference {
+            assert!(d.field.starts_with("events["), "byte {k}: {d}");
+            named += 1;
+        }
+    }
+    assert!(named > 0);
+}
+
+// ---- whole flights of the simulator ----
+
+mod flights {
+    use super::*;
+    use oxide_core::schedule::{H743_FULL, Profile};
+    use oxide_sim::fault_scenarios;
+    use oxide_sim::flight_log::{Level, LogBuild, SharedBuffer};
+    use oxide_sim::scenario::Script;
+    use oxide_sim::{SimOptions, Simulation};
+
+    /// A flight: the file (with a log), the trace hash and the number of ticks.
+    pub struct Flight {
+        pub bytes: Vec<u8>,
+        pub hash: u64,
+        pub ticks: u64,
+    }
+
+    pub fn fly(name: &str, profile: Profile, level: Option<Level>) -> Flight {
+        let scenario = fault_scenarios::by_name(name).expect("scenario");
+        let mut sim = scenario.build(profile, 0).expect("builds");
+        let buf = SharedBuffer::new();
+        if let Some(level) = level {
+            sim.start_log(level, &LogBuild::sim("test"), Box::new(buf.clone()))
+                .expect("log starts");
+        }
+        let mut ticks = 0;
+        sim.run_until(scenario.end(), |_| ticks += 1);
+        if level.is_some() {
+            sim.finish_log().expect("finishes");
+        }
+        Flight {
+            bytes: buf.bytes(),
+            hash: sim.trace_hash(),
+            ticks,
+        }
+    }
+
+    fn proves(name: &str, profile: Profile) {
+        let flight = fly(name, profile, Some(Level::Replay));
+        let r = replay(&flight.bytes, &ReplayOptions::default()).expect("replays");
+        assert!(
+            r.identical(),
+            "{name} on {}: {:?}",
+            profile.name,
+            r.first_difference
+        );
+        assert_eq!(r.stop, Stop::End, "{name} on {}", profile.name);
+        assert_eq!(r.ticks, flight.ticks, "{name} on {}", profile.name);
+        assert_eq!(r.profile, profile.name);
+    }
+
+    #[test]
+    fn rc_loss_position_replays_identically_on_the_f405() {
+        proves("rc-loss-position", F405_LEAN);
+    }
+
+    #[test]
+    fn gps_loss_replays_identically_on_the_f405() {
+        proves("gps-loss", F405_LEAN);
+    }
+
+    #[test]
+    fn motor_loss_replays_identically_on_the_f405() {
+        proves("motor-loss", F405_LEAN);
+    }
+
+    #[test]
+    fn rc_loss_position_replays_identically_on_the_h743() {
+        proves("rc-loss-position", H743_FULL);
+    }
+
+    #[test]
+    fn a_replay_level_log_does_not_change_the_flight() {
+        for (name, profile) in [
+            ("rc-loss-position", F405_LEAN),
+            ("gps-loss", F405_LEAN),
+            ("motor-loss", F405_LEAN),
+            ("rc-loss-position", H743_FULL),
+        ] {
+            let plain = fly(name, profile, None);
+            let logged = fly(name, profile, Some(Level::Replay));
+            assert_eq!(plain.hash, logged.hash, "{name} on {}", profile.name);
+            assert_eq!(plain.ticks, logged.ticks);
+        }
+    }
+
+    #[test]
+    fn nothing_drops_in_the_simulator_at_the_replay_level() {
+        let scenario = fault_scenarios::by_name("rc-loss-position").expect("scenario");
+        for profile in [F405_LEAN, H743_FULL] {
+            let mut sim = scenario.build(profile, 0).expect("builds");
+            sim.start_log(
+                Level::Replay,
+                &LogBuild::sim("test"),
+                Box::new(SharedBuffer::new()),
+            )
+            .expect("starts");
+            sim.run_until(scenario.end(), |_| {});
+            let st = sim.log_stats().expect("stats");
+            assert_eq!(
+                (st.dropped_stream, st.dropped_must, st.dropouts),
+                (0, 0, 0),
+                "{}",
+                profile.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_stores_saved_call_between_ticks_is_recorded_on_the_next_tick_and_replays() {
+        let airframe = Airframe::reference_quad().expect("airframe");
+        let mut sim = Simulation::<Script, 4>::with_options(
+            &airframe,
+            F405_LEAN,
+            Script::default(),
+            SimOptions::default(),
+        )
+        .expect("builds");
+        let buf = SharedBuffer::new();
+        sim.start_log(Level::Replay, &LogBuild::sim("test"), Box::new(buf.clone()))
+            .expect("starts");
+        let id = params::find("RATE_ROLL_P").unwrap();
+        for k in 0..60 {
+            if k == 10 {
+                sim.queue_param_set(ParamSet {
+                    id,
+                    value: ParamValue::F32(31.0),
+                });
+            }
+            if k == 40 {
+                assert!(sim.core().params_unsaved());
+                sim.core_mut().clear_unsaved();
+                assert!(!sim.core().params_unsaved());
+            }
+            sim.step();
+        }
+        sim.finish_log().expect("finishes");
+        let bytes = buf.bytes();
+        let file = UlogFile::parse(&bytes).unwrap();
+        let saved: Vec<u64> = file
+            .records("oxide_in_tick")
+            .filter(|r| r.bool("saved") == Some(true))
+            .filter_map(|r| r.u64("seq"))
+            .collect();
+        assert_eq!(saved, [40]);
+        let r = replay(&bytes, &ReplayOptions::default()).unwrap();
+        assert_eq!(
+            (r.ticks, r.identical()),
+            (60, true),
+            "{:?}",
+            r.first_difference
+        );
+    }
+}
