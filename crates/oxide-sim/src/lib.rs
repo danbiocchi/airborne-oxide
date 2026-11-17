@@ -6,6 +6,7 @@
 //! simulation state (DESIGN §5.2).
 
 pub mod airframe;
+pub mod autopilot;
 pub mod battery;
 pub mod fault_scenarios;
 pub mod faults;
@@ -24,6 +25,7 @@ pub mod vehicle;
 pub mod wind;
 
 pub use airframe::Airframe;
+pub use autopilot::{Autopilot, AutopilotInput, AutopilotOutput, CoreAutopilot};
 pub use scenario_file::{ScenarioError, ScenarioFile};
 pub use sim::{CoreRecord, SimOptions, Simulation, StepRecord};
 
