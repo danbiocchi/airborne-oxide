@@ -216,6 +216,14 @@ impl Link {
                     self.peer = Some(from);
                     return Ok(Some(packet));
                 }
+                // Windows reports a datagram longer than the buffer as an
+                // error, where other systems cut it off and return the
+                // buffer's length (the check above).
+                Err(e) if is_cut_off(&e) => {
+                    return Err(LinkError::TooLong {
+                        limit: MAX_DATAGRAM,
+                    });
+                }
                 Err(e) => match e.kind() {
                     // The socket's time-out can run out a little before our
                     // deadline on some systems: the deadline check at the top
@@ -232,11 +240,29 @@ impl Link {
     }
 }
 
+/// Windows' error code for "the datagram was larger than the buffer"
+/// (`WSAEMSGSIZE`).
+const WINDOWS_MESSAGE_TOO_LONG: i32 = 10040;
+
+/// The receive failed because the datagram did not fit the buffer. Only
+/// Windows reports this as an error.
+fn is_cut_off(e: &io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error() == Some(WINDOWS_MESSAGE_TOO_LONG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn only_windows_reports_a_cut_off_datagram_as_an_error() {
+        let too_long = io::Error::from_raw_os_error(WINDOWS_MESSAGE_TOO_LONG);
+        assert_eq!(is_cut_off(&too_long), cfg!(windows));
+        assert!(!is_cut_off(&io::Error::from(io::ErrorKind::TimedOut)));
+        assert!(!is_cut_off(&io::Error::from_raw_os_error(1)));
+    }
 
     /// A motor packet of 16 channels with the given count.
     fn packet(count: u32) -> Vec<u8> {
