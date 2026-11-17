@@ -51,7 +51,8 @@ use crate::bridge::{
 };
 use crate::link::Link;
 use crate::mav::{self, MavClient, MavError, MavEvent};
-use crate::parm;
+use crate::motors::{DEFAULT_SPIN_MAX, DEFAULT_SPIN_MIN, MotorMap};
+use crate::parm::{self, ParmError};
 use crate::reply::Reply;
 use crate::sitl::{Sitl, SitlConfig, SitlError, json_port_of};
 
@@ -298,6 +299,9 @@ pub enum ArduCopterError {
     Config(ConfigError),
     /// The instance number is above 9.
     Instance(u8),
+    /// A parameter file does not parse (its values are read for the motor
+    /// map).
+    ParamFile { path: PathBuf, source: ParmError },
     /// The UDP port could not be bound.
     Bind { port: u16, source: io::Error },
     /// The simulator program could not be started.
@@ -337,6 +341,9 @@ impl fmt::Display for ArduCopterError {
         match self {
             Self::Config(e) => write!(f, "the ArduCopter configuration is not usable: {e}"),
             Self::Instance(i) => write!(f, "instance {i} is not between 0 and 9"),
+            Self::ParamFile { path, source } => {
+                write!(f, "start: {}: {source}", path.display())
+            }
             Self::Bind { port, source } => {
                 write!(f, "start: cannot bind UDP port {port}: {source}")
             }
@@ -379,6 +386,7 @@ impl std::error::Error for ArduCopterError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Config(e) => Some(e),
+            Self::ParamFile { source, .. } => Some(source),
             Self::Bind { source, .. } => Some(source),
             Self::Start(e) | Self::Finish(e) => Some(e),
             Self::Connect { source, .. } | Self::Mav { source, .. } => Some(source),
@@ -725,6 +733,90 @@ impl ArmWatch {
     }
 }
 
+/// The motor parameters the program will run with: the last value of
+/// `MOT_SPIN_MIN`, `MOT_SPIN_MAX`, `MOT_PWM_MIN` and `MOT_PWM_MAX` among the
+/// parameter files (in order) and then the extra parameters, with the
+/// program's defaults for those that are set nowhere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotorParams {
+    pub spin_min: f64,
+    pub spin_max: f64,
+    pub pwm_min: f64,
+    pub pwm_max: f64,
+}
+
+impl Default for MotorParams {
+    fn default() -> Self {
+        Self {
+            spin_min: f64::from(DEFAULT_SPIN_MIN),
+            spin_max: f64::from(DEFAULT_SPIN_MAX),
+            pwm_min: 1000.0,
+            pwm_max: 2000.0,
+        }
+    }
+}
+
+impl MotorParams {
+    /// Applies one parameter: a name that is not a motor parameter changes
+    /// nothing.
+    pub fn apply(&mut self, name: &str, value: f64) {
+        match name {
+            "MOT_SPIN_MIN" => self.spin_min = value,
+            "MOT_SPIN_MAX" => self.spin_max = value,
+            "MOT_PWM_MIN" => self.pwm_min = value,
+            "MOT_PWM_MAX" => self.pwm_max = value,
+            _ => {}
+        }
+    }
+
+    /// The effective motor parameters of a configuration: reads the parameter
+    /// files, then applies the extra parameters.
+    pub fn of_config(config: &ArduCopterConfig) -> Result<Self, ArduCopterError> {
+        let mut p = Self::default();
+        for path in &config.param_files {
+            let text = std::fs::read_to_string(path).map_err(|source| {
+                ArduCopterError::Start(SitlError::ParamFileUnreadable {
+                    path: path.clone(),
+                    source,
+                })
+            })?;
+            let values = parm::parse(&text).map_err(|source| ArduCopterError::ParamFile {
+                path: path.clone(),
+                source,
+            })?;
+            for (name, value) in values {
+                p.apply(&name, value);
+            }
+        }
+        for (name, value) in &config.extra_params {
+            p.apply(name, *value);
+        }
+        Ok(p)
+    }
+}
+
+/// The exchange's configuration for `config`: the step, the time-out and the
+/// motor map's range, which is the program's own `MOT_SPIN_MIN` and
+/// `MOT_SPIN_MAX` ([`MotorParams`]), so that the map follows the parameter
+/// files and the extra parameters. A pulse range other than 1000 to 2000 µs
+/// is refused.
+pub fn bridge_config(config: &ArduCopterConfig) -> Result<BridgeConfig, ArduCopterError> {
+    let motor = MotorParams::of_config(config)?;
+    if motor.pwm_min != 1000.0 || motor.pwm_max != 2000.0 {
+        return Err(ArduCopterError::Config(ConfigError::PwmRange {
+            min: motor.pwm_min,
+            max: motor.pwm_max,
+        }));
+    }
+    let mut c = BridgeConfig::new(STEP_US);
+    c.reply_timeout = config.reply_timeout;
+    c.spin_min = motor.spin_min as f32;
+    c.spin_max = motor.spin_max as f32;
+    MotorMap::new(c.spin_min, c.spin_max)
+        .map_err(|e| ArduCopterError::Config(ConfigError::Motors(e)))?;
+    Ok(c)
+}
+
 /// ArduCopter as the simulator's autopilot.
 pub struct ArduCopter {
     ex: Exchange,
@@ -774,11 +866,7 @@ impl ArduCopter {
     pub fn start(config: ArduCopterConfig) -> Result<Self, ArduCopterError> {
         let port =
             json_port_of(config.instance).ok_or(ArduCopterError::Instance(config.instance))?;
-        let bridge = {
-            let mut c = BridgeConfig::new(STEP_US);
-            c.reply_timeout = config.reply_timeout;
-            c
-        };
+        let bridge = bridge_config(&config)?;
         // The socket is bound before the program starts, as it sends to it.
         let link = Link::bind(port).map_err(|source| ArduCopterError::Bind { port, source })?;
         let ex = Exchange::new(link, bridge).map_err(ArduCopterError::Config)?;
@@ -1679,5 +1767,59 @@ mod tests {
             assert!((sd / model - 1.0).abs() < 0.02, "axis {axis}: sd {sd}");
             assert!((lag1 - 0.30).abs() < 0.03, "axis {axis}: lag-1 {lag1}");
         }
+    }
+
+    fn config_with(extra: Vec<(String, f64)>) -> ArduCopterConfig {
+        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        c.extra_params = extra;
+        c
+    }
+
+    #[test]
+    fn the_motor_map_is_built_from_the_parameter_files() {
+        // The committed files set neither: the program's defaults, which are
+        // the map's constants (read from the binary: 0.15, 0.95, 1000, 2000).
+        let b = bridge_config(&config_with(Vec::new())).expect("config");
+        assert_eq!(b.spin_min, 0.15);
+        assert_eq!(b.spin_max, 0.95);
+        assert_eq!(
+            MotorParams::of_config(&config_with(Vec::new()))
+                .unwrap()
+                .pwm_max,
+            2000.0
+        );
+    }
+
+    #[test]
+    fn extra_parameters_that_name_the_motor_range_reach_the_motor_map() {
+        let b = bridge_config(&config_with(vec![
+            ("MOT_SPIN_MAX".into(), 0.9),
+            ("MOT_SPIN_MIN".into(), 0.12),
+        ]))
+        .expect("config");
+        assert_eq!((b.spin_min, b.spin_max), (0.12, 0.9));
+        // The last value wins, as it does in the program's file.
+        let b = bridge_config(&config_with(vec![
+            ("MOT_SPIN_MAX".into(), 0.9),
+            ("MOT_SPIN_MAX".into(), 0.8),
+        ]))
+        .expect("config");
+        assert_eq!(b.spin_max, 0.8);
+        // A range the map refuses is a configuration error.
+        let e = bridge_config(&config_with(vec![("MOT_SPIN_MAX".into(), 1.2)])).unwrap_err();
+        assert!(
+            matches!(e, ArduCopterError::Config(ConfigError::Motors(_))),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_pulse_range_other_than_1000_to_2000_is_refused() {
+        let e = bridge_config(&config_with(vec![("MOT_PWM_MAX".into(), 1900.0)])).unwrap_err();
+        assert!(
+            matches!(e, ArduCopterError::Config(ConfigError::PwmRange { .. })),
+            "{e}"
+        );
+        assert!(e.to_string().contains("MOT_PWM_MAX 1900"), "{e}");
     }
 }

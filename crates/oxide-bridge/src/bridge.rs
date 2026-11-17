@@ -82,6 +82,9 @@ pub enum ConfigError {
     Motors(MotorError),
     /// A time-out is zero.
     Timeout,
+    /// The parameters set `MOT_PWM_MIN` or `MOT_PWM_MAX` to other than 1000
+    /// and 2000 µs: the motor map's pulse scale is fixed.
+    PwmRange { min: f64, max: f64 },
 }
 
 impl fmt::Display for ConfigError {
@@ -90,6 +93,11 @@ impl fmt::Display for ConfigError {
             Self::Step => write!(f, "the step must not be zero"),
             Self::Motors(e) => write!(f, "{e}"),
             Self::Timeout => write!(f, "the time-outs must not be zero"),
+            Self::PwmRange { min, max } => write!(
+                f,
+                "MOT_PWM_MIN {min} and MOT_PWM_MAX {max} must be 1000 and 2000: \
+                 the motor map reads pulses on that scale"
+            ),
         }
     }
 }

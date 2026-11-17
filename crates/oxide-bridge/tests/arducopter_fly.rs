@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use oxide_bridge::arducopter::{
     ArduCopter, ArduCopterConfig, ArduCopterError, BrainLink, FlightAudit, Flown, FlyError,
-    GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest, bridged_options, fly,
-    gps_blend_sd_ratio,
+    GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest, bridge_config,
+    bridged_options, fly, gps_blend_sd_ratio,
 };
 use oxide_bridge::mav::{MavEvent, id};
 use oxide_bridge::reply::timestamp_ns;
@@ -1340,6 +1340,66 @@ fn fly_gust_hold(instance: u8, tag: &str, index: u64, speedup: u32) -> HoldNumbe
         rms_v_m: Real::sqrt(sum_v / n as f64),
         flown,
         log,
+    }
+}
+
+/// The motor map's range is the program's own: `MOT_SPIN_MIN`, `MOT_SPIN_MAX`,
+/// `MOT_PWM_MIN` and `MOT_PWM_MAX` as the running program reports them are
+/// the values the bridge builds its map from, with the committed files and
+/// with an extra parameter that moves one of them.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_motor_map_is_the_range_the_program_runs_with() {
+    let lease = Instance::lease();
+    for (tag, extra) in [
+        ("map-files", Vec::new()),
+        ("map-extra", vec![("MOT_SPIN_MAX".to_string(), 0.9)]),
+    ] {
+        let root = TempDir::new(tag);
+        let mut sim = simulation(lease.0, &root, NoPilot, SimOptions::realistic(1), |c| {
+            c.extra_params = extra.clone()
+        });
+        sim.preroll(PREROLL_STEPS).unwrap_or_else(|e| panic!("{e}"));
+        for name in ["MOT_SPIN_MIN", "MOT_SPIN_MAX", "MOT_PWM_MIN", "MOT_PWM_MAX"] {
+            sim.autopilot()
+                .instrument()
+                .param_request(name)
+                .expect("param_request");
+        }
+        for _ in 0..400 {
+            sim.try_step().unwrap_or_else(|e| panic!("{e}"));
+        }
+        let audit = sim
+            .into_autopilot()
+            .finish()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let read = |name: &str| -> f32 {
+            audit
+                .heard
+                .iter()
+                .find_map(|h| match &h.event {
+                    MavEvent::ParamValue { name: n, value, .. } if n == name => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{tag}: no value for {name} was read"))
+        };
+        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        c.extra_params = extra.clone();
+        let map = bridge_config(&c).expect("the bridge's configuration");
+        println!(
+            "MEASURED {tag}: the program has MOT_SPIN_MIN {} MOT_SPIN_MAX {} MOT_PWM_MIN {} \
+             MOT_PWM_MAX {}; the map has {} {}",
+            read("MOT_SPIN_MIN"),
+            read("MOT_SPIN_MAX"),
+            read("MOT_PWM_MIN"),
+            read("MOT_PWM_MAX"),
+            map.spin_min,
+            map.spin_max
+        );
+        assert_eq!(read("MOT_SPIN_MIN"), map.spin_min, "{tag}");
+        assert_eq!(read("MOT_SPIN_MAX"), map.spin_max, "{tag}");
+        assert_eq!(read("MOT_PWM_MIN"), 1000.0, "{tag}");
+        assert_eq!(read("MOT_PWM_MAX"), 2000.0, "{tag}");
     }
 }
 
