@@ -66,7 +66,7 @@ ArduCopter's output *k* drives our rotor *k*. With `A = (pwm − 1000) / 1000`, 
 
 ### 6. Pilot, commands and faults
 
-- **Stick flying** goes through the `rc` channels of the reply, clocked by our time stamps. The pilot's modes map to ArduCopter's: Stabilized to STABILIZE, Altitude to ALT_HOLD, Position to LOITER.
+- **Stick flying** goes through the `rc` channels of the reply, clocked by our time stamps. The channels are numbered by our own choice (`oxide_bridge::bridge::rc_pulses`): 1 roll, 2 pitch, 3 throttle, 4 yaw (1000 to 2000, 1500 at the centre), 5 mode switch (positions 0, 1, 2 as 1000, 1500, 2000), 6 arm switch (1000 off, 2000 on), 7 kill switch (1000 off, 2000 on), 8 unused (1000). The part that runs the real program maps channels 5 to 8 to ArduCopter's own mode and auxiliary-function parameters; it must not assume other numbers. The pilot's modes map to ArduCopter's: Stabilized to STABILIZE, Altitude to ALT_HOLD, Position to LOITER.
 - **Offboard flying** goes over MAVLink in GUIDED: arm, take off, then position targets. Commands are sent from the physics thread at fixed simulated times, and the set of requested telemetry messages is fixed, because both change the instant ArduCopter acts and with it the whole flight.
 - **MAVLink is read all the time.** SITL stops when its send queue fills, which would hang both processes.
 - **Faults** reach ArduCopter by the route that works, observed in the spike:
