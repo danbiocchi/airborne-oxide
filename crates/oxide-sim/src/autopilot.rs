@@ -187,7 +187,7 @@ impl<const N: usize> Autopilot<N> for CoreAutopilot<N> {
         u64::from(self.core.profile().base_period_us)
     }
 
-    #[inline]
+    #[inline(always)]
     fn tick(
         &mut self,
         t: Micros,

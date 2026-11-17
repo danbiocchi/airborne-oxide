@@ -9,8 +9,6 @@
 //!    valid from `t + base` (LET);
 //! 3. integrate physics over `[t, t + base]` with the command valid at `t`.
 
-use std::collections::VecDeque;
-
 use oxide_core::Core;
 use oxide_core::config::{EstimatorSource, FailsafeParams, VehicleConfig};
 use oxide_core::io::ParamSet;
@@ -330,7 +328,7 @@ pub struct Simulation<P: Pilot, const N: usize, A: Autopilot<N> = CoreAutopilot<
     active: [f32; N],
     /// Commands that have not fallen due yet, oldest issued first (one
     /// entry for our core, whose commands are valid one tick later).
-    pending: VecDeque<PendingCommand<N>>,
+    pending: Vec<PendingCommand<N>>,
     specific_force_world: Vec3<f64>,
     hash: TraceHash,
     physics_faults: u32,
@@ -545,7 +543,7 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             sensors,
             wind,
             active: [0.0; N],
-            pending: VecDeque::new(),
+            pending: Vec::with_capacity(2),
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
             hash: TraceHash::default(),
             physics_faults: 0,
@@ -694,19 +692,19 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
         // tick's command joins the queue, and every command that is due
         // (`t_valid <= t`, this tick's own included) takes effect, the one
         // issued last winning; those not due yet wait.
-        self.pending.push_back(PendingCommand {
+        self.pending.push(PendingCommand {
             t_valid: out.t_valid,
             motors: out.motors,
         });
-        for _ in 0..self.pending.len() {
-            if let Some(p) = self.pending.pop_front() {
-                if p.t_valid <= t {
-                    self.active = p.motors;
-                } else {
-                    self.pending.push_back(p);
-                }
+        let active = &mut self.active;
+        self.pending.retain(|p| {
+            if p.t_valid <= t {
+                *active = p.motors;
+                false
+            } else {
+                true
             }
-        }
+        });
         let record = StepRecord {
             t,
             position: self.body.position,
