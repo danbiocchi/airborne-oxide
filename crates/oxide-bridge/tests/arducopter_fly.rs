@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use oxide_bridge::arducopter::{
     ArduCopter, ArduCopterConfig, ArduCopterError, BrainLink, FlightAudit, Flown, FlyError,
-    GpsError, GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest,
-    bridged_options, fly,
+    GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest, bridged_options, fly,
+    gps_blend_sd_ratio,
 };
 use oxide_bridge::mav::{MavEvent, id};
 use oxide_bridge::sitl::PINNED;
@@ -664,6 +664,7 @@ struct Fix {
     time_usec: u64,
     lat: i32,
     lon: i32,
+    alt_mm: i32,
     vel_cms: u16,
 }
 
@@ -676,6 +677,7 @@ fn fixes(a: &FlightAudit) -> Vec<Fix> {
             time_usec,
             lat,
             lon,
+            alt_mm,
             vel_cms,
             ..
         } = h.event
@@ -687,6 +689,7 @@ fn fixes(a: &FlightAudit) -> Vec<Fix> {
                 time_usec,
                 lat,
                 lon,
+                alt_mm,
                 vel_cms,
             });
         }
@@ -808,12 +811,13 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         n1.len(),
         n0.len()
     );
-    // What the real program does with the error (measured; the reason the
-    // specification's two numbers are not met): its GPS lag reads the position
-    // 150 ms back between two stored samples 200 ms apart, so each fix is
-    // 0.75 of the error held before and 0.25 of the error held after. Fix j
-    // (j = 1 is the first of the flight) is 0.75 d(j-2) + 0.25 d(j-1) of our
-    // draws d(0), d(1), ...
+    // What the real program does with the error (measured): its GPS lag reads
+    // the position 150 ms back between two stored samples 200 ms apart, so each
+    // fix is 0.75 of the error held before and 0.25 of the error held after.
+    // Fix j (j = 1 is the first of the flight) is 0.75 d(j-2) + 0.25 d(j-1) of
+    // the bridge's draws d(0), d(1), ... The bridge draws with our model's
+    // sigma over the blend's ratio (`gps_blend_sd_ratio`), so that the error
+    // ArduCopter's GPS reports has our model's standard deviation.
     let predicted = |j: usize, draws: &[[f64; 2]]| -> (f64, f64) {
         let d = |k: usize| -> [f64; 2] { draws.get(k).copied().unwrap_or([0.0; 2]) };
         let (a, b) = (
@@ -822,15 +826,14 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         );
         (0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1])
     };
-    let mut state = GpsErrorState::new(
-        GpsError {
-            enabled: true,
-            sigma_m: sigma,
-            period_us: 200_000,
-            first_fix_us: 0,
-        },
-        1,
+    let mut bridged = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+    let _ = bridged_options(SimOptions::realistic(1), &mut bridged);
+    let drawn_sigma = bridged.gps_error.sigma_m;
+    assert!(
+        (drawn_sigma * gps_blend_sd_ratio(200_000) - sigma).abs() < 1e-12,
+        "{drawn_sigma}"
     );
+    let mut state = GpsErrorState::new(bridged.gps_error, 1);
     let draws: Vec<[f64; 2]> = (0..200).map(|k| state.at(k * 200_000)).collect();
     let all = fixes(&with.audit);
     let first_flight = all
@@ -853,12 +856,12 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         count += 2;
     }
     let rms = Real::sqrt(sum_sq / f64::from(count));
-    let expect_sd = sigma * Real::sqrt(0.75 * 0.75 + 0.25 * 0.25);
     println!(
-        "MEASURED GPS error: the reported error against 0.75 d(j-2) + 0.25 d(j-1): rms residual \
-         {rms:.4} m over {count} values; expected sd {expect_sd:.4} m; specification's criteria: \
-         sd within 20 % of {sigma}: north {:.1} %, east {:.1} % (NOT MET); lag-1 under 0.3: \
-         {:.3}, {:.3} (NOT MET)",
+        "MEASURED GPS error: the reported error against 0.75 d(j-2) + 0.25 d(j-1) with the \
+         bridge drawing sd {drawn_sigma:.4} m: rms residual {rms:.4} m over {count} values; \
+         reported sd against our model's {sigma}: north {:+.1} %, east {:+.1} % (limit 20 %); \
+         lag-1 {:.3}, {:.3} (the blend's 0.30; the specification's limit 0.3 cannot be met \
+         through this blend)",
         100.0 * (std_dev(&n1) / sigma - 1.0),
         100.0 * (std_dev(&e1) / sigma - 1.0),
         lag1(&n1),
@@ -891,14 +894,18 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         );
     }
     for (name, v) in [("north", &n1), ("east", &e1)] {
+        // The decided numbers (ADR-0006 section 4): ArduCopter's GPS error has
+        // our model's standard deviation, within the specification's 20 %.
         let sd = std_dev(v);
         assert!(
-            (sd - expect_sd).abs() <= 0.12 * expect_sd,
-            "{name}: sd {sd} against {expect_sd}"
+            (sd - sigma).abs() <= 0.2 * sigma,
+            "{name}: sd {sd} against our model's {sigma}"
         );
-        // The blend makes successive fixes share a draw: a lag-1 correlation of
-        // 0.1875 / 0.625 = 0.30 for white draws.
-        assert!(lag1(v).abs() < 0.5, "{name}: lag-1 {}", lag1(v));
+        // Successive fixes share a draw through the lag's blend: lag-1 0.30
+        // for white draws. With 145 fixes the estimate has a standard error of
+        // 0.08, so it is held to 0.30 within 0.15 (not to the white-noise
+        // limit of 0.3, which the blend cannot meet).
+        assert!((lag1(v) - 0.30).abs() <= 0.15, "{name}: lag-1 {}", lag1(v));
     }
     for (name, v) in [("north", &n0), ("east", &e0)] {
         assert!(
@@ -907,6 +914,30 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
             std_dev(v)
         );
     }
+
+    // The GPS height is not the bridge's: the program's own height error (set
+    // by `SIM_GPS1_NOISE`, a slow sine) is 0.21 m in standard deviation, where
+    // our model's is `pos_sigma_v_m`. ADR-0006 section 4 lists the difference;
+    // this pins the figure the record states.
+    let alt_sd = |r: &RestRun| {
+        let alt: Vec<f64> = fixes(&r.audit)
+            .iter()
+            .filter(|f| f.at_us >= window)
+            .map(|f| f64::from(f.alt_mm) * 1e-3)
+            .collect();
+        std_dev(&alt)
+    };
+    let (alt1, alt0) = (alt_sd(&with), alt_sd(&without));
+    let model_v = SimOptions::realistic(1).sensors.gps.pos_sigma_v_m;
+    println!(
+        "MEASURED GPS height error: sd {alt1:.4} m with the horizontal error, {alt0:.4} m without; \
+         our model's {model_v} m"
+    );
+    assert!((0.15..=0.30).contains(&alt1), "height sd {alt1}");
+    assert!(
+        (alt1 - alt0).abs() < 0.01,
+        "the horizontal error moved the height"
+    );
 
     // Nothing else changed. The velocity ArduCopter reports (ground speed).
     let (vm1, vs1) = summary(&v1);

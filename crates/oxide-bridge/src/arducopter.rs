@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use oxide_core::io::TrajectorySetpoint;
+use oxide_core::math::Real;
 use oxide_core::time::Micros;
 use oxide_sim::autopilot::{Autopilot, AutopilotInput, AutopilotOutput, PrerollInput};
 use oxide_sim::rng::{Rng, Stream};
@@ -133,13 +134,41 @@ pub struct TelemetryRequest {
     pub at_step: u64,
 }
 
+/// The GPS lag of the program, µs: `SIM_GPS1_LAG_MS 150` in `base.parm` (a
+/// unit test of [`crate::parm`] pins that value).
+pub const GPS_LAG_US: u64 = 150_000;
+
+/// The ratio of the standard deviation of the error ArduCopter's GPS reports
+/// to the standard deviation of the errors the bridge holds in its replies.
+///
+/// The program's GPS lag reads the position `GPS_LAG_US` back, between two
+/// stored samples one GPS period apart, so each fix is
+/// `w d(j-2) + (1 - w) d(j-1)` of the held errors `d`, with `w = lag /
+/// period`; for white `d` its standard deviation is `sqrt(w² + (1-w)²)` of
+/// theirs (0.7906 for 150 ms and 200 ms, measured on V4.7.2: the reported
+/// error is that blend of our draws to within 0.01 m rms) and successive
+/// fixes share a draw, so their correlation is `w (1-w) / (w² + (1-w)²)`
+/// (0.30). [`bridged_options`] divides our model's standard deviation by this
+/// ratio, so that ArduCopter's GPS has the horizontal error our model has.
+/// Only the 150 ms lag and 200 ms period are measured.
+pub fn gps_blend_sd_ratio(period_us: u64) -> f64 {
+    if period_us == 0 {
+        return 1.0;
+    }
+    let w = (GPS_LAG_US as f64 / period_us as f64).min(1.0);
+    Real::sqrt(w * w + (1.0 - w) * (1.0 - w))
+}
+
 /// The GPS horizontal error of ADR-0006 §4.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpsError {
     /// Switched off when false (the flight then has none).
     pub enabled: bool,
-    /// Standard deviation per axis, m (our GPS model's horizontal position
-    /// noise: [`fly`] takes it from `options.sensors.gps`).
+    /// Standard deviation per axis of the errors the bridge draws and holds,
+    /// m. [`fly`] sets it to our GPS model's horizontal position noise
+    /// divided by [`gps_blend_sd_ratio`]: ArduCopter's own GPS lag blends two
+    /// successive draws, and the error its GPS then reports has our model's
+    /// standard deviation.
     pub sigma_m: f64,
     /// A new draw every period, µs of flight time.
     pub period_us: u64,
@@ -1246,15 +1275,16 @@ pub struct Flown {
 
 /// Sets what a bridged flight needs in the options (the IMU sampled every
 /// 1000 µs and the wind every 1000 µs, ADR-0006 §4 and §7) and in the
-/// configuration (the seed, the ground station and the GPS error's standard
-/// deviation and period from the options), and returns the options. Nothing
-/// else is changed.
+/// configuration (the seed, the ground station, the GPS error's period from
+/// the options and its standard deviation: our GPS model's, divided by
+/// [`gps_blend_sd_ratio`]), and returns the options. Nothing else is changed.
 pub fn bridged_options(mut options: SimOptions, config: &mut ArduCopterConfig) -> SimOptions {
     options.sensors.imu.period_us = 1000;
     options.wind_period_us = Some(1000);
     config.seed = options.seed;
     config.gcs = options.links.gcs;
-    config.gps_error.sigma_m = options.sensors.gps.pos_sigma_h_m;
+    config.gps_error.sigma_m =
+        options.sensors.gps.pos_sigma_h_m / gps_blend_sd_ratio(options.sensors.gps.period_us);
     config.gps_error.period_us = options.sensors.gps.period_us;
     config.gps_error.first_fix_us = options.sensors.gps.first_fix_us;
     options
@@ -1262,8 +1292,8 @@ pub fn bridged_options(mut options: SimOptions, config: &mut ArduCopterConfig) -
 
 /// Flies a bridged flight: sets what it needs (see [`bridged_options`]) and nothing else
 /// (`options.sensors.imu.period_us = 1000`, `options.wind_period_us =
-/// Some(1000)` (ADR-0006 §7), the GPS error's standard deviation and period
-/// from `options.sensors.gps`, the seed from `options.seed`, the ground
+/// Some(1000)` (ADR-0006 §7), the GPS error's standard deviation (see
+/// [`bridged_options`]) and period from `options.sensors.gps`, the seed from `options.seed`, the ground
 /// station from `options.links.gcs`), starts the program, runs the pre-roll
 /// of [`PREROLL_STEPS`] steps and then the flight to `duration`, calling
 /// `on_step` for every tick. Options that configure only our own core are
@@ -1578,7 +1608,10 @@ mod tests {
         assert_eq!(after.wind_period_us, Some(1000));
         assert_eq!(c.seed, 5);
         assert!(!c.gcs, "the default scenario has no ground station");
-        assert_eq!(c.gps_error.sigma_m, before.sensors.gps.pos_sigma_h_m);
+        assert_eq!(
+            c.gps_error.sigma_m,
+            before.sensors.gps.pos_sigma_h_m / gps_blend_sd_ratio(200_000)
+        );
         assert_eq!(c.gps_error.period_us, 200_000);
         let mut expected = before;
         expected.sensors.imu.period_us = 1000;
@@ -1588,5 +1621,49 @@ mod tests {
         with_gcs.links.gcs = true;
         let _ = bridged_options(with_gcs, &mut c);
         assert!(c.gcs);
+    }
+
+    #[test]
+    fn the_blend_ratio_is_sqrt_0_625_for_150_ms_of_lag_and_a_200_ms_period() {
+        let r = gps_blend_sd_ratio(200_000);
+        assert!((r - Real::sqrt(0.625)).abs() < 1e-12, "{r}");
+        assert!((r - 0.7906).abs() < 1e-4, "{r}");
+        // A period at or under the lag blends nothing; a zero period is not
+        // divided by.
+        assert_eq!(gps_blend_sd_ratio(150_000), 1.0);
+        assert_eq!(gps_blend_sd_ratio(100_000), 1.0);
+        assert_eq!(gps_blend_sd_ratio(0), 1.0);
+    }
+
+    /// The error ArduCopter's GPS reports is the blend of two successive
+    /// draws (measured on the binary, test 6 of `arducopter_fly`): with the
+    /// draws a bridged flight sets, it has our model's standard deviation
+    /// and a lag-1 correlation of 0.30.
+    #[test]
+    fn the_error_arducopters_gps_reports_has_our_models_sd_and_a_lag_1_of_0_3() {
+        let mut c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        let options = bridged_options(SimOptions::realistic(1), &mut c);
+        let model = options.sensors.gps.pos_sigma_h_m;
+        assert_eq!(model, 0.3);
+        let mut g = GpsErrorState::new(c.gps_error, 5);
+        let d: Vec<[f64; 2]> = (0..40_000).map(|k| g.at(k * 200_000)).collect();
+        for axis in 0..2 {
+            let fix: Vec<f64> = d
+                .windows(2)
+                .map(|w| 0.75 * w[0][axis] + 0.25 * w[1][axis])
+                .collect();
+            let n = fix.len() as f64;
+            let mean = fix.iter().sum::<f64>() / n;
+            let var = fix.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+            let lag1 = fix
+                .windows(2)
+                .map(|w| (w[0] - mean) * (w[1] - mean))
+                .sum::<f64>()
+                / (n - 1.0)
+                / var;
+            let sd = Real::sqrt(var);
+            assert!((sd / model - 1.0).abs() < 0.02, "axis {axis}: sd {sd}");
+            assert!((lag1 - 0.30).abs() < 0.03, "axis {axis}: lag-1 {lag1}");
+        }
     }
 }
