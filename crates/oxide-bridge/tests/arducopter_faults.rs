@@ -82,20 +82,11 @@ fn scenario_path(name: &str) -> PathBuf {
         .join(format!("{name}.toml"))
 }
 
-/// The files and extra parameters of a bridged flight of `file`: the three
-/// committed files, and our core's battery thresholds as ArduCopter's.
+/// The files and extra parameters of a bridged flight: the runner's own.
 fn configure(c: &mut ArduCopterConfig, airframe: &Airframe) {
-    c.param_files = vec![
-        parm::base_path(),
-        parm::starting_gains_path(),
-        parm::failsafes_path(),
-    ];
-    c.extra_params = battery_failsafe_params(
-        &FailsafeParams::default(),
-        u8::try_from(airframe.battery.cells).expect("cells"),
-        airframe.battery.internal_resistance_ohm,
-        HOVER_POWER_W,
-    );
+    let (files, extras) = oxide_bridge::runner::committed_params(airframe);
+    c.param_files = files;
+    c.extra_params = extras;
 }
 
 /// What a recorded flight keeps of each tick.
@@ -1404,6 +1395,49 @@ fn the_gps_loss_flight_repeats_bit_for_bit_on_two_instances() {
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_battery_low_flight_repeats_bit_for_bit_on_two_instances() {
     assert_repeats("battery-low");
+}
+
+/// The runner flies a faulted file as this file's glue does: the same trace,
+/// packet and reply hashes, the same parameter hash, the same writes.
+fn assert_runner_agrees(name: &str) {
+    let (la, lb) = (Instance::lease(), Instance::lease());
+    let (ia, ib) = (la.0, lb.0);
+    let (glue, runner) = std::thread::scope(|s| {
+        let a = s.spawn(|| fly_run(name, 0, ia, "glue"));
+        let b = s.spawn(|| {
+            let root = TempDir::new("runner");
+            let src = oxide_bridge::scenario::LoadedScenario::load(scenario_path(name))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let setup = oxide_bridge::runner::Setup::new(binary(), root.path().join("f"), ib);
+            oxide_bridge::runner::fly_scenario(&src, 0, &setup).unwrap_or_else(|e| panic!("{e}"))
+        });
+        (a.join().expect("glue"), b.join().expect("runner"))
+    });
+    let audit = runner
+        .audit
+        .as_ref()
+        .expect("a bridged flight has an audit");
+    println!(
+        "MEASURED {name}: glue trace {:016x} packet {:016x} reply {:016x}; runner trace {:016x} packet {:016x} reply {:016x}",
+        glue.flown.trace_hash,
+        glue.audit().packet_hash,
+        glue.audit().reply_hash,
+        runner.trace_hash,
+        audit.packet_hash,
+        audit.reply_hash
+    );
+    assert_eq!(runner.trace_hash, glue.flown.trace_hash);
+    assert_eq!(audit.packet_hash, glue.audit().packet_hash);
+    assert_eq!(audit.reply_hash, glue.audit().reply_hash);
+    assert_eq!(audit.params_sha256, glue.audit().params_sha256);
+    assert_eq!(audit.param_writes(), glue.audit().param_writes());
+    assert!(!audit.param_writes().is_empty(), "the faults were written");
+}
+
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_runner_flies_gps_loss_as_the_glue_of_this_file_does() {
+    assert_runner_agrees("gps-loss");
 }
 
 // ---- What needs no write, without the binary --------------------------------

@@ -5,8 +5,8 @@
 //! [`translate`] decides. The file's `[params]` are our core's parameters and
 //! never reach ArduCopter as they are: [`PARAMS`] says what each name
 //! becomes. The pilot must be offboard throughout (stick flying is a later
-//! part), and faults are not translated until [`FAULTS_TRANSLATABLE`] is
-//! flipped.
+//! part). Faults are translated: the fault translator writes them to
+//! the program ([`FAULTS_TRANSLATABLE`]).
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -23,9 +23,10 @@ pub const AIRFRAME: &str = "quad-x-5in";
 /// The value of the pilot's mode switch that means offboard.
 pub const MODE_OFFBOARD: u8 = 2;
 
-/// Whether a scenario with faults is translatable. The faults are applied by
-/// a later part (T3 of the work) and this flag is the one place that says so.
-pub const FAULTS_TRANSLATABLE: bool = false;
+/// Whether a scenario with faults is translatable: the faults are applied to
+/// the program as parameter writes (`faults::FaultTranslator`). This flag is
+/// the one place that says so.
+pub const FAULTS_TRANSLATABLE: bool = true;
 
 /// What a scenario parameter becomes for ArduCopter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +104,7 @@ impl fmt::Display for Untranslatable {
                 f,
                 "the parameter {name} is {value}: the fence radius must be a finite number, not negative"
             ),
-            Self::Faults(n) => write!(f, "faults: joined in T3 (the file has {n})"),
+            Self::Faults(n) => write!(f, "faults are not translatable (the file has {n})"),
         }
     }
 }
@@ -372,17 +373,12 @@ mod tests {
     }
 
     #[test]
-    fn a_scenario_with_a_fault_is_not_translatable_while_the_constant_is_off() {
+    fn a_scenario_with_a_fault_is_translatable_because_the_faults_are_applied() {
         let faulted = load(&format!(
             "{HEAD}{OFFBOARD}[[fault]]\nkind = \"gps-loss\"\nstart_s = 5.0\n"
         ));
-        if FAULTS_TRANSLATABLE {
-            assert!(translate(&faulted).is_ok());
-            return;
-        }
-        let e = translate(&faulted).unwrap_err();
-        assert_eq!(e, Untranslatable::Faults(1));
-        assert!(e.to_string().contains("faults: joined in T3"), "{e}");
+        const { assert!(FAULTS_TRANSLATABLE) };
+        assert!(translate(&faulted).is_ok());
     }
 
     #[test]
@@ -427,24 +423,24 @@ mod tests {
             "battery-low",
             "battery-critical",
             "setpoint-gap",
+            "gps-loss",
+            "imu-loss",
+            "motor-loss",
+            "brain-crash",
         ] {
             assert!(ok.iter().any(|n| n == must), "{must}: {why:?}");
         }
-        // Every refusal is for a fault or for sticks (the pilot files); none
-        // is for a parameter name outside the table.
+        // Every refusal is for sticks (the pilot files); none is for a fault
+        // or for a parameter name outside the table.
         for (name, e) in &why {
             assert!(
-                matches!(
-                    e,
-                    Untranslatable::Faults(_) | Untranslatable::StickFlying { .. }
-                ),
+                matches!(e, Untranslatable::StickFlying { .. }),
                 "{name}: {e}"
             );
         }
         assert!(why.iter().any(
             |(n, e)| n == "rc-loss-position" && matches!(e, Untranslatable::StickFlying { .. })
         ));
-        assert!(why.iter().any(|(n, _)| n == "gps-loss"));
     }
 
     #[test]

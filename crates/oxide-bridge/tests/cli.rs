@@ -62,19 +62,20 @@ fn a_wrong_use_ends_with_a_sentence_and_exit_code_1() {
 
 #[test]
 fn a_scenario_the_bridge_cannot_translate_is_a_wrong_use_that_says_why() {
-    let faulted = scenario("gps-loss");
     let sticks = scenario("rc-loss-position");
-    for (file, needle) in [(faulted, "faults: joined in T3"), (sticks, "stick flying")] {
-        let o = bridge(&[
-            "fly",
-            "--scenario",
-            path(&file),
-            "--binary",
-            "/no/such/arducopter",
-        ]);
-        assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
-        assert!(text(&o.stderr).contains(needle), "{}", text(&o.stderr));
-    }
+    let o = bridge(&[
+        "fly",
+        "--scenario",
+        path(&sticks),
+        "--binary",
+        "/no/such/arducopter",
+    ]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("stick flying"),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 #[test]

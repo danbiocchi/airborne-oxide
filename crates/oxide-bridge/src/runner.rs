@@ -7,12 +7,14 @@ use core::fmt;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use oxide_core::config::FailsafeParams;
 use oxide_core::math::Real;
 use oxide_sim::outcome::FlightClass;
 use oxide_sim::scenario_file::{Checker, RunProfile, ScenarioFile, Verdict};
 use oxide_sim::{Airframe, SimError, StepRecord};
 
 use crate::arducopter::{ArduCopterConfig, FlightAudit, FlyError, fly};
+use crate::faults::{HOVER_POWER_W, battery_failsafe_params};
 use crate::parm;
 use crate::scenario::{LoadedScenario, Translation, Untranslatable, translate};
 
@@ -214,16 +216,37 @@ impl Recorder {
     }
 }
 
-/// The parameter files and the extra parameters of a bridged flight: the
-/// committed files, then the setup's, and the translation's parameters
-/// after them.
+/// What every bridged flight is given, whatever the scenario: the committed
+/// files (`base.parm`, `starting-gains.parm`, `failsafes.parm`) and our core's
+/// battery thresholds as ArduCopter's own ([`battery_failsafe_params`]).
+pub fn committed_params(airframe: &Airframe) -> (Vec<PathBuf>, Vec<(String, f64)>) {
+    let files = vec![
+        parm::base_path(),
+        parm::starting_gains_path(),
+        parm::failsafes_path(),
+    ];
+    let cells = u8::try_from(airframe.battery.cells).unwrap_or(u8::MAX);
+    let extras = battery_failsafe_params(
+        &FailsafeParams::default(),
+        cells,
+        airframe.battery.internal_resistance_ohm,
+        HOVER_POWER_W,
+    );
+    (files, extras)
+}
+
+/// The parameter files and the extra parameters of a bridged flight, in the
+/// order they are applied: the committed files, then the setup's own files,
+/// then the battery thresholds, then the scenario's (the fence).
 pub fn arducopter_params(
     translation: &Translation,
     setup: &Setup,
+    airframe: &Airframe,
 ) -> (Vec<PathBuf>, Vec<(String, f64)>) {
-    let mut files = vec![parm::base_path(), parm::starting_gains_path()];
+    let (mut files, mut extras) = committed_params(airframe);
     files.extend(setup.param_files.iter().cloned());
-    (files, translation.extra_params.clone())
+    extras.extend(translation.extra_params.iter().cloned());
+    (files, extras)
 }
 
 /// Flies run `index` of `src` through the bridge, judges it, and returns
@@ -239,7 +262,7 @@ pub fn fly_scenario(
     // Our core's parameters never reach the other autopilot as they are.
     let mut options = file.options(&airframe, index);
     options.params.clear();
-    let (param_files, extra_params) = arducopter_params(&translation, setup);
+    let (param_files, extra_params) = arducopter_params(&translation, setup, &airframe);
     let mut config = ArduCopterConfig::new(&setup.binary, &setup.out, setup.instance);
     config.flight_name = Some("sitl".into());
     config.speedup = setup.speedup;
@@ -321,4 +344,49 @@ pub fn fly_core(
         param_files: Vec::new(),
         extra_params: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenario::LoadedScenario;
+
+    #[test]
+    fn the_parameters_of_a_bridged_flight_are_the_committed_files_the_battery_then_the_fence() {
+        let af = Airframe::reference_quad().expect("airframe");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/geofence.toml");
+        let src = LoadedScenario::load(path).expect("geofence");
+        let t = translate(&src.file).expect("translatable");
+        let mut setup = Setup::new("/x", "/y", 0);
+        setup.param_files.push(PathBuf::from("mine.parm"));
+        let (files, extras) = arducopter_params(&t, &setup, &af);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "base.parm",
+                "starting-gains.parm",
+                "failsafes.parm",
+                "mine.parm"
+            ]
+        );
+        let extra_names: Vec<&str> = extras.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            extra_names,
+            [
+                "BATT_LOW_VOLT",
+                "BATT_CRT_VOLT",
+                "FENCE_ENABLE",
+                "FENCE_TYPE",
+                "FENCE_RADIUS",
+                "FENCE_ACTION"
+            ]
+        );
+        let value = |n: &str| extras.iter().find(|(m, _)| m == n).expect("present").1;
+        assert!((value("BATT_LOW_VOLT") - 20.767).abs() < 0.001);
+        assert!((value("BATT_CRT_VOLT") - 19.553).abs() < 0.001);
+    }
 }

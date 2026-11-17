@@ -181,13 +181,13 @@ fn the_fence_parameters_are_in_the_program_and_the_flight_shows_the_fence_acting
     let translation = translate(&src.file).expect("translatable");
     // 1. The program has the fence parameters (a parameter read).
     let setup = Setup::new(binary(), root.path().join("probe"), lease.0);
-    let (files, extra) = arducopter_params(&translation, &setup);
+    let airframe = Airframe::reference_quad().expect("airframe");
+    let (files, extra) = arducopter_params(&translation, &setup, &airframe);
     let mut config = ArduCopterConfig::new(binary(), root.path().join("probe"), lease.0);
     config.flight_name = Some("sitl".into());
     config.param_files = files;
     config.extra_params = extra;
     config.brain = BrainLink::Serial1;
-    let airframe = Airframe::reference_quad().expect("airframe");
     let mut options = src.file.options(&airframe, 0);
     options.params.clear();
     let options = bridged_options(options, &mut config);
