@@ -328,7 +328,7 @@ impl<E: std::fmt::Display> std::fmt::Display for PrerollError<E> {
         match self {
             Self::AfterStep { tick } => write!(
                 f,
-                "the pre-roll comes before the flight, and this simulation has taken {tick} step(s)"
+                "the pre-roll comes before the flight, and this simulation has already stepped (tick {tick})"
             ),
             Self::AlreadyRun => write!(f, "a pre-roll has already run on this simulation"),
             Self::Autopilot { k, source } => {
@@ -389,6 +389,9 @@ pub struct Simulation<P: Pilot, const N: usize, A: Autopilot<N> = CoreAutopilot<
     next_param_ack: bool,
     /// A pre-roll has run (or started).
     prerolled: bool,
+    /// A step was attempted (it may have failed before the tick advanced,
+    /// after the wind and the sensors had moved).
+    stepped: bool,
 }
 
 impl<P: Pilot, const N: usize> Simulation<P, N, CoreAutopilot<N>> {
@@ -623,6 +626,7 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             next_param_set: None,
             next_param_ack: false,
             prerolled: false,
+            stepped: false,
         })
     }
 
@@ -635,9 +639,12 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
     /// the trace hash stay as they are. Stops at the first error of the
     /// autopilot and returns it with its `k`.
     ///
-    /// Only before the first step, and once.
+    /// Only before the first step (a step that failed counts), and once.
+    /// The IMU samples are those of a vehicle at rest in no wind: with a
+    /// steady wind the flight's accelerometer reads the drag too, a little
+    /// (about 0.1 m/s2) different from the pre-roll's.
     pub fn preroll(&mut self, steps: u64) -> Result<(), PrerollError<A::Error>> {
-        if self.tick != 0 {
+        if self.tick != 0 || self.stepped {
             return Err(PrerollError::AfterStep { tick: self.tick });
         }
         if self.prerolled {
@@ -733,6 +740,7 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
     /// advance for that tick, so a caller stops (or abandons the run) rather
     /// than retrying it.
     pub fn try_step(&mut self) -> Result<StepRecord<N>, A::Error> {
+        self.stepped = true;
         let t = self.time();
 
         // 1. Wind and sensors at t.

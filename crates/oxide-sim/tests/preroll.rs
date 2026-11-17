@@ -200,7 +200,15 @@ fn the_bias_carries_over_into_the_flight() {
 }
 
 fn ground_flight(preroll: u64) -> (Vec<StepRecord<4>>, Vec<SensorFrame>, u64) {
-    let mut s = sim(Watcher::new(500), 21);
+    ground_flight_for(preroll, 21, 3)
+}
+
+fn ground_flight_for(
+    preroll: u64,
+    seed: u64,
+    seconds: u64,
+) -> (Vec<StepRecord<4>>, Vec<SensorFrame>, u64) {
+    let mut s = sim(Watcher::new(500), seed);
     if preroll > 0 {
         s.preroll(preroll).expect("preroll");
         assert_eq!(s.time(), Micros(0));
@@ -211,7 +219,7 @@ fn ground_flight(preroll: u64) -> (Vec<StepRecord<4>>, Vec<SensorFrame>, u64) {
         );
     }
     let mut rec = Vec::new();
-    s.try_run_until(Micros::from_secs(3), |r| rec.push(*r))
+    s.try_run_until(Micros::from_secs(seconds), |r| rec.push(*r))
         .expect("flies");
     let hash = s.trace_hash();
     (rec, s.into_autopilot().frames, hash)
@@ -289,4 +297,112 @@ fn our_core_that_never_prerolls_flies_the_known_flight() {
     .expect("builds");
     sim.run_until(Micros::from_secs(20), |_| {});
     assert_eq!(format!("{:016x}", sim.trace_hash()), "3de16d7a9847deaf");
+}
+
+/// Fails its first tick (and no other).
+struct FailsFirst {
+    ticks: u64,
+}
+
+impl Autopilot<4> for FailsFirst {
+    type Error = Died;
+    fn period_us(&self) -> u64 {
+        500
+    }
+    fn tick(
+        &mut self,
+        t: Micros,
+        _input: &AutopilotInput<'_, 4>,
+    ) -> Result<AutopilotOutput<4>, Died> {
+        self.ticks += 1;
+        if self.ticks == 1 {
+            return Err(Died { k: 0 });
+        }
+        Ok(AutopilotOutput {
+            t_valid: Micros(t.0 + 500),
+            motors: [0.0; 4],
+            armed: false,
+            core: None,
+        })
+    }
+}
+
+#[test]
+fn preroll_is_refused_after_a_step_that_failed_at_tick_0() {
+    let mut s =
+        Simulation::with_autopilot(&airframe(), FailsFirst { ticks: 0 }, NoPilot, options(4))
+            .expect("builds");
+    assert!(s.try_step().is_err());
+    // The tick counter did not move, but the wind and the sensors did.
+    let e = s
+        .preroll(10)
+        .expect_err("the suite has already flown a sample");
+    assert!(matches!(e, PrerollError::AfterStep { .. }), "{e:?}");
+}
+
+#[test]
+fn a_preroll_of_zero_steps_leaves_the_flight_unchanged_and_counts_as_run() {
+    let (ra, fa, ha) = ground_flight_for(0, 5, 2);
+    let mut s = sim(Watcher::new(500), 5);
+    s.preroll(0).expect("zero steps");
+    assert_eq!(s.autopilot().preroll_calls, 0);
+    let e = s.preroll(1).expect_err("a second pre-roll");
+    assert!(matches!(e, PrerollError::AlreadyRun), "{e:?}");
+    let mut rb = Vec::new();
+    s.try_run_until(Micros::from_secs(2), |r| rb.push(*r))
+        .expect("flies");
+    assert_eq!(s.trace_hash(), ha);
+    assert_eq!(ra, rb);
+    let fb = s.into_autopilot().frames;
+    assert_eq!(fa, fb, "every sample of the flight is the same");
+}
+
+#[test]
+fn nothing_but_the_imu_moves_through_a_gust() {
+    for seed in [1, 2, 3] {
+        assert!(
+            gust_hold_wind(seed)
+                .gusts
+                .iter()
+                .any(|g| g.start_s + g.duration_s < 40.0),
+            "a whole gust is inside the flight"
+        );
+        let (ra, fa, ha) = ground_flight_for(0, seed, 40);
+        let (rb, fb, hb) = ground_flight_for(20_000, seed, 40);
+        assert_eq!(ha, hb, "seed {seed}");
+        assert_eq!(ra, rb, "seed {seed}: records (wind included) are identical");
+        for (x, y) in fa.iter().zip(&fb) {
+            assert_eq!(x.gps, y.gps);
+            assert_eq!(x.baro, y.baro);
+            assert_eq!(x.mag, y.mag);
+            assert_eq!(x.battery, y.battery);
+        }
+    }
+}
+
+#[test]
+fn our_core_accepts_a_preroll_and_its_default_hook_does_nothing() {
+    use oxide_sim::scenario::HoverStep;
+    let mut sim = Simulation::<_, 4>::with_options(
+        &airframe(),
+        F405_LEAN,
+        HoverStep::default(),
+        SimOptions::default(),
+    )
+    .expect("builds");
+    sim.preroll(0).expect("zero steps on the core");
+    sim.run_until(Micros::from_secs(20), |_| {});
+    assert_eq!(format!("{:016x}", sim.trace_hash()), "3de16d7a9847deaf");
+
+    let mut sim = Simulation::<_, 4>::with_options(
+        &airframe(),
+        F405_LEAN,
+        HoverStep::default(),
+        SimOptions::default(),
+    )
+    .expect("builds");
+    sim.preroll(2000).expect("the core takes a pre-roll");
+    assert_eq!(sim.time(), Micros(0));
+    assert_eq!(sim.trace_hash(), 0xcbf2_9ce4_8422_2325);
+    sim.run_until(Micros::from_secs(1), |_| {});
 }

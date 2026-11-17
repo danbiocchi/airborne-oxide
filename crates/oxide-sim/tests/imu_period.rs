@@ -218,3 +218,40 @@ fn our_core_refuses_a_period_other_than_its_step() {
     let ok = Simulation::<_, 4>::with_options(&airframe(), F405_LEAN, NoPilot, options(1, 1000));
     assert!(ok.is_ok());
 }
+
+/// The harmonics of spinning rotors advance by the rotor angle of one IMU
+/// period (not of one step): the same suite at period 1000 us and step 500 us
+/// gives, bit for bit, what it gives at period 0 and step 1000 us.
+#[test]
+fn the_rotor_phase_advances_by_the_imu_period() {
+    use oxide_sim::sensors::{SensorSuite, Truth};
+    use oxide_sim::vehicle::BodyState;
+
+    let body = BodyState::<4> {
+        rotor_speed: [0.7, 0.55, 0.8, 0.6],
+        ..BodyState::default()
+    };
+    let truth = Truth {
+        body: &body,
+        specific_force_world: oxide_core::math::Vec3::new(0.0, 0.0, -9.80665),
+        battery_v: 16.0,
+        battery_a: 10.0,
+        max_omega: 2000.0,
+    };
+    let mut fine_cfg = SensorConfig::realistic();
+    fine_cfg.imu.period_us = 1000;
+    let mut fine = SensorSuite::<4>::new(fine_cfg, 3, 500).expect("fine");
+    let mut coarse = SensorSuite::<4>::new(SensorConfig::realistic(), 3, 1000).expect("coarse");
+    let mut n = 0;
+    for i in 0..600u64 {
+        let f = fine.sample(Micros(i * 500), &truth).imu;
+        if i % 2 == 0 {
+            let c = coarse.sample(Micros(i / 2 * 1000), &truth).imu;
+            assert_eq!(f.map(|s| bits(&s)), c.map(|s| bits(&s)), "sample {i}");
+            n += 1;
+        } else {
+            assert!(f.is_none());
+        }
+    }
+    assert_eq!(n, 300);
+}
