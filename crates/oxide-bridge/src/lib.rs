@@ -19,6 +19,7 @@ pub mod link;
 pub mod mav;
 pub mod motors;
 pub mod packet;
+pub mod parm;
 pub mod reply;
 pub mod sha256;
 pub mod sitl;

@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! The parameter files of a bridged ArduCopter flight (ADR-0006 section 4,
+//! ADR-0007 section 2), committed in `arducopter/`.
+//!
+//! A file is `NAME VALUE` per line; `#` starts a comment. The program reads
+//! the files as its defaults ([`crate::sitl::SitlConfig::param_files`]).
+
+use core::fmt;
+use std::path::PathBuf;
+
+/// `arducopter/base.parm`: frame, thrust curve, sensors, battery, log, radio
+/// and mode mapping. No gains.
+pub const BASE: &str = include_str!("../arducopter/base.parm");
+/// `arducopter/starting-gains.parm`: the hand step before the tuner.
+pub const STARTING_GAINS: &str = include_str!("../arducopter/starting-gains.parm");
+
+/// The path of `base.parm` in the source tree this crate was built from.
+pub fn base_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/base.parm")
+}
+
+/// The path of `starting-gains.parm` in the source tree this crate was built
+/// from.
+pub fn starting_gains_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/starting-gains.parm")
+}
+
+/// A line that is not a parameter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParmError {
+    /// 1-based line number.
+    pub line: usize,
+    pub reason: String,
+}
+
+impl fmt::Display for ParmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "parameter file line {}: {}", self.line, self.reason)
+    }
+}
+
+impl std::error::Error for ParmError {}
+
+/// The `(name, value)` pairs of a file, in order. Blank lines and comment
+/// lines are skipped; a line is a name, white space and one finite number,
+/// and nothing else.
+pub fn parse(text: &str) -> Result<Vec<(String, f64)>, ParmError> {
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let body = raw.split('#').next().unwrap_or("").trim();
+        if body.is_empty() {
+            continue;
+        }
+        let bad = |reason: &str| ParmError {
+            line,
+            reason: reason.to_string(),
+        };
+        let mut parts = body.split_whitespace();
+        let (Some(name), Some(value), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(bad("expected `NAME VALUE`"));
+        };
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(bad("a name is upper-case letters, digits and `_`"));
+        }
+        let value: f64 = value
+            .parse()
+            .map_err(|_| bad("the value is not a number"))?;
+        if !value.is_finite() {
+            return Err(bad("the value is not finite"));
+        }
+        out.push((name.to_string(), value));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn all() -> Vec<(String, f64)> {
+        let mut v = parse(BASE).expect("base.parm parses");
+        v.extend(parse(STARTING_GAINS).expect("starting-gains.parm parses"));
+        v
+    }
+
+    #[test]
+    fn the_files_on_disk_are_the_ones_compiled_in() {
+        assert_eq!(std::fs::read_to_string(base_path()).expect("base"), BASE);
+        assert_eq!(
+            std::fs::read_to_string(starting_gains_path()).expect("gains"),
+            STARTING_GAINS
+        );
+    }
+
+    #[test]
+    fn no_name_appears_twice_across_the_two_files() {
+        let mut seen = BTreeMap::new();
+        for (name, value) in all() {
+            assert!(
+                seen.insert(name.clone(), value).is_none(),
+                "{name} appears twice"
+            );
+        }
+    }
+
+    #[test]
+    fn the_names_the_specification_lists_are_there_with_its_values() {
+        let map: BTreeMap<String, f64> = all().into_iter().collect();
+        let base: BTreeMap<String, f64> = parse(BASE).expect("base").into_iter().collect();
+        let gains: BTreeMap<String, f64> =
+            parse(STARTING_GAINS).expect("gains").into_iter().collect();
+        let want_base = [
+            ("FRAME_CLASS", 1.0),
+            ("FRAME_TYPE", 1.0),
+            ("MOT_THST_EXPO", 1.0),
+            ("MOT_THST_HOVER", 0.16),
+            ("SIM_DRIFT_SPEED", 0.0),
+            ("SIM_BARO_RND", 0.173),
+            ("SIM_MAG_RND", 27.0),
+            ("SIM_GPS1_LAG_MS", 150.0),
+            ("SIM_GPS1_VERR_X", 0.1),
+            ("SIM_GPS1_VERR_Y", 0.1),
+            ("SIM_GPS1_VERR_Z", 0.1),
+            ("SIM_GPS1_NOISE", 0.3),
+            ("BATT_MONITOR", 4.0),
+            ("LOG_BACKEND_TYPE", 0.0),
+            ("SIM_FLOAT_EXCEPT", 0.0),
+            ("FLTMODE_CH", 5.0),
+            ("FLTMODE1", 0.0),
+            ("FLTMODE4", 5.0),
+            ("FLTMODE6", 4.0),
+            ("RC6_OPTION", 153.0),
+            ("GUID_OPTIONS", 1.0),
+            ("RC7_OPTION", 31.0),
+        ];
+        for (name, value) in want_base {
+            assert_eq!(base.get(name), Some(&value), "base.parm {name}");
+        }
+        let want_gains = [
+            ("ATC_RAT_RLL_P", 0.05),
+            ("ATC_RAT_RLL_I", 0.05),
+            ("ATC_RAT_RLL_D", 0.0012),
+            ("ATC_RAT_PIT_P", 0.05),
+            ("ATC_RAT_PIT_I", 0.05),
+            ("ATC_RAT_PIT_D", 0.0012),
+            ("ATC_RAT_YAW_P", 0.065),
+            ("ATC_RAT_YAW_I", 0.0065),
+        ];
+        for (name, value) in want_gains {
+            assert_eq!(gains.get(name), Some(&value), "starting-gains.parm {name}");
+        }
+        assert_eq!(gains.len(), 8, "the gains file holds the eight gains only");
+        // No gain in the base file.
+        assert!(
+            !base.keys().any(|n| n.starts_with("ATC_")),
+            "no gain in base.parm"
+        );
+        assert_eq!(map.len(), base.len() + gains.len());
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_parameter_is_refused_with_its_number() {
+        assert_eq!(parse("# c\n\nA_B 1.5 # x\nC 2\n").expect("ok").len(), 2);
+        for bad in ["A", "A 1 2", "a 1", "A x", "A inf", "A NaN"] {
+            let e = parse(&format!("# ok\n{bad}\n")).expect_err(bad);
+            assert_eq!(e.line, 2, "{bad}");
+        }
+    }
+}
