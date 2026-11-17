@@ -83,7 +83,12 @@ pub struct AutopilotInput<'a, const N: usize> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutopilotOutput<const N: usize> {
     /// The commands act from this time (LET: the tick's own time plus the
-    /// period, for our core).
+    /// period, for our core). The simulator honours it: a command acts over
+    /// the first physics step that starts at or after `t_valid` (one valid at
+    /// the tick's own time acts at once, one valid later waits; it is never
+    /// replaced by a later command before it falls due, and of several due
+    /// at once the one issued last wins). A command that never falls due is
+    /// kept, so a far-future `t_valid` costs memory.
     pub t_valid: Micros,
     /// Normalised motor commands, 0 to 1.
     pub motors: [f32; N],

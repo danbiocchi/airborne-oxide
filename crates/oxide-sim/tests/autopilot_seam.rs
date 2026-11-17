@@ -41,6 +41,9 @@ struct Stub {
     /// The call (counted from 0) that fails.
     fail_at_call: Option<u64>,
     calls: u64,
+    /// The commands are valid this many periods after the tick's time (1 is
+    /// the logical execution time of our core).
+    valid_after_periods: u64,
 }
 
 impl Stub {
@@ -53,6 +56,7 @@ impl Stub {
             kd: 0.18,
             fail_at_call: None,
             calls: 0,
+            valid_after_periods: 1,
         }
     }
 }
@@ -81,7 +85,7 @@ impl Autopilot<4> for Stub {
         let u = 0.40 + self.kp * (self.hold_m - height) - self.kd * climb;
         let u = if armed { u.clamp(0.0, 1.0) as f32 } else { 0.0 };
         Ok(AutopilotOutput {
-            t_valid: Micros(t.0 + self.period_us),
+            t_valid: Micros(t.0 + self.valid_after_periods * self.period_us),
             motors: [u; 4],
             armed,
             core: None,
@@ -323,4 +327,34 @@ fn our_core_through_the_seam_flies_the_flight_it_always_flew() {
     .expect("our core cannot fail");
     assert_eq!(records, 20_000);
     assert_eq!(format!("{:016x}", sim.trace_hash()), "3de16d7a9847deaf");
+}
+
+fn max_height(log: &[StepRecord<4>]) -> f64 {
+    log.iter().map(|r| -r.position.z).fold(0.0, f64::max)
+}
+
+#[test]
+fn a_command_is_applied_from_its_t_valid_whenever_that_is() {
+    let mut heights = Vec::new();
+    let mut hashes = Vec::new();
+    for k in 0..4 {
+        let mut stub = Stub::new(500);
+        stub.valid_after_periods = k;
+        let (log, hash) = fly_stub(stub, 3);
+        heights.push(max_height(&log));
+        hashes.push(hash);
+    }
+    // A command valid later than the next tick is not lost: the vehicle
+    // still flies (it never left the ground when each new command replaced
+    // the one that had not fallen due yet).
+    for (k, h) in heights.iter().enumerate() {
+        assert!(*h > 1.0, "valid {k} periods after the tick: max height {h}");
+    }
+    // Every delay is a different flight: a command valid at the tick itself
+    // acts one period earlier than one valid a period later, and so on.
+    for a in 0..hashes.len() {
+        for b in a + 1..hashes.len() {
+            assert_ne!(hashes[a], hashes[b], "delays {a} and {b} flew the same");
+        }
+    }
 }

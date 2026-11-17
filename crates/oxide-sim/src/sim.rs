@@ -9,6 +9,8 @@
 //!    valid from `t + base` (LET);
 //! 3. integrate physics over `[t, t + base]` with the command valid at `t`.
 
+use std::collections::VecDeque;
+
 use oxide_core::Core;
 use oxide_core::config::{EstimatorSource, FailsafeParams, VehicleConfig};
 use oxide_core::io::ParamSet;
@@ -304,8 +306,7 @@ impl<const N: usize> StepRecord<N> {
     }
 }
 
-/// The command the autopilot's last tick produced, waiting for its
-/// `t_valid`.
+/// A command the autopilot produced, waiting for its `t_valid`.
 #[derive(Clone, Copy, Debug)]
 struct PendingCommand<const N: usize> {
     t_valid: Micros,
@@ -327,7 +328,9 @@ pub struct Simulation<P: Pilot, const N: usize, A: Autopilot<N> = CoreAutopilot<
     wind: Wind,
     /// The motor commands acting over the current step.
     active: [f32; N],
-    pending: Option<PendingCommand<N>>,
+    /// Commands that have not fallen due yet, oldest issued first (one
+    /// entry for our core, whose commands are valid one tick later).
+    pending: VecDeque<PendingCommand<N>>,
     specific_force_world: Vec3<f64>,
     hash: TraceHash,
     physics_faults: u32,
@@ -536,7 +539,7 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             sensors,
             wind,
             active: [0.0; N],
-            pending: None,
+            pending: VecDeque::new(),
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
             hash: TraceHash::default(),
             physics_faults: 0,
@@ -661,12 +664,21 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             }
         };
 
-        // 3. Physics over [t, t + base] with the command valid at t.
-        if let Some(p) = self.pending.take() {
-            if p.t_valid <= t {
-                self.active = p.motors;
-            } else {
-                self.pending = Some(p);
+        // 3. Physics over [t, t + base] with the commands valid at t: this
+        // tick's command joins the queue, and every command that is due
+        // (`t_valid <= t`, this tick's own included) takes effect, the one
+        // issued last winning; those not due yet wait.
+        self.pending.push_back(PendingCommand {
+            t_valid: out.t_valid,
+            motors: out.motors,
+        });
+        for _ in 0..self.pending.len() {
+            if let Some(p) = self.pending.pop_front() {
+                if p.t_valid <= t {
+                    self.active = p.motors;
+                } else {
+                    self.pending.push_back(p);
+                }
             }
         }
         let record = StepRecord {
@@ -686,10 +698,6 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             core: out.core,
         };
         self.integrate(wind);
-        self.pending = Some(PendingCommand {
-            t_valid: out.t_valid,
-            motors: out.motors,
-        });
         self.hash_state();
         self.tick = self.tick.saturating_add(1);
         Ok(record)
