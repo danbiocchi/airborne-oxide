@@ -25,6 +25,15 @@
 //!   quad offboard: our setpoint stream becomes GUIDED commands on a MAVLink
 //!   link of its own. [`arducopter::fly`] runs a whole bridged flight and
 //!   returns the physics' trace hash and the [`arducopter::FlightAudit`].
+//! - [`scenario`]: what of a scenario file ArduCopter can be given (the table
+//!   of `[params]`, the refusals) and the file loaded with its hash.
+//! - [`runner`]: one flight from a scenario file, through the bridge
+//!   ([`runner::fly_scenario`]) or on our own core ([`runner::fly_core`]),
+//!   judged and classed the same way.
+//! - [`record`]: the flight's record as files (`audit.txt`, `row.csv`) and the
+//!   table's row format.
+//! - [`batch`]: many flights, each in a child process of its own.
+//! - [`cli`]: the command line of the binary `oxide-bridge` (`fly`, `batch`).
 //!
 //! # A bridged flight repeats bit for bit
 //!
@@ -42,13 +51,18 @@
 //! copied into this repository.
 
 pub mod arducopter;
+pub mod batch;
 pub mod bridge;
+pub mod cli;
 pub mod faults;
 pub mod link;
 pub mod mav;
 pub mod motors;
 pub mod packet;
 pub mod parm;
+pub mod record;
 pub mod reply;
+pub mod runner;
+pub mod scenario;
 pub mod sha256;
 pub mod sitl;
