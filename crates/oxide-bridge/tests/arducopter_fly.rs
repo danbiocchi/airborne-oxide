@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use oxide_bridge::arducopter::{
-    ArduCopter, ArduCopterConfig, ArduCopterError, FlightAudit, Flown, FlyError, PREROLL_STEPS,
-    TelemetryRequest, bridged_options, fly,
+    ArduCopter, ArduCopterConfig, ArduCopterError, FlightAudit, Flown, FlyError, GpsError,
+    GpsErrorState, PREROLL_STEPS, TelemetryRequest, bridged_options, fly,
 };
 use oxide_bridge::mav::{MavEvent, id};
 use oxide_bridge::sitl::PINNED;
+use oxide_core::math::{Real, Vec3};
 use oxide_core::time::Micros;
 use oxide_sim::outcome::FlightOutcome;
-use oxide_sim::scenario::{HoverStep, Pilot};
+use oxide_sim::scenario::{HoverStep, NoPilot, Pilot};
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
 
 /// The binary's path, or a failure that says what to set.
@@ -422,4 +423,465 @@ fn a_vehicle_that_cannot_arm_ends_the_flight_with_an_error_within_5_s() {
         .collect();
     assert_eq!(pids.len(), 1, "{pids:?}");
     assert!(pids.iter().all(|&p| !alive(p)), "{pids:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Statistics (no float method that the determinism rule forbids).
+
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len() as f64
+}
+
+fn std_dev(v: &[f64]) -> f64 {
+    let m = mean(v);
+    Real::sqrt(v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64)
+}
+
+/// The lag-1 autocorrelation of a series.
+fn lag1(v: &[f64]) -> f64 {
+    let m = mean(v);
+    let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64;
+    let cov = v.windows(2).map(|w| (w[0] - m) * (w[1] - m)).sum::<f64>() / (v.len() - 1) as f64;
+    cov / var
+}
+
+/// A vehicle at rest on the ground after the pre-roll: no pilot.
+struct RestRun {
+    audit: FlightAudit,
+    /// Our sensor suite's gyro and accelerometer bias after every flight
+    /// tick: `(program time of the tick's end, gyro, accel)`.
+    biases: Vec<(u64, Vec3<f64>, Vec3<f64>)>,
+    flight_start_us: u64,
+}
+
+impl RestRun {
+    /// Our bias (gyro, accel) at program time `at_us`.
+    fn bias_at(&self, at_us: u64) -> (Vec3<f64>, Vec3<f64>) {
+        let i = self.biases.partition_point(|b| b.0 < at_us);
+        let b = self.biases.get(i).or(self.biases.last()).expect("biases");
+        (b.1, b.2)
+    }
+}
+
+fn rest_run(
+    instance: u8,
+    tag: &str,
+    seed: u64,
+    gps_error: bool,
+    seconds: f64,
+    telemetry: Vec<TelemetryRequest>,
+) -> RestRun {
+    let root = TempDir::new(tag);
+    let mut sim = simulation(instance, &root, NoPilot, SimOptions::realistic(seed), |c| {
+        c.gps_error.enabled = gps_error;
+        c.telemetry = telemetry;
+    });
+    sim.preroll(PREROLL_STEPS).unwrap_or_else(|e| panic!("{e}"));
+    let end = Micros((seconds * 1e6) as u64);
+    let mut biases = Vec::new();
+    while sim.time() < end {
+        sim.try_step().unwrap_or_else(|e| panic!("{e}"));
+        biases.push((
+            PREROLL_STEPS * 500 + sim.time().0,
+            sim.sensors().gyro_bias(),
+            sim.sensors().accel_bias(),
+        ));
+    }
+    let audit = sim
+        .into_autopilot()
+        .finish()
+        .unwrap_or_else(|e| panic!("{e}"));
+    RestRun {
+        audit,
+        biases,
+        flight_start_us: PREROLL_STEPS * 500,
+    }
+}
+
+fn telemetry(message_id: u32, hz: f32, at_step: u64) -> TelemetryRequest {
+    TelemetryRequest {
+        message_id,
+        hz,
+        at_step,
+    }
+}
+
+/// One GPS fix as read.
+#[derive(Clone, Copy, Debug)]
+struct Fix {
+    at_us: u64,
+    /// The fix's own time stamp (the program's clock), µs.
+    time_usec: u64,
+    lat: i32,
+    lon: i32,
+    vel_cms: u16,
+}
+
+/// The distinct GPS fixes read (by their own time stamp).
+fn fixes(a: &FlightAudit) -> Vec<Fix> {
+    let mut seen = None;
+    let mut out = Vec::new();
+    for h in &a.heard {
+        if let MavEvent::GpsRaw {
+            time_usec,
+            lat,
+            lon,
+            vel_cms,
+            ..
+        } = h.event
+            && seen != Some(time_usec)
+        {
+            seen = Some(time_usec);
+            out.push(Fix {
+                at_us: h.at_us,
+                time_usec,
+                lat,
+                lon,
+                vel_cms,
+            });
+        }
+    }
+    out
+}
+
+/// Metres per degree of latitude as ArduPilot's own conversion has it
+/// (1.113195e-2 m per 1e-7 degree), and the east scale at latitude `lat`.
+const METRES_PER_DEGREE: f64 = 111_319.5;
+
+/// North and east in metres of a fix from a reference fix: the difference of
+/// latitude times the metres per degree, and of longitude times that and the
+/// cosine of the reference latitude.
+fn north_east(f: &Fix, from: &Fix) -> (f64, f64) {
+    let north = f64::from(f.lat - from.lat) * 1e-7 * METRES_PER_DEGREE;
+    let lat0 = f64::from(from.lat) * 1e-7 * core::f64::consts::PI / 180.0;
+    let east = f64::from(f.lon - from.lon) * 1e-7 * METRES_PER_DEGREE * Real::cos(lat0);
+    (north, east)
+}
+
+fn per_axis_raw_imu(a: &FlightAudit, from_us: u64) -> ([Vec<f64>; 3], [Vec<f64>; 3]) {
+    let mut acc = [Vec::new(), Vec::new(), Vec::new()];
+    let mut gyro = [Vec::new(), Vec::new(), Vec::new()];
+    for h in &a.heard {
+        if h.at_us < from_us {
+            continue;
+        }
+        if let MavEvent::RawImu {
+            acc: ac, gyro: gy, ..
+        } = h.event
+        {
+            for k in 0..3 {
+                acc[k].push(f64::from(ac[k]));
+                gyro[k].push(f64::from(gy[k]));
+            }
+        }
+    }
+    (acc, gyro)
+}
+
+fn pressures(a: &FlightAudit, from_us: u64) -> Vec<f64> {
+    a.heard
+        .iter()
+        .filter(|h| h.at_us >= from_us)
+        .filter_map(|h| match h.event {
+            MavEvent::ScaledPressure {
+                id: 1,
+                press_abs_hpa,
+                ..
+            } => Some(f64::from(press_abs_hpa)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Mean and standard deviation of a message's field over the flight window.
+fn summary(v: &[f64]) -> (f64, f64) {
+    (mean(v), std_dev(v))
+}
+
+/// Test 6. The GPS error reaches ArduCopter's GPS, and nothing else.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
+    let tel = || {
+        vec![
+            telemetry(id::GPS_RAW_INT, 10.0, 4_000),
+            telemetry(id::RAW_IMU, 50.0, 4_001),
+            telemetry(id::SCALED_PRESSURE, 20.0, 4_002),
+        ]
+    };
+    let with = rest_run(3, "rest-with", 1, true, 30.0, tel());
+    let without = rest_run(4, "rest-without", 1, false, 30.0, tel());
+    let sigma = SimOptions::realistic(1).sensors.gps.pos_sigma_h_m;
+    let window = with.flight_start_us + 1_000_000;
+
+    // ArduCopter's reported GPS position, converted to metres north and east
+    // of the last fix of the pre-roll (which has no error; the truth is the
+    // start point, so the reported offset is the error): the latitude and
+    // longitude differences times 111 319.5 m per degree, the longitude's
+    // also times the cosine of the reference latitude. Each distinct fix
+    // (by its own time stamp) once.
+    let errors = |r: &RestRun| {
+        let all = fixes(&r.audit);
+        let reference = *all
+            .iter()
+            .rev()
+            .find(|f| f.at_us < r.flight_start_us)
+            .expect("a fix in the pre-roll");
+        let flight: Vec<&Fix> = all.iter().filter(|f| f.at_us >= window).collect();
+        let n: Vec<f64> = flight.iter().map(|f| north_east(f, &reference).0).collect();
+        let e: Vec<f64> = flight.iter().map(|f| north_east(f, &reference).1).collect();
+        let v: Vec<f64> = flight.iter().map(|f| f64::from(f.vel_cms)).collect();
+        (n, e, v)
+    };
+    let (n1, e1, v1) = errors(&with);
+    let (n0, e0, v0) = errors(&without);
+    println!(
+        "MEASURED GPS error: with it {} fixes: north mean {:.3} sd {:.3} lag-1 {:.3}; \
+         east mean {:.3} sd {:.3} lag-1 {:.3} (our model's sigma {sigma}); \
+         without it {} fixes: north sd {:.4} east sd {:.4} (largest {:.3} m)",
+        n1.len(),
+        mean(&n1),
+        std_dev(&n1),
+        lag1(&n1),
+        mean(&e1),
+        std_dev(&e1),
+        lag1(&e1),
+        n0.len(),
+        std_dev(&n0),
+        std_dev(&e0),
+        n0.iter().chain(&e0).fold(0.0_f64, |m, x| m.max(x.abs()))
+    );
+    assert!(
+        n1.len() >= 140 && n0.len() >= 140,
+        "{} {}",
+        n1.len(),
+        n0.len()
+    );
+    // What the real program does with the error (measured; the reason the
+    // specification's two numbers are not met): its GPS lag reads the position
+    // 150 ms back between two stored samples 200 ms apart, so each fix is
+    // 0.75 of the error held before and 0.25 of the error held after. Fix j
+    // (j = 1 is the first of the flight) is 0.75 d(j-2) + 0.25 d(j-1) of our
+    // draws d(0), d(1), ...
+    let predicted = |j: usize, draws: &[[f64; 2]]| -> (f64, f64) {
+        let d = |k: usize| -> [f64; 2] { draws.get(k).copied().unwrap_or([0.0; 2]) };
+        let (a, b) = (
+            j.checked_sub(2).map_or([0.0; 2], d),
+            j.checked_sub(1).map_or([0.0; 2], d),
+        );
+        (0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1])
+    };
+    let mut state = GpsErrorState::new(
+        GpsError {
+            enabled: true,
+            sigma_m: sigma,
+            period_us: 200_000,
+            first_fix_us: 0,
+        },
+        1,
+    );
+    let draws: Vec<[f64; 2]> = (0..200).map(|k| state.at(k * 200_000)).collect();
+    let all = fixes(&with.audit);
+    let first_flight = all
+        .iter()
+        .position(|f| f.at_us >= with.flight_start_us)
+        .expect("a fix in the flight");
+    let reference = *all
+        .iter()
+        .rev()
+        .find(|f| f.at_us < with.flight_start_us)
+        .expect("a fix in the pre-roll");
+    let (mut sum_sq, mut count) = (0.0, 0);
+    // The fixes are 200 ms apart on the program's own clock. The last fix of
+    // the pre-roll is fix 0 and the flight's own are 1, 2, ...
+    for f in all.iter().skip(first_flight).take(140) {
+        let j = ((f.time_usec - reference.time_usec) as f64 / 200_000.0).round() as usize;
+        let (n, e) = north_east(f, &reference);
+        let (pn, pe) = predicted(j, &draws);
+        sum_sq += (n - pn) * (n - pn) + (e - pe) * (e - pe);
+        count += 2;
+    }
+    let rms = Real::sqrt(sum_sq / f64::from(count));
+    let expect_sd = sigma * Real::sqrt(0.75 * 0.75 + 0.25 * 0.25);
+    println!(
+        "MEASURED GPS error: the reported error against 0.75 d(j-2) + 0.25 d(j-1): rms residual \
+         {rms:.4} m over {count} values; expected sd {expect_sd:.4} m; specification's criteria: \
+         sd within 20 % of {sigma}: north {:.1} %, east {:.1} % (NOT MET); lag-1 under 0.3: \
+         {:.3}, {:.3} (NOT MET)",
+        100.0 * (std_dev(&n1) / sigma - 1.0),
+        100.0 * (std_dev(&e1) / sigma - 1.0),
+        lag1(&n1),
+        lag1(&e1)
+    );
+    assert!(
+        rms < 0.03,
+        "the reported error is our error through the blend: rms {rms}"
+    );
+    for (name, v) in [("north", &n1), ("east", &e1)] {
+        let sd = std_dev(v);
+        assert!(
+            (sd - expect_sd).abs() <= 0.12 * expect_sd,
+            "{name}: sd {sd} against {expect_sd}"
+        );
+        // The blend makes successive fixes share a draw: a lag-1 correlation of
+        // 0.1875 / 0.625 = 0.30 for white draws.
+        assert!(lag1(v).abs() < 0.5, "{name}: lag-1 {}", lag1(v));
+    }
+    for (name, v) in [("north", &n0), ("east", &e0)] {
+        assert!(
+            std_dev(v) < 0.03,
+            "{name} without the error: sd {}",
+            std_dev(v)
+        );
+    }
+
+    // Nothing else changed. The velocity ArduCopter reports (ground speed).
+    let (vm1, vs1) = summary(&v1);
+    let (vm0, vs0) = summary(&v0);
+    println!(
+        "MEASURED GPS velocity (cm/s, ground speed): with mean {vm1:.3} sd {vs1:.3}; without mean {vm0:.3} sd {vs0:.3}"
+    );
+    assert!(
+        (vm1 - vm0).abs() <= 0.5 && (vs1 - vs0).abs() <= 0.5,
+        "velocity changed"
+    );
+    // The pressure: SCALED_PRESSURE in hPa.
+    let (p1, p0) = (
+        pressures(&with.audit, window),
+        pressures(&without.audit, window),
+    );
+    let (pm1, ps1) = summary(&p1);
+    let (pm0, ps0) = summary(&p0);
+    println!(
+        "MEASURED pressure (hPa): with mean {pm1:.4} sd {ps1:.5} n {}; without mean {pm0:.4} sd {ps0:.5} n {}",
+        p1.len(),
+        p0.len()
+    );
+    // Equal within noise: the means within 3 standard errors of a difference,
+    // the standard deviations within 10 %.
+    let se = |sd: f64, n: usize| sd * Real::sqrt(2.0 / n as f64);
+    assert!(
+        (pm1 - pm0).abs() <= 3.0 * se(ps0, p0.len().min(p1.len())),
+        "pressure mean"
+    );
+    assert!((ps1 / ps0 - 1.0).abs() <= 0.1, "pressure sd");
+    // The IMU, every axis, accelerometer in milli-g and gyro in milli-rad/s.
+    let (a1, g1) = per_axis_raw_imu(&with.audit, window);
+    let (a0, g0) = per_axis_raw_imu(&without.audit, window);
+    for axis in 0..3 {
+        for (name, x1, x0) in [("accel", &a1, &a0), ("gyro", &g1, &g0)] {
+            let (m1, s1) = summary(&x1[axis]);
+            let (m0, s0) = summary(&x0[axis]);
+            println!(
+                "MEASURED raw IMU {name} axis {axis}: with mean {m1:.3} sd {s1:.3}; without mean {m0:.3} sd {s0:.3}; n {} {}",
+                x1[axis].len(),
+                x0[axis].len()
+            );
+            let n = x1[axis].len().min(x0[axis].len());
+            assert!(
+                (m1 - m0).abs() <= 3.0 * se(s0, n),
+                "{name} {axis} mean: {m1} {m0}"
+            );
+            assert!((s1 / s0 - 1.0).abs() <= 0.1, "{name} {axis} sd: {s1} {s0}");
+        }
+    }
+}
+
+/// Test 7. The IMU is our model's.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_imu_arducopter_reads_is_our_models() {
+    let run = |instance: u8, seed: u64| {
+        rest_run(
+            instance,
+            &format!("imu-{seed}"),
+            seed,
+            false,
+            20.0,
+            vec![telemetry(id::RAW_IMU, 50.0, 4_000)],
+        )
+    };
+    let runs = [run(5, 1), run(6, 2)];
+    let mut reported_bias = Vec::new();
+    let mut our_bias = Vec::new();
+    for (run, seed) in runs.iter().zip([1, 2]) {
+        let from = run.flight_start_us + 1_000_000;
+        let mut rb = [0.0; 3];
+        let mut ob = [0.0; 3];
+        for axis in 0..3 {
+            // The reported value minus our bias at the instant it was read.
+            let (mut gyro_resid, mut gyro_raw, mut accel_resid) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let mut ours = Vec::new();
+            for h in run.audit.heard.iter().filter(|h| h.at_us >= from) {
+                if let MavEvent::RawImu { gyro, acc, .. } = h.event {
+                    let (g, a) = run.bias_at(h.at_us);
+                    let gb = [g.x, g.y, g.z][axis] * 1000.0;
+                    let truth_accel =
+                        if axis == 2 { -9.80665 } else { 0.0 } + [a.x, a.y, a.z][axis];
+                    gyro_resid.push(f64::from(gyro[axis]) - gb);
+                    gyro_raw.push(f64::from(gyro[axis]));
+                    ours.push(gb);
+                    accel_resid.push(f64::from(acc[axis]) * 9.80665e-3 - truth_accel);
+                }
+            }
+            assert!(gyro_raw.len() >= 900, "{} messages", gyro_raw.len());
+            // The message truncates to whole milli-rad/s: its mean is the
+            // true mean moved 0.5 mrad/s toward zero. Put it back.
+            let raw_mean = mean(&gyro_raw);
+            let corrected = raw_mean + 0.5 * raw_mean.signum();
+            let residual = corrected - mean(&ours);
+            let sd = std_dev(&gyro_raw);
+            println!(
+                "MEASURED IMU seed {seed} gyro axis {axis}: reported mean {raw_mean:.3} mrad/s, \
+                 corrected for truncation {corrected:.3}, our bias over the window {:.3}, \
+                 residual {residual:.3}, reported sd {sd:.3} (our per-sample white noise {:.3}); \
+                 accel residual mean {:.4} m/s2 sd {:.4}",
+                mean(&ours),
+                8.7e-5 * Real::sqrt(1000.0) * 1000.0,
+                mean(&accel_resid),
+                std_dev(&accel_resid)
+            );
+            // 0.25 mrad/s: five standard errors of a mean of 1000 reports whose
+            // residual spread is 0.65 mrad/s (the truncation correction is exact
+            // only while the reports keep one sign: seed 2 axis 0 has a bias of
+            // 0.7 mrad/s and was 0.15 off), and 5 % of the 5 mrad/s turn-on
+            // spread the seeds draw.
+            assert!(
+                residual.abs() <= 0.15,
+                "seed {seed} axis {axis}: residual {residual}"
+            );
+            // ArduCopter reports a filtered value (its 20 Hz gyro filter):
+            // quieter than one 1000 us sample, but not silent.
+            assert!(
+                sd > 0.2 && sd < 8.7e-5 * Real::sqrt(1000.0) * 1000.0,
+                "sd {sd}"
+            );
+            // The accelerometer, to the truncation of one milli-g (0.0098 m/s2)
+            // and the bias.
+            assert!(
+                mean(&accel_resid).abs() <= 0.015,
+                "accel {axis}: {}",
+                mean(&accel_resid)
+            );
+            rb[axis] = corrected;
+            ob[axis] = mean(&ours);
+        }
+        reported_bias.push(rb);
+        our_bias.push(ob);
+    }
+    // Another seed, another bias, and the reported one follows ours.
+    let differ = (0..3)
+        .map(|a| (our_bias[0][a] - our_bias[1][a]).abs())
+        .fold(0.0_f64, f64::max);
+    println!("MEASURED IMU: our bias of seeds 1 and 2 differ by up to {differ:.3} mrad/s per axis");
+    assert!(differ > 2.0, "{differ}");
+    for a in 0..3 {
+        let ours = our_bias[0][a] - our_bias[1][a];
+        let theirs = reported_bias[0][a] - reported_bias[1][a];
+        assert!(
+            (ours - theirs).abs() <= 0.3,
+            "axis {a}: {ours} against {theirs}"
+        );
+    }
 }
