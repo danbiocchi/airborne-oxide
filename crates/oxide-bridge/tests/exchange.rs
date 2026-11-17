@@ -36,11 +36,25 @@ fn config(timeout: Duration) -> BridgeConfig {
 }
 
 /// A bridge on a fresh socket and a stand-in aimed at it.
-fn rig(mut sitl: Options, timeout: Duration) -> (JsonBridge, FakeSitl) {
+fn rig(sitl: Options, timeout: Duration) -> (JsonBridge, FakeSitl) {
+    rig_with(sitl, config(timeout))
+}
+
+/// The same with a given bridge configuration.
+fn rig_with(mut sitl: Options, config: BridgeConfig) -> (JsonBridge, FakeSitl) {
     let link = Link::bind(0).expect("bind");
     sitl.bridge_port = link.local_port();
-    let bridge = JsonBridge::new(link, config(timeout)).expect("config");
+    let bridge = JsonBridge::new(link, config).expect("config");
     (bridge, FakeSitl::spawn(sitl))
+}
+
+/// No reply broke the wire format, as the strict stand-in reads it.
+fn assert_well_formed(report: &Report) {
+    assert_eq!(
+        report.rejected, 0,
+        "{} replies broke the wire format; the first: {:?}",
+        report.rejected, report.first_rejection
+    );
 }
 
 fn simulation<P: Pilot>(bridge: JsonBridge, pilot: P) -> Simulation<P, 4, JsonBridge> {
@@ -118,6 +132,7 @@ fn a_flight_of_5_s_against_the_stand_in_leaves_the_ground_and_holds_the_height()
     // One reply per frame, each framed by newlines.
     assert_eq!(f.report.replies.len(), f.records.len());
     assert_eq!(f.report.resends, 0);
+    assert_well_formed(&f.report);
     for (i, line) in f.report.replies.iter().enumerate() {
         assert!(
             line.starts_with('\n') && line.ends_with("}\n"),
@@ -249,6 +264,7 @@ fn the_stand_in_that_needs_the_leading_newline_accepts_every_reply() {
     o.require_leading_newline = true;
     let f = fly(o, 1);
     assert_eq!(f.report.ignored, 0, "none was ignored");
+    assert_well_formed(&f.report);
     assert_eq!(f.report.replies.len(), 2_000);
     assert_eq!(f.report.resends, 0, "and so none had to be sent again");
     assert!(f.records.iter().any(|r| r.armed), "the flight ran");
@@ -307,6 +323,7 @@ fn the_radio_is_sent_as_pulses_until_it_is_lost_and_then_not_at_all() {
         .expect("the flight does not fail");
     drop(sim);
     let report = sitl.finish();
+    assert_well_formed(&report);
     assert_eq!(report.replies.len(), 6_000);
     let rc = "\"rc\":{\"rc_1\":1750,\"rc_2\":1375,\"rc_3\":1600,\"rc_4\":1500,\
               \"rc_5\":1500,\"rc_6\":2000,\"rc_7\":1000,\"rc_8\":1000}}";
@@ -352,4 +369,89 @@ fn a_non_finite_truth_ends_the_flight_with_the_field_named_and_sends_nothing() {
     drop(sim);
     let report = sitl.finish();
     assert_eq!(report.replies.len(), 10, "nothing was sent for that tick");
+}
+
+#[test]
+fn without_the_radio_and_the_battery_options_no_reply_has_either_section() {
+    // The pilot sends frames for 2 s; with `send_rc` off none of them reaches
+    // the reply, and with `send_battery` off the battery is left out too.
+    let mut c = config(Duration::from_secs(10));
+    c.send_rc = false;
+    c.send_battery = false;
+    let (bridge, sitl) = rig_with(Options::new(0), c);
+    let mut sim = simulation(bridge, RadioFor2s);
+    sim.try_run_until(Micros::from_secs(3), |_| {})
+        .expect("the flight does not fail");
+    drop(sim);
+    let report = sitl.finish();
+    assert_well_formed(&report);
+    assert_eq!(report.replies.len(), 6_000);
+    for (k, line) in report.replies.iter().enumerate() {
+        assert!(!line.contains("\"rc\""), "frame {k}: {line}");
+        assert!(!line.contains("\"battery\""), "frame {k}: {line}");
+        assert!(line.ends_with("]}\n"), "the line ends after the velocity");
+    }
+    // And the options are independent: the radio alone, the battery alone.
+    for (rc, battery) in [(true, false), (false, true)] {
+        let mut c = config(Duration::from_secs(10));
+        c.send_rc = rc;
+        c.send_battery = battery;
+        let (bridge, sitl) = rig_with(Options::new(0), c);
+        let mut sim = simulation(bridge, RadioFor2s);
+        sim.try_run_until(Micros::from_secs(1), |_| {})
+            .expect("the flight does not fail");
+        drop(sim);
+        let report = sitl.finish();
+        assert_well_formed(&report);
+        for line in &report.replies {
+            assert_eq!(line.contains("\"rc\""), rc, "{line}");
+            assert_eq!(line.contains("\"battery\""), battery, "{line}");
+        }
+    }
+}
+
+#[test]
+fn a_slow_start_up_is_waited_for_by_the_first_packet_time_out_not_the_reply_one() {
+    // The stand-in sends its first packet after 300 ms; the reply time-out is
+    // 100 ms and the first-packet time-out 5 s. The flight must succeed.
+    let mut o = Options::new(0);
+    o.start_delay = Duration::from_millis(300);
+    let mut c = config(Duration::from_millis(100));
+    c.first_packet_timeout = Duration::from_secs(5);
+    let (bridge, sitl) = rig_with(o, c);
+    let mut sim = simulation(bridge, NoPilot);
+    let t0 = Instant::now();
+    sim.try_run_until(Micros::from_secs(1), |_| {})
+        .expect("the start-up is not a time-out");
+    assert!(t0.elapsed() >= Duration::from_millis(250), "it did wait");
+    drop(sim);
+    let report = sitl.finish();
+    assert_well_formed(&report);
+    assert_eq!(report.replies.len(), 2_000);
+}
+
+#[test]
+fn a_simulator_that_never_starts_is_the_first_packet_time_out_within_that_time() {
+    // Nothing ever comes: the error is the first-packet one, after about the
+    // first-packet time-out (400 ms here), not the reply time-out (50 ms).
+    let link = Link::bind(0).expect("bind");
+    let mut c = config(Duration::from_millis(50));
+    c.first_packet_timeout = Duration::from_millis(400);
+    let bridge = JsonBridge::new(link, c).expect("config");
+    let mut sim = simulation(bridge, NoPilot);
+    let t0 = Instant::now();
+    let err = sim.try_step().expect_err("nobody is there");
+    let took = t0.elapsed();
+    match &err {
+        BridgeError::Link {
+            step: 0,
+            source: LinkError::FirstPacketTimeout { waited },
+        } => assert_eq!(*waited, Duration::from_millis(400)),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    assert_eq!(sim.time(), Micros(0), "the tick did not happen");
 }
