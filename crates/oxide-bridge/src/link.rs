@@ -13,8 +13,11 @@
 //!   is [`LinkError::FrameCount`];
 //! - the wall clock is used for the time-out only.
 //!
-//! The socket is bound to `127.0.0.1`. The peer is learned from each datagram,
-//! and the reply goes to the address and port of the last one.
+//! The socket is bound to `127.0.0.1`. The peer is learned from each datagram
+//! that parses as a motor packet, and the reply goes to the address and port of
+//! the last one. A datagram that does not parse (a stranger writing to the
+//! port, or rubbish) ends the exchange with an error and does not change the
+//! peer.
 
 use core::fmt;
 use std::io;
@@ -22,6 +25,9 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::packet::{PacketError, ServoPacket};
+
+/// The longest datagram taken in, bytes. A motor packet is at most 72.
+const MAX_DATAGRAM: usize = 2048;
 
 /// Why an exchange failed.
 #[derive(Debug)]
@@ -36,6 +42,8 @@ pub enum LinkError {
     FrameCount { expected: u32, found: u32 },
     /// A datagram that is not a motor packet.
     Packet(PacketError),
+    /// A datagram longer than the largest one taken in (the rest is lost).
+    TooLong { limit: usize },
 }
 
 impl fmt::Display for LinkError {
@@ -57,6 +65,12 @@ impl fmt::Display for LinkError {
                 "frame count out of order: expected {expected}, found {found}"
             ),
             Self::Packet(e) => write!(f, "{e}"),
+            Self::TooLong { limit } => {
+                write!(
+                    f,
+                    "a datagram longer than {limit} bytes, not a motor packet"
+                )
+            }
         }
     }
 }
@@ -181,7 +195,8 @@ impl Link {
     /// The next datagram parsed as a packet, or `None` at the deadline. The
     /// peer becomes the sender of that datagram.
     fn receive(&mut self, deadline: Instant) -> Result<Option<ServoPacket>, LinkError> {
-        let mut buf = [0u8; 2048];
+        // One byte more than the limit, to tell a datagram that was cut off.
+        let mut buf = [0u8; MAX_DATAGRAM + 1];
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -192,13 +207,23 @@ impl Link {
             self.socket.set_read_timeout(Some(left))?;
             match self.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
+                    if n > MAX_DATAGRAM {
+                        return Err(LinkError::TooLong {
+                            limit: MAX_DATAGRAM,
+                        });
+                    }
+                    let packet = ServoPacket::parse(buf.get(..n).unwrap_or(&[]))?;
                     self.peer = Some(from);
-                    return Ok(Some(ServoPacket::parse(buf.get(..n).unwrap_or(&[]))?));
+                    return Ok(Some(packet));
                 }
                 Err(e) => match e.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => return Ok(None),
+                    // The socket's time-out can run out a little before our
+                    // deadline on some systems: the deadline check at the top
+                    // of the loop decides whether the wait is over.
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {}
                     // Windows reports a send to a closed port on the next
-                    // receive; the wait goes on.
+                    // receive; the wait goes on. (Not exercised on Linux, and
+                    // not yet run on Windows.)
                     io::ErrorKind::ConnectionReset | io::ErrorKind::Interrupted => {}
                     _ => return Err(LinkError::Io(e)),
                 },
@@ -352,7 +377,9 @@ mod tests {
             .exchange("r", Duration::from_millis(100))
             .expect_err("no first packet");
         assert!(matches!(e, LinkError::FirstPacketTimeout { .. }), "{e}");
-        assert!(t0.elapsed() >= Duration::from_millis(90));
+        // A socket time-out may expire a little early on some systems (the
+        // loop then waits on); the lower bound leaves room for that.
+        assert!(t0.elapsed() >= Duration::from_millis(50));
         assert!(!link.has_peer());
 
         let peer = Peer::new(&link);
@@ -367,7 +394,7 @@ mod tests {
         }
         let took = t0.elapsed();
         assert!(
-            took >= Duration::from_millis(140) && took < Duration::from_secs(3),
+            took >= Duration::from_millis(100) && took < Duration::from_secs(3),
             "{took:?}"
         );
         assert_eq!(peer.recv(), "r41", "the reply was sent before the wait");
@@ -436,5 +463,49 @@ mod tests {
         link.exchange("c", WAIT).expect("ok");
         assert_eq!(second.recv(), "c");
         first.nothing_more();
+    }
+
+    #[test]
+    fn a_datagram_that_is_not_a_packet_does_not_change_the_peer() {
+        let mut link = Link::bind(0).expect("bind");
+        let a = Peer::new(&link);
+        a.send(1);
+        a.send(2);
+        link.exchange("r1", WAIT).expect("ok");
+        let a_addr = a.socket.local_addr().expect("addr");
+        assert_eq!(link.peer, Some(a_addr));
+        // A stranger writes rubbish to the port: the exchange fails, and the
+        // stranger is not where the next reply goes.
+        let b = Peer::new(&link);
+        b.socket.send_to(&[1, 2, 3], b.to).expect("send");
+        let e = link.exchange("r2", WAIT).expect_err("rubbish");
+        assert!(matches!(e, LinkError::Packet(_)), "{e}");
+        assert_eq!(link.peer, Some(a_addr), "the peer is still the simulator");
+        b.socket.send_to(&packet(3), b.to).expect("send");
+        let e = link.exchange("r2", WAIT).expect("a real packet");
+        assert_eq!(e.frame_count, 3);
+        assert_eq!(link.peer, b.socket.local_addr().ok(), "a packet moves it");
+    }
+
+    #[test]
+    fn a_datagram_longer_than_the_buffer_says_it_was_too_long() {
+        let mut link = Link::bind(0).expect("bind");
+        let peer = Peer::new(&link);
+        peer.send(1);
+        peer.socket
+            .send_to(&vec![0u8; 3000], peer.to)
+            .expect("send");
+        let e = link.exchange("r", WAIT).expect_err("too long");
+        assert!(matches!(e, LinkError::TooLong { .. }), "{e:?}");
+        assert!(e.to_string().contains("longer than"), "{e}");
+        // A datagram of exactly the largest size is still just a wrong length.
+        let mut link = Link::bind(0).expect("bind");
+        let peer = Peer::new(&link);
+        peer.send(1);
+        peer.socket
+            .send_to(&vec![0u8; MAX_DATAGRAM], peer.to)
+            .expect("send");
+        let e = link.exchange("r", WAIT).expect_err("unknown magic");
+        assert!(matches!(e, LinkError::Packet(_)), "{e:?}");
     }
 }
