@@ -269,6 +269,66 @@ impl FlightOutcome {
     }
 }
 
+/// Touchdown faster than this, m/s downward, is a crash (ADR-0007 section 4).
+pub const CRASH_TOUCHDOWN_MPS: f64 = 2.0;
+/// A tilt beyond this while armed, deg, is a crash.
+pub const CRASH_TILT_DEG: f64 = 60.0;
+/// Farther than this from where the vehicle armed, m, is a fly-away.
+pub const FLY_AWAY_DISTANCE_M: f64 = 100.0;
+/// Higher than this, m, is a fly-away.
+pub const FLY_AWAY_HEIGHT_M: f64 = 60.0;
+
+/// How a flight ended, from the physics alone (ADR-0007 section 4). The same
+/// code classes our core's flights and another autopilot's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlightClass {
+    /// Neither of the others.
+    Safe,
+    /// The vehicle met the ground at more than [`CRASH_TOUCHDOWN_MPS`]
+    /// downward, or tilted more than [`CRASH_TILT_DEG`] while armed.
+    Crash,
+    /// More than [`FLY_AWAY_DISTANCE_M`] from where it armed, or more than
+    /// [`FLY_AWAY_HEIGHT_M`] high, and not a crash.
+    FlyAway,
+}
+
+impl FlightClass {
+    /// The name written in tables: `safe`, `crash`, `fly-away`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Crash => "crash",
+            Self::FlyAway => "fly-away",
+        }
+    }
+}
+
+impl core::fmt::Display for FlightClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FlightOutcome {
+    /// The class of the flight. A flight that is both a crash and a fly-away
+    /// is a crash. It uses only fields every autopilot's flight has.
+    pub fn class(&self) -> FlightClass {
+        if self
+            .touchdown_speed_mps
+            .is_some_and(|v| v > CRASH_TOUCHDOWN_MPS)
+            || self.max_tilt_deg > CRASH_TILT_DEG
+        {
+            FlightClass::Crash
+        } else if self.max_distance_from_home_m > FLY_AWAY_DISTANCE_M
+            || self.max_height_m > FLY_AWAY_HEIGHT_M
+        {
+            FlightClass::FlyAway
+        } else {
+            FlightClass::Safe
+        }
+    }
+}
+
 /// How a run should end.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ending {
@@ -1632,5 +1692,67 @@ mod tests {
         let j = landed_expect().check(&landed_outcome());
         assert!(j.not_judged.is_empty());
         assert!(landed_outcome().invariants().not_judged.is_empty());
+    }
+    fn outcome_with(f: impl FnOnce(&mut FlightOutcome)) -> FlightOutcome {
+        let mut o = FlightOutcome::new();
+        f(&mut o);
+        o
+    }
+
+    #[test]
+    fn a_flight_that_did_nothing_is_safe() {
+        assert_eq!(FlightOutcome::new().class(), FlightClass::Safe);
+    }
+
+    #[test]
+    fn touchdown_is_a_crash_only_above_two_metres_per_second() {
+        let at = |v| outcome_with(|o| o.touchdown_speed_mps = Some(v)).class();
+        assert_eq!(at(2.0), FlightClass::Safe);
+        assert_eq!(at(2.01), FlightClass::Crash);
+        assert_eq!(at(0.0), FlightClass::Safe);
+        assert_eq!(at(9.0), FlightClass::Crash);
+        assert_eq!(outcome_with(|_| {}).class(), FlightClass::Safe);
+    }
+
+    #[test]
+    fn a_tilt_is_a_crash_only_beyond_sixty_degrees() {
+        let at = |v| outcome_with(|o| o.max_tilt_deg = v).class();
+        assert_eq!(at(60.0), FlightClass::Safe);
+        assert_eq!(at(60.01), FlightClass::Crash);
+        assert_eq!(at(35.0), FlightClass::Safe);
+    }
+
+    #[test]
+    fn a_distance_or_a_height_is_a_fly_away_only_beyond_the_limits() {
+        let far = |v| outcome_with(|o| o.max_distance_from_home_m = v).class();
+        assert_eq!(far(100.0), FlightClass::Safe);
+        assert_eq!(far(100.01), FlightClass::FlyAway);
+        let high = |v| outcome_with(|o| o.max_height_m = v).class();
+        assert_eq!(high(60.0), FlightClass::Safe);
+        assert_eq!(high(60.01), FlightClass::FlyAway);
+    }
+
+    #[test]
+    fn a_flight_that_is_both_is_a_crash() {
+        let o = outcome_with(|o| {
+            o.max_distance_from_home_m = 500.0;
+            o.max_height_m = 80.0;
+            o.touchdown_speed_mps = Some(5.0);
+        });
+        assert_eq!(o.class(), FlightClass::Crash);
+        let o = outcome_with(|o| {
+            o.max_distance_from_home_m = 500.0;
+            o.max_tilt_deg = 90.0;
+        });
+        assert_eq!(o.class(), FlightClass::Crash);
+        let o = outcome_with(|o| o.max_distance_from_home_m = 500.0);
+        assert_eq!(o.class(), FlightClass::FlyAway);
+    }
+
+    #[test]
+    fn the_class_names_are_the_ones_tables_carry() {
+        assert_eq!(FlightClass::Safe.name(), "safe");
+        assert_eq!(FlightClass::Crash.to_string(), "crash");
+        assert_eq!(FlightClass::FlyAway.to_string(), "fly-away");
     }
 }

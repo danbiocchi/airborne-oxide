@@ -24,7 +24,7 @@ use oxide_core::math::{Real, Vec3};
 use oxide_core::schedule::F405_LEAN;
 use oxide_core::time::Micros;
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics};
-use oxide_sim::outcome::FlightOutcome;
+use oxide_sim::outcome::{FlightClass, FlightOutcome};
 use oxide_sim::scenario::{GustHold, HoverStep, NoPilot, Pilot, gust_hold};
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
 
@@ -90,22 +90,8 @@ fn simulation<P: Pilot>(
     Simulation::with_autopilot(&airframe(), ap, pilot, options).expect("the simulation")
 }
 
-/// How a flight ended, from the physics alone (ADR-0007 section 4).
-#[derive(Debug, PartialEq)]
-enum Class {
-    Safe,
-    Crash,
-    FlyAway,
-}
-
-fn class_of(o: &FlightOutcome) -> Class {
-    if o.touchdown_speed_mps.is_some_and(|v| v > 2.0) || o.max_tilt_deg > 60.0 {
-        Class::Crash
-    } else if o.max_distance_from_home_m > 100.0 || o.max_height_m > 60.0 {
-        Class::FlyAway
-    } else {
-        Class::Safe
-    }
+fn class_of(o: &FlightOutcome) -> FlightClass {
+    o.class()
 }
 
 fn outcome_of(log: &[StepRecord<4>]) -> FlightOutcome {
@@ -371,7 +357,7 @@ fn check_hover_step(log: &[StepRecord<4>], pilot: &HoverStep, label: &str) -> Ho
         assert!(*e <= 0.3, "waypoint {from}: {e} m at {t} s");
     }
     assert!(numbers.max_tilt <= 35.0, "tilt {}", numbers.max_tilt);
-    assert_eq!(class_of(&o), Class::Safe);
+    assert_eq!(class_of(&o), FlightClass::Safe);
     assert_eq!(o.physics_faults, 0);
     assert!(!o.non_finite);
     numbers
@@ -1570,7 +1556,7 @@ fn gust_hold_flies_for_runs_0_1_and_2() {
         assert!(m.max_v_error_m <= c.max_v_error_m, "{index}: {m:?}");
         assert!(m.max_tilt_deg <= c.max_tilt_deg, "{index}: {m:?}");
         assert!(!m.non_finite && m.physics_faults == 0);
-        assert_eq!(class_of(&o), Class::Safe);
+        assert_eq!(class_of(&o), FlightClass::Safe);
         // Armed (by the pulses) from the second the pilot's switch needs
         // plus the program's own arming delay (2 s): reported against the
         // criterion's 3.5 s, which was written for our core.
