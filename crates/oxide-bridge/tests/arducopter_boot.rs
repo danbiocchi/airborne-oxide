@@ -8,6 +8,12 @@
 //! side by side), its own directory under the system's temporary directory,
 //! and leaves no process behind: the child is ended by `Drop` on every way
 //! out, a panic included.
+//!
+//! The instance numbers here are fixed, one per test (0 to 9), and
+//! `arducopter_fly.rs` leases the same ten numbers from a pool of its own:
+//! the two files must not run at the same time, or their ports collide.
+//! `cargo test` runs one test binary after the other, so the command line of
+//! the specification is safe; do not start the two binaries side by side.
 
 #[path = "support/rest.rs"]
 mod rest;

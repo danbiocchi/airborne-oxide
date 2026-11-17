@@ -28,6 +28,13 @@
 //! command goes out *before* the reply of its exchange, so that it is in the
 //! program's socket when the program reads the next frame.
 //!
+//! The repeat tests of `tests/arducopter_fly.rs` do not prove the rule: the
+//! program writes its TCP answers before its next motor packet, so most data
+//! read from MAVLink arrives in time to repeat anyway (a decision taken from
+//! the vehicle's heartbeat instead of the pulses repeats bit for bit). The rule
+//! is held by the lib test
+//! `no_decision_path_reads_what_was_read_from_mavlink`, which reads this file.
+//!
 //! The simulated time of an event in the audit is `exchange number × step`,
 //! counted from the first exchange of the pre-roll ("program time"). The
 //! flight starts at `preroll_steps × step`.
@@ -1829,5 +1836,60 @@ mod tests {
             "{e}"
         );
         assert!(e.to_string().contains("MOT_PWM_MAX 1900"), "{e}");
+    }
+
+    /// The decision paths (the brain, `send_flight`, `send_instrument`, the
+    /// pre-roll and flight ticks) never read what came from MAVLink: the
+    /// audit's lists and the vehicle's own armed flag and mode. Reading this
+    /// file is crude, and what it guards is the determinism rule of the module
+    /// documentation.
+    #[test]
+    fn no_decision_path_reads_what_was_read_from_mavlink() {
+        let src = include_str!("arducopter.rs");
+        let between = |from: &str, to: &str| -> &str {
+            let a = src.find(from).unwrap_or_else(|| panic!("{from} not found"));
+            let b = a + src[a..]
+                .find(to)
+                .unwrap_or_else(|| panic!("{to} not found"));
+            &src[a..b]
+        };
+        let regions = [
+            (
+                "Brain",
+                between("impl Brain {", "/// Watches for a vehicle"),
+            ),
+            (
+                "send_instrument and send_flight",
+                between(
+                    "    fn send_instrument(",
+                    "    /// Reads everything that is waiting on every link",
+                ),
+            ),
+            (
+                "the pre-roll and flight ticks",
+                between(
+                    "impl Autopilot<4> for ArduCopter {",
+                    "/// Why [`fly`] failed.",
+                ),
+            ),
+        ];
+        let heard = [
+            "vehicle_armed",
+            "vehicle_mode",
+            "self.audit.status_texts",
+            "self.audit.armed_changes",
+            "self.audit.mode_changes",
+            "self.audit.heard",
+            "self.audit.vehicle_heartbeats",
+            "MavEvent",
+        ];
+        for (name, text) in regions {
+            for token in heard {
+                assert!(
+                    !text.contains(token),
+                    "{name} reads `{token}`: what comes from MAVLink is audit data only"
+                );
+            }
+        }
     }
 }
