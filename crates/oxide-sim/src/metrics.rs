@@ -315,8 +315,7 @@ impl HoldMetrics {
 
     /// True when nothing is violated and nothing is left unjudged.
     pub fn passed(&self, c: &HoldCriteria) -> bool {
-        let j = self.judge(c);
-        j.violations.is_empty() && j.not_judged.is_empty()
+        self.judge(c).passed()
     }
 }
 

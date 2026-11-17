@@ -448,6 +448,14 @@ pub struct Judgement {
     pub not_judged: Vec<NotJudged>,
 }
 
+impl Judgement {
+    /// True when nothing is violated and nothing is left unjudged: a
+    /// requirement that could not be judged is not a pass.
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty() && self.not_judged.is_empty()
+    }
+}
+
 impl FlightOutcome {
     /// The checks every flight gets, whether or not its file states an
     /// `[expect]`: no non-finite truth, no physics or timing faults, the

@@ -358,3 +358,39 @@ fn a_command_is_applied_from_its_t_valid_whenever_that_is() {
         }
     }
 }
+
+#[test]
+fn a_flight_with_requirements_it_could_not_judge_has_not_passed() {
+    let (log, _) = fly_stub(Stub::new(500), 5);
+    let text = "name = \"x\"\nduration_s = 5.0\n[expect]\nreasons = [\"RC_LOST\"]\nby_s = 4.0\n\
+                [expect.ending]\nkind = \"flying-at-height\"\nheight_m = 2.0\ntolerance_m = 1.0\n";
+    let file = oxide_sim::scenario_file::load_str(text).expect("loads");
+    let mut checker = oxide_sim::scenario_file::Checker::new(&file);
+    for r in &log {
+        checker.add(r);
+    }
+    let verdict = checker.finish();
+    assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+    assert!(!verdict.not_judged.is_empty());
+    assert!(!verdict.passed(), "unjudged requirements are not a pass");
+    let first = verdict.first_problem().expect("something stops the pass");
+    assert!(first.starts_with("not judged: "), "{first}");
+    // The same on the expectation's own answer.
+    let o = outcome_of(&log);
+    let expect = file.expect.expect("the file states expectations");
+    assert!(!expect.check(&o).passed());
+    // A truth-only expectation that holds is not violated.
+    let truth = Expect {
+        ending: Ending::FlyingAtHeight {
+            height_m: 2.0,
+            tolerance_m: 1.0,
+        },
+        by_s: 4.5,
+        max_height_m: Some(5.0),
+        ..Expect::default()
+    };
+    let j = truth.check(&o);
+    assert!(j.violations.is_empty(), "{:?}", j.violations);
+    // (the invariants that need the core are still listed: not a pass)
+    assert!(!j.not_judged.is_empty() && !j.passed());
+}

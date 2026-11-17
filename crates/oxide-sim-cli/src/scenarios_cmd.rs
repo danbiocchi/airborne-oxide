@@ -109,7 +109,7 @@ struct Job {
 /// cannot be set up fails.
 fn first_failure(file: &ScenarioFile, job: &Job) -> Option<String> {
     match file.fly_checked(job.profile.profile(), job.index, &[]) {
-        Ok(v) => v.violations.into_iter().next(),
+        Ok(v) => v.first_problem(),
         Err(e) => Some(format!("cannot run: {e}")),
     }
 }

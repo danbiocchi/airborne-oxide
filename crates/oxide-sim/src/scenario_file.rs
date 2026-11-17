@@ -355,6 +355,24 @@ pub struct Verdict {
     pub not_judged: Vec<NotJudged>,
 }
 
+impl Verdict {
+    /// True when nothing is violated and nothing is left unjudged. A flight
+    /// with `not_judged` entries has not passed: its requirements were not
+    /// all answered.
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty() && self.not_judged.is_empty()
+    }
+
+    /// The first thing that stops the flight from passing, in words: the
+    /// first violation, else the first requirement that was not judged.
+    pub fn first_problem(&self) -> Option<String> {
+        self.violations
+            .first()
+            .cloned()
+            .or_else(|| self.not_judged.first().map(|n| format!("not judged: {n}")))
+    }
+}
+
 /// Collects a flight's outcome and hold statistics step by step, then judges
 /// them against the file's `[expect]` and `[expect.hold]`.
 #[derive(Clone, Debug)]

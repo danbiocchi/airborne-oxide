@@ -947,10 +947,12 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     }
     let mut passed = 0usize;
     for (i, m) in runs.iter().enumerate() {
-        let f = m.judge(&c).violations;
-        if f.is_empty() {
+        let j = m.judge(&c);
+        if j.passed() {
             passed += 1;
         } else {
+            let mut f = j.violations;
+            f.extend(j.not_judged.iter().map(|n| format!("not judged: {n}")));
             println!("FAIL index {i}: {}", f.join("; "));
         }
     }
@@ -1163,13 +1165,7 @@ fn fly_scenario<P: Pilot>(
             .map_or("-".into(), |t| format!("{t:.2} s"))
     ));
     if let Some(h) = &verdict.hold {
-        lines.push(format!(
-            "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {:.3} m",
-            h.max_h_error_m,
-            h.rms_h_error_m,
-            h.max_v_error_m,
-            h.core.map_or(f64::NAN, |k| k.est_max_h_error_m)
-        ));
+        lines.push(hold_line(h));
     }
     lines.push(format!("trace hash {:016x}", sim.trace_hash()));
     lines.extend(result_lines(
@@ -1179,9 +1175,22 @@ fn fly_scenario<P: Pilot>(
     ));
     Ok(ScenarioRun {
         lines,
-        passed: verdict.violations.is_empty(),
+        passed: verdict.passed(),
         write_error,
     })
+}
+
+/// The `hold` line of a scenario summary. The estimate's error is the core's:
+/// without the core part the line says so instead of printing a number.
+fn hold_line(h: &HoldMetrics) -> String {
+    let estimate = h.core.map_or_else(
+        || format!("({})", oxide_sim::outcome::NEEDS_CORE),
+        |k| format!("{:.3} m", k.est_max_h_error_m),
+    );
+    format!(
+        "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {estimate}",
+        h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m
+    )
 }
 
 /// Replays the log at `path` with the parameter overrides given, and returns
@@ -1255,11 +1264,18 @@ fn result_lines(
         " (invariants only: the file states no expectations)"
     };
     let mut out = Vec::new();
-    if violations.is_empty() {
-        out.push(format!("result     PASS{note}"));
-    } else {
+    if !violations.is_empty() {
         out.push(format!("result     FAIL{note}"));
         out.extend(violations.iter().map(|v| format!("  violated: {v}")));
+    } else if !not_judged.is_empty() {
+        // Nothing violated, but not everything was answered: not a pass.
+        out.push(format!(
+            "result     NOT JUDGED ({} requirement{} could not be judged){note}",
+            not_judged.len(),
+            if not_judged.len() == 1 { "" } else { "s" }
+        ));
+    } else {
+        out.push(format!("result     PASS{note}"));
     }
     out.extend(not_judged.iter().map(|n| format!("  not judged: {n}")));
     out
@@ -1624,6 +1640,46 @@ mod tests {
         assert_eq!(broken[1], "  violated: 2 timing faults");
         let judged = fault_scenarios::by_name("gcs-loss").expect("embedded");
         assert_eq!(result_lines(&judged, &[], &[]), vec!["result     PASS"]);
+    }
+
+    #[test]
+    fn the_hold_line_without_the_core_part_says_what_it_needs() {
+        let line = hold_line(&HoldMetrics::new());
+        assert!(
+            line.ends_with("estimate max horizontal (needs the flight core's status)"),
+            "{line}"
+        );
+        assert!(!line.contains("NaN"), "{line}");
+    }
+
+    #[test]
+    fn unjudged_requirements_are_not_a_pass() {
+        let file = scenario_file::load_str("name = \"bare\"\nduration_s = 2.0\n").expect("loads");
+        let verdict = scenario_file::Verdict {
+            outcome: oxide_sim::outcome::FlightOutcome::new(),
+            hold: None,
+            violations: Vec::new(),
+            not_judged: vec![oxide_sim::outcome::NotJudged {
+                key: "reasons",
+                reason: oxide_sim::outcome::NEEDS_CORE,
+            }],
+        };
+        assert!(!verdict.not_judged.is_empty(), "{:?}", verdict.not_judged);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .first_problem()
+                .is_some_and(|p| p.starts_with("not judged: ")),
+            "{:?}",
+            verdict.first_problem()
+        );
+        let lines = result_lines(&file, &verdict.violations, &verdict.not_judged);
+        assert!(
+            lines[0].starts_with("result     NOT JUDGED (")
+                && !lines.iter().any(|l| l.contains("PASS")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 1 + verdict.not_judged.len(), "{lines:?}");
     }
 
     #[test]
