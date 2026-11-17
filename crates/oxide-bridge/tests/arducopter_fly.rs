@@ -557,17 +557,25 @@ fn alive(pid: u32) -> bool {
 
 /// A program that dies is noticed within a fraction of a second, not when the
 /// reply time-out (10 s by default) runs out: killed 1.5 s (wall) into the
-/// pre-roll and again 6.5 s (wall) in, in the flight.
+/// pre-roll, and again at flight time 10 s.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn a_program_that_dies_ends_the_flight_at_once_not_at_the_reply_time_out() {
     use std::sync::Arc;
     use std::time::Duration;
+    let kill = |pid: u32| {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    };
     let lease = Instance::lease();
-    for (tag, kill_after_ms, preroll_only) in
-        [("kill-preroll", 1_500, true), ("kill-flight", 6_500, false)]
-    {
+    for in_preroll in [true, false] {
+        let tag = if in_preroll {
+            "kill-preroll"
+        } else {
+            "kill-flight"
+        };
         let root = TempDir::new(tag);
         let mut sim = simulation(
             lease.0,
@@ -578,28 +586,35 @@ fn a_program_that_dies_ends_the_flight_at_once_not_at_the_reply_time_out() {
         );
         let pid = sim.autopilot().pid().expect("the program's pid");
         let killed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-        let flag = Arc::clone(&killed_at);
-        let killer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(kill_after_ms));
-            *flag.lock().expect("flag") = Some(Instant::now());
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+        let killer = in_preroll.then(|| {
+            let flag = Arc::clone(&killed_at);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1_500));
+                *flag.lock().expect("flag") = Some(Instant::now());
+                kill(pid);
+            })
         });
-        let message = match sim.preroll(PREROLL_STEPS) {
-            Err(e) => {
-                assert!(preroll_only, "{tag}: the pre-roll failed: {e}");
-                e.to_string()
-            }
-            Ok(()) => {
-                assert!(!preroll_only, "{tag}: the pre-roll ended before the kill");
-                sim.try_run_until(Micros(40_000_000), |_| {})
-                    .expect_err("the program was killed")
-                    .to_string()
-            }
+        let message = if in_preroll {
+            sim.preroll(PREROLL_STEPS)
+                .expect_err("the program was killed")
+                .to_string()
+        } else {
+            sim.preroll(PREROLL_STEPS).unwrap_or_else(|e| panic!("{e}"));
+            let flag = Arc::clone(&killed_at);
+            sim.try_run_until(Micros(40_000_000), |r| {
+                let mut at = flag.lock().expect("flag");
+                if at.is_none() && r.t >= Micros(10_000_000) {
+                    *at = Some(Instant::now());
+                    kill(pid);
+                }
+            })
+            .expect_err("the program was killed")
+            .to_string()
         };
         let ended = Instant::now();
-        killer.join().expect("the killer");
+        if let Some(k) = killer {
+            k.join().expect("the killer");
+        }
         let killed = killed_at.lock().expect("flag").expect("the kill happened");
         let after = ended.duration_since(killed);
         println!(
