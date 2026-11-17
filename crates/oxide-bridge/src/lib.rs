@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The bridge that flies another autopilot's simulator build on our physics
 //! (ADR-0006): the JSON exchange, the simulator program as a checked child
-//! process, and the MAVLink client for it.
+//! process, the MAVLink client for it, and an autopilot that flies offboard.
 //!
 //! - [`packet`]: the motor packet the simulator sends (binary, little-endian).
 //! - [`reply`]: the line of text we answer with.
@@ -12,7 +12,31 @@
 //!   own new directory, and never leaves it running.
 //! - [`mav`]: the MAVLink client: typed events out, small sends in, never
 //!   blocking on the program (which only moves while we exchange).
-//! - [`bridge`]: [`bridge::JsonBridge`], an `oxide_sim::Autopilot<4>`.
+//! - [`bridge`]: the one implementation of the exchange and the reply
+//!   ([`bridge::Exchange`]), and [`bridge::JsonBridge`], an
+//!   `oxide_sim::Autopilot<4>` that flies the radio's channels.
+//! - [`parm`]: the committed ArduCopter parameter files (`arducopter/*.parm`)
+//!   and their parser.
+//! - [`arducopter`]: [`arducopter::ArduCopter`], an `oxide_sim::Autopilot<4>`
+//!   that starts the program, runs the 45 s pre-roll, and flies our
+//!   quad offboard: our setpoint stream becomes GUIDED commands on a MAVLink
+//!   link of its own. [`arducopter::fly`] runs a whole bridged flight and
+//!   returns the physics' trace hash and the [`arducopter::FlightAudit`].
+//!
+//! # A bridged flight repeats bit for bit
+//!
+//! Nothing read from MAVLink influences anything sent to the program or to
+//! the physics: every command goes out at a simulated time fixed in advance
+//! or decided from lockstep data (the truth and the motor pulses). What is
+//! read goes into the audit and nowhere else. The ground-station failsafe
+//! sees no ground station unless the scenario has one: the measuring
+//! instrument sends its heartbeat as system 250, not 255.
+//!
+//! The tests that fly the real program are `#[ignore]`d: set
+//! `OXIDE_ARDUCOPTER` to the program's path and run
+//! `cargo test -p oxide-bridge --release -- --ignored` (a flight is 85
+//! simulated seconds). The program is a separate GPL process and is never
+//! copied into this repository.
 
 pub mod arducopter;
 pub mod bridge;
