@@ -158,18 +158,20 @@ fn the_same_flight_twice_hashes_the_same_and_another_target_does_not() {
 }
 
 #[test]
-fn the_time_stamps_the_stand_in_received_are_k_times_500_001_ns_as_text() {
+fn the_time_stamps_the_stand_in_received_are_k_plus_1_times_500_001_ns_as_text() {
     let f = fly(Options::new(0), 3);
     assert_eq!(f.report.replies.len(), 6_000);
     for (k, line) in f.report.replies.iter().enumerate() {
-        let ns = k as u64 * 500_001;
+        let ns = (k as u64 + 1) * 500_001;
         let want = format!("{}.{:09}", ns / 1_000_000_000, ns % 1_000_000_000);
         assert_eq!(timestamp_of(line), want, "frame {k}");
     }
-    assert_eq!(timestamp_of(&f.report.replies[0]), "0.000000000");
-    assert_eq!(timestamp_of(&f.report.replies[1]), "0.000500001");
-    assert_eq!(timestamp_of(&f.report.replies[2]), "0.001000002");
-    assert_eq!(timestamp_of(&f.report.replies[2_000]), "1.000002000");
+    // The first reply carries one step, not zero (measured on the real
+    // program: a first stamp of zero does not repeat).
+    assert_eq!(timestamp_of(&f.report.replies[0]), "0.000500001");
+    assert_eq!(timestamp_of(&f.report.replies[1]), "0.001000002");
+    assert_eq!(timestamp_of(&f.report.replies[2]), "0.001500003");
+    assert_eq!(timestamp_of(&f.report.replies[1_999]), "1.000002000");
 }
 
 #[test]

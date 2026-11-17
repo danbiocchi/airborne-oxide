@@ -15,6 +15,9 @@
 //! pre-roll, arming and the modes come later, in the part that runs the real
 //! program).
 //!
+//! The time stamp of the reply of exchange `n` (from 0) is one step times
+//! `n + 1`; see [`Exchange`], which both autopilots of this crate use.
+//!
 //! `armed` is "any of the four pulses is above 1000". The pulses are lockstep
 //! data and repeat bit for bit; the autopilot's own armed flag arrives over a
 //! channel whose timing depends on the wall clock and is audit data only.
@@ -22,13 +25,17 @@
 use core::fmt;
 use std::time::Duration;
 
-use oxide_core::io::RcSample;
+use oxide_core::io::{RcSample, Stamped};
+use oxide_core::math::Vec3;
 use oxide_core::time::Micros;
 use oxide_sim::autopilot::{Autopilot, AutopilotInput, AutopilotOutput};
+use oxide_sim::hash::TraceHash;
 use oxide_sim::scenario::COMMAND_PERIOD_US;
+use oxide_sim::vehicle::BodyState;
 
 use crate::link::{Link, LinkError};
 use crate::motors::{DEFAULT_SPIN_MAX, DEFAULT_SPIN_MIN, MotorError, MotorMap};
+use crate::packet::ServoPacket;
 use crate::reply::{BatteryReading, Reply, ReplyError, timestamp_ns};
 
 /// How the bridge is set up.
@@ -93,7 +100,7 @@ impl std::error::Error for ConfigError {}
 #[derive(Debug)]
 pub enum BridgeError {
     /// The exchange failed: a time-out, a frame count out of order, a bad
-    /// datagram, the socket.
+    /// datagram, the socket. `step` counts the exchanges done before it.
     Link { step: u64, source: LinkError },
     /// The state to send is not a finite number; nothing was sent.
     Reply { step: u64, source: ReplyError },
@@ -149,45 +156,108 @@ pub fn rc_pulses(rc: &RcSample) -> Option<[u16; 8]> {
     ])
 }
 
+/// What a reply holds besides the time stamp and the radio, from the body
+/// the simulator shows: the truth as it is, the specific force rotated into
+/// the body frame (the ideal IMU sample of `oxide_sim::sensors::imu`), the
+/// battery. The one place the reply's fields are filled; a caller that has
+/// its own IMU sample or a position error overwrites those fields.
+pub fn reply_of_body<const N: usize>(
+    timestamp_ns: u64,
+    body: &BodyState<N>,
+    specific_force_world: Vec3<f64>,
+    battery: (f64, f64),
+    send_battery: bool,
+    rc: Option<[u16; 8]>,
+) -> Reply {
+    let accel = body.attitude.inverse_rotate(specific_force_world);
+    Reply {
+        timestamp_ns,
+        gyro: [body.rate.x, body.rate.y, body.rate.z],
+        accel_body: [accel.x, accel.y, accel.z],
+        position: [body.position.x, body.position.y, body.position.z],
+        velocity: [body.velocity.x, body.velocity.y, body.velocity.z],
+        quaternion: [
+            body.attitude.w,
+            body.attitude.x,
+            body.attitude.y,
+            body.attitude.z,
+        ],
+        battery: send_battery.then_some(BatteryReading {
+            voltage: battery.0,
+            current: battery.1,
+        }),
+        rc,
+    }
+}
+
 /// Fills the reply from one tick's input: the truth, as the ideal IMU sample
-/// forms it. This is the one small function that a later part replaces or
-/// extends (our IMU model's samples, a GPS error).
+/// forms it (see [`reply_of_body`]).
 pub fn reply_from_input<const N: usize>(
     timestamp_ns: u64,
     input: &AutopilotInput<'_, N>,
     battery: bool,
     rc: Option<[u16; 8]>,
 ) -> Reply {
-    let b = input.body;
-    let accel = b.attitude.inverse_rotate(input.specific_force_world);
-    Reply {
+    reply_of_body(
         timestamp_ns,
-        gyro: [b.rate.x, b.rate.y, b.rate.z],
-        accel_body: [accel.x, accel.y, accel.z],
-        position: [b.position.x, b.position.y, b.position.z],
-        velocity: [b.velocity.x, b.velocity.y, b.velocity.z],
-        quaternion: [b.attitude.w, b.attitude.x, b.attitude.y, b.attitude.z],
-        battery: battery.then_some(BatteryReading {
-            voltage: input.battery_v,
-            current: input.battery_a,
-        }),
+        input.body,
+        input.specific_force_world,
+        (input.battery_v, input.battery_a),
+        battery,
         rc,
+    )
+}
+
+/// The radio as the reply sends it: the last valid frame while it is no
+/// older than the radio's period. A frame with failsafe or a lost frame ends
+/// it; so does a silent radio.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RcLatch {
+    /// The last valid radio frame and the tick it arrived at.
+    last: Option<(Micros, [u16; 8])>,
+}
+
+impl RcLatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The channels to send at `t`, given the frame that arrived at this tick
+    /// (if any).
+    pub fn at(&mut self, t: Micros, frame: &Option<Stamped<RcSample>>) -> Option<[u16; 8]> {
+        if let Some(frame) = frame {
+            self.last = if frame.value.is_valid() {
+                rc_pulses(&frame.value).map(|p| (t, p))
+            } else {
+                None
+            };
+        }
+        let (at, pulses) = self.last?;
+        (t.since(at) <= COMMAND_PERIOD_US).then_some(pulses)
     }
 }
 
-/// The JSON bridge as the simulator's autopilot.
+/// The exchange with the simulator build, once: the socket, the motor map,
+/// the reply's time stamp and the hashes that prove a flight repeats. Both
+/// autopilots of this crate send their replies through it, so that there is
+/// one implementation of the stamps, the line and the wait.
+///
+/// The time stamp of exchange `n` (counting every reply sent, from 0) is
+/// `timestamp_ns(step, n + 1)`: the first reply carries one step, not zero.
+/// A first stamp of zero is accepted by the program, but the run then does
+/// not repeat (measured on ArduCopter V4.7.2).
 #[derive(Debug)]
-pub struct JsonBridge {
+pub struct Exchange {
     link: Link,
     config: BridgeConfig,
     motors: MotorMap,
     line: String,
-    /// The last valid radio frame and the tick it arrived at.
-    last_rc: Option<(Micros, [u16; 8])>,
     frames: u64,
+    reply_hash: TraceHash,
+    packet_hash: TraceHash,
 }
 
-impl JsonBridge {
+impl Exchange {
     pub fn new(link: Link, config: BridgeConfig) -> Result<Self, ConfigError> {
         if config.step_us == 0 {
             return Err(ConfigError::Step);
@@ -202,8 +272,9 @@ impl JsonBridge {
             config,
             motors,
             line: String::with_capacity(512),
-            last_rc: None,
             frames: 0,
+            reply_hash: TraceHash::default(),
+            packet_hash: TraceHash::default(),
         })
     }
 
@@ -213,51 +284,37 @@ impl JsonBridge {
     pub fn link(&self) -> &Link {
         &self.link
     }
-    /// Replies sent so far (one per successful tick).
+    /// Replies sent so far (one per successful exchange): the number of the
+    /// next exchange.
     pub fn frames(&self) -> u64 {
         self.frames
     }
+    /// The time stamp of the next reply, ns.
+    pub fn next_timestamp_ns(&self) -> u64 {
+        timestamp_ns(self.config.step_us, self.frames.saturating_add(1))
+    }
+    /// FNV-1a over the bytes of every reply line sent.
+    pub fn reply_hash(&self) -> u64 {
+        self.reply_hash.value()
+    }
+    /// FNV-1a over every motor packet received (frame count and pulses).
+    pub fn packet_hash(&self) -> u64 {
+        self.packet_hash.value()
+    }
 
-    /// The radio channels to send at `t`: the last valid frame while it is no
-    /// older than the radio's period. A frame with failsafe or a lost frame
-    /// ends it; so does a silent radio.
-    fn rc_at(&mut self, t: Micros, input: &AutopilotInput<'_, 4>) -> Option<[u16; 8]> {
-        if let Some(frame) = &input.rc {
-            self.last_rc = if frame.value.is_valid() {
-                rc_pulses(&frame.value).map(|p| (t, p))
-            } else {
-                None
-            };
+    /// Stamps `reply` with the next time stamp, sends it and returns the
+    /// simulator build's next motor packet. The battery and radio sections
+    /// are dropped when the configuration says so. If the reply cannot be
+    /// written, or the exchange fails, nothing is counted.
+    pub fn exchange(&mut self, mut reply: Reply) -> Result<ServoPacket, BridgeError> {
+        let step = self.frames;
+        reply.timestamp_ns = self.next_timestamp_ns();
+        if !self.config.send_battery {
+            reply.battery = None;
         }
-        let (at, pulses) = self.last_rc?;
-        (t.since(at) <= COMMAND_PERIOD_US).then_some(pulses)
-    }
-}
-
-impl Autopilot<4> for JsonBridge {
-    type Error = BridgeError;
-
-    fn period_us(&self) -> u64 {
-        self.config.step_us
-    }
-
-    fn tick(
-        &mut self,
-        t: Micros,
-        input: &AutopilotInput<'_, 4>,
-    ) -> Result<AutopilotOutput<4>, BridgeError> {
-        let step = t.0 / self.config.step_us;
-        let rc = if self.config.send_rc {
-            self.rc_at(t, input)
-        } else {
-            None
-        };
-        let reply = reply_from_input(
-            timestamp_ns(self.config.step_us, step),
-            input,
-            self.config.send_battery,
-            rc,
-        );
+        if !self.config.send_rc {
+            reply.rc = None;
+        }
         self.line.clear();
         reply
             .write(&mut self.line)
@@ -273,11 +330,88 @@ impl Autopilot<4> for JsonBridge {
             .exchange(&self.line, self.config.reply_timeout)
             .map_err(|source| BridgeError::Link { step, source })?;
         self.frames += 1;
-        let pulses = packet.pwm.get(..4).unwrap_or(&[]);
+        self.reply_hash.write_bytes(self.line.as_bytes());
+        self.packet_hash.write_u64(u64::from(packet.frame_count));
+        for p in packet.pwm.iter().take(packet.channels) {
+            self.packet_hash.write_bytes(&p.to_le_bytes());
+        }
+        Ok(packet)
+    }
+
+    /// The first four pulses of a packet.
+    pub fn pulses(packet: &ServoPacket) -> [u16; 4] {
+        let mut out = [0; 4];
+        for (o, &p) in out.iter_mut().zip(packet.pwm.iter()) {
+            *o = p;
+        }
+        out
+    }
+
+    /// The motor commands for rotors 0 to 3 from a packet.
+    pub fn rotors(&self, packet: &ServoPacket) -> [f32; 4] {
+        self.motors.rotors(&Self::pulses(packet))
+    }
+}
+
+/// `armed` is "any of the four pulses is above 1000".
+pub fn armed_by_pulses(pulses: &[u16; 4]) -> bool {
+    pulses.iter().any(|&p| p > 1000)
+}
+
+/// The JSON bridge as the simulator's autopilot.
+#[derive(Debug)]
+pub struct JsonBridge {
+    ex: Exchange,
+    rc: RcLatch,
+}
+
+impl JsonBridge {
+    pub fn new(link: Link, config: BridgeConfig) -> Result<Self, ConfigError> {
+        Ok(Self {
+            ex: Exchange::new(link, config)?,
+            rc: RcLatch::new(),
+        })
+    }
+
+    pub fn config(&self) -> &BridgeConfig {
+        self.ex.config()
+    }
+    pub fn link(&self) -> &Link {
+        self.ex.link()
+    }
+    /// Replies sent so far (one per successful tick).
+    pub fn frames(&self) -> u64 {
+        self.ex.frames()
+    }
+    pub fn exchange(&self) -> &Exchange {
+        &self.ex
+    }
+
+    /// The radio channels to send at `t` (see [`RcLatch`]).
+    fn rc_at(&mut self, t: Micros, input: &AutopilotInput<'_, 4>) -> Option<[u16; 8]> {
+        self.rc.at(t, &input.rc)
+    }
+}
+
+impl Autopilot<4> for JsonBridge {
+    type Error = BridgeError;
+
+    fn period_us(&self) -> u64 {
+        self.ex.config().step_us
+    }
+
+    fn tick(
+        &mut self,
+        t: Micros,
+        input: &AutopilotInput<'_, 4>,
+    ) -> Result<AutopilotOutput<4>, BridgeError> {
+        let rc = self.rc_at(t, input);
+        let reply = reply_from_input(0, input, true, rc);
+        let packet = self.ex.exchange(reply)?;
         Ok(AutopilotOutput {
             t_valid: t,
-            motors: self.motors.rotors(pulses),
-            armed: pulses.iter().any(|&p| p > 1000),
+            motors: self.ex.rotors(&packet),
+            armed: armed_by_pulses(&Exchange::pulses(&packet)),
             core: None,
         })
     }
@@ -534,5 +668,63 @@ mod tests {
         assert_eq!(o.motors, [0.25, 0.5, 0.75, 1.0], "output k drives rotor k");
         assert!(o.core.is_none());
         assert_eq!(b.frames(), 3);
+    }
+
+    fn stamp_of(datagram: &[u8]) -> String {
+        let text = String::from_utf8_lossy(datagram).into_owned();
+        let key = "\"timestamp\":";
+        let start = text.find(key).expect("a time stamp") + key.len();
+        let end = text[start..].find(',').expect("a comma") + start;
+        text[start..end].to_string()
+    }
+
+    #[test]
+    fn the_first_reply_carries_one_step_and_exchange_n_carries_n_plus_one_steps() {
+        let mut config = BridgeConfig::new(500);
+        config.reply_timeout = Duration::from_secs(5);
+        let mut ex = Exchange::new(Link::bind(0).expect("bind"), config).expect("config");
+        let to = std::net::SocketAddr::from(([127, 0, 0, 1], ex.link().local_port()));
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        for count in 1..=4 {
+            peer.send_to(&packet(count, [1000; 4]), to).expect("send");
+        }
+        assert_eq!(
+            ex.next_timestamp_ns(),
+            500_001,
+            "the next stamp is one step"
+        );
+        let frame = SensorFrame::default();
+        let body = BodyState::<4>::default();
+        let i = none(&body, &frame);
+        for n in 0..3u64 {
+            assert_eq!(ex.frames(), n);
+            ex.exchange(reply_from_input(0, &i, true, None))
+                .expect("exchange");
+        }
+        let mut buf = [0u8; 2048];
+        for (n, want) in ["0.000500001", "0.001000002", "0.001500003"]
+            .iter()
+            .enumerate()
+        {
+            let len = peer.recv(&mut buf).expect("a reply");
+            assert_eq!(&stamp_of(&buf[..len]), want, "exchange {n}");
+        }
+        assert_eq!(ex.frames(), 3);
+        // The hashes saw three replies and three packets.
+        assert_ne!(ex.reply_hash(), TraceHash::default().value());
+        assert_ne!(ex.packet_hash(), TraceHash::default().value());
+    }
+
+    #[test]
+    fn the_radio_latch_is_the_bridges_rule_on_its_own() {
+        let mut l = RcLatch::new();
+        let good = sticks(0.0, 0.0, 0.5, 0.0);
+        assert_eq!(l.at(Micros(0), &None), None);
+        let want = rc_pulses(&good);
+        assert_eq!(l.at(Micros(20_000), &at(20_000, good)), want);
+        assert_eq!(l.at(Micros(40_000), &None), want);
+        assert_eq!(l.at(Micros(40_500), &None), None);
     }
 }
