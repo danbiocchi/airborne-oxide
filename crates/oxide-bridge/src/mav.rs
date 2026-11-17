@@ -19,7 +19,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 use std::io;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use mavlink::dialects::ardupilotmega::{
@@ -280,12 +280,19 @@ impl MavClient {
         limit: Duration,
     ) -> Result<Self, MavError> {
         let start = Instant::now();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
         loop {
+            // Each attempt is bounded by what is left of the limit: Windows
+            // keeps trying a refused connection for about two seconds, where
+            // Linux fails at once. (A zero time-out is not allowed.)
+            let left = limit
+                .saturating_sub(start.elapsed())
+                .max(Duration::from_millis(1));
             // Connected here, not by the crate's own address form, so that a
             // write time-out can be set: the crate's writer and reader share
             // this socket, and without a time-out a peer that stops reading
             // would block a send for ever once the buffers are full.
-            let attempt = TcpStream::connect(("127.0.0.1", port)).and_then(|stream| {
+            let attempt = TcpStream::connect_timeout(&addr, left).and_then(|stream| {
                 stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 let config = mavlink::TcpConfig::from_stream(stream)?;
