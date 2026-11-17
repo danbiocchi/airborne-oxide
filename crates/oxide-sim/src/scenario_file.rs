@@ -483,6 +483,7 @@ impl ScenarioFile {
         SimOptions {
             seed,
             sensors: self.sensors.config(),
+            wind_period_us: None,
             wind: self.wind.config(seed),
             estimator: self.estimator,
             faults: self.faults.clone(),

@@ -44,6 +44,12 @@ pub struct SimOptions {
     pub seed: u64,
     pub sensors: SensorConfig,
     pub wind: WindConfig,
+    /// How often the wind is drawn, µs: it is sampled at the multiples of
+    /// this period and held in between. `None` is every step. It must be a
+    /// whole multiple of the step (else [`SimError::WindPeriod`]). A flight
+    /// at a finer step than another's can use the other's period and then
+    /// has the same wind sample for sample (ADR-0006 §7).
+    pub wind_period_us: Option<u64>,
     /// Replaces the airframe's estimator source. With `External` the
     /// simulator also sends ground truth as the `state` input; with `Ekf` it
     /// does not.
@@ -71,6 +77,7 @@ impl Default for SimOptions {
             seed: 0,
             sensors: SensorConfig::ideal(),
             wind: WindConfig::calm(),
+            wind_period_us: None,
             estimator: EstimatorSource::External,
             faults: Vec::new(),
             links: LinkConfig::default(),
@@ -88,6 +95,7 @@ impl SimOptions {
             seed,
             sensors: SensorConfig::realistic(),
             wind: WindConfig::calm(),
+            wind_period_us: None,
             estimator: EstimatorSource::Ekf,
             faults: Vec::new(),
             links: LinkConfig::default(),
@@ -324,6 +332,10 @@ pub struct Simulation<P: Pilot, const N: usize, A: Autopilot<N> = CoreAutopilot<
     dt: f64,
     sensors: SensorSuite<N>,
     wind: Wind,
+    /// The wind's sampling period, µs (a whole number of ticks).
+    wind_period_us: u64,
+    /// The wind held since the last sample.
+    held_wind: Vec3<f64>,
     /// The motor commands acting over the current step.
     active: [f32; N],
     /// Commands that have not fallen due yet, oldest issued first (one
@@ -530,6 +542,13 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
         options.links.validate(base_us)?;
         crate::faults::validate_faults(&options.faults, N, &options.links)?;
         let sensors = SensorSuite::new(options.sensors, options.seed, base_us)?;
+        let wind_period_us = options.wind_period_us.unwrap_or(base_us);
+        if wind_period_us == 0 || !wind_period_us.is_multiple_of(base_us) {
+            return Err(SimError::WindPeriod {
+                period_us: wind_period_us,
+                step_us: base_us,
+            });
+        }
         let wind = Wind::new(options.wind, Rng::stream(options.seed, Stream::Wind));
         Ok(Self {
             autopilot,
@@ -542,6 +561,8 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             dt: Micros(base_us).as_secs_f64(),
             sensors,
             wind,
+            wind_period_us,
+            held_wind: Vec3::zero(),
             active: [0.0; N],
             pending: Vec::with_capacity(2),
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
@@ -625,7 +646,12 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
         let t = self.time();
 
         // 1. Wind and sensors at t.
-        let wind = self.wind.sample(t);
+        // The wind is drawn on its own grid (a multiple of the step) and held
+        // between samples, so a finer step sees the same wind (ADR-0006 §7).
+        if t.0.is_multiple_of(self.wind_period_us) {
+            self.held_wind = self.wind.sample(t);
+        }
+        let wind = self.held_wind;
         let mut frame = self.sensors.sample(
             t,
             &Truth {
