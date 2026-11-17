@@ -13,6 +13,8 @@ publish.workspace = true
 [dependencies]
 oxide-core.workspace = true
 oxide-sim.workspace = true
+# MAVLink 2 for the ArduCopter link (ADR-0006 §10); this crate only.
+mavlink = { version = "0.21.0", default-features = false, features = ["std", "transport-tcp", "dialect-ardupilotmega"] }
 
 [lints]
 workspace = true
