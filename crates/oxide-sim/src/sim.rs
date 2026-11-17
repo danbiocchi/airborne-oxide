@@ -23,7 +23,7 @@ use oxide_core::time::Micros;
 
 use crate::SimError;
 use crate::airframe::{Airframe, BatterySpec};
-use crate::autopilot::{Autopilot, AutopilotInput, CoreAutopilot};
+use crate::autopilot::{Autopilot, AutopilotInput, CoreAutopilot, PrerollInput};
 use crate::battery::Battery;
 use crate::faults::{
     ActiveFaults, BRAIN_HEARTBEAT_PERIOD_US, Fault, FaultKind, GCS_HEARTBEAT_PERIOD_US, LinkConfig,
@@ -312,6 +312,41 @@ impl<const N: usize> StepRecord<N> {
     }
 }
 
+/// Why [`Simulation::preroll`] stopped.
+#[derive(Debug, PartialEq)]
+pub enum PrerollError<E> {
+    /// The simulation has already taken a step (`tick` of them).
+    AfterStep { tick: u64 },
+    /// A pre-roll has already run (or started) on this simulation.
+    AlreadyRun,
+    /// The autopilot's `preroll_tick` failed at step `k`.
+    Autopilot { k: u64, source: E },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for PrerollError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AfterStep { tick } => write!(
+                f,
+                "the pre-roll comes before the flight, and this simulation has taken {tick} step(s)"
+            ),
+            Self::AlreadyRun => write!(f, "a pre-roll has already run on this simulation"),
+            Self::Autopilot { k, source } => {
+                write!(f, "the autopilot failed at pre-roll step {k}: {source}")
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for PrerollError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Autopilot { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// A command the autopilot produced, waiting for its `t_valid`.
 #[derive(Clone, Copy, Debug)]
 struct PendingCommand<const N: usize> {
@@ -352,6 +387,8 @@ pub struct Simulation<P: Pilot, const N: usize, A: Autopilot<N> = CoreAutopilot<
     next_param_set: Option<ParamSet>,
     /// An acknowledgement of a parameter fault for the next tick's inputs.
     next_param_ack: bool,
+    /// A pre-roll has run (or started).
+    prerolled: bool,
 }
 
 impl<P: Pilot, const N: usize> Simulation<P, N, CoreAutopilot<N>> {
@@ -585,7 +622,49 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
             brain_progress: 0,
             next_param_set: None,
             next_param_ack: false,
+            prerolled: false,
         })
+    }
+
+    /// The pre-roll: the vehicle rests on the ground before the flight, and
+    /// the autopilot's [`preroll_tick`](Autopilot::preroll_tick) is called
+    /// for `k = 0..steps`, one per tick, with the body at rest and the IMU
+    /// sample of that step (the IMU model's turn-on bias, walk and noise: its
+    /// state, and only that, advances). Nothing else happens: no physics, no
+    /// wind, no pilot, no faults, no other sensor, and the tick counter and
+    /// the trace hash stay as they are. Stops at the first error of the
+    /// autopilot and returns it with its `k`.
+    ///
+    /// Only before the first step, and once.
+    pub fn preroll(&mut self, steps: u64) -> Result<(), PrerollError<A::Error>> {
+        if self.tick != 0 {
+            return Err(PrerollError::AfterStep { tick: self.tick });
+        }
+        if self.prerolled {
+            return Err(PrerollError::AlreadyRun);
+        }
+        self.prerolled = true;
+        for k in 0..steps {
+            let truth = Truth {
+                body: &self.body,
+                specific_force_world: self.specific_force_world,
+                battery_v: self.battery.voltage_v,
+                battery_a: self.battery.current_a,
+                max_omega: self.model.max_omega,
+            };
+            let imu = self.sensors.preroll_imu(k, &truth);
+            let input = PrerollInput {
+                body: &self.body,
+                specific_force_world: self.specific_force_world,
+                battery_v: self.battery.voltage_v,
+                battery_a: self.battery.current_a,
+                imu,
+            };
+            self.autopilot
+                .preroll_tick(k, &input)
+                .map_err(|source| PrerollError::Autopilot { k, source })?;
+        }
+        Ok(())
     }
 
     /// Puts a parameter change into the next tick's inputs (at most one per

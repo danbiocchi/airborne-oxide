@@ -19,7 +19,8 @@ use core::convert::Infallible;
 use oxide_core::Core;
 use oxide_core::config::EstimatorSource;
 use oxide_core::io::{
-    BrainHeartbeat, GcsHeartbeat, Inputs, ParamSet, RcSample, Stamped, TrajectorySetpoint,
+    BrainHeartbeat, GcsHeartbeat, ImuSample, Inputs, ParamSet, RcSample, Stamped,
+    TrajectorySetpoint,
 };
 use oxide_core::math::Vec3;
 use oxide_core::params::LoadReport;
@@ -52,6 +53,34 @@ pub trait Autopilot<const N: usize> {
         t: Micros,
         input: &AutopilotInput<'_, N>,
     ) -> Result<AutopilotOutput<N>, Self::Error>;
+    /// One step of the pre-roll: the vehicle rests on the ground before the flight (no wind, no faults, no pilot).
+    /// `k` counts the pre-roll steps from 0. What the autopilot returns as commands is not asked: nothing moves.
+    fn preroll_tick(&mut self, k: u64, input: &PrerollInput<'_, N>) -> Result<(), Self::Error> {
+        let _ = (k, input);
+        Ok(())
+    }
+}
+
+/// What the simulator shows an autopilot at one step of the pre-roll
+/// ([`Simulation::preroll`](crate::Simulation::preroll)): the vehicle at rest
+/// on the ground, before the flight.
+#[derive(Clone, Copy, Debug)]
+pub struct PrerollInput<'a, const N: usize> {
+    /// The body state at rest (the initial state; position NED m, velocity
+    /// NED m/s, attitude body to world, rate FRD rad/s, rotor speeds
+    /// normalised); the same at every step.
+    pub body: &'a BodyState<N>,
+    /// Specific force in the world frame, m/s² (the value the simulation
+    /// starts with: gravity's reaction, `(0, 0, -g)` in NED).
+    pub specific_force_world: Vec3<f64>,
+    /// The battery's resting voltage, V.
+    pub battery_v: f64,
+    /// The battery's resting current, A.
+    pub battery_a: f64,
+    /// The IMU sample of this step (gyro rad/s and specific force m/s², body
+    /// FRD, with the model's turn-on bias, walk and noise), or `None` when
+    /// the IMU's period has no sample due at this step.
+    pub imu: Option<ImuSample>,
 }
 
 /// What the simulator knows at one tick, `t`: everything the loop has at the

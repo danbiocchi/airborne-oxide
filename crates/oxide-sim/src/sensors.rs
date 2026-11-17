@@ -397,6 +397,19 @@ impl<const N: usize> SensorSuite<N> {
         }
     }
 
+    /// The IMU sample of pre-roll step `k` (the steps count from 0, one per
+    /// tick) for a vehicle at rest: `None` when the IMU's period has no
+    /// sample due at `k` ticks, else the sample, built by the code `sample`
+    /// uses. Advances only the IMU's state (its random stream, bias walk and
+    /// rotor phases): no other sensor, no queue and no clock.
+    pub fn preroll_imu(&mut self, k: u64, truth: &Truth<'_, N>) -> Option<ImuSample> {
+        let p = self.config.imu.period_us;
+        if p != 0 && !due(k.saturating_mul(self.base_us), p) {
+            return None;
+        }
+        Some(self.imu_sample(truth))
+    }
+
     /// Current gyro bias (truth, for diagnostics), rad/s body.
     pub fn gyro_bias(&self) -> Vec3<f64> {
         self.gyro_bias

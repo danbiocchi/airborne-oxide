@@ -25,9 +25,9 @@ pub mod vehicle;
 pub mod wind;
 
 pub use airframe::Airframe;
-pub use autopilot::{Autopilot, AutopilotInput, AutopilotOutput, CoreAutopilot};
+pub use autopilot::{Autopilot, AutopilotInput, AutopilotOutput, CoreAutopilot, PrerollInput};
 pub use scenario_file::{ScenarioError, ScenarioFile};
-pub use sim::{CoreRecord, SimOptions, Simulation, StepRecord};
+pub use sim::{CoreRecord, PrerollError, SimOptions, Simulation, StepRecord};
 
 use core::fmt;
 
