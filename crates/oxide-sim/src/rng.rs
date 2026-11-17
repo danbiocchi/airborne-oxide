@@ -41,6 +41,10 @@ pub enum Stream {
     Wind,
     /// Scenario randomisation (wind strength, gust times, ...).
     Scenario,
+    /// The horizontal position error a bridge adds to another autopilot's
+    /// GPS (ADR-0006 §4). A stream of its own: our GPS model's draws
+    /// ([`Stream::Gps`]) are not touched by it.
+    GpsError,
 }
 
 impl Stream {
@@ -54,6 +58,7 @@ impl Stream {
             Stream::Battery => 5,
             Stream::Wind => 6,
             Stream::Scenario => 7,
+            Stream::GpsError => 8,
         }
     }
 }
@@ -207,6 +212,27 @@ mod tests {
         assert_ne!(a[0], other.next_u64());
         let mut seed8 = Rng::stream(8, Stream::Imu);
         assert_ne!(a[0], seed8.next_u64());
+    }
+
+    #[test]
+    fn the_stream_identifiers_never_change() {
+        let ids = [
+            (Stream::Imu, 1),
+            (Stream::Gps, 2),
+            (Stream::Baro, 3),
+            (Stream::Mag, 4),
+            (Stream::Battery, 5),
+            (Stream::Wind, 6),
+            (Stream::Scenario, 7),
+            (Stream::GpsError, 8),
+        ];
+        for (stream, id) in ids {
+            assert_eq!(stream.id(), id, "{stream:?}");
+        }
+        // The new stream is its own: not the GPS model's.
+        let mut a = Rng::stream(5, Stream::GpsError);
+        let mut b = Rng::stream(5, Stream::Gps);
+        assert_ne!(a.next_u64(), b.next_u64());
     }
 
     #[test]

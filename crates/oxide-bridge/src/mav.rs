@@ -294,6 +294,10 @@ impl MavClient {
             // would block a send for ever once the buffers are full.
             let attempt = TcpStream::connect_timeout(&addr, left).and_then(|stream| {
                 stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+                // A small command must reach the program at once: it is
+                // read at the next step, and a delayed segment would move
+                // the step at which it acts.
+                stream.set_nodelay(true)?;
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
                 let config = mavlink::TcpConfig::from_stream(stream)?;
                 mavlink::Connectable::connect::<MavMessage>(&config)
@@ -561,11 +565,30 @@ impl MavClient {
             })
     }
 
+    /// Our system id, as sent in every header.
+    pub fn system_id(&self) -> u8 {
+        self.system_id
+    }
+
+    /// Our component id, as sent in every header.
+    pub fn component_id(&self) -> u8 {
+        self.component_id
+    }
+
     /// Our own `HEARTBEAT` (a ground station, no autopilot, no mode).
     pub fn heartbeat(&self) -> Result<(), MavError> {
+        self.heartbeat_of(MavType::MAV_TYPE_GCS)
+    }
+
+    /// Our own `HEARTBEAT` as a companion computer (type onboard controller).
+    pub fn onboard_heartbeat(&self) -> Result<(), MavError> {
+        self.heartbeat_of(MavType::MAV_TYPE_ONBOARD_CONTROLLER)
+    }
+
+    fn heartbeat_of(&self, mavtype: MavType) -> Result<(), MavError> {
         self.send(&MavMessage::HEARTBEAT(HEARTBEAT_DATA {
             custom_mode: 0,
-            mavtype: MavType::MAV_TYPE_GCS,
+            mavtype,
             autopilot: MavAutopilot::MAV_AUTOPILOT_INVALID,
             base_mode: MavModeFlag::empty(),
             system_status: MavState::MAV_STATE_ACTIVE,

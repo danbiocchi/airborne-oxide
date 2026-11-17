@@ -349,7 +349,12 @@ impl Exchange {
 
     /// The motor commands for rotors 0 to 3 from a packet.
     pub fn rotors(&self, packet: &ServoPacket) -> [f32; 4] {
-        self.motors.rotors(&Self::pulses(packet))
+        self.rotors_from_pulses(&Self::pulses(packet))
+    }
+
+    /// The motor commands for rotors 0 to 3 from four pulses.
+    pub fn rotors_from_pulses(&self, pulses: &[u16; 4]) -> [f32; 4] {
+        self.motors.rotors(pulses)
     }
 }
 

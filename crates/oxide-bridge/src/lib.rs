@@ -14,6 +14,7 @@
 //!   blocking on the program (which only moves while we exchange).
 //! - [`bridge`]: [`bridge::JsonBridge`], an `oxide_sim::Autopilot<4>`.
 
+pub mod arducopter;
 pub mod bridge;
 pub mod link;
 pub mod mav;
