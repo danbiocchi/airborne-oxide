@@ -234,3 +234,27 @@ fn a_batch_whose_run_fails_twice_writes_what_it_has_and_exits_3() {
     );
     let _ = std::fs::remove_dir_all(&out);
 }
+
+#[test]
+fn the_core_routes_of_the_binary_fly_the_profile_they_name() {
+    for (name, hash) in [
+        ("core-f405", "9712d37590a317dc"),
+        ("core-h743", "476abddf98142653"),
+    ] {
+        let out = scratch(name);
+        let o = bridge(&[
+            "fly",
+            "--scenario",
+            path(&scenario("gust-hold")),
+            "--autopilot",
+            name,
+            "--out",
+            path(&out),
+        ]);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+        let row = read_row(&out.join("row.csv")).expect("row");
+        assert_eq!(row.get("autopilot"), name);
+        assert_eq!(row.get("trace_hash"), hash, "{name}");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+}

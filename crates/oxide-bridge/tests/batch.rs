@@ -384,21 +384,29 @@ fn each_child_is_pinned_to_a_core_of_its_own_where_taskset_exists() {
         c.pin = Pin::Taskset { first_core: 0 };
         c
     });
-    let mut cores: Vec<usize> = r
+    let spawned: Vec<(u64, usize)> = r
         .events
         .iter()
         .filter_map(|e| match e {
-            Event::Spawned { core, .. } => *core,
+            Event::Spawned { index, core, .. } => core.map(|c| (*index, c)),
             _ => None,
         })
         .collect();
+    let mut cores: Vec<usize> = spawned.iter().map(|(_, c)| *c).collect();
     cores.sort_unstable();
     assert_eq!(cores, vec![0, 1]);
+    // Which worker takes which run is a race; the core a child was told
+    // about is the core it ran on.
     for row in &r.result.rows {
-        let index: usize = row.get("index").parse().expect("index");
+        let index: u64 = row.get("index").parse().expect("index");
+        let told = spawned
+            .iter()
+            .find(|(i, _)| *i == index)
+            .expect("spawned")
+            .1;
         assert!(
-            row.get("note").ends_with(&format!("cpus={index}")),
-            "child {index} was not on core {index}: {}",
+            row.get("note").ends_with(&format!("cpus={told}")),
+            "child {index} was told core {told}: {}",
             row.get("note")
         );
     }

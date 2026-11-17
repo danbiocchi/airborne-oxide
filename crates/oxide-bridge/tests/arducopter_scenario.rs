@@ -569,11 +569,16 @@ fn the_binary_exits_0_when_flown_1_when_wrongly_used_and_2_when_it_did_not_start
     assert_eq!(row.get("started"), "no");
 }
 
-/// Not a check: the wall times the report asks for, printed. A batch of three
-/// runs at one, two and three jobs, pinned and not, and one flight alone.
+/// Not a check: the wall times, printed. A batch of six runs at one, two and
+/// three jobs, pinned and not, and one flight alone. It does nothing unless
+/// `OXIDE_MEASURE_WALL` is set (it takes minutes and shares the machine).
 #[test]
-#[ignore = "a measurement: needs the program, takes minutes, shares the machine"]
+#[ignore = "a measurement: needs the program and OXIDE_MEASURE_WALL"]
 fn measure_the_wall_time_of_a_flight_and_of_batches() {
+    if std::env::var_os("OXIDE_MEASURE_WALL").is_none() {
+        println!("OXIDE_MEASURE_WALL is not set: nothing measured");
+        return;
+    }
     let all = lease_all();
     let root = TempDir::new("wall");
     let range = format!("{}-{}", all.range.0, all.range.1);
