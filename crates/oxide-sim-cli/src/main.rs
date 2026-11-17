@@ -1337,6 +1337,74 @@ mod tests {
         parse_from(args.iter().map(|s| (*s).to_string()))
     }
 
+    /// A record of our core after `ticks` ticks of the F405 hover-step flight.
+    fn a_core_record(ticks: usize) -> StepRecord<4> {
+        let mut sim = Simulation::<_, 4>::new(
+            &Airframe::reference_quad().expect("reference airframe"),
+            F405_LEAN,
+            HoverStep::default(),
+        )
+        .expect("builds");
+        let mut r = sim.step();
+        for _ in 0..ticks {
+            r = sim.step();
+        }
+        r
+    }
+
+    fn csv_cells(r: &StepRecord<4>) -> std::collections::HashMap<String, String> {
+        let header = std::str::from_utf8(CSV_HEADER).expect("ascii");
+        let names: Vec<&str> = header.trim_end().split(',').collect();
+        let row = csv_row(r);
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        assert_eq!(names.len(), cells.len(), "a cell per column");
+        names
+            .into_iter()
+            .zip(cells)
+            .map(|(n, c)| (n.to_string(), c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_record_without_the_core_part_has_empty_core_cells_and_the_neutral_armed() {
+        let mut r = a_core_record(100);
+        // With the core part: the cells are filled.
+        r.armed = true;
+        let with = csv_cells(&r);
+        assert!(!with["nav"].is_empty() && !with["action"].is_empty());
+        assert_eq!(with["armed"], "1");
+        // Without it: the core's columns are empty, `armed` is the flag.
+        r.core = None;
+        for armed in [true, false] {
+            r.armed = armed;
+            let c = csv_cells(&r);
+            for col in [
+                "nav",
+                "action",
+                "reasons",
+                "est_x",
+                "est_y",
+                "est_z",
+                "est_roll",
+                "est_pitch",
+                "est_yaw",
+                "est_vx",
+                "est_vy",
+                "est_vz",
+            ] {
+                assert_eq!(c[col], "", "column {col} of a record without the core");
+            }
+            assert_eq!(c["armed"], if armed { "1" } else { "0" });
+            // The truth columns are as they were.
+            assert_eq!(c["x"], with["x"]);
+            assert_eq!(c["battery_v"], with["battery_v"]);
+        }
+        // `armed` follows the neutral flag, not the core's status.
+        let mut r = a_core_record(100);
+        r.armed = !r.core.expect("core part").status.armed;
+        assert_eq!(csv_cells(&r)["armed"], if r.armed { "1" } else { "0" });
+    }
+
     #[test]
     fn the_usage_names_exactly_the_commands_main_dispatches() {
         let mut in_usage: Vec<&str> = USAGE
