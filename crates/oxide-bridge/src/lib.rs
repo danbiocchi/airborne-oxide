@@ -16,3 +16,4 @@ pub mod motors;
 pub mod packet;
 pub mod reply;
 pub mod sha256;
+pub mod sitl;
