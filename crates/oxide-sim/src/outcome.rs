@@ -72,6 +72,9 @@ pub struct FlightOutcome {
     /// core part.
     pub core: Option<CoreOutcome>,
     // Recorder state.
+    /// Records added so far: with none, whether the autopilot has a core part
+    /// is not known.
+    records: u64,
     was_above: bool,
     touched_down: bool,
     prev_down_speed: f64,
@@ -189,6 +192,7 @@ impl FlightOutcome {
             non_finite: false,
             physics_faults: 0,
             core: None,
+            records: 0,
             was_above: false,
             touched_down: false,
             prev_down_speed: 0.0,
@@ -205,6 +209,7 @@ impl FlightOutcome {
 
     /// Adds one tick.
     pub fn add<const N: usize>(&mut self, r: &StepRecord<N>) {
+        self.records = self.records.saturating_add(1);
         let disarmed_at = if let Some(core) = r.core.as_ref() {
             self.core
                 .get_or_insert_with(CoreOutcome::new)
@@ -457,12 +462,30 @@ impl Judgement {
 }
 
 impl FlightOutcome {
+    /// An outcome that has seen no record cannot tell whether the autopilot
+    /// has a core part (the part is created by the first record that carries
+    /// one). Judged as it is, every key that reads the core would be listed
+    /// as needing a core our own flight never failed to have. A flight that
+    /// never started is judged as an empty core part would be (nothing
+    /// happened: what is required of the status is violated), as it always
+    /// was. `None` when the outcome has records, or has the part already.
+    fn as_judged_without_records(&self) -> Option<Self> {
+        (self.records == 0 && self.core.is_none()).then(|| {
+            let mut o = self.clone();
+            o.core = Some(CoreOutcome::new());
+            o
+        })
+    }
+
     /// The checks every flight gets, whether or not its file states an
     /// `[expect]`: no non-finite truth, no physics or timing faults, the
     /// action never decreased while armed, no motor command while disarmed.
     /// The timing-fault and action checks read the core's status: without the
     /// core part they are listed as not judged.
     pub fn invariants(&self) -> Judgement {
+        if let Some(empty) = self.as_judged_without_records() {
+            return empty.invariants();
+        }
         let o = self;
         let mut j = Judgement::default();
         let v = &mut j.violations;
@@ -513,6 +536,9 @@ impl Expect {
     /// a navigation state. A key left at its empty default requires nothing
     /// and is not listed.
     pub fn check(&self, o: &FlightOutcome) -> Judgement {
+        if let Some(empty) = o.as_judged_without_records() {
+            return self.check(&empty);
+        }
         let mut j = o.invariants();
         let v = &mut j.violations;
 
@@ -1541,6 +1567,28 @@ mod tests {
                 .any(|k| k.starts_with("invariant: failsafe action"))
         );
         assert!(j.not_judged.iter().all(|n| n.reason == NEEDS_CORE));
+    }
+
+    #[test]
+    fn an_outcome_with_no_records_is_judged_as_an_empty_flight_not_as_core_less() {
+        let o = FlightOutcome::new();
+        let j = o.invariants();
+        assert!(j.not_judged.is_empty(), "{:?}", j.not_judged);
+        let e = Expect {
+            nav_contains: vec![NavState::Hold],
+            ..Expect::default()
+        };
+        let j = e.check(&o);
+        assert!(j.not_judged.is_empty(), "{:?}", j.not_judged);
+        assert!(
+            j.violations.iter().any(|v| v.contains("navigation never")),
+            "{:?}",
+            j.violations
+        );
+        // With a record that has no core part the answer is "not judged".
+        let mut o = FlightOutcome::new();
+        o.add(&plain(0.0, Vec3::zero(), false));
+        assert!(!e.check(&o).not_judged.is_empty());
     }
 
     #[test]
