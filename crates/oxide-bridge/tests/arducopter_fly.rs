@@ -13,15 +13,18 @@ use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use oxide_bridge::arducopter::{
-    ArduCopter, ArduCopterConfig, ArduCopterError, FlightAudit, Flown, FlyError, GpsError,
-    GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest, bridged_options, fly,
+    ArduCopter, ArduCopterConfig, ArduCopterError, BrainLink, FlightAudit, Flown, FlyError,
+    GpsError, GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest,
+    bridged_options, fly,
 };
 use oxide_bridge::mav::{MavEvent, id};
 use oxide_bridge::sitl::PINNED;
 use oxide_core::math::{Real, Vec3};
+use oxide_core::schedule::F405_LEAN;
 use oxide_core::time::Micros;
+use oxide_sim::metrics::{HoldCriteria, HoldMetrics};
 use oxide_sim::outcome::FlightOutcome;
-use oxide_sim::scenario::{HoverStep, NoPilot, Pilot};
+use oxide_sim::scenario::{GustHold, HoverStep, NoPilot, Pilot, gust_hold};
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
 
 /// The binary's path, or a failure that says what to set.
@@ -1237,4 +1240,413 @@ fn a_position_target_during_the_climb_is_obeyed() {
         "the early target moved the vehicle north"
     );
     assert!(without.0.1.abs() < 0.3 && without.0.2.abs() < 0.3);
+}
+
+// ---------------------------------------------------------------------------
+// Gust-hold (test 3), the same flight twice (test 4), the wind (test 5).
+
+/// What one gust-hold flight measured.
+struct HoldNumbers {
+    metrics: HoldMetrics,
+    rms_v_m: f64,
+    flown: Flown,
+    log: Vec<StepRecord<4>>,
+}
+
+fn fly_gust_hold(instance: u8, tag: &str, index: u64, speedup: u32) -> HoldNumbers {
+    let (pilot, options) = gust_hold(index);
+    let target = pilot.hold.cast::<f64>();
+    let c = HoldCriteria::default();
+    let secs = pilot.duration_s;
+    let (log, flown) = fly_logged(instance, tag, pilot, options, secs, move |cfg| {
+        cfg.speedup = speedup;
+    });
+    let mut m = HoldMetrics::new();
+    let (mut sum_v, mut n) = (0.0, 0u64);
+    for r in &log {
+        m.add(r, target, &c);
+        if r.t.as_secs_f64() >= c.window_start_s {
+            let dz = r.position.z - target.z;
+            sum_v += dz * dz;
+            n += 1;
+        }
+    }
+    HoldNumbers {
+        metrics: m,
+        rms_v_m: Real::sqrt(sum_v / n as f64),
+        flown,
+        log,
+    }
+}
+
+/// Test 3. Gust-hold flies, for three runs.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn gust_hold_flies_for_runs_0_1_and_2() {
+    let lease = Instance::lease();
+    let c = HoldCriteria::default();
+    for index in 0..3u64 {
+        let h = fly_gust_hold(lease.0, &format!("gust-{index}"), index, 100);
+        let m = h.metrics;
+        let o = outcome_of(&h.log);
+        println!(
+            "MEASURED gust-hold {index}: horizontal rms {:.4} m, max {:.4} m; vertical rms {:.4} m, \
+             max {:.4} m; largest tilt {:.2} deg; ticks not armed after {} s: {}; physics faults {}; \
+             class {:?}; arming: first pulse above 1000 us at {:.3} s",
+            m.rms_h_error_m,
+            m.max_h_error_m,
+            h.rms_v_m,
+            m.max_v_error_m,
+            m.max_tilt_deg,
+            c.armed_from_s,
+            m.unarmed_ticks,
+            m.physics_faults,
+            class_of(&o),
+            h.log
+                .iter()
+                .find(|r| r.armed)
+                .map_or(f64::NAN, |r| r.t.as_secs_f64())
+        );
+        // The truth criteria of the scenario file.
+        assert!(m.max_h_error_m <= c.max_h_error_m, "{index}: {m:?}");
+        assert!(m.rms_h_error_m <= c.rms_h_error_m, "{index}: {m:?}");
+        assert!(m.max_v_error_m <= c.max_v_error_m, "{index}: {m:?}");
+        assert!(m.max_tilt_deg <= c.max_tilt_deg, "{index}: {m:?}");
+        assert!(!m.non_finite && m.physics_faults == 0);
+        assert_eq!(class_of(&o), Class::Safe);
+        // Armed (by the pulses) from the second the pilot's switch needs
+        // plus the program's own arming delay (2 s): reported against the
+        // criterion's 3.5 s, which was written for our core.
+        let armed_from = h
+            .log
+            .iter()
+            .find(|r| r.armed)
+            .map(|r| r.t.as_secs_f64())
+            .expect("armed");
+        assert!(armed_from <= c.window_start_s - 5.0, "{armed_from}");
+        assert!(
+            h.log
+                .iter()
+                .filter(|r| r.t.as_secs_f64() >= armed_from)
+                .all(|r| r.armed),
+            "armed (by the pulses) from {armed_from} s to the end"
+        );
+        // The window is judged for what the truth says; the audit is kept.
+        assert_eq!(h.flown.audit.sent_as(255), 0);
+    }
+}
+
+/// The first record at which two flights' logs differ, with what differs.
+fn first_difference(a: &[StepRecord<4>], b: &[StepRecord<4>]) -> Option<String> {
+    if a.len() != b.len() {
+        return Some(format!("{} records against {}", a.len(), b.len()));
+    }
+    a.iter().zip(b).enumerate().find_map(|(i, (x, y))| {
+        (x.motors != y.motors || x.position != y.position || x.velocity != y.velocity)
+            .then(|| format!("record {i} (t {:?}): {x:?} against {y:?}", x.t))
+    })
+}
+
+/// The commands of two audits, side by side, where they first differ.
+fn first_sent_difference(a: &FlightAudit, b: &FlightAudit) -> Option<String> {
+    if a.sent.len() != b.sent.len() {
+        return Some(format!("{} sent against {}", a.sent.len(), b.sent.len()));
+    }
+    a.sent
+        .iter()
+        .zip(&b.sent)
+        .position(|(x, y)| x != y)
+        .map(|i| format!("sent #{i}: {:?} against {:?}", a.sent[i], b.sent[i]))
+}
+
+/// Test 4. The same gust-hold flight twice, side by side on two instances, and
+/// once more at another speed-up of the program's own clock.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_same_gust_hold_flight_repeats_bit_for_bit_on_two_instances_and_at_another_speed() {
+    let a_lease = Instance::lease();
+    let b_lease = Instance::lease();
+    let (ia, ib) = (a_lease.0, b_lease.0);
+    // Two flights at once on two instances (the program's own timing then
+    // differs between them); then a third alone at a tenth of the speed-up.
+    let (ra, rb) = std::thread::scope(|s| {
+        let a = s.spawn(|| fly_gust_hold(ia, "twice-a", 0, 100));
+        let b = s.spawn(|| fly_gust_hold(ib, "twice-b", 0, 100));
+        (a.join().expect("flight a"), b.join().expect("flight b"))
+    });
+    let rc = fly_gust_hold(ia, "twice-c", 0, 10);
+    let key = |h: &HoldNumbers| {
+        (
+            h.flown.trace_hash,
+            h.flown.audit.packet_hash,
+            h.flown.audit.reply_hash,
+            h.flown.audit.params_sha256.clone(),
+        )
+    };
+    println!(
+        "MEASURED repeat: instances {ia}/{ib}\n a {:?}\n b {:?}\n c (speed-up 10) {:?}",
+        key(&ra),
+        key(&rb),
+        key(&rc)
+    );
+    for (name, other) in [
+        ("b (other instance, side by side)", &rb),
+        ("c (speed-up 10)", &rc),
+    ] {
+        if key(&ra) != key(other) {
+            panic!(
+                "flight {name} differs from a.\nfirst differing record: {:?}\nfirst differing \
+                 command: {:?}\naudit a:\n{}\naudit other:\n{}",
+                first_difference(&ra.log, &other.log),
+                first_sent_difference(&ra.flown.audit, &other.flown.audit),
+                ra.flown.audit,
+                other.flown.audit
+            );
+        }
+    }
+    assert!(
+        ra.flown
+            .audit
+            .sent
+            .iter()
+            .any(|s| matches!(s.what, SentKind::PositionTarget { .. }))
+    );
+}
+
+/// Test 5. The wind of the bridged flight is the F405 core flight's, bit for
+/// bit, at every 1000 us instant.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_wind_of_the_bridged_flight_is_the_f405_core_flights_at_every_1000_us() {
+    let lease = Instance::lease();
+    for index in [0u64, 1] {
+        let h = fly_gust_hold(lease.0, &format!("wind-{index}"), index, 100);
+        // The F405 core flies the same scenario with the wind drawn on the
+        // same 1000 us grid (ADR-0006 section 7).
+        let (pilot, mut options) = gust_hold(index);
+        options.wind_period_us = Some(1000);
+        let secs = pilot.duration_s;
+        let mut core: Vec<StepRecord<4>> = Vec::new();
+        let mut sim =
+            Simulation::<_, 4>::with_options(&airframe(), F405_LEAN, pilot, options).expect("sim");
+        sim.run_until(Micros((secs * 1e6) as u64), |r| core.push(*r));
+        let core_at: std::collections::HashMap<u64, Vec3<f64>> =
+            core.iter().map(|r| (r.t.0, r.wind)).collect();
+        let (mut compared, mut nonzero) = (0u64, 0u64);
+        for r in h.log.iter().filter(|r| r.t.0 % 1000 == 0) {
+            let w = core_at
+                .get(&r.t.0)
+                .unwrap_or_else(|| panic!("the core flight has no record at {:?}", r.t));
+            assert_eq!(
+                (r.wind.x.to_bits(), r.wind.y.to_bits(), r.wind.z.to_bits()),
+                (w.x.to_bits(), w.y.to_bits(), w.z.to_bits()),
+                "wind at {:?}",
+                r.t
+            );
+            compared += 1;
+            if r.wind != Vec3::zero() {
+                nonzero += 1;
+            }
+        }
+        println!(
+            "MEASURED wind {index}: {compared} instants compared bit for bit, {nonzero} non-zero; \
+             core base step {} us, bridged step 500 us",
+            core.get(1).map_or(0, |r| r.t.0 - core[0].t.0)
+        );
+        assert!(compared >= 39_000 && nonzero > 30_000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The instrument is not a ground station (test 8), the brain link (test 10).
+
+/// The tail of test 2's checks for any hover-step flight: it armed and flew.
+fn hover_flight(
+    instance: u8,
+    tag: &str,
+    edit: impl FnOnce(&mut ArduCopterConfig),
+    options: SimOptions,
+) -> (Vec<StepRecord<4>>, Flown, HoverNumbers) {
+    let pilot = HoverStep::default();
+    let secs = pilot.duration_s;
+    let (log, flown) = fly_logged(instance, tag, pilot.clone(), options, secs, edit);
+    let numbers = check_hover_step(&log, &pilot, tag);
+    (log, flown, numbers)
+}
+
+/// Test 8 (a) and (c). No ground station in the scenario: no heartbeat as
+/// system 255, and the vehicle still talked; with one: 1 Hz as system 255, and
+/// the flight is test 2's.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_instrument_is_not_a_ground_station_and_a_ground_station_is_heard_when_the_scenario_has_one()
+{
+    let lease = Instance::lease();
+    // (a) The default scenario.
+    let (_, none, n_none) = hover_flight(lease.0, "gcs-none", |_| {}, SimOptions::realistic(1));
+    let a = &none.audit;
+    assert_eq!(a.sent_as(255), 0, "{a}");
+    assert!(a.heartbeats_sent_as(250) >= 60);
+    assert!(
+        !a.status_texts.is_empty(),
+        "status texts were read all the same"
+    );
+    assert!(a.vehicle_heartbeats > 40);
+    // (c) With a ground station.
+    let mut options = SimOptions::realistic(1);
+    options.links.gcs = true;
+    let (_, gcs, n_gcs) = hover_flight(lease.0, "gcs-on", |_| {}, options);
+    let g = &gcs.audit;
+    let n255 = g.heartbeats_sent_as(255);
+    println!(
+        "MEASURED gcs: without: {} heartbeats as 255, trace {}; with: {n255} heartbeats as 255 \
+         (all links, sent_as(255) {}), largest tilt {:.2} against {:.2}, errors {:?}",
+        a.heartbeats_sent_as(255),
+        none.trace_hash,
+        g.sent_as(255),
+        n_gcs.max_tilt,
+        n_none.max_tilt,
+        n_gcs.errors
+    );
+    assert_eq!(n255, 20, "one a second from the first flight tick");
+    assert_eq!(g.sent_as(255), n255, "nothing but heartbeats as 255");
+    assert!(
+        g.sent
+            .iter()
+            .filter(|s| s.system_id == 255)
+            .all(|s| s.link == LinkName::Gcs)
+    );
+    assert!(
+        g.sent
+            .iter()
+            .filter(|s| s.link == LinkName::Brain)
+            .all(|s| s.system_id == 251)
+    );
+}
+
+/// Test 8 (b). With the ground-station failsafe on, an instrument that stops
+/// its heartbeats at 15 s changes nothing; as system 255 it is a ground station
+/// and the failsafe fires (the control).
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn silent_instrument_heartbeats_do_not_trip_the_ground_station_failsafe() {
+    let lease = Instance::lease();
+    let run = |tag: &str, system: u8| {
+        let (pilot, options) = (GustHold::default(), SimOptions::realistic(1));
+        let secs = 40.0;
+        fly_logged(lease.0, tag, pilot, options, secs, move |c| {
+            c.extra_params.push(("FS_GCS_ENABLE".into(), 1.0));
+            c.instrument_heartbeats_stop_at_s = Some(15.0);
+            c.instrument_system_id = system;
+        })
+    };
+    let (log, flown) = run("fs-250", 250);
+    let a = &flown.audit;
+    let from = a.program_us_of_flight_s(15.0);
+    let to = a.program_us_of_flight_s(35.0);
+    let worst = log
+        .iter()
+        .filter(|r| (15.0..=35.0).contains(&r.t.as_secs_f64()))
+        .map(|r| (r.position - Vec3::new(0.0, 0.0, -2.0)).norm())
+        .fold(0.0, f64::max);
+    let late_texts: Vec<_> = a
+        .status_texts
+        .iter()
+        .filter(|(t, _, _)| *t >= from)
+        .collect();
+    let late_modes: Vec<_> = a
+        .mode_changes
+        .iter()
+        .filter(|(t, _)| *t >= from - 5_000_000)
+        .collect();
+    println!(
+        "MEASURED fs-gcs (instrument as 250): largest distance from the hold point 15 to 35 s \
+         {worst:.3} m; status texts after 15 s: {late_texts:?}; mode changes from 10 s: {late_modes:?}; \
+         heartbeats as 250: {} (last at {:?})",
+        a.heartbeats_sent_as(250),
+        a.sent
+            .iter()
+            .rev()
+            .find(|s| s.what == SentKind::Heartbeat && s.system_id == 250)
+            .map(|s| s.at_us)
+    );
+    assert!(worst <= 0.5, "{worst}");
+    assert!(
+        a.status_texts
+            .iter()
+            .all(|(_, _, t)| !t.to_lowercase().contains("failsafe") && !t.contains("GCS")),
+        "{}",
+        texts(a)
+    );
+    assert_eq!(
+        a.mode_changes.last().map(|m| m.1),
+        Some(4),
+        "GUIDED to the end: {:?}",
+        a.mode_changes
+    );
+    assert!(
+        a.mode_changes.iter().all(|(t, _)| *t < to),
+        "no mode change late"
+    );
+    assert_eq!(a.sent_as(255), 0);
+    // The control: the same with the instrument as system 255 makes the
+    // failsafe fire, so the parameter was live in the run above.
+    let (_, control) = run("fs-255", 255);
+    let c = &control.audit;
+    println!(
+        "MEASURED fs-gcs control (instrument as 255): texts after 15 s: {:?}; modes {:?}",
+        c.status_texts
+            .iter()
+            .filter(|(t, _, _)| *t >= from)
+            .collect::<Vec<_>>(),
+        c.mode_changes
+    );
+    assert!(
+        c.status_texts
+            .iter()
+            .any(|(_, _, t)| t.to_lowercase().contains("failsafe")),
+        "{}",
+        texts(c)
+    );
+}
+
+/// Test 10. The brain's commands on the instrument link instead of serial 1.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_brain_can_send_its_commands_on_the_instrument_link_too() {
+    let lease = Instance::lease();
+    let (_, serial1, n1) = hover_flight(lease.0, "brain-serial1", |_| {}, SimOptions::realistic(1));
+    let (_, on_instrument, n2) = hover_flight(
+        lease.0,
+        "brain-instrument",
+        |c| c.brain = BrainLink::Instrument,
+        SimOptions::realistic(1),
+    );
+    let a = &on_instrument.audit;
+    println!(
+        "MEASURED brain link: serial 1: trace {} errors {:?} tilt {:.2}; instrument link: trace {} \
+         errors {:?} tilt {:.2}; commands on the instrument link {}",
+        serial1.trace_hash,
+        n1.errors,
+        n1.max_tilt,
+        on_instrument.trace_hash,
+        n2.errors,
+        n2.max_tilt,
+        a.sent
+            .iter()
+            .filter(|s| s.link == LinkName::Instrument
+                && matches!(
+                    s.what,
+                    SentKind::TakeOff { .. } | SentKind::PositionTarget { .. }
+                ))
+            .count()
+    );
+    assert!(a.sent.iter().any(|s| s.link == LinkName::Instrument
+        && s.system_id == 250
+        && matches!(s.what, SentKind::TakeOff { .. })));
+    assert_eq!(
+        a.sent.iter().filter(|s| s.link == LinkName::Brain).count(),
+        0
+    );
+    assert_eq!(a.sent_as(255), 0);
 }

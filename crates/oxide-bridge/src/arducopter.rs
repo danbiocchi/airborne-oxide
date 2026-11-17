@@ -187,6 +187,11 @@ pub struct ArduCopterConfig {
     pub telemetry: Vec<TelemetryRequest>,
     /// A test switch: the instrument's heartbeats stop at this flight time, s.
     pub instrument_heartbeats_stop_at_s: Option<f64>,
+    /// The instrument's system id ([`INSTRUMENT_SYSTEM_ID`], which is not the
+    /// ground station's). A test switch: with 255 the instrument *is* the
+    /// ground station, which shows that the ground-station failsafe is armed
+    /// when a test says it sees none.
+    pub instrument_system_id: u8,
     /// How long to wait for each next packet.
     pub reply_timeout: Duration,
 }
@@ -221,6 +226,7 @@ impl ArduCopterConfig {
                 },
             ],
             instrument_heartbeats_stop_at_s: None,
+            instrument_system_id: INSTRUMENT_SYSTEM_ID,
             reply_timeout: Duration::from_secs(10),
         }
     }
@@ -748,7 +754,7 @@ impl ArduCopter {
             MavClient::connect(port, system, component, limit)
                 .map_err(|source| ArduCopterError::Connect { link, source })
         };
-        let instrument = connect(0, INSTRUMENT_SYSTEM_ID, 190, LinkName::Instrument)?;
+        let instrument = connect(0, config.instrument_system_id, 190, LinkName::Instrument)?;
         let audit = FlightAudit {
             binary_sha256: sitl.binary_sha256().to_string(),
             command_line: sitl.command_line().to_vec(),
@@ -903,7 +909,7 @@ impl ArduCopter {
                 .map_err(|e| self.mav_error(LinkName::Instrument, e))?;
             self.record(
                 LinkName::Instrument,
-                INSTRUMENT_SYSTEM_ID,
+                self.config.instrument_system_id,
                 SentKind::Heartbeat,
             );
         }
@@ -917,7 +923,7 @@ impl ArduCopter {
                     .map_err(|e| self.mav_error(LinkName::Instrument, e))?;
                 self.record(
                     LinkName::Instrument,
-                    INSTRUMENT_SYSTEM_ID,
+                    self.config.instrument_system_id,
                     SentKind::MessageInterval {
                         message_id: req.message_id,
                         hz: req.hz,
@@ -967,7 +973,7 @@ impl ArduCopter {
                 .on_setpoint(n, self.armed, height, &sp, &mut self.commands);
             let on_instrument = self.config.brain == BrainLink::Instrument;
             let (link, system) = if on_instrument {
-                (LinkName::Instrument, INSTRUMENT_SYSTEM_ID)
+                (LinkName::Instrument, self.config.instrument_system_id)
             } else {
                 (LinkName::Brain, BRAIN_SYSTEM_ID)
             };
