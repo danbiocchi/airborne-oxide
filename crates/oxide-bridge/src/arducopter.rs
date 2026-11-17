@@ -921,6 +921,11 @@ impl ArduCopter {
         &self.audit
     }
 
+    /// The program's process id, while it is held.
+    pub fn pid(&self) -> Option<u32> {
+        self.sitl.as_ref().and_then(Sitl::pid)
+    }
+
     /// The program's directory.
     pub fn dir(&self) -> Option<&std::path::Path> {
         self.sitl.as_ref().map(Sitl::dir)
@@ -1209,7 +1214,10 @@ impl ArduCopter {
 
     /// Sends the reply for exchange `n`, reads the pulses, drains the links.
     fn exchange(&mut self, reply: Reply) -> Result<[u16; 4], ArduCopterError> {
-        let packet = match self.ex.exchange(reply) {
+        // The program's end is noticed within 100 ms, not at the reply
+        // time-out.
+        let mut alive = || self.sitl.as_mut().is_none_or(|s| s.check().is_ok());
+        let packet = match self.ex.exchange_watched(reply, Some(&mut alive)) {
             Ok(p) => p,
             Err(source) => {
                 let at = self.now();

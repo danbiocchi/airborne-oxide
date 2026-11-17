@@ -332,7 +332,19 @@ impl Exchange {
     /// simulator build's next motor packet. The battery and radio sections
     /// are dropped when the configuration says so. If the reply cannot be
     /// written, or the exchange fails, nothing is counted.
-    pub fn exchange(&mut self, mut reply: Reply) -> Result<ServoPacket, BridgeError> {
+    pub fn exchange(&mut self, reply: Reply) -> Result<ServoPacket, BridgeError> {
+        self.exchange_watched(reply, None)
+    }
+
+    /// [`Exchange::exchange`] with a watcher that is asked every 100 ms while
+    /// the wait goes on: when it says `false` (the simulator process has
+    /// ended) the exchange fails at once with [`LinkError::PeerGone`] instead
+    /// of at the reply time-out.
+    pub fn exchange_watched(
+        &mut self,
+        mut reply: Reply,
+        mut watch: Option<crate::link::Watch<'_, '_>>,
+    ) -> Result<ServoPacket, BridgeError> {
         let step = self.frames;
         reply.timestamp_ns = self.next_timestamp_ns();
         if !self.config.send_battery {
@@ -348,12 +360,15 @@ impl Exchange {
         // The first packet of the program may take a while to come.
         if !self.link.has_peer() {
             self.link
-                .wait_for_first_packet(self.config.first_packet_timeout)
+                .wait_for_first_packet_watched(
+                    self.config.first_packet_timeout,
+                    watch.as_deref_mut(),
+                )
                 .map_err(|source| BridgeError::Link { step, source })?;
         }
         let packet = self
             .link
-            .exchange(&self.line, self.config.reply_timeout)
+            .exchange_watched(&self.line, self.config.reply_timeout, watch)
             .map_err(|source| BridgeError::Link { step, source })?;
         let one_step = timestamp_ns(self.config.step_us, 1);
         if reply.timestamp_ns != self.last_stamp_ns.saturating_add(one_step) {

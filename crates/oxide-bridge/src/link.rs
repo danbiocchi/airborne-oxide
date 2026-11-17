@@ -11,7 +11,10 @@
 //!   advances its physics on it;
 //! - a packet whose count is not the last plus one (it skipped, or went back)
 //!   is [`LinkError::FrameCount`];
-//! - the wall clock is used for the time-out only.
+//! - the wall clock is used for the time-out only, and for asking a watcher
+//!   every 100 ms whether the simulator is still there
+//!   ([`Link::exchange_watched`]): a simulator that has ended is then noticed
+//!   at once and not when the time-out runs out.
 //!
 //! The socket is bound to `127.0.0.1`. The peer is learned from each datagram
 //! that parses as a motor packet, and the reply goes to the address and port of
@@ -25,6 +28,12 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::packet::{PacketError, ServoPacket};
+
+/// How often a waiting exchange asks its watcher whether the peer is alive.
+const WATCH_EVERY: Duration = Duration::from_millis(100);
+
+/// Called while an exchange waits: `false` says the peer has gone.
+pub type Watch<'a, 'b> = &'a mut (dyn FnMut() -> bool + 'b);
 
 /// The longest datagram taken in, bytes. A motor packet is at most 72.
 const MAX_DATAGRAM: usize = 2048;
@@ -44,6 +53,9 @@ pub enum LinkError {
     Packet(PacketError),
     /// A datagram longer than the largest one taken in (the rest is lost).
     TooLong { limit: usize },
+    /// The watcher said the simulator process is gone, `waited` after the
+    /// reply went out.
+    PeerGone { waited: Duration },
 }
 
 impl fmt::Display for LinkError {
@@ -65,6 +77,11 @@ impl fmt::Display for LinkError {
                 "frame count out of order: expected {expected}, found {found}"
             ),
             Self::Packet(e) => write!(f, "{e}"),
+            Self::PeerGone { waited } => write!(
+                f,
+                "the simulator process is gone: nothing came for {} ms",
+                waited.as_millis()
+            ),
             Self::TooLong { limit } => {
                 write!(
                     f,
@@ -137,15 +154,27 @@ impl Link {
     /// Sends `reply` for the packet held and returns the next packet. The
     /// first call waits for the simulator's first packet before it replies.
     pub fn exchange(&mut self, reply: &str, timeout: Duration) -> Result<ServoPacket, LinkError> {
+        self.exchange_watched(reply, timeout, None)
+    }
+
+    /// [`Link::exchange`] that asks `watch` every 100 ms while it waits and
+    /// ends with [`LinkError::PeerGone`] when it says `false`. A packet that
+    /// has arrived is taken before the watcher is asked.
+    pub fn exchange_watched(
+        &mut self,
+        reply: &str,
+        timeout: Duration,
+        mut watch: Option<Watch<'_, '_>>,
+    ) -> Result<ServoPacket, LinkError> {
         if self.peer.is_none() {
-            self.wait_for_first_packet(timeout)?;
+            self.wait_for_first_packet_watched(timeout, watch.as_deref_mut())?;
         }
         let deadline = Instant::now() + timeout;
         self.send(reply)?;
         let last = self.last_count.unwrap_or(0);
         let expected = last.wrapping_add(1);
         loop {
-            let Some(p) = self.receive(deadline)? else {
+            let Some(p) = self.receive(deadline, watch.as_deref_mut())? else {
                 return Err(LinkError::Timeout {
                     frame: expected,
                     waited: timeout,
@@ -171,7 +200,17 @@ impl Link {
     /// first packet than for the others calls this before the first
     /// [`Link::exchange`].
     pub fn wait_for_first_packet(&mut self, timeout: Duration) -> Result<(), LinkError> {
-        let Some(p) = self.receive(Instant::now() + timeout)? else {
+        self.wait_for_first_packet_watched(timeout, None)
+    }
+
+    /// [`Link::wait_for_first_packet`] with a watcher (see
+    /// [`Link::exchange_watched`]).
+    pub fn wait_for_first_packet_watched(
+        &mut self,
+        timeout: Duration,
+        watch: Option<Watch<'_, '_>>,
+    ) -> Result<(), LinkError> {
+        let Some(p) = self.receive(Instant::now() + timeout, watch)? else {
             return Err(LinkError::FirstPacketTimeout { waited: timeout });
         };
         self.last_count = Some(p.frame_count);
@@ -194,16 +233,35 @@ impl Link {
 
     /// The next datagram parsed as a packet, or `None` at the deadline. The
     /// peer becomes the sender of that datagram.
-    fn receive(&mut self, deadline: Instant) -> Result<Option<ServoPacket>, LinkError> {
+    fn receive(
+        &mut self,
+        deadline: Instant,
+        mut watch: Option<Watch<'_, '_>>,
+    ) -> Result<Option<ServoPacket>, LinkError> {
         // One byte more than the limit, to tell a datagram that was cut off.
         let mut buf = [0u8; MAX_DATAGRAM + 1];
+        let started = Instant::now();
+        let mut next_watch = started + WATCH_EVERY;
         loop {
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
             }
+            if let Some(w) = watch.as_mut()
+                && now >= next_watch
+            {
+                next_watch = now + WATCH_EVERY;
+                if !w() {
+                    return Err(LinkError::PeerGone {
+                        waited: now - started,
+                    });
+                }
+            }
             // A zero time-out would mean "wait for ever" to the socket.
-            let left = (deadline - now).max(Duration::from_millis(1));
+            let mut left = (deadline - now).max(Duration::from_millis(1));
+            if watch.is_some() {
+                left = left.min(WATCH_EVERY);
+            }
             self.socket.set_read_timeout(Some(left))?;
             match self.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
@@ -324,6 +382,54 @@ mod tests {
         assert_eq!(link.last_frame_count(), Some(6));
         assert_eq!(peer.recv(), "r5", "the reply to the first packet");
         peer.nothing_more();
+    }
+
+    #[test]
+    fn a_watcher_that_says_the_peer_is_gone_ends_the_wait_at_once() {
+        let mut link = Link::bind(0).expect("bind");
+        let peer = Peer::new(&link);
+        peer.send(5);
+        let mut calls = 0;
+        let mut watch = || {
+            calls += 1;
+            calls < 3
+        };
+        let started = Instant::now();
+        let e = link
+            .exchange_watched("r", Duration::from_secs(20), Some(&mut watch))
+            .expect_err("the peer is gone");
+        let waited = started.elapsed();
+        assert!(matches!(e, LinkError::PeerGone { .. }), "{e}");
+        assert!(e.to_string().contains("gone"), "{e}");
+        assert!(
+            waited >= Duration::from_millis(200) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_packet_that_has_come_is_taken_before_the_watcher_is_asked() {
+        let mut link = Link::bind(0).expect("bind");
+        let peer = Peer::new(&link);
+        peer.send(5);
+        peer.send(6);
+        let mut watch = || false;
+        let p = link
+            .exchange_watched("r", WAIT, Some(&mut watch))
+            .expect("the packet was there");
+        assert_eq!(p.frame_count, 6);
+    }
+
+    #[test]
+    fn a_watcher_that_says_alive_changes_nothing_about_the_time_out() {
+        let mut link = Link::bind(0).expect("bind");
+        let peer = Peer::new(&link);
+        peer.send(5);
+        let mut watch = || true;
+        let e = link
+            .exchange_watched("r", Duration::from_millis(350), Some(&mut watch))
+            .expect_err("nothing comes");
+        assert!(matches!(e, LinkError::Timeout { .. }), "{e}");
     }
 
     #[test]

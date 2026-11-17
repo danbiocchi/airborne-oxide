@@ -555,6 +555,67 @@ fn alive(pid: u32) -> bool {
     }
 }
 
+/// A program that dies is noticed within a fraction of a second, not when the
+/// reply time-out (10 s by default) runs out: killed 1.5 s (wall) into the
+/// pre-roll and again 6.5 s (wall) in, in the flight.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn a_program_that_dies_ends_the_flight_at_once_not_at_the_reply_time_out() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let lease = Instance::lease();
+    for (tag, kill_after_ms, preroll_only) in
+        [("kill-preroll", 1_500, true), ("kill-flight", 6_500, false)]
+    {
+        let root = TempDir::new(tag);
+        let mut sim = simulation(
+            lease.0,
+            &root,
+            HoverStep::default(),
+            SimOptions::realistic(1),
+            |c| assert_eq!(c.reply_timeout, Duration::from_secs(10)),
+        );
+        let pid = sim.autopilot().pid().expect("the program's pid");
+        let killed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let flag = Arc::clone(&killed_at);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(kill_after_ms));
+            *flag.lock().expect("flag") = Some(Instant::now());
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        });
+        let message = match sim.preroll(PREROLL_STEPS) {
+            Err(e) => {
+                assert!(preroll_only, "{tag}: the pre-roll failed: {e}");
+                e.to_string()
+            }
+            Ok(()) => {
+                assert!(!preroll_only, "{tag}: the pre-roll ended before the kill");
+                sim.try_run_until(Micros(40_000_000), |_| {})
+                    .expect_err("the program was killed")
+                    .to_string()
+            }
+        };
+        let ended = Instant::now();
+        killer.join().expect("the killer");
+        let killed = killed_at.lock().expect("flag").expect("the kill happened");
+        let after = ended.duration_since(killed);
+        println!(
+            "MEASURED {tag}: the error came {:.3} s after the kill: {message}",
+            after.as_secs_f64()
+        );
+        assert!(after < Duration::from_secs(2), "{tag}: {after:?}");
+        assert!(
+            message.contains("ended") || message.contains("gone"),
+            "{message}"
+        );
+        drop(sim);
+        assert!(!alive(pid), "{tag}: the program is still there");
+    }
+}
+
 /// Test 9. A vehicle that cannot arm is an error, not a hang.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
