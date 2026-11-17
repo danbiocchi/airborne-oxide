@@ -480,7 +480,9 @@ The strategy (option "c+") is to build our own core and **measure** it against A
    - **oxide-core:** our auto-tune.
 
    The resulting parameter files are committed with the gate report. Runs on default gains may be reported but don't count toward the decision.
-4. **Criteria committed in advance.** Gate criteria go in an ADR before the run. For example, gate 1, on the reference quad over N = 500 seeds:
+
+   **Gate 1 is an exception** ([ADR-0007](adr/0007-gate-1-criteria.md)): our auto-tune does not exist until M2, so at gate 1 ArduCopter gets its full procedure and oxide-core flies the gains it has. The rule holds from gate 2.
+4. **Criteria committed in advance.** Gate criteria go in an ADR before the run. Gate 1's are in [ADR-0007](adr/0007-gate-1-criteria.md). In short, on the reference quad over N = 500 gust seeds:
    - zero crashes;
    - position RMSE in the gust profile ≤ 1.0× ArduCopter's;
    - fault-recovery metrics no worse.
