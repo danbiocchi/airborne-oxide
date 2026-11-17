@@ -1,6 +1,6 @@
 # ADR-0006: The ArduPilot bridge
 
-Status: accepted as the design (M1d). The seam of §2 is built; the bridge is not built yet. The measurements below come from a prototype that was thrown away.
+Status: accepted as the design (M1d). Built so far: the seam of §2; the wind grid, the IMU grid and the pre-roll in the simulator; the exchange of §3, proven against a stand-in. Not built yet: the ArduCopter process, MAVLink, and the translation of pilots and faults. The measurements below come from a prototype that was thrown away.
 
 ## Context
 
@@ -41,14 +41,14 @@ A flight is judged from the physics: where the vehicle went, how far it tilted, 
 - **The step of a bridged flight is 500 µs.** ArduCopter's loop is 2500 µs, so it gets five steps per loop. Steps of 250, 500, 1000 and 1250 µs all flew with the same tilt and horizontal error; 2500 µs cannot arm, because ArduCopter demands an IMU rate of 1.8 times its loop rate. 500 µs divides the loop evenly at half the cost of 250 µs. Our core's own profiles keep their steps (1000 µs and 250 µs): no existing flight changes.
 - **Time stamps.** The reply's time stamp for step *k* is *k* × (step + 1 ns). SITL adds the differences into a whole number of microseconds and truncates, so exact steps make its clock run 0.04 % slow; the extra nanosecond makes it exact (measured).
 - **Framing.** Every reply starts and ends with a newline. SITL drops a first reply that does not start with one.
-- **A flight starts with a pre-roll.** For a fixed 45 simulated seconds the vehicle rests on the ground with no wind and no faults while ArduCopter starts its estimator. Scenario time zero is the end of the pre-roll. A flight in which ArduCopter is not ready to arm by then has failed to start and is reported as that, not as a flight.
+- **A flight starts with a pre-roll.** For a fixed 45 simulated seconds the vehicle rests on the ground with no wind and no faults while ArduCopter starts its estimator. The simulator runs it (`Simulation::preroll`), and only our IMU model advances in it: ArduCopter sees the IMU's turn-on bias from its own start, as on a real vehicle, and the flight that follows has the wind and the other sensors of a flight with no pre-roll, bit for bit. Scenario time zero is the end of the pre-roll. A flight in which ArduCopter is not ready to arm by then has failed to start and is reported as that, not as a flight.
 - **Commands act at once.** The motor packet that answers the state at *t* drives the physics from *t*. This is how ArduPilot's own simulator and its JSON examples work, and it gives ArduCopter no handicap. Our core keeps its rule that a command acts one tick after the tick that computed it (DESIGN §4.2), so it flies with up to 1 ms more delay than ArduCopter.
 
 ### 4. What ArduCopter senses
 
 | Quantity | Where it comes from | Setting |
 |---|---|---|
-| Gyro and accelerometer | **Our IMU model's samples**, sent in the reply: the same noise, bias and vibration model our core flies on | `SIM_DRIFT_SPEED 0` (SITL otherwise adds its own slow gyro drift) |
+| Gyro and accelerometer | **Our IMU model's samples**, sent in the reply: the same noise, bias and vibration model our core flies on, sampled every 1000 µs as for the F405 profile | `SIM_DRIFT_SPEED 0` (SITL otherwise adds its own slow gyro drift) |
 | GPS | SITL's, from the position and velocity we send | 5 Hz as ours; `SIM_GPS1_LAG_MS 150` (our delay); `SIM_GPS1_VERR 0.1` (our velocity noise) |
 | GPS horizontal error | **Ours, added to the horizontal position we send**: 0.3 m per sample, as our GPS model draws it, held between GPS samples. It starts after the pre-roll, so ArduCopter's origin is set without it | none exists in SITL |
 | Barometer | SITL's, from the height we send | `SIM_BARO_RND 0.173` (measured: 0.10 m, our noise) |
@@ -57,6 +57,8 @@ A flight is judged from the physics: where the vehicle went, how far it tilted, 
 | Radio | Our pilot's sticks, sent in the reply as `rc` channels | |
 
 The GPS error row is the owner's decision: without it, a comparison of position hold measures the GPS models and not the autopilots. In a first look our core held position within 0.035 to 0.044 m RMS in gusts on clean sensors and within 0.15 to 0.22 m on its noisy GPS, while ArduCopter, whose simulated GPS had no horizontal error, held within about 0.10 m. Before the gate is run, a test must show that ArduCopter's reported GPS position carries the added error and that nothing else it senses changed. If that cannot be shown, the gate removes the horizontal GPS error from our core's model instead, and the gate report says so.
+
+The IMU is sampled every 1000 µs, not at every 500 µs step, for this reason: our IMU model has a fixed noise density, so the noise of one sample grows as the sampling period shrinks, and SITL reads the latest value we send without averaging. Sampled at every step, ArduCopter would get √2 times the noise per sample that our F405 core gets. The IMU model has a sampling period of its own for this (`ImuModel::period_us`); with the same seed a bridged flight and the F405 flight have the same IMU bias and the same noise draws.
 
 What cannot be made equal, and is listed in the gate report: our barometer's random offset at start-up (SITL has none); the height the GPS reports (SITL's error is a slow sine, ours is random); ArduCopter's GPS, barometer and compass are sampled by SITL's code, not ours. Rangefinder and airspeed are not sent: we do not model them, and SITL's rangefinder input on this interface is faulty at the pinned version.
 
