@@ -14,6 +14,12 @@
 //! - **Offboard**: our setpoint stream becomes GUIDED commands on the brain
 //!   link (take-off, then position targets); the brain's heartbeat goes out
 //!   at 1 Hz.
+//! - **Faults**: the faults active at the tick go through
+//!   [`FaultTranslator`], and each parameter write it returns is sent on the
+//!   instrument's link before the tick's exchange and recorded in the audit
+//!   ([`SentKind::ParamSet`]); the echo is recorded when it is read. The
+//!   faults that need no write need no code: the pilot's radio, the brain's
+//!   and the ground station's links are forwarded only while they arrive.
 //! - **The instrument**: a client on serial 0 that sends a heartbeat at 1 Hz
 //!   as a system id that is not the ground station's, requests a fixed set of
 //!   telemetry messages at fixed steps, and reads. It is the measuring
@@ -48,6 +54,7 @@ use oxide_core::io::TrajectorySetpoint;
 use oxide_core::math::Real;
 use oxide_core::time::Micros;
 use oxide_sim::autopilot::{Autopilot, AutopilotInput, AutopilotOutput, PrerollInput};
+use oxide_sim::faults::ActiveFaults;
 use oxide_sim::rng::{Rng, Stream};
 use oxide_sim::scenario::Pilot;
 use oxide_sim::sim::{PrerollError, SimOptions, StepRecord};
@@ -56,6 +63,7 @@ use oxide_sim::{Airframe, SimError, Simulation};
 use crate::bridge::{
     BridgeConfig, BridgeError, ConfigError, Exchange, RcLatch, armed_by_pulses, reply_of_body,
 };
+use crate::faults::FaultTranslator;
 use crate::link::Link;
 use crate::mav::{self, MavClient, MavError, MavEvent};
 use crate::motors::{DEFAULT_SPIN_MAX, DEFAULT_SPIN_MIN, MotorMap};
@@ -494,9 +502,25 @@ impl std::error::Error for ArduCopterError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SentKind {
     Heartbeat,
-    MessageInterval { message_id: u32, hz: f32 },
-    TakeOff { height_m: f32 },
-    PositionTarget { n: f32, e: f32, d: f32, yaw: f32 },
+    MessageInterval {
+        message_id: u32,
+        hz: f32,
+    },
+    TakeOff {
+        height_m: f32,
+    },
+    PositionTarget {
+        n: f32,
+        e: f32,
+        d: f32,
+        yaw: f32,
+    },
+    /// A parameter written for a fault (`param_set` on the instrument's
+    /// link): the name and the value as sent.
+    ParamSet {
+        name: String,
+        value: f32,
+    },
 }
 
 /// One thing sent, with the program time of the exchange it went before.
@@ -584,6 +608,30 @@ impl FlightAudit {
             .iter()
             .filter(|s| s.system_id == system_id)
             .count()
+    }
+
+    /// The parameter writes sent: program time of the exchange each went
+    /// before, name, value.
+    pub fn param_writes(&self) -> Vec<(u64, &str, f32)> {
+        self.sent
+            .iter()
+            .filter_map(|s| match &s.what {
+                SentKind::ParamSet { name, value } => Some((s.at_us, name.as_str(), *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The echoes (`PARAM_VALUE`) heard: program time of the read, name,
+    /// value. A read time is not repeatable to the step.
+    pub fn param_echoes(&self) -> Vec<(u64, &str, f32)> {
+        self.heard
+            .iter()
+            .filter_map(|h| match &h.event {
+                MavEvent::ParamValue { name, value, .. } => Some((h.at_us, name.as_str(), *value)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Program time of a flight time, µs.
@@ -989,6 +1037,7 @@ pub struct ArduCopter {
     gps_error: GpsErrorState,
     rc: RcLatch,
     brain: Brain,
+    faults: FaultTranslator,
     arm_watch: ArmWatch,
     /// The pulses of the previous exchange say armed.
     armed: bool,
@@ -1062,6 +1111,7 @@ impl ArduCopter {
             imu: None,
             rc: RcLatch::new(),
             brain: Brain::default(),
+            faults: FaultTranslator::new(),
             arm_watch: ArmWatch::default(),
             armed: false,
             preroll_steps: 0,
@@ -1308,6 +1358,27 @@ impl ArduCopter {
         Ok(())
     }
 
+    /// The parameter writes of the faults that start or end at this tick,
+    /// sent on the instrument's link before the exchange and recorded. Decided
+    /// from the fault list and the tick alone ([`FaultTranslator`]): the echo
+    /// of a write is not waited for.
+    fn send_faults(&mut self, active: &ActiveFaults) -> Result<(), ArduCopterError> {
+        for w in self.faults.step(active) {
+            self.instrument
+                .param_set(w.name, w.value)
+                .map_err(|e| self.mav_error(LinkName::Instrument, e))?;
+            self.record(
+                LinkName::Instrument,
+                self.config.instrument_system_id,
+                SentKind::ParamSet {
+                    name: w.name.to_string(),
+                    value: w.value,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Reads everything that is waiting on every link, into the audit.
     fn drain(&mut self) -> Result<(), ArduCopterError> {
         let at_us = self.ex.frames() * STEP_US;
@@ -1456,6 +1527,7 @@ impl Autopilot<4> for ArduCopter {
         }
         self.send_instrument()?;
         self.send_flight(t, input)?;
+        self.send_faults(&input.faults)?;
         let rc = self.rc.at(t, &input.rc);
         let mut reply = reply_of_body(
             0,
@@ -2208,6 +2280,13 @@ mod tests {
                     "    fn send_instrument(",
                     "    /// Reads everything that is waiting on every link",
                 ),
+            ),
+            (
+                "the fault translator",
+                include_str!("faults.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or(""),
             ),
             (
                 "the pre-roll and flight ticks",

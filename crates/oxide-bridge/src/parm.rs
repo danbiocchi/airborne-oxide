@@ -13,6 +13,10 @@ use std::path::PathBuf;
 pub const BASE: &str = include_str!("../arducopter/base.parm");
 /// `arducopter/starting-gains.parm`: the hand step before the tuner.
 pub const STARTING_GAINS: &str = include_str!("../arducopter/starting-gains.parm");
+/// `arducopter/failsafes.parm`: ADR-0007 section 3, each failsafe switched on
+/// with its usual action. Not in the default file list of
+/// [`crate::arducopter::ArduCopterConfig::new`]: a flight takes it on request.
+pub const FAILSAFES: &str = include_str!("../arducopter/failsafes.parm");
 
 /// The path of `base.parm` in the source tree this crate was built from.
 pub fn base_path() -> PathBuf {
@@ -23,6 +27,11 @@ pub fn base_path() -> PathBuf {
 /// from.
 pub fn starting_gains_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/starting-gains.parm")
+}
+
+/// The path of `failsafes.parm` in the source tree this crate was built from.
+pub fn failsafes_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/failsafes.parm")
 }
 
 /// A line that is not a parameter.
@@ -95,6 +104,41 @@ mod tests {
             std::fs::read_to_string(starting_gains_path()).expect("gains"),
             STARTING_GAINS
         );
+        assert_eq!(
+            std::fs::read_to_string(failsafes_path()).expect("failsafes"),
+            FAILSAFES
+        );
+    }
+
+    #[test]
+    fn the_failsafes_file_holds_the_five_settings_of_the_gate_record_and_nothing_else() {
+        let f: Vec<(String, f64)> = parse(FAILSAFES).expect("failsafes.parm parses");
+        let want = [
+            ("FS_THR_ENABLE", 1.0),
+            ("FS_EKF_ACTION", 1.0),
+            ("BATT_FS_LOW_ACT", 2.0),
+            ("BATT_FS_CRT_ACT", 1.0),
+            ("FS_GCS_ENABLE", 1.0),
+        ];
+        let got: Vec<(&str, f64)> = f.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        assert_eq!(got, want);
+        // Each line has a comment that names its row (the line before).
+        for (name, _) in want {
+            let at = FAILSAFES.find(name).expect("the name is in the text");
+            let before = &FAILSAFES[..at];
+            let last_line = before.trim_end().lines().last().unwrap_or("");
+            assert!(
+                last_line.starts_with('#'),
+                "{name} has no comment before it"
+            );
+        }
+        // None of them is in the other two files (a later file would win).
+        for (name, _) in want {
+            assert!(
+                !all().iter().any(|(n, _)| n == name),
+                "{name} is also in base or gains"
+            );
+        }
     }
 
     #[test]
