@@ -22,7 +22,6 @@ use rest::{Rest, RestError};
 
 const BASE_PARAMS: &str = "FRAME_CLASS 1\nFRAME_TYPE 1\nLOG_BACKEND_TYPE 0\n";
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-const LONG: Duration = Duration::from_secs(20);
 
 /// The binary's path, or a failure that says what to set.
 fn binary() -> PathBuf {
@@ -87,9 +86,10 @@ impl Flight {
         let link = Link::bind(port).unwrap_or_else(|e| panic!("cannot bind UDP port {port}: {e}"));
         let sitl = Sitl::start(config).expect("start the simulator");
         let mav_port = sitl.mavlink_port(0).expect("serial 0");
-        let client = MavClient::connect(mav_port, 255, 190, config_limit())
-            .unwrap_or_else(|e| panic!("{e}"));
-        let rest = Rest::new(link, client, first_k, REPLY_TIMEOUT, LONG)
+        let limit = sitl.startup_limit();
+        let client =
+            MavClient::connect(mav_port, 255, 190, limit).unwrap_or_else(|e| panic!("{e}"));
+        let rest = Rest::new(link, client, first_k, REPLY_TIMEOUT, limit)
             .unwrap_or_else(|e| panic!("first packet: {e}"));
         Self {
             rest,
@@ -97,10 +97,6 @@ impl Flight {
             _root: root,
         }
     }
-}
-
-fn config_limit() -> Duration {
-    LONG
 }
 
 fn is_heartbeat(e: &MavEvent) -> bool {

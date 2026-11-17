@@ -5,7 +5,14 @@
 //! for the flight, writes the effective parameter file into it and starts the
 //! program there. It neither binds the UDP port nor connects MAVLink: the
 //! caller owns the [`crate::link::Link`] and the [`crate::mav::MavClient`].
-//! The child is ended by [`Sitl::stop`] and, whatever happens, by `Drop`.
+//! The child is ended by [`Sitl::stop`] and, whatever happens, by `Drop`. A
+//! process that is killed (SIGKILL) runs no `Drop`: the flight's directory
+//! holds `sitl.pid` (the child's pid, then the binary's path, one per line)
+//! so that the orphan can be found and ended.
+//!
+//! The checksum is taken from the file at its path and the program is then
+//! started from that path: a file replaced in between would run unchecked.
+//! That race is accepted (a single-user test machine is the intended use).
 
 use core::fmt;
 use std::io;
@@ -123,6 +130,9 @@ pub enum SitlError {
         found: String,
         expected: &'static str,
     },
+    /// The flight name is not one plain directory name (it would leave the
+    /// root, or is empty).
+    BadFlightName { name: String },
     /// The flight's directory exists already; a directory is never reused.
     DirExists { path: PathBuf },
     /// The flight's directory could not be made.
@@ -168,6 +178,10 @@ impl fmt::Display for SitlError {
                 f,
                 "the simulator binary {} has SHA-256 {found}, not the pinned {expected}",
                 path.display()
+            ),
+            Self::BadFlightName { name } => write!(
+                f,
+                "the flight name {name:?} is not a single plain directory name (no separator, no `.` or `..`, not empty)"
             ),
             Self::DirExists { path } => write!(
                 f,
@@ -239,6 +253,7 @@ pub struct Sitl {
     binary_sha256: String,
     params_sha256: String,
     command_line: Vec<String>,
+    startup_limit: Duration,
 }
 
 /// Why a parameter name is refused, if it is: it must be non-empty, printable
@@ -337,6 +352,16 @@ impl Sitl {
                 instance: config.instance,
             });
         }
+        if let Some(name) = &config.flight_name {
+            let mut parts = Path::new(name).components();
+            let single = matches!(
+                (parts.next(), parts.next()),
+                (Some(std::path::Component::Normal(n)), None) if n == name.as_str()
+            );
+            if !single {
+                return Err(SitlError::BadFlightName { name: name.clone() });
+            }
+        }
         // 1. The binary.
         let binary = absolute(&config.binary);
         let binary_sha256 = match sha256::of_file(&binary) {
@@ -429,14 +454,38 @@ impl Sitl {
         let child = spawn(&mut cmd, &binary)?;
         let mut command_line = vec![binary.display().to_string()];
         command_line.extend(args);
-        Ok(Self {
+        let pid_path = dir.join("sitl.pid");
+        let sitl = Self {
             child: Some(child),
             instance: config.instance,
             dir,
             binary_sha256,
             params_sha256,
             command_line,
-        })
+            startup_limit: config.startup_limit,
+        };
+        // So that a person, or a later run, can find and end the program if
+        // this process is killed before it can (a SIGKILL runs no `Drop`).
+        // If it cannot be written, `sitl` is dropped here and ends the child.
+        std::fs::write(
+            &pid_path,
+            format!(
+                "{}\n{}\n",
+                sitl.child.as_ref().map_or(0, Child::id),
+                binary.display()
+            ),
+        )
+        .map_err(|source| SitlError::Write {
+            path: pid_path,
+            source,
+        })?;
+        Ok(sitl)
+    }
+
+    /// The wall-clock limit the caller applies to its first-packet and
+    /// MAVLink waits after the start (from the configuration).
+    pub fn startup_limit(&self) -> Duration {
+        self.startup_limit
     }
 
     /// The UDP port the program sends motor packets to (the caller binds it
@@ -679,6 +728,49 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn a_flight_name_that_leaves_the_root_is_refused_and_nothing_is_made() {
+        let root = scratch("name");
+        let bin = fake_binary(&root, b"x");
+        let outside = root.join("escaped");
+        let absolute = root.join("absolute");
+        for bad in [
+            "../escaped".to_string(),
+            "a/b".to_string(),
+            "..".to_string(),
+            ".".to_string(),
+            String::new(),
+            absolute.display().to_string(),
+        ] {
+            let mut c = SitlConfig::new(&bin, root.join("flights"));
+            c.accept_any_binary = true;
+            c.flight_name = Some(bad.clone());
+            let e = Sitl::start(c).unwrap_err();
+            assert!(
+                matches!(e, SitlError::BadFlightName { .. }),
+                "{bad:?}: {e:?}"
+            );
+            assert!(e.to_string().contains(&format!("{bad:?}")), "{e}");
+        }
+        assert!(!outside.exists() && !absolute.exists());
+        assert!(!root.join("flights").exists(), "nothing was made");
+        // A plain single name is still fine (it gets as far as the spawn).
+        let mut c = SitlConfig::new(&bin, root.join("flights"));
+        c.accept_any_binary = true;
+        c.flight_name = Some("plain-1.x".into());
+        let e = Sitl::start(c).unwrap_err();
+        assert!(matches!(e, SitlError::Spawn { .. }), "{e:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_start_up_limit_is_kept_for_the_caller() {
+        let root = scratch("limit");
+        let c = SitlConfig::new(root.join("x"), root.join("flights"));
+        assert_eq!(c.startup_limit, Duration::from_secs(20));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     mod with_a_script {
         use super::*;
@@ -772,6 +864,24 @@ mod tests {
             // Output goes to two files.
             assert_eq!(wait_for(&dir.join("stdout.txt")).trim(), "to-stdout");
             assert_eq!(wait_for(&dir.join("stderr.txt")).trim(), "to-stderr");
+            drop(sitl);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_pid_file_names_the_child_and_the_binary_and_the_start_up_limit_is_kept() {
+            let root = scratch("pid");
+            let bin = script(&root, "exec sleep 60");
+            let mut c = config(&bin, &root);
+            c.startup_limit = Duration::from_secs(7);
+            let sitl = Sitl::start(c).expect("start");
+            assert_eq!(sitl.startup_limit(), Duration::from_secs(7));
+            let pid = sitl.pid().expect("pid");
+            let text = fs::read_to_string(sitl.dir().join("sitl.pid")).expect("pid file");
+            let mut lines = text.lines();
+            assert_eq!(lines.next(), Some(pid.to_string().as_str()));
+            assert_eq!(lines.next(), Some(&*bin.display().to_string()));
+            assert_eq!(lines.next(), None, "{text:?}");
             drop(sitl);
             let _ = fs::remove_dir_all(&root);
         }
