@@ -455,6 +455,13 @@ pub struct FlightAudit {
     pub packet_hash: u64,
     /// FNV-1a over every reply line sent.
     pub reply_hash: u64,
+    /// The time stamp of the last reply, ns: `exchanges` steps, each one step
+    /// and 1 ns (see `reply::timestamp_ns`).
+    pub last_stamp_ns: u64,
+    /// Replies whose time stamp was not exactly one step after the one before
+    /// (the pre-roll's last to the flight's first included). Zero: the
+    /// program's clock never jumped or ran back.
+    pub stamp_breaks: u64,
     /// The program had ended before it was stopped, and the end of its error
     /// output (filled by `finish`).
     pub sitl_ended_before_stop: Option<bool>,
@@ -523,6 +530,11 @@ impl fmt::Display for FlightAudit {
             f,
             "  packet hash {:016x}, reply hash {:016x}",
             self.packet_hash, self.reply_hash
+        )?;
+        writeln!(
+            f,
+            "  last time stamp {} ns, {} stamp breaks",
+            self.last_stamp_ns, self.stamp_breaks
         )?;
         let mut sent_other = 0;
         writeln!(f, "  sent (heartbeats not listed):")?;
@@ -858,6 +870,8 @@ impl ArduCopter {
     fn sync_hashes(&mut self) {
         self.audit.packet_hash = self.ex.packet_hash();
         self.audit.reply_hash = self.ex.reply_hash();
+        self.audit.last_stamp_ns = self.ex.last_stamp_ns();
+        self.audit.stamp_breaks = self.ex.stamp_breaks();
         self.audit.exchanges = self.ex.frames();
         self.audit.preroll_steps = self.preroll_steps;
     }

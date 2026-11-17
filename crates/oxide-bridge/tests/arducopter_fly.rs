@@ -18,6 +18,7 @@ use oxide_bridge::arducopter::{
     gps_blend_sd_ratio,
 };
 use oxide_bridge::mav::{MavEvent, id};
+use oxide_bridge::reply::timestamp_ns;
 use oxide_bridge::sitl::PINNED;
 use oxide_core::math::{Real, Vec3};
 use oxide_core::schedule::F405_LEAN;
@@ -168,6 +169,36 @@ fn fly_logged<P: Pilot>(
     (log, flown)
 }
 
+/// The program's clock is ours and never jumped or ran back: every reply's
+/// time stamp was exactly one step after the one before (the first, one step),
+/// the pre-roll's last to the flight's first included, and the last is
+/// `exchanges` steps; and the program's own clock (`SYSTEM_TIME`) never
+/// differed from the simulated time of the step that read it by more than
+/// 50 ms.
+fn assert_stamps_continuous(a: &FlightAudit) {
+    assert_eq!(a.stamp_breaks, 0, "{a}");
+    assert_eq!(
+        a.last_stamp_ns,
+        timestamp_ns(a.step_us, a.exchanges),
+        "the last stamp is not exchanges x step"
+    );
+    let worst = a
+        .heard
+        .iter()
+        .filter_map(|h| match h.event {
+            MavEvent::SystemTime { time_boot_ms, .. } => {
+                Some((f64::from(time_boot_ms) - h.at_us as f64 * 1e-3).abs())
+            }
+            _ => None,
+        })
+        .fold(0.0, f64::max);
+    println!(
+        "MEASURED the program's clock against ours over {} exchanges: largest gap {worst:.1} ms",
+        a.exchanges
+    );
+    assert!(worst <= 50.0, "the program's clock jumped: {worst} ms");
+}
+
 fn texts(audit: &FlightAudit) -> String {
     audit
         .status_texts
@@ -203,6 +234,7 @@ fn the_pre_roll_leaves_a_vehicle_that_is_ready_and_has_never_armed() {
     let a = ap.audit();
     assert_eq!(a.preroll_steps, PREROLL_STEPS);
     assert_eq!(a.exchanges, PREROLL_STEPS);
+    assert_stamps_continuous(a);
     // No pulse above 1000 us on outputs 1 to 4 through the whole pre-roll
     // (a pulse above is an error that stops the pre-roll).
     println!(
@@ -390,6 +422,7 @@ fn the_hover_step_flies() {
     // After 45 s no PreArm text is outstanding: it armed.
     let a = &flown.audit;
     assert!(a.armed_changes.iter().any(|(_, armed)| *armed), "{a}");
+    assert_stamps_continuous(a);
     println!("{a}");
 
     // What was sent, to whom, and when (all decided from lockstep data).
@@ -1364,6 +1397,7 @@ fn gust_hold_flies_for_runs_0_1_and_2() {
         );
         // The window is judged for what the truth says; the audit is kept.
         assert_eq!(h.flown.audit.sent_as(255), 0);
+        assert_stamps_continuous(&h.flown.audit);
     }
 }
 

@@ -255,6 +255,11 @@ pub struct Exchange {
     frames: u64,
     reply_hash: TraceHash,
     packet_hash: TraceHash,
+    /// The time stamp of the last reply sent, ns.
+    last_stamp_ns: u64,
+    /// Replies whose time stamp was not exactly one step after the one before
+    /// it (the first: not exactly one step).
+    stamp_breaks: u64,
 }
 
 impl Exchange {
@@ -275,6 +280,8 @@ impl Exchange {
             frames: 0,
             reply_hash: TraceHash::default(),
             packet_hash: TraceHash::default(),
+            last_stamp_ns: 0,
+            stamp_breaks: 0,
         })
     }
 
@@ -292,6 +299,17 @@ impl Exchange {
     /// The time stamp of the next reply, ns.
     pub fn next_timestamp_ns(&self) -> u64 {
         timestamp_ns(self.config.step_us, self.frames.saturating_add(1))
+    }
+    /// The time stamp of the last reply sent, ns (0 before the first).
+    pub fn last_stamp_ns(&self) -> u64 {
+        self.last_stamp_ns
+    }
+    /// How many replies were stamped other than exactly one step after the
+    /// reply before (the first: one step after zero). The clock of the
+    /// program must never jump or run back; this is counted from the stamps
+    /// as they were written, whatever computed them.
+    pub fn stamp_breaks(&self) -> u64 {
+        self.stamp_breaks
     }
     /// FNV-1a over the bytes of every reply line sent.
     pub fn reply_hash(&self) -> u64 {
@@ -329,6 +347,11 @@ impl Exchange {
             .link
             .exchange(&self.line, self.config.reply_timeout)
             .map_err(|source| BridgeError::Link { step, source })?;
+        let one_step = timestamp_ns(self.config.step_us, 1);
+        if reply.timestamp_ns != self.last_stamp_ns.saturating_add(one_step) {
+            self.stamp_breaks += 1;
+        }
+        self.last_stamp_ns = reply.timestamp_ns;
         self.frames += 1;
         self.reply_hash.write_bytes(self.line.as_bytes());
         self.packet_hash.write_u64(u64::from(packet.frame_count));
@@ -717,6 +740,8 @@ mod tests {
             assert_eq!(&stamp_of(&buf[..len]), want, "exchange {n}");
         }
         assert_eq!(ex.frames(), 3);
+        assert_eq!(ex.last_stamp_ns(), 1_500_003);
+        assert_eq!(ex.stamp_breaks(), 0, "three stamps, one step apart");
         // The hashes saw three replies and three packets.
         assert_ne!(ex.reply_hash(), TraceHash::default().value());
         assert_ne!(ex.packet_hash(), TraceHash::default().value());
