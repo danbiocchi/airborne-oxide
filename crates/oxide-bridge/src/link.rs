@@ -123,15 +123,10 @@ impl Link {
     /// Sends `reply` for the packet held and returns the next packet. The
     /// first call waits for the simulator's first packet before it replies.
     pub fn exchange(&mut self, reply: &str, timeout: Duration) -> Result<ServoPacket, LinkError> {
-        let start = Instant::now();
-        let deadline = start + timeout;
         if self.peer.is_none() {
-            // The first packet, whatever its count.
-            let Some(p) = self.receive(deadline)? else {
-                return Err(LinkError::FirstPacketTimeout { waited: timeout });
-            };
-            self.last_count = Some(p.frame_count);
+            self.wait_for_first_packet(timeout)?;
         }
+        let deadline = Instant::now() + timeout;
         self.send(reply)?;
         let last = self.last_count.unwrap_or(0);
         let expected = last.wrapping_add(1);
@@ -155,6 +150,18 @@ impl Link {
                 });
             }
         }
+    }
+
+    /// Waits for the simulator's first packet (whatever its count) and
+    /// learns the peer from it. A caller that wants a longer wait for the
+    /// first packet than for the others calls this before the first
+    /// [`Link::exchange`].
+    pub fn wait_for_first_packet(&mut self, timeout: Duration) -> Result<(), LinkError> {
+        let Some(p) = self.receive(Instant::now() + timeout)? else {
+            return Err(LinkError::FirstPacketTimeout { waited: timeout });
+        };
+        self.last_count = Some(p.frame_count);
+        Ok(())
     }
 
     /// Sends a reply to the peer and keeps it for a resend.
