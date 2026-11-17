@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! One flight from a scenario file: through the bridge ([`fly_scenario`]) or
+//! on our own core ([`fly_core`]), judged by the same [`Checker`] and classed
+//! by the same code, so that one table serves both sides of the benchmark.
+
+use core::fmt;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use oxide_core::math::Real;
+use oxide_sim::outcome::FlightClass;
+use oxide_sim::scenario_file::{Checker, RunProfile, ScenarioFile, Verdict};
+use oxide_sim::{Airframe, SimError, StepRecord};
+
+use crate::arducopter::{ArduCopterConfig, FlightAudit, FlyError, fly};
+use crate::parm;
+use crate::scenario::{LoadedScenario, Translation, Untranslatable, translate};
+
+/// Who flies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Autopilot {
+    /// The simulator program, through the bridge.
+    ArduCopter,
+    /// Our flight core, on a profile.
+    Core(RunProfile),
+}
+
+impl Autopilot {
+    /// The name in tables and on the command line.
+    pub fn name(&self) -> String {
+        match self {
+            Self::ArduCopter => "arducopter".into(),
+            Self::Core(p) => format!("core-{}", p.name()),
+        }
+    }
+
+    /// `arducopter`, `core-f405` or `core-h743`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "arducopter" => Some(Self::ArduCopter),
+            "core-f405" => Some(Self::Core(RunProfile::F405)),
+            "core-h743" => Some(Self::Core(RunProfile::H743)),
+            _ => None,
+        }
+    }
+}
+
+/// Where and how a bridged flight runs.
+#[derive(Clone, Debug)]
+pub struct Setup {
+    /// The simulator program.
+    pub binary: PathBuf,
+    /// The flight's directory: the record goes here and the program's own
+    /// directory (`sitl`) is made inside it, so it must not hold one.
+    pub out: PathBuf,
+    /// The program's instance number, 0 to 9.
+    pub instance: u8,
+    /// The program's own speed-up.
+    pub speedup: u32,
+    /// Parameter files read after the committed ones, in order.
+    pub param_files: Vec<PathBuf>,
+}
+
+impl Setup {
+    pub fn new(binary: impl Into<PathBuf>, out: impl Into<PathBuf>, instance: u8) -> Self {
+        Self {
+            binary: binary.into(),
+            out: out.into(),
+            instance,
+            speedup: 100,
+            param_files: Vec::new(),
+        }
+    }
+}
+
+/// Why a flight did not produce a verdict.
+#[derive(Debug)]
+pub enum RunError {
+    /// The scenario cannot be flown through the bridge.
+    NotTranslatable(Untranslatable),
+    /// The simulation could not be built (our core's route).
+    Sim(SimError),
+    /// The bridged flight did not start or failed.
+    Fly(FlyError),
+}
+
+impl RunError {
+    /// What the failed bridged flight left of its audit.
+    pub fn audit(&self) -> Option<&FlightAudit> {
+        match self {
+            Self::Fly(FlyError::Flight { audit, .. }) => audit.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotTranslatable(e) => write!(f, "{e}"),
+            Self::Sim(e) => write!(f, "cannot set up the simulation: {e}"),
+            Self::Fly(e @ FlyError::Flight { .. }) => write!(f, "the flight failed: {e}"),
+            Self::Fly(e) => write!(f, "the flight did not start: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+/// One flight, judged.
+#[derive(Clone, Debug)]
+pub struct ScenarioFlight {
+    pub scenario: String,
+    pub index: u64,
+    pub seed: u64,
+    pub autopilot: Autopilot,
+    pub verdict: Verdict,
+    /// From the physics alone ([`FlightOutcome::class`](oxide_sim::outcome::FlightOutcome::class)).
+    pub class: FlightClass,
+    /// The RMS vertical distance from the hold point over the hold window,
+    /// m; with `[expect.hold]` only.
+    pub rms_v_m: Option<f64>,
+    /// `Simulation::trace_hash` at the end.
+    pub trace_hash: u64,
+    /// The hashes of the exchange; a bridged flight only.
+    pub packet_hash: Option<u64>,
+    pub reply_hash: Option<u64>,
+    /// The bridge's audit of the flight; a bridged flight only.
+    pub audit: Option<FlightAudit>,
+    /// Wall time of the whole flight, pre-roll included, s.
+    pub wall_s: f64,
+    /// Flight time of the last record with a motor command above zero, s.
+    pub last_motor_on_s: Option<f64>,
+    /// The scenario's parameters that are ours only (not sent).
+    pub ours_only: Vec<(String, f64)>,
+    /// The parameter files the program started with, as paths.
+    pub param_files: Vec<String>,
+    /// The parameters given after the files.
+    pub extra_params: Vec<(String, f64)>,
+}
+
+impl ScenarioFlight {
+    /// The row's note: the first problem of the verdict, then what is ours
+    /// only.
+    pub fn note(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = self.verdict.first_problem() {
+            parts.push(format!("first problem: {p}"));
+        }
+        if !self.ours_only.is_empty() {
+            let list: Vec<String> = self
+                .ours_only
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect();
+            parts.push(format!("ours only: {}", list.join(" ")));
+        }
+        parts.join("; ")
+    }
+
+    /// The three hashes that must repeat, as a key.
+    pub fn hashes(&self) -> (u64, Option<u64>, Option<u64>) {
+        (self.trace_hash, self.packet_hash, self.reply_hash)
+    }
+}
+
+/// Collects what the step records say beyond the verdict: the vertical hold
+/// error and the last motor command.
+struct Recorder {
+    checker: Checker,
+    /// Hold point z (NED), the window's start and the running sum.
+    vertical: Option<(f64, f64, f64, u64)>,
+    last_motor_on_s: Option<f64>,
+}
+
+impl Recorder {
+    fn new(file: &ScenarioFile) -> Self {
+        let target_z = file
+            .pilot
+            .setpoints
+            .iter()
+            .rev()
+            .find_map(|(_, sp)| sp.map(|sp| f64::from(sp.position.z)));
+        let vertical = match (file.hold, target_z) {
+            (Some(c), Some(z)) => Some((z, c.window_start_s, 0.0, 0)),
+            _ => None,
+        };
+        Self {
+            checker: Checker::new(file),
+            vertical,
+            last_motor_on_s: None,
+        }
+    }
+
+    fn add(&mut self, r: &StepRecord<4>) {
+        self.checker.add(r);
+        if r.motors.iter().any(|m| *m > 0.0) {
+            self.last_motor_on_s = Some(r.t.as_secs_f64());
+        }
+        match &mut self.vertical {
+            Some((z, from, sum, n)) if r.t.as_secs_f64() >= *from => {
+                let dz = r.position.z - *z;
+                *sum += dz * dz;
+                *n += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn rms_v_m(&self) -> Option<f64> {
+        self.vertical
+            .filter(|(_, _, _, n)| *n > 0)
+            .map(|(_, _, sum, n)| Real::sqrt(sum / n as f64))
+    }
+}
+
+/// The parameter files and the extra parameters of a bridged flight: the
+/// committed files, then the setup's, and the translation's parameters
+/// after them.
+pub fn arducopter_params(
+    translation: &Translation,
+    setup: &Setup,
+) -> (Vec<PathBuf>, Vec<(String, f64)>) {
+    let mut files = vec![parm::base_path(), parm::starting_gains_path()];
+    files.extend(setup.param_files.iter().cloned());
+    (files, translation.extra_params.clone())
+}
+
+/// Flies run `index` of `src` through the bridge, judges it, and returns
+/// what happened. Nothing is written: see [`crate::record`].
+pub fn fly_scenario(
+    src: &LoadedScenario,
+    index: u64,
+    setup: &Setup,
+) -> Result<ScenarioFlight, RunError> {
+    let file = &src.file;
+    let translation = translate(file).map_err(RunError::NotTranslatable)?;
+    let airframe = Airframe::reference_quad().map_err(RunError::Sim)?;
+    // Our core's parameters never reach the other autopilot as they are.
+    let mut options = file.options(&airframe, index);
+    options.params.clear();
+    let (param_files, extra_params) = arducopter_params(&translation, setup);
+    let mut config = ArduCopterConfig::new(&setup.binary, &setup.out, setup.instance);
+    config.flight_name = Some("sitl".into());
+    config.speedup = setup.speedup;
+    config.param_files.clone_from(&param_files);
+    config.extra_params.clone_from(&extra_params);
+    config.brain = translation.brain;
+    let mut rec = Recorder::new(file);
+    let wall = Instant::now();
+    let flown = fly(
+        &airframe,
+        file.pilot.clone(),
+        options,
+        config,
+        file.end(),
+        |r| rec.add(r),
+    )
+    .map_err(RunError::Fly)?;
+    let wall_s = wall.elapsed().as_secs_f64();
+    let rms_v_m = rec.rms_v_m();
+    let last_motor_on_s = rec.last_motor_on_s;
+    let verdict = rec.checker.finish();
+    Ok(ScenarioFlight {
+        scenario: file.name.clone(),
+        index,
+        seed: file.seed(index),
+        autopilot: Autopilot::ArduCopter,
+        class: verdict.outcome.class(),
+        verdict,
+        rms_v_m,
+        trace_hash: flown.trace_hash,
+        packet_hash: Some(flown.audit.packet_hash),
+        reply_hash: Some(flown.audit.reply_hash),
+        audit: Some(flown.audit),
+        wall_s,
+        last_motor_on_s,
+        ours_only: translation.ours_only,
+        param_files: param_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        extra_params,
+    })
+}
+
+/// Flies run `index` of `src` on our own core, on `profile`, with the file's
+/// own parameters, and judges it by the same [`Checker`].
+pub fn fly_core(
+    src: &LoadedScenario,
+    index: u64,
+    profile: RunProfile,
+) -> Result<ScenarioFlight, RunError> {
+    let file = &src.file;
+    let mut sim = file
+        .build_with_params(profile.profile(), index, &[])
+        .map_err(RunError::Sim)?;
+    let mut rec = Recorder::new(file);
+    let wall = Instant::now();
+    sim.run_until(file.end(), |r| rec.add(r));
+    let wall_s = wall.elapsed().as_secs_f64();
+    let trace_hash = sim.trace_hash();
+    let rms_v_m = rec.rms_v_m();
+    let last_motor_on_s = rec.last_motor_on_s;
+    let verdict = rec.checker.finish();
+    Ok(ScenarioFlight {
+        scenario: file.name.clone(),
+        index,
+        seed: file.seed(index),
+        autopilot: Autopilot::Core(profile),
+        class: verdict.outcome.class(),
+        verdict,
+        rms_v_m,
+        trace_hash,
+        packet_hash: None,
+        reply_hash: None,
+        audit: None,
+        wall_s,
+        last_motor_on_s,
+        ours_only: Vec::new(),
+        param_files: Vec::new(),
+        extra_params: Vec::new(),
+    })
+}
