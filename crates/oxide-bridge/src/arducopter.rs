@@ -791,6 +791,13 @@ impl ArduCopter {
         self.sitl.as_ref().map(Sitl::dir)
     }
 
+    /// The instrument's MAVLink client, for a probe that sends something of its
+    /// own between two ticks (what is sent is not in the audit's `sent` list,
+    /// which is the autopilot's own sending). Nothing in a flight uses it.
+    pub fn instrument(&self) -> &MavClient {
+        &self.instrument
+    }
+
     /// The pulses of the previous exchange say armed.
     pub fn armed(&self) -> bool {
         self.armed

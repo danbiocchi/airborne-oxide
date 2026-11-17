@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use oxide_bridge::arducopter::{
     ArduCopter, ArduCopterConfig, ArduCopterError, FlightAudit, Flown, FlyError, GpsError,
-    GpsErrorState, PREROLL_STEPS, TelemetryRequest, bridged_options, fly,
+    GpsErrorState, LinkName, PREROLL_STEPS, Sent, SentKind, TelemetryRequest, bridged_options, fly,
 };
 use oxide_bridge::mav::{MavEvent, id};
 use oxide_bridge::sitl::PINNED;
@@ -355,6 +355,118 @@ fn the_hover_step_flies() {
     let a = &flown.audit;
     assert!(a.armed_changes.iter().any(|(_, armed)| *armed), "{a}");
     println!("{a}");
+
+    // What was sent, to whom, and when (all decided from lockstep data).
+    let program_us = |flight_s: f64| a.program_us_of_flight_s(flight_s);
+    let t_arm = log.iter().find(|r| r.armed).expect("armed").t;
+    let armed_at = program_us(t_arm.as_secs_f64());
+    let takeoffs: Vec<&Sent> = a
+        .sent
+        .iter()
+        .filter(|s| matches!(s.what, SentKind::TakeOff { .. }))
+        .collect();
+    let targets: Vec<&Sent> = a
+        .sent
+        .iter()
+        .filter(|s| matches!(s.what, SentKind::PositionTarget { .. }))
+        .collect();
+    assert!(!takeoffs.is_empty() && !targets.is_empty(), "{a}");
+    // Nothing for the brain before the pulses say armed: the take-off goes at
+    // the first armed tick (the pulses of the exchange before it), and the
+    // targets after the height is within 0.3 m of the take-off height.
+    assert!(
+        takeoffs.iter().all(|s| s.at_us >= armed_at),
+        "a take-off before arming: {takeoffs:?} against {armed_at}"
+    );
+    println!(
+        "MEASURED brain: first take-off at {:.4} s, the pulses armed at {:.4} s; {} take-offs, {} position targets; first target at {:.4} s",
+        takeoffs[0].at_us as f64 * 1e-6,
+        armed_at as f64 * 1e-6,
+        takeoffs.len(),
+        targets.len(),
+        targets[0].at_us as f64 * 1e-6
+    );
+    assert!(
+        takeoffs[0].at_us - armed_at <= 40_000,
+        "the first take-off is at the first armed setpoint tick"
+    );
+    for s in &targets {
+        let t = (s.at_us - a.preroll_steps * a.step_us) as f64 * 1e-6;
+        let h = log
+            .iter()
+            .find(|r| r.t.as_secs_f64() >= t)
+            .map(|r| -r.position.z)
+            .expect("a record");
+        assert!(h >= 1.7 - 1e-9, "a target at {t} s with the height {h} m");
+    }
+    // The instrument is not the ground station; the brain has an id of its own.
+    assert_eq!(a.sent_as(255), 0, "nothing was sent as system 255");
+    assert!(a.sent.iter().all(|s| match s.link {
+        LinkName::Instrument => s.system_id == 250,
+        LinkName::Brain => s.system_id == 251,
+        LinkName::Gcs => false,
+    }));
+    assert!(
+        a.sent
+            .iter()
+            .filter(|s| matches!(
+                s.what,
+                SentKind::TakeOff { .. } | SentKind::PositionTarget { .. }
+            ))
+            .all(|s| s.link == LinkName::Brain)
+    );
+    // Heartbeats at 1 Hz: the instrument's from the first exchange, the
+    // brain's from the first flight tick.
+    let instr = a.heartbeats_sent_as(250);
+    println!(
+        "MEASURED heartbeats as 250: {instr}, as 251: {}",
+        a.heartbeats_sent_as(251)
+    );
+    assert_eq!(
+        instr, 65,
+        "45 s of pre-roll and 20 s of flight, one per second from the first"
+    );
+    assert_eq!(a.heartbeats_sent_as(251), 20);
+    // The vehicle acknowledged the take-off; every acknowledgement it sent to
+    // the brain is audit data.
+    assert!(a.heard.iter().any(|h| h.link == LinkName::Brain
+        && matches!(
+            h.event,
+            MavEvent::CommandAck {
+                command: 22,
+                result: 0
+            }
+        )));
+}
+
+/// The same hover-step three times, on two instances and at two speed-ups of
+/// the program's own clock: the physics, the reply lines and the motor packets
+/// repeat bit for bit.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_hover_step_repeats_bit_for_bit() {
+    let mut results = Vec::new();
+    for (instance, speedup) in [(4, 100), (5, 100), (6, 10)] {
+        let pilot = HoverStep::default();
+        let secs = pilot.duration_s;
+        let (_, flown) = fly_logged(
+            instance,
+            &format!("repeat-{instance}"),
+            pilot,
+            SimOptions::realistic(1),
+            secs,
+            move |c| c.speedup = speedup,
+        );
+        results.push((
+            flown.trace_hash,
+            flown.audit.packet_hash,
+            flown.audit.reply_hash,
+            flown.audit.params_sha256,
+        ));
+    }
+    println!("MEASURED repeat: {results:?}");
+    assert_eq!(results[0], results[1], "two instances");
+    assert_eq!(results[0], results[2], "another speed-up");
 }
 
 fn alive(pid: u32) -> bool {
@@ -717,6 +829,28 @@ fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
         rms < 0.03,
         "the reported error is our error through the blend: rms {rms}"
     );
+    // The error starts after the pre-roll: the fixes of its last 20 s, with
+    // the error on, show none (ArduCopter's origin is set without it).
+    for (name, run) in [("with", &with), ("without", &without)] {
+        let all = fixes(&run.audit);
+        let quiet: Vec<&Fix> = all
+            .iter()
+            .filter(|f| f.at_us >= 25_000_000 && f.at_us < run.flight_start_us)
+            .collect();
+        let n: Vec<f64> = quiet.iter().map(|f| north_east(f, &reference).0).collect();
+        let e: Vec<f64> = quiet.iter().map(|f| north_east(f, &reference).1).collect();
+        println!(
+            "MEASURED pre-roll fixes {name} the error (25 s to 45 s): {} fixes, north sd {:.4} east sd {:.4}",
+            quiet.len(),
+            std_dev(&n),
+            std_dev(&e)
+        );
+        assert!(quiet.len() >= 90, "{}", quiet.len());
+        assert!(
+            std_dev(&n) < 0.03 && std_dev(&e) < 0.03,
+            "{name}: the pre-roll has an error"
+        );
+    }
     for (name, v) in [("north", &n1), ("east", &e1)] {
         let sd = std_dev(v);
         assert!(
@@ -884,4 +1018,170 @@ fn the_imu_arducopter_reads_is_our_models() {
             "axis {a}: {ours} against {theirs}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The "believed, to be proven" points of the specification, settled on the
+// binary and pinned.
+
+/// The mode switch's three positions are STABILIZE, LOITER and GUIDED.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_mode_switch_positions_are_stabilize_loiter_and_guided() {
+    use oxide_sim::scenario::Script;
+    let script = Script {
+        mode: vec![(0.0, 0), (3.0, 1), (6.0, 2), (9.0, 0)],
+        duration_s: 12.0,
+        ..Script::default()
+    };
+    let (_, flown) = fly_logged(7, "modes", script, SimOptions::realistic(1), 12.0, |_| {});
+    let a = &flown.audit;
+    let start = a.preroll_steps * a.step_us;
+    let modes: Vec<(f64, u32)> = a
+        .mode_changes
+        .iter()
+        .filter(|(t, _)| *t >= start)
+        .map(|(t, m)| ((*t - start) as f64 * 1e-6, *m))
+        .collect();
+    println!("MEASURED mode changes in the flight (flight time, vehicle mode): {modes:?}");
+    // Switch 1000 us: STABILIZE (0); 1500 us: LOITER (5); 2000 us: GUIDED (4).
+    let seq: Vec<u32> = modes.iter().map(|m| m.1).collect();
+    assert_eq!(seq, vec![0, 5, 4, 0], "{modes:?}");
+    for (got, want) in modes.iter().zip([0.0, 3.0, 6.0, 9.0]) {
+        assert!(
+            got.0 >= want && got.0 - want < 0.3,
+            "{got:?} against {want}"
+        );
+    }
+}
+
+/// Arming from the radio in GUIDED needs `GUID_OPTIONS` bit 0.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn arming_from_the_radio_in_guided_needs_guid_options_bit_0() {
+    let root = TempDir::new("guidopt");
+    let mut c = config(8, &root);
+    c.extra_params.push(("GUID_OPTIONS".into(), 0.0));
+    let r = fly(
+        &airframe(),
+        HoverStep::default(),
+        SimOptions::realistic(1),
+        c,
+        Micros(20_000_000),
+        |_| {},
+    );
+    let Err(FlyError::Flight { source, .. }) = r else {
+        panic!("with GUID_OPTIONS 0 the radio does not arm in GUIDED, but {r:?}");
+    };
+    println!("MEASURED GUID_OPTIONS 0: {source}");
+    assert!(
+        matches!(source, ArduCopterError::DidNotArm { .. }),
+        "{source}"
+    );
+}
+
+/// Channel 7 as the motor emergency stop: switched on in flight, the motors
+/// go to nothing.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_kill_switch_stops_the_motors() {
+    use oxide_core::io::TrajectorySetpoint;
+    use oxide_sim::scenario::Script;
+    let hold = TrajectorySetpoint {
+        position: Vec3::new(0.0, 0.0, -2.0),
+        ..TrajectorySetpoint::default()
+    };
+    let script = Script {
+        arm_at_s: 1.5,
+        kill_at_s: Some(9.0),
+        mode: vec![(0.0, 2)],
+        setpoints: vec![(0.0, Some(hold))],
+        duration_s: 12.0,
+        ..Script::default()
+    };
+    let (log, flown) = fly_logged(9, "kill", script, SimOptions::realistic(1), 12.0, |_| {});
+    let before = log
+        .iter()
+        .rev()
+        .find(|r| r.t.as_secs_f64() < 9.0)
+        .expect("a record");
+    let first_off = log
+        .iter()
+        .filter(|r| r.t.as_secs_f64() >= 9.0)
+        .find(|r| r.motors.iter().all(|&m| m == 0.0))
+        .map(|r| r.t.as_secs_f64());
+    let texts: Vec<_> = flown
+        .audit
+        .texts_containing("MotorEStop")
+        .map(|(t, _, x)| (*t as f64 * 1e-6, x.clone()))
+        .collect();
+    println!(
+        "MEASURED kill switch at 9.0 s: motors {:?} before, all zero first at {first_off:?}; texts {texts:?}",
+        before.motors
+    );
+    // The program debounces a radio switch for about 0.2 s (the mode switch
+    // took the same time); the motors are at zero 0.226 s after the switch.
+    let off = first_off.expect("the motors went to zero");
+    assert!(off - 9.0 < 0.5, "{off}");
+    assert!(
+        texts.iter().any(|(_, x)| x == "RC7: MotorEStop HIGH"),
+        "{texts:?}"
+    );
+}
+
+/// A position target sent while the take-off is still climbing: accepted.
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn a_position_target_during_the_climb_is_obeyed() {
+    // Two runs: one where the instrument sends a target 1 m north when the
+    // vehicle is at 0.8 m, one without. The climb ends at 2 m.
+    let run = |instance: u8, probe: bool| {
+        let root = TempDir::new(&format!("early-{probe}"));
+        let mut sim = simulation(
+            instance,
+            &root,
+            HoverStep {
+                // Hold the first waypoint (0, 0, -2) throughout.
+                waypoints: HoverStep::default().waypoints.into_iter().take(2).collect(),
+                ..HoverStep::default()
+            },
+            SimOptions::realistic(1),
+            |_| {},
+        );
+        sim.preroll(PREROLL_STEPS).unwrap_or_else(|e| panic!("{e}"));
+        let mut sent = false;
+        let mut at_height = None;
+        while sim.time() < Micros(9_000_000) {
+            sim.try_step().unwrap_or_else(|e| panic!("{e}"));
+            let b = *sim.body();
+            if probe && !sent && -b.position.z > 0.8 {
+                sent = true;
+                sim.autopilot()
+                    .instrument()
+                    .position_target_local_ned(1.0, 0.0, -2.0, 0.0)
+                    .expect("send");
+            }
+            if at_height.is_none() && -b.position.z > 1.9 {
+                at_height = Some((sim.time().as_secs_f64(), b.position.x, b.velocity.x));
+            }
+        }
+        let end = sim.body().position.x;
+        drop(sim);
+        (at_height.expect("2 m reached"), end)
+    };
+    let with = run(1, true);
+    let without = run(2, false);
+    println!(
+        "MEASURED early target: with it, at 1.9 m (time, x, vx) {:?}, at 9 s x = {:.3}; without it {:?}, x = {:.3}",
+        with.0, with.1, without.0, without.1
+    );
+    // Accepted and obeyed: the vehicle is already moving north at 1.9 m. (A
+    // single target expires after GUID_TIMEOUT, 3 s, and the vehicle then
+    // brakes and holds: it is not at 1 m at 9 s. The brain re-sends each
+    // second.)
+    assert!(
+        with.0.1 > 0.3 && with.0.2 > 0.5,
+        "the early target moved the vehicle north"
+    );
+    assert!(without.0.1.abs() < 0.3 && without.0.2.abs() < 0.3);
 }
