@@ -346,4 +346,46 @@ mod tests {
         assert_eq!(timestamp_ns(500, 0), 0);
         assert_eq!(timestamp_ns(500, u64::MAX), u64::MAX, "saturates, no panic");
     }
+
+    /// The exact value, in u128 so that nothing can overflow or round.
+    fn exact_ns(step_us: u64, k: u64) -> u128 {
+        u128::from(k) * (u128::from(step_us) * 1000 + 1)
+    }
+
+    #[test]
+    fn the_time_stamp_is_exact_integer_arithmetic_at_large_step_numbers() {
+        // 2^40 steps of 500 us is about 6.4 years. A float route (k times
+        // 500.001 us in f64 seconds, then times 1e9) differs from the integer
+        // value in the last digits there; at 2^40 - 1 it gives
+        // 549756913399127872 where the exact value is 549756913399127775.
+        let ks = [
+            1u64,
+            3,
+            999_999_937,
+            (1 << 32) - 1,
+            1 << 32,
+            (1 << 33) + 12_345,
+            123_456_789_012,
+            (1 << 40) - 1,
+            1 << 40,
+        ];
+        for step_us in [500u64, 1000, 250, 4000, 999] {
+            for k in ks {
+                let want = exact_ns(step_us, k);
+                assert!(want < u128::from(u64::MAX), "{step_us} {k}");
+                let got = timestamp_ns(step_us, k);
+                assert_eq!(u128::from(got), want, "step {step_us} us, k = {k}");
+                // And the printed text is those nanoseconds as a decimal.
+                let mut r = bare();
+                r.timestamp_ns = got;
+                let text = format!(
+                    "\n{{\"timestamp\":{}.{:09},",
+                    want / 1_000_000_000,
+                    want % 1_000_000_000
+                );
+                assert!(line(&r).starts_with(&text), "step {step_us} us, k = {k}");
+            }
+        }
+        assert_eq!(timestamp_ns(500, (1 << 40) - 1), 549_756_913_399_127_775);
+    }
 }
