@@ -2304,6 +2304,7 @@ mod tests {
             "self.audit.mode_changes",
             "self.audit.heard",
             "self.audit.vehicle_heartbeats",
+            "param_echoes",
             "MavEvent",
         ];
         for (name, text) in regions {
