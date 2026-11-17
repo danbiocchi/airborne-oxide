@@ -588,7 +588,7 @@ struct EstimateErrors {
 
 impl EstimateErrors {
     fn update(&mut self, r: &StepRecord<4>) {
-        let Some(est) = r.estimate else { return };
+        let Some(est) = r.estimate() else { return };
         let p = est.position.cast::<f64>();
         let (dn, de) = (p.x - r.position.x, p.y - r.position.y);
         let dh = oxide_core::math::Real::sqrt(dn * dn + de * de);
@@ -610,13 +610,18 @@ fn csv_row(r: &StepRecord<4>) -> String {
     let e = r.attitude.to_euler();
     let sp = r.setpoint.map(|s| s.position);
     let f = |v: Option<f32>| v.map_or(String::new(), |x| format!("{x:.4}"));
-    let est = r.estimate;
+    let est = r.estimate();
+    // The core's columns are empty cells for a record without the core part.
+    let status = r.status();
+    let nav = status.map_or(String::new(), |s| format!("{:?}", s.nav));
+    let action = status.map_or(String::new(), |s| format!("{:?}", s.action));
+    let reasons = status.map_or(String::new(), |s| s.reasons.0.to_string());
     let est_pos = est.map(|s| s.position);
     let est_euler = est.map(|s| s.attitude.cast::<f64>().to_euler());
     let g = |v: Option<f32>| v.map_or(String::new(), |x| format!("{x:.5}"));
     let h = |v: Option<f64>| v.map_or(String::new(), |x| format!("{x:.5}"));
     format!(
-        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:?},{:?},{},{},{},{}\n",
+        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{}\n",
         r.t.as_secs_f64(),
         r.position.x,
         r.position.y,
@@ -636,7 +641,7 @@ fn csv_row(r: &StepRecord<4>) -> String {
         r.motors[3],
         r.battery_v,
         r.battery_a,
-        u8::from(r.status.armed),
+        u8::from(r.armed),
         f(sp.map(|p| p.x)),
         f(sp.map(|p| p.y)),
         f(sp.map(|p| p.z)),
@@ -649,12 +654,12 @@ fn csv_row(r: &StepRecord<4>) -> String {
         r.wind.x,
         r.wind.y,
         r.wind.z,
-        r.status.nav,
-        r.status.action,
+        nav,
+        action,
         g(est.map(|s| s.velocity.x)),
         g(est.map(|s| s.velocity.y)),
         g(est.map(|s| s.velocity.z)),
-        r.status.reasons.0,
+        reasons,
     )
 }
 

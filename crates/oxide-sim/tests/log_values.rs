@@ -200,9 +200,16 @@ fn fly_with(name: &str, profile: Profile, before_tick: &Script2) -> Flight {
                 Tick {
                     newest,
                     tel: sim.core().telemetry(),
-                    status: r.status,
+                    status: *r.status().expect("core part"),
                     motors: r.motors,
-                    events: r.events.iter().copied().collect(),
+                    events: r
+                        .core
+                        .as_ref()
+                        .expect("core part")
+                        .events
+                        .iter()
+                        .copied()
+                        .collect(),
                 },
             );
         }

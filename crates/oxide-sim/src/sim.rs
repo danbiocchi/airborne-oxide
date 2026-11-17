@@ -266,17 +266,38 @@ pub struct StepRecord<const N: usize> {
     pub rotor_speed: [f64; N],
     pub battery_v: f64,
     pub battery_a: f64,
-    pub status: Status,
+    /// Whether the autopilot reports itself armed after this tick (from its
+    /// output; for our core, `status.armed`).
+    pub armed: bool,
     pub setpoint: Option<TrajectorySetpoint>,
-    /// The core's published state estimate after this tick.
-    pub estimate: Option<StateSample>,
     /// Wind (air-mass velocity, NED, m/s) acting during this tick.
     pub wind: Vec3<f64>,
     /// Physics steps so far that produced a non-finite state (the vehicle
     /// was frozen in place instead). Must be 0 in a healthy run.
     pub physics_faults: u32,
+    /// What only our flight core has; `None` for another autopilot.
+    pub core: Option<CoreRecord>,
+}
+
+/// What only our flight core reports about a tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoreRecord {
+    pub status: Status,
     /// Events the core reported with this tick's outputs.
     pub events: EventList,
+    /// The core's published state estimate after this tick.
+    pub estimate: Option<StateSample>,
+}
+
+impl<const N: usize> StepRecord<N> {
+    /// The core's status, if the record has the core part.
+    pub fn status(&self) -> Option<&Status> {
+        self.core.as_ref().map(|c| &c.status)
+    }
+    /// The core's published estimate (`None` without the core part, too).
+    pub fn estimate(&self) -> Option<StateSample> {
+        self.core.as_ref().and_then(|c| c.estimate)
+    }
 }
 
 pub struct Simulation<P: Pilot, const N: usize> {
@@ -590,12 +611,15 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             rotor_speed: self.body.rotor_speed,
             battery_v: self.battery.voltage_v,
             battery_a: self.battery.current_a,
-            status: out.status,
+            armed: out.status.armed,
             setpoint,
-            estimate: self.core.estimate(),
             wind,
             physics_faults: self.physics_faults,
-            events: out.events,
+            core: Some(CoreRecord {
+                status: out.status,
+                events: out.events,
+                estimate: self.core.estimate(),
+            }),
         };
         self.integrate(wind);
         self.pending = Some(out);

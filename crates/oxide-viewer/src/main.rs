@@ -324,7 +324,7 @@ fn log_events(
     r: &StepRecord<4>,
 ) -> Result<Option<Vec3<f64>>, Box<dyn Error>> {
     let mut armed_at = None;
-    for e in r.events.iter() {
+    for e in r.core.iter().flat_map(|c| c.events.iter()) {
         let msg = describe(e.kind);
         println!("[{:8.3} s] {msg}", e.t.as_secs_f64());
         rec.set_duration_secs("sim_time", e.t.as_secs_f64());
@@ -402,7 +402,7 @@ fn log_step(
         &rerun::Scalars::new([r.wind.norm()]),
     )?;
     // Estimate: second box, trail and error plots (only with a published estimate).
-    if let Some(est) = r.estimate {
+    if let Some(est) = r.estimate() {
         let eq = est.attitude.cast::<f32>();
         rec.log(
             "world/estimate",
@@ -433,11 +433,13 @@ fn log_step(
         )?;
     }
     let e = r.attitude.to_euler();
-    rec.log(
-        "plots/failsafe_action_rank",
-        &rerun::Scalars::new([action_rank(r.status.action)]),
-    )?;
-    log_validity(rec, r.status.valid)?;
+    if let Some(status) = r.status() {
+        rec.log(
+            "plots/failsafe_action_rank",
+            &rerun::Scalars::new([action_rank(status.action)]),
+        )?;
+        log_validity(rec, status.valid)?;
+    }
     rec.log("plots/altitude_m", &rerun::Scalars::new([-r.position.z]))?;
     rec.log("plots/roll_deg", &rerun::Scalars::new([e.x.to_degrees()]))?;
     rec.log("plots/pitch_deg", &rerun::Scalars::new([e.y.to_degrees()]))?;
@@ -540,7 +542,7 @@ fn drive<P: Pilot>(
             if trail.len() > 3000 {
                 trail.remove(0);
             }
-            if let Some(est) = r.estimate {
+            if let Some(est) = r.estimate() {
                 est_trail.push([est.position.x, est.position.y, est.position.z]);
                 if est_trail.len() > 3000 {
                     est_trail.remove(0);

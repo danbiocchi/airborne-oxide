@@ -33,7 +33,7 @@ fn hover_step_meets_requirements(profile: Profile) {
 
     for r in window(&log, 0.0, 1.5) {
         assert!(
-            !r.status.armed && r.motors == [0.0; 4],
+            !r.armed && r.motors == [0.0; 4],
             "{name}: motors must be off before arming"
         );
     }
@@ -42,7 +42,11 @@ fn hover_step_meets_requirements(profile: Profile) {
             r.position.is_finite() && r.attitude.is_finite(),
             "{name}: state went non-finite"
         );
-        assert_eq!(r.status.timing_faults, 0, "{name}: timing fault");
+        assert_eq!(
+            r.status().expect("core part").timing_faults,
+            0,
+            "{name}: timing fault"
+        );
         let e = r.attitude.to_euler();
         assert!(
             e.x.abs().max(e.y.abs()) < 36f64.to_radians(),
@@ -119,7 +123,7 @@ impl Pilot for KillAt8 {
 fn kill_switch_stops_motors_in_flight() {
     let (log, _) = fly(F405_LEAN, KillAt8(HoverStep::default()), 12);
     assert!(
-        at(&log, 7.9).status.armed && at(&log, 7.9).position.z < -1.5,
+        at(&log, 7.9).armed && at(&log, 7.9).position.z < -1.5,
         "should be flying before the kill"
     );
     // Three confirming supervisor runs at 50 Hz plus one LET period.
@@ -129,7 +133,7 @@ fn kill_switch_stops_motors_in_flight() {
             "motors must stay off after kill at {:?}",
             r.t
         );
-        assert!(r.status.killed && !r.status.armed);
+        assert!(r.status().expect("core part").killed && !r.armed);
     }
     assert!(
         at(&log, 11.9).position.z.abs() < 1e-9,

@@ -188,19 +188,19 @@ fn landing_thrust_is_not_cut_in_the_air_in_wind() {
                 let mut landing_seen = false;
                 sim.run_until(end, |r| {
                     let landing = matches!(
-                        r.status.nav,
+                        r.status().expect("core part").nav,
                         NavState::Rtl | NavState::Land | NavState::LandNow
                     );
                     landing_seen |= landing;
                     let mean = r.motors.iter().sum::<f32>() / r.motors.len() as f32;
                     // The minimum thrust is a motor command of about 0.14.
-                    if r.status.armed && landing && -r.position.z > 0.2 {
+                    if r.armed && landing && -r.position.z > 0.2 {
                         assert!(
                             mean > 0.2,
                             "{name} ({air}) index {index}: thrust cut {:.2} m up at {:.2} s (nav {:?})",
                             -r.position.z,
                             r.t.as_secs_f64(),
-                            r.status.nav
+                            r.status().expect("core part").nav
                         );
                     }
                 });

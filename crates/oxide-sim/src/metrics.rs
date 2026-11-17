@@ -122,16 +122,20 @@ impl HoldMetrics {
         } else {
             self.non_finite = true;
         }
-        self.timing_faults = r.status.timing_faults;
-        self.rejected = r.status.estimator.rejected;
-        self.resets = r.status.estimator.resets;
+        // Until the metrics are split into a truth part and a core part.
+        let Some(core) = r.core.as_ref() else {
+            return;
+        };
+        self.timing_faults = core.status.timing_faults;
+        self.rejected = core.status.estimator.rejected;
+        self.resets = core.status.estimator.resets;
         self.physics_faults = r.physics_faults;
 
         if t >= c.armed_from_s {
-            if !r.status.armed {
+            if !core.status.armed {
                 self.unarmed_ticks += 1;
             }
-            if r.estimate.is_none() || r.status.no_estimate || !r.status.valid.full() {
+            if core.estimate.is_none() || core.status.no_estimate || !core.status.valid.full() {
                 self.no_estimate_ticks += 1;
             }
         }
@@ -152,7 +156,7 @@ impl HoldMetrics {
             self.non_finite = true;
         }
 
-        let Some(est) = r.estimate else { return };
+        let Some(est) = core.estimate else { return };
         let p = est.position.cast::<f64>();
         let v = est.velocity.cast::<f64>();
         let (dn, de) = (p.x - r.position.x, p.y - r.position.y);
@@ -311,22 +315,30 @@ mod tests {
             rotor_speed: [0.0; 4],
             battery_v: 16.0,
             battery_a: 0.0,
-            status: Status {
-                armed: true,
-                valid: oxide_core::io::Validity::ALL,
-                ..Status::default()
-            },
+            armed: true,
             setpoint: None,
-            estimate: Some(StateSample {
-                position: pos.cast::<f32>(),
-                velocity: Vec3::zero(),
-                attitude: Quat::identity(),
-                rate: Vec3::zero(),
-            }),
             wind: Vec3::zero(),
             physics_faults: 0,
-            events: oxide_core::io::EventList::new(),
+            core: Some(crate::CoreRecord {
+                status: Status {
+                    armed: true,
+                    valid: oxide_core::io::Validity::ALL,
+                    ..Status::default()
+                },
+                events: oxide_core::io::EventList::new(),
+                estimate: Some(StateSample {
+                    position: pos.cast::<f32>(),
+                    velocity: Vec3::zero(),
+                    attitude: Quat::identity(),
+                    rate: Vec3::zero(),
+                }),
+            }),
         }
+    }
+
+    /// The core part of a record that has one.
+    fn core(r: &mut StepRecord<4>) -> &mut crate::CoreRecord {
+        r.core.as_mut().expect("the record has a core part")
     }
 
     fn target() -> Vec3<f64> {
@@ -368,7 +380,7 @@ mod tests {
         let mut m = HoldMetrics::new();
         let mut r = rec(20.0, target());
         // Estimate rotated 2 degrees about z relative to truth.
-        r.estimate = r.estimate.map(|mut e| {
+        core(&mut r).estimate = core(&mut r).estimate.map(|mut e| {
             e.attitude = Quat::from_rotation_vector(Vec3::new(0.0, 0.0, 2.0_f32.to_radians()));
             e
         });
@@ -387,7 +399,7 @@ mod tests {
         let c = HoldCriteria::default();
         let mut m = HoldMetrics::new();
         let mut r = rec(20.0, target());
-        r.estimate = r.estimate.map(|mut e| {
+        core(&mut r).estimate = core(&mut r).estimate.map(|mut e| {
             e.position = Vec3::new(0.6, 0.8, -2.0 + 0.25);
             e.velocity = Vec3::new(0.0, 0.3, 0.4);
             e
@@ -397,7 +409,7 @@ mod tests {
         assert!((m.est_max_v_error_m - 0.25).abs() < 1e-6);
         assert!((m.est_max_vel_error_mps - 0.5).abs() < 1e-6);
         let mut none = rec(21.0, target());
-        none.estimate = None;
+        core(&mut none).estimate = None;
         m.add(&none, target(), &c);
         assert_eq!(m.no_estimate_ticks, 1);
         assert!(!m.passed(&c));
@@ -425,14 +437,16 @@ mod tests {
         let c = HoldCriteria::default();
         let mut m = HoldMetrics::new();
         let mut early = rec(3.4, target());
-        early.status.armed = false;
-        early.estimate = None;
+        early.armed = false;
+        core(&mut early).status.armed = false;
+        core(&mut early).estimate = None;
         m.add(&early, target(), &c);
         assert_eq!((m.unarmed_ticks, m.no_estimate_ticks), (0, 0));
         let mut late = rec(3.5, target());
-        late.status.armed = false;
-        late.status.timing_faults = 2;
-        late.status.estimator.resets = 2;
+        late.armed = false;
+        core(&mut late).status.armed = false;
+        core(&mut late).status.timing_faults = 2;
+        core(&mut late).status.estimator.resets = 2;
         m.add(&late, target(), &c);
         assert_eq!(m.unarmed_ticks, 1);
         assert_eq!(m.timing_faults, 2);

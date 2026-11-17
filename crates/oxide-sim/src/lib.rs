@@ -25,7 +25,7 @@ pub mod wind;
 
 pub use airframe::Airframe;
 pub use scenario_file::{ScenarioError, ScenarioFile};
-pub use sim::{SimOptions, Simulation, StepRecord};
+pub use sim::{CoreRecord, SimOptions, Simulation, StepRecord};
 
 use core::fmt;
 

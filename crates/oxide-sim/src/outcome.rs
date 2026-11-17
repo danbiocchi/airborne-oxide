@@ -125,9 +125,13 @@ impl FlightOutcome {
 
     /// Adds one tick.
     pub fn add<const N: usize>(&mut self, r: &StepRecord<N>) {
-        let s = &r.status;
+        // Until the outcome is split into a truth part and a core part.
+        let Some(core) = r.core.as_ref() else {
+            return;
+        };
+        let s = &core.status;
 
-        for e in r.events.iter() {
+        for e in core.events.iter() {
             self.events.push(*e);
             match e.kind {
                 EventKind::Disarmed(reason) => {
@@ -598,18 +602,22 @@ mod tests {
             rotor_speed: [0.0; 4],
             battery_v: 22.0,
             battery_a: 0.0,
-            status: st,
+            armed: st.armed,
             setpoint: None,
-            estimate: None,
             wind: Vec3::zero(),
             physics_faults: 0,
-            events: EventList::new(),
+            core: Some(crate::CoreRecord {
+                status: st,
+                events: EventList::new(),
+                estimate: None,
+            }),
         }
     }
 
     fn with_event(mut r: StepRecord<4>, kind: EventKind) -> StepRecord<4> {
         let t = r.t;
-        assert!(r.events.push(Event { t, kind }));
+        let core = r.core.as_mut().expect("the record has a core part");
+        assert!(core.events.push(Event { t, kind }));
         r
     }
 
@@ -868,7 +876,11 @@ mod tests {
         let mut o = FlightOutcome::new();
         let mut r = flying(0.0, up(1.0), Action::None);
         r.physics_faults = 2;
-        r.status.timing_faults = 3;
+        r.core
+            .as_mut()
+            .expect("the record has a core part")
+            .status
+            .timing_faults = 3;
         o.add(&r);
         assert_eq!((o.physics_faults, o.timing_faults), (2, 3));
         assert!(!o.non_finite);
