@@ -8,9 +8,8 @@
 //! (`OXIDE_ARDUCOPTER_INSTANCES`). A test that runs a batch holds the whole
 //! range for its time.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
 use oxide_bridge::arducopter::{
@@ -422,6 +421,8 @@ fn twice_on_two_indices_says_that_each_repeats() {
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn a_child_killed_in_mid_flight_is_reported_and_the_run_flown_again() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
     let all = lease_all();
     let root = TempDir::new("killed");
     let out = root.path().join("batch");
