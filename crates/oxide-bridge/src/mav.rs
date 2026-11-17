@@ -19,6 +19,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 use std::io;
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use mavlink::dialects::ardupilotmega::{
@@ -55,6 +56,13 @@ pub mod id {
 /// (yaw ignore, 1024) is clear. `504 + 2048 = 2552`. "Position only, yaw
 /// ignored" is this plus 1024, 3576.
 pub const TYPE_MASK_POSITION_YAW: u16 = 2552;
+
+/// How long a send may wait for room in the socket before it fails with
+/// [`MavError::Io`]. A frame cut off by the time-out leaves the stream torn:
+/// the connection is not usable afterwards. The program only reads MAVLink
+/// while we exchange, so a caller must not send thousands of messages inside
+/// one exchange step.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Why a MAVLink call failed.
 #[derive(Debug)]
@@ -272,9 +280,18 @@ impl MavClient {
         limit: Duration,
     ) -> Result<Self, MavError> {
         let start = Instant::now();
-        let address = format!("tcpout:127.0.0.1:{port}");
         loop {
-            match mavlink::connect::<MavMessage>(&address) {
+            // Connected here, not by the crate's own address form, so that a
+            // write time-out can be set: the crate's writer and reader share
+            // this socket, and without a time-out a peer that stops reading
+            // would block a send for ever once the buffers are full.
+            let attempt = TcpStream::connect(("127.0.0.1", port)).and_then(|stream| {
+                stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                let config = mavlink::TcpConfig::from_stream(stream)?;
+                mavlink::Connectable::connect::<MavMessage>(&config)
+            });
+            match attempt {
                 Ok(mut conn) => {
                     conn.set_protocol_version(MavlinkVersion::V2);
                     return Ok(Self {
@@ -1133,6 +1150,44 @@ mod tests {
         );
         assert!(e.to_string().contains(&port.to_string()), "{e}");
         assert!(e.to_string().contains("ms"), "{e}");
+    }
+
+    #[test]
+    fn a_parameter_name_of_16_characters_is_accepted_and_17_is_refused() {
+        let (c, mut peer) = pair();
+        let sixteen = "ABCDEFGHIJKLMNOP";
+        assert_eq!(sixteen.len(), 16);
+        c.param_set(sixteen, 1.0).expect("16 characters");
+        let (_, m) = peer.recv();
+        let MavMessage::PARAM_SET(d) = m else {
+            panic!("{m:?}")
+        };
+        assert_eq!(&d.param_id[..], sixteen.as_bytes(), "all 16 bytes arrive");
+        let e = c.param_set("ABCDEFGHIJKLMNOPQ", 1.0).unwrap_err();
+        assert!(matches!(e, MavError::BadArgument { .. }), "{e:?}");
+        assert!(c.param_request("ABCDEFGHIJKLMNOPQ").is_err());
+        c.param_request(sixteen).expect("request, 16 characters");
+        let (_, m) = peer.recv();
+        assert!(matches!(m, MavMessage::PARAM_REQUEST_READ(_)), "{m:?}");
+    }
+
+    #[test]
+    fn a_peer_that_never_reads_makes_a_send_fail_instead_of_blocking_for_ever() {
+        let (c, _peer) = pair(); // the peer is held open and never reads
+        let t = Instant::now();
+        let mut sent = 0u64;
+        let e = loop {
+            match c.heartbeat() {
+                Ok(()) => sent += 1,
+                Err(e) => break e,
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "still sending after {sent} messages: the write has no time-out"
+            );
+        };
+        assert!(matches!(e, MavError::Io(_)), "{e:?}");
+        assert!(sent > 100, "{sent}");
     }
 
     #[test]
