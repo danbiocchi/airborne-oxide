@@ -139,7 +139,7 @@ fn the_same_stub_flight_hashes_the_same_and_a_different_gain_does_not() {
     let mut other = Stub::new(500);
     other.kp = 0.30;
     let (_, c) = fly_stub(other, 5);
-    assert_ne!(a, c, "the hash covers the commands");
+    assert_ne!(a, c, "a different gain flies a different flight");
 }
 
 fn outcome_of(log: &[StepRecord<4>]) -> FlightOutcome {
@@ -393,4 +393,50 @@ fn a_flight_with_requirements_it_could_not_judge_has_not_passed() {
     assert!(j.violations.is_empty(), "{:?}", j.violations);
     // (the invariants that need the core are still listed: not a pass)
     assert!(!j.not_judged.is_empty() && !j.passed());
+}
+
+/// Commands every rotor at one fixed value from the first tick.
+struct Fixed(f32);
+
+impl Autopilot<4> for Fixed {
+    type Error = StubError;
+
+    fn period_us(&self) -> u64 {
+        500
+    }
+
+    fn tick(
+        &mut self,
+        t: Micros,
+        _input: &AutopilotInput<'_, 4>,
+    ) -> Result<AutopilotOutput<4>, StubError> {
+        Ok(AutopilotOutput {
+            t_valid: Micros(t.0 + 500),
+            motors: [self.0; 4],
+            armed: true,
+            core: None,
+        })
+    }
+}
+
+#[test]
+fn the_hash_covers_the_commands_even_when_the_truth_is_the_same() {
+    // The physics clamps a command to 0..1, so 1.0 and 2.0 fly the same
+    // flight: only the commands themselves differ.
+    let fly = |u: f32| {
+        let mut sim =
+            Simulation::with_autopilot(&airframe(), Fixed(u), NoPilot, SimOptions::default())
+                .expect("builds");
+        let mut truth = Vec::new();
+        sim.try_run_until(Micros::from_secs(1), |r| {
+            truth.push((r.position, r.velocity, r.attitude, r.rate, r.rotor_speed));
+        })
+        .expect("cannot fail");
+        (truth, sim.trace_hash())
+    };
+    let (full, hash_full) = fly(1.0);
+    let (over, hash_over) = fly(2.0);
+    assert_eq!(full, over, "the truth is the same");
+    assert!(full.last().is_some_and(|t| t.0.z < -0.1), "and it flew");
+    assert_ne!(hash_full, hash_over, "the hash covers the commands");
 }
