@@ -1403,6 +1403,58 @@ fn the_motor_map_is_the_range_the_program_runs_with() {
     }
 }
 
+/// ArduCopter reads our battery: the voltage and current of `SYS_STATUS` in a
+/// hover are the pack's, the values the reply carries (`BATT_MONITOR 4`).
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn arducopter_reads_our_battery_voltage_and_current() {
+    let lease = Instance::lease();
+    let pilot = HoverStep::default();
+    let secs = pilot.duration_s;
+    let (log, flown) = fly_logged(
+        lease.0,
+        "battery",
+        pilot,
+        SimOptions::realistic(1),
+        secs,
+        |c| {
+            c.telemetry.push(telemetry(id::SYS_STATUS, 10.0, 4_002));
+        },
+    );
+    let a = &flown.audit;
+    let from = a.program_us_of_flight_s(secs - 8.0);
+    let read: Vec<(f64, f64)> = a
+        .heard
+        .iter()
+        .filter(|h| h.at_us >= from)
+        .filter_map(|h| match h.event {
+            MavEvent::SysStatus {
+                voltage_mv,
+                current_ca,
+                ..
+            } => Some((f64::from(voltage_mv) * 1e-3, f64::from(current_ca) * 1e-2)),
+            _ => None,
+        })
+        .collect();
+    let truth: Vec<&StepRecord<4>> = log
+        .iter()
+        .filter(|r| r.t.as_secs_f64() >= secs - 8.0)
+        .collect();
+    let tv = mean(&truth.iter().map(|r| r.battery_v).collect::<Vec<_>>());
+    let ta = mean(&truth.iter().map(|r| r.battery_a).collect::<Vec<_>>());
+    let rv = mean(&read.iter().map(|x| x.0).collect::<Vec<_>>());
+    let ra = mean(&read.iter().map(|x| x.1).collect::<Vec<_>>());
+    println!(
+        "MEASURED battery over the last 8 s: {} SYS_STATUS messages; voltage read {rv:.3} V against \
+         the pack's {tv:.3} V; current read {ra:.2} A against {ta:.2} A",
+        read.len()
+    );
+    assert!(read.len() >= 50, "{}", read.len());
+    assert!(tv > 20.0 && ta > 5.0, "a hovering pack: {tv} V {ta} A");
+    assert!((rv - tv).abs() <= 0.1, "voltage {rv} against {tv}");
+    assert!((ra - ta).abs() <= 0.1 * ta, "current {ra} against {ta}");
+}
+
 /// Test 3. Gust-hold flies, for three runs.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
