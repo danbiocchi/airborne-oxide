@@ -69,13 +69,15 @@ The scenario is `gust-hold`, seeds 0 to 499. The measure of a flight is the simu
 
 Reported beside it and deciding nothing: our core on the true state; the vertical error and the tilt of both; the same statistics for the H743 profile; the number of seeds in which each was the better.
 
+ArduCopter starts later than our core in this scenario. It holds its motors still for 2.0 s after it arms, so its motors come alive 2.2 s after the arm switch (at 5.2 s; our core's at 3.1 s), and it is at the hold point at about 8.7 s (our core at 5.3 s). Both are there well before the 15 s from which the error is measured (measured on runs 0 to 2 with the bridge). The scenario file's limit that the vehicle be armed from 3.5 s on is our core's own and is not judged for ArduCopter.
+
 ### 6. Criterion B: failures
 
 **Scored scenarios.** A scenario is scored when every failure in it can be applied to ArduCopter by a route of ADR-0006 §6 and its pilot can be translated. Each is flown on the seeds its file names (10). The list:
 
 - Scored: `gps-loss`, `gps-loss-pilot`, `gps-loss-recovers`, `baro-loss`, `mag-loss`, `rc-loss-position`, `rc-loss-override`, `rc-loss-on-ground`, `rc-loss-offboard-gcs`, `gcs-loss`, `no-human-link`, `battery-low`, `battery-critical`, `geofence`, and every `pair-*` scenario whose two failures are both in this list.
 - Scored on the time to motors off, not on the outcome: `motor-loss` and `imu-loss`. A quadrotor cannot fly on with either, and our core's designed response is to stop the motors.
-- Scored only if the companion link of ADR-0006 §6 works: `brain-crash`, `brain-hang`, `setpoint-gap` and the pairs with a brain failure.
+- Scored, because the companion link of ADR-0006 §6 works (proven on the binary when the bridge was built): `brain-crash`, `brain-hang`, `setpoint-gap` and the pairs with a brain failure.
 - Not scored: `kill-in-rtl` (the pilot's kill switch has no agreed ArduCopter counterpart). `hover-step` has no failure and is flown as a check of the bridge.
 
 A scenario may leave the scored list only for a technical reason found while the bridge is built, written into this record before the run.
