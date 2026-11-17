@@ -261,13 +261,51 @@ fn the_fence_parameters_are_in_the_program_and_the_flight_shows_the_fence_acting
             (*t as f64 - (a.preroll_steps * a.step_us) as f64) * 1e-6
         );
     }
+    // The same flight without the fence parameters: the control.
+    let mut config = ArduCopterConfig::new(binary(), root.path().join("control"), lease.0);
+    config.flight_name = Some("sitl".into());
+    let mut control = oxide_sim::outcome::FlightOutcome::new();
+    let mut options = src.file.options(&airframe, 0);
+    options.params.clear();
+    let flown = fly(
+        &airframe,
+        src.file.pilot.clone(),
+        options,
+        config,
+        src.file.end(),
+        |r| control.add(r),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    println!(
+        "MEASURED geofence 0 without the fence: max distance from home {:.2} m, max height {:.2} m,          class {}, modes {:?}, texts naming the fence {}",
+        control.max_distance_from_home_m,
+        control.max_height_m,
+        control.class(),
+        flown.audit.mode_changes,
+        flown.audit.texts_containing("ence").count()
+    );
+    for (t, sev, x) in flown
+        .audit
+        .status_texts
+        .iter()
+        .filter(|(t, _, _)| *t > 45_000_000)
+    {
+        println!(
+            "MEASURED geofence control text [{:.3}] ({sev}) {x}",
+            (*t as f64 - (a.preroll_steps * a.step_us) as f64) * 1e-6
+        );
+    }
+    // The fence acts: with it the vehicle does not go to the setpoint 20 m
+    // out; without it, it does.
     assert!(
-        a.texts_containing("ence").next().is_some(),
-        "no status text names the fence"
+        control.max_distance_from_home_m > 15.0,
+        "without the fence the vehicle should reach the setpoint: {}",
+        control.max_distance_from_home_m
     );
     assert!(
-        o.max_distance_from_home_m < 20.0,
-        "the vehicle went the whole 20 m: the fence did not act"
+        o.max_distance_from_home_m < 2.0,
+        "with the fence the vehicle went {} m out",
+        o.max_distance_from_home_m
     );
 }
 
