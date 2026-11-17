@@ -480,8 +480,10 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
     /// as for our core, and what it says about the world applies: `seed`,
     /// `sensors` (our sensor models run and their frame goes to the
     /// autopilot, which may ignore it), `wind`, `faults`, `links`, `battery`.
-    /// What configures our flight core is ignored: `estimator`, `failsafe`,
-    /// `params`. The tick period, which is also the physics step, is the
+    /// What configures our flight core does not apply: `params` and
+    /// `failsafe` are refused with [`SimError::Param`] when given (they would
+    /// do nothing, silently), and `estimator`, which `SimOptions::realistic`
+    /// sets, is ignored. The tick period, which is also the physics step, is the
     /// autopilot's [`period_us`](Autopilot::period_us): it must divide the
     /// command period, and the sensors' and links' periods must be whole
     /// multiples of it, else [`SimError::TimeBase`], as for a profile.
@@ -491,6 +493,20 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
         pilot: P,
         options: SimOptions,
     ) -> Result<Self, SimError> {
+        const NOT_OURS: &str =
+            "configures our flight core, and this simulation hosts another autopilot";
+        if let Some((name, _)) = options.params.first() {
+            return Err(SimError::Param {
+                name: name.clone(),
+                reason: NOT_OURS.into(),
+            });
+        }
+        if options.failsafe.is_some() {
+            return Err(SimError::Param {
+                name: "failsafe".into(),
+                reason: NOT_OURS.into(),
+            });
+        }
         let mut airframe = airframe.clone();
         if let Some(b) = options.battery.clone() {
             airframe.battery = b;

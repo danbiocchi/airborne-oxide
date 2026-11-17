@@ -553,3 +553,34 @@ fn an_autopilot_error_is_a_std_error_and_the_autopilot_can_be_taken_back() {
     fn is_std_error<E: std::error::Error + 'static>() {}
     is_std_error::<<oxide_sim::CoreAutopilot<4> as Autopilot<4>>::Error>();
 }
+
+#[test]
+fn options_that_configure_only_our_core_are_refused_for_another_autopilot() {
+    let with = |options: SimOptions| {
+        Simulation::<NoPilot, 4, Stub>::with_autopilot(
+            &airframe(),
+            Stub::new(500),
+            NoPilot,
+            options,
+        )
+        .err()
+    };
+    let e = with(SimOptions {
+        params: vec![("BAT_LOW_V".to_string(), 14.0)],
+        ..SimOptions::default()
+    })
+    .expect("parameters are our core's");
+    assert!(
+        matches!(&e, SimError::Param { name, .. } if name == "BAT_LOW_V"),
+        "{e}"
+    );
+    let e = with(SimOptions {
+        failsafe: Some(oxide_core::config::FailsafeParams::default()),
+        ..SimOptions::default()
+    })
+    .expect("the failsafe configuration is our core's");
+    assert!(matches!(&e, SimError::Param { .. }), "{e}");
+    // The estimator choice comes with `SimOptions::realistic` and is not
+    // about the world: it is ignored.
+    assert!(with(SimOptions::realistic(3)).is_none());
+}
