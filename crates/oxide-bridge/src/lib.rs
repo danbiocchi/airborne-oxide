@@ -15,6 +15,9 @@
 //! - [`bridge`]: the one implementation of the exchange and the reply
 //!   ([`bridge::Exchange`]), and [`bridge::JsonBridge`], an
 //!   `oxide_sim::Autopilot<4>` that flies the radio's channels.
+//! - [`faults`]: our faults as ArduCopter's parameter writes
+//!   ([`faults::FaultTranslator`]) and our battery thresholds as its own
+//!   ([`faults::battery_failsafe_params`]).
 //! - [`parm`]: the committed ArduCopter parameter files (`arducopter/*.parm`)
 //!   and their parser.
 //! - [`arducopter`]: [`arducopter::ArduCopter`], an `oxide_sim::Autopilot<4>`
@@ -40,6 +43,7 @@
 
 pub mod arducopter;
 pub mod bridge;
+pub mod faults;
 pub mod link;
 pub mod mav;
 pub mod motors;

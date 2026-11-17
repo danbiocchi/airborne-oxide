@@ -1,0 +1,19 @@
+# ArduCopter V4.7.2 failsafes for gate 1 (ADR-0007 section 3): each is
+# switched on with the action its documentation gives as the usual one,
+# because a default of "warn only" is not a response. No other parameter is
+# set to make ArduCopter's response resemble ours. The battery thresholds
+# (BATT_LOW_VOLT, BATT_CRT_VOLT) come from our core's own thresholds
+# (oxide_bridge::faults::battery_failsafe_params), not from this file.
+# The geofence is the scenario's own (FENCE_*), written by the runner.
+
+# Radio lost (row "Radio lost"): 1 = return to launch.
+FS_THR_ENABLE 1
+# Estimator unhealthy, which is what a lost GPS becomes (row "Estimator
+# unhealthy (GPS lost)"): 1 = land.
+FS_EKF_ACTION 1
+# Battery low (row "Battery low"): 2 = return to launch.
+BATT_FS_LOW_ACT 2
+# Battery critical (row "Battery critical"): 1 = land.
+BATT_FS_CRT_ACT 1
+# Ground station lost (row "Ground station lost"): 1 = return to launch.
+FS_GCS_ENABLE 1
