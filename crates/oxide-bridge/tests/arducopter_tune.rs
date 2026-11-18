@@ -267,10 +267,8 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
     // The gains the tuner started from are the starting gains.
     assert_eq!(before["ATC_RAT_RLL_P"], 0.05);
     // The vehicle left the box: how far and when.
-    assert_eq!(
-        ra.stats.box_exit_s.map(|t| (t * 1000.0).round()),
-        Some(123_189.0)
-    );
+    let exit = ra.stats.box_exit_s.expect("the vehicle left the box");
+    assert!((exit - 123.1895).abs() < 1e-3, "{exit}");
     assert!(
         (ra.stats.max_horizontal_m - 31.04).abs() < 0.05,
         "{:?}",
