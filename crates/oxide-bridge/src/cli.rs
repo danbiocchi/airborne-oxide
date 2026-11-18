@@ -451,6 +451,17 @@ fn fly_once(
     }
 }
 
+/// Flies a run a second time with `second` and says whether the three hashes
+/// (trace, packet, reply) of the second flight are those of `first`.
+fn fly_again(
+    first: &ScenarioFlight,
+    second: impl FnOnce() -> Result<ScenarioFlight, RunError>,
+) -> Result<(ScenarioFlight, bool), RunError> {
+    let second = second()?;
+    let same = second.hashes() == first.hashes();
+    Ok((second, same))
+}
+
 /// `oxide-bridge fly`.
 pub fn run_fly(args: &FlyArgs) -> ExitCode {
     let (src, binary) = match prepare(&args.common) {
@@ -485,9 +496,8 @@ pub fn run_fly(args: &FlyArgs) -> ExitCode {
     let mut repeats = None;
     if args.common.twice {
         let second_out = out.join("second");
-        match fly_once(&src, args.index, &plan, &second_out) {
-            Ok(second) => {
-                let same = second.hashes() == flight.hashes();
+        match fly_again(&flight, || fly_once(&src, args.index, &plan, &second_out)) {
+            Ok((second, same)) => {
                 if let Err(e) = record::write_files(
                     &second_out,
                     &record::audit_text(&src, &second, None),
@@ -703,6 +713,48 @@ pub fn main_with(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real flight to compare (our core, so that no binary is needed).
+    fn a_flight() -> ScenarioFlight {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scenarios/hover-step.toml");
+        let src = LoadedScenario::load(path).expect("hover-step");
+        runner::fly_core(&src, 0, oxide_sim::scenario_file::RunProfile::F405).expect("flies")
+    }
+
+    #[test]
+    fn a_second_flight_repeats_only_when_all_three_hashes_are_the_firsts() {
+        let first = a_flight();
+        let again = |edit: &dyn Fn(&mut ScenarioFlight)| {
+            let mut f = first.clone();
+            edit(&mut f);
+            fly_again(&first, || Ok(f)).expect("flown").1
+        };
+        assert!(again(&|_| {}), "the same hashes repeat");
+        assert!(!again(&|f| f.trace_hash ^= 1), "a trace hash differs");
+        assert!(
+            !again(&|f| f.packet_hash = Some(7)),
+            "a packet hash differs, the others the same"
+        );
+        assert!(
+            !again(&|f| f.reply_hash = Some(7)),
+            "a reply hash differs, the others the same"
+        );
+        // The second flight is the one returned, and an error of it is passed on.
+        let (second, _) = fly_again(&first, || {
+            let mut f = first.clone();
+            f.wall_s = 123.0;
+            Ok(f)
+        })
+        .expect("flown");
+        assert_eq!(second.wall_s, 123.0);
+        assert!(
+            fly_again(&first, || Err(RunError::Sim(
+                oxide_sim::SimError::TimeBase(1)
+            )))
+            .is_err()
+        );
+    }
 
     fn words(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()
