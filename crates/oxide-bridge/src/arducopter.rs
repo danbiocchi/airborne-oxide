@@ -162,7 +162,10 @@ pub const GPS_LAG_US: u64 = 150_000;
 /// samples one GPS period apart, so each fix it reports is
 /// `a sent(j-2) + b sent(j-1)` of the errors the bridge sent, with `a = lag /
 /// period` and `b = 1 - a` (measured on V4.7.2 for 150 ms and 200 ms: 0.007 m
-/// rms residual). The bridge sends the sequence
+/// rms residual). A lag beyond one period only delays that by whole periods:
+/// `a` is the part of `lag / period` after the whole periods (measured at
+/// 250 ms: the unblended sequence is reported with 0.79 of its standard
+/// deviation and a correlation of 0.3). The bridge sends the sequence
 /// `sent(k) = (n(k) - lo sent(k-1)) / hi` of independent draws `n`, `hi` the
 /// larger and `lo` the smaller of `a` and `b`: the blend of that sequence is
 /// `n` through a filter that changes no frequency's size, so the reported
@@ -183,8 +186,8 @@ impl GpsBlend {
     }
 }
 
-/// A lag whose blend cannot be undone: within 5 % of half the period, the two
-/// weights are nearly equal and the pre-filter's pole is on the unit circle.
+/// A lag whose blend cannot be undone: its part beyond whole periods is within
+/// 5 % of half the period, the two weights are nearly equal and the pre-filter's pole is on the unit circle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpsLagUnusable {
     pub lag_us: u64,
@@ -195,9 +198,9 @@ impl fmt::Display for GpsLagUnusable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "the GPS lag of {} us is within 5 % of half the GPS period of {} us: the two \
-             samples the program blends then weigh alike and the blend cannot be undone; \
-             use another lag",
+            "the GPS lag of {} us is within 5 % of half the GPS period of {} us (the part of \
+             the lag beyond whole periods is what counts): the two samples the program blends \
+             then weigh alike and the blend cannot be undone; use another lag",
             self.lag_us, self.period_us
         )
     }
@@ -220,7 +223,9 @@ pub struct GpsError {
     /// The draws are at `first_fix_us + k × period`.
     pub first_fix_us: u64,
     /// The program's GPS lag, µs: `SIM_GPS1_LAG_MS` times 1000. It is checked
-    /// against the parameter files when the autopilot is built.
+    /// against the parameter files when the autopilot is built. Any lag the
+    /// program accepts is undone except one whose part beyond whole periods is
+    /// within 5 % of half a period ([`GpsError::blend`]).
     pub lag_us: u64,
 }
 
@@ -236,16 +241,24 @@ impl GpsError {
         }
     }
 
-    /// The blend to undo: `None` for a lag of 0 or of a whole period or more
-    /// (the program then reads one stored sample, and `sent = n`); an error
-    /// for a lag within 5 % of half the period.
+    /// The blend to undo. The program reads the position `lag` back between
+    /// two stored samples, so only the part of the lag beyond whole periods
+    /// sets the weights: `a = (lag mod period) / period` (measured on V4.7.2
+    /// at 250 ms with a 200 ms period: the report is blended, not white).
+    /// `None` for a lag of 0 or of a whole number of periods (the program
+    /// then reads one stored sample, and `sent = n`); an error for a part
+    /// within 5 % of half the period.
     pub fn blend(&self) -> Result<Option<GpsBlend>, GpsLagUnusable> {
-        if self.lag_us == 0 || self.period_us == 0 || self.lag_us >= self.period_us {
+        if self.lag_us == 0 || self.period_us == 0 {
             return Ok(None);
         }
-        let a = self.lag_us as f64 / self.period_us as f64;
-        // |lag - period / 2| <= 5 % of period / 2, in whole microseconds.
-        if self.lag_us.abs_diff(self.period_us - self.lag_us) * 20 <= self.period_us {
+        let part_us = self.lag_us % self.period_us;
+        if part_us == 0 {
+            return Ok(None);
+        }
+        let a = part_us as f64 / self.period_us as f64;
+        // |part - period / 2| <= 5 % of period / 2, in whole microseconds.
+        if part_us.abs_diff(self.period_us - part_us) * 20 <= self.period_us {
             return Err(GpsLagUnusable {
                 lag_us: self.lag_us,
                 period_us: self.period_us,
@@ -2058,6 +2071,36 @@ mod tests {
                 );
             }
         }
+        // A lag beyond a period is blended by its part beyond whole periods
+        // (the program reads between two stored samples whatever the lag):
+        // 250 ms is 0.25 of a period more than one, 350 ms is 0.75 more.
+        for (lag_us, hi, lo) in [
+            (250_000, 0.75, 0.25),
+            (350_000, 0.75, 0.25),
+            (450_000, 0.75, 0.25),
+            (270_000, 0.65, 0.35),
+        ] {
+            let c = GpsError {
+                lag_us,
+                ..GpsError::ours()
+            };
+            let b = c.blend().unwrap().unwrap_or_else(|| panic!("{lag_us}"));
+            assert!(
+                (b.hi - hi).abs() < 1e-12 && (b.lo - lo).abs() < 1e-12,
+                "{lag_us}"
+            );
+            // The sequence it sends is the pre-filtered one, not the draws.
+            let mut g = GpsErrorState::new(c, 4);
+            let mut want = Rng::stream(4, Stream::GpsError);
+            let sd = c.sigma_m * b.sent_over_reported();
+            let start = [want.gaussian(sd), want.gaussian(sd)];
+            let (n, e) = (want.gaussian(0.3), want.gaussian(0.3));
+            assert_eq!(
+                g.at(0),
+                [(n - b.lo * start[0]) / b.hi, (e - b.lo * start[1]) / b.hi],
+                "{lag_us}"
+            );
+        }
         // A lag of a quarter of the period has weights 0.25 and 0.75.
         let c = GpsError {
             lag_us: 50_000,
@@ -2069,7 +2112,7 @@ mod tests {
 
     #[test]
     fn a_lag_within_5_percent_of_half_the_period_is_refused_with_a_sentence() {
-        for lag_us in [95_000, 100_000, 104_000] {
+        for lag_us in [95_000, 100_000, 104_000, 295_000, 300_000, 504_000] {
             let c = GpsError {
                 lag_us,
                 ..GpsError::ours()
@@ -2079,7 +2122,7 @@ mod tests {
             assert!(s.contains("half") && s.contains(&lag_us.to_string()), "{s}");
         }
         // Just outside the band both sides.
-        for lag_us in [94_000, 106_000] {
+        for lag_us in [94_000, 106_000, 294_000, 306_000] {
             let c = GpsError {
                 lag_us,
                 ..GpsError::ours()

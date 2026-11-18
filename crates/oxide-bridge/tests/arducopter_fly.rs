@@ -690,10 +690,23 @@ fn rest_run(
     seconds: f64,
     telemetry: Vec<TelemetryRequest>,
 ) -> RestRun {
+    rest_run_with(instance, tag, seed, gps_error, seconds, telemetry, |_| {})
+}
+
+fn rest_run_with(
+    instance: u8,
+    tag: &str,
+    seed: u64,
+    gps_error: bool,
+    seconds: f64,
+    telemetry: Vec<TelemetryRequest>,
+    edit: impl FnOnce(&mut ArduCopterConfig),
+) -> RestRun {
     let root = TempDir::new(tag);
     let mut sim = simulation(instance, &root, NoPilot, SimOptions::realistic(seed), |c| {
         c.gps_error.enabled = gps_error;
         c.telemetry = telemetry;
+        edit(c);
     });
     sim.preroll(PREROLL_STEPS).unwrap_or_else(|e| panic!("{e}"));
     let end = Micros((seconds * 1e6) as u64);
@@ -834,6 +847,56 @@ fn summary(v: &[f64]) -> (f64, f64) {
 }
 
 /// Test 6. The GPS error reaches ArduCopter's GPS, and nothing else.
+/// The program blends by the part of its GPS lag beyond whole periods, so a lag
+/// of a period and a quarter (250 ms with fixes 200 ms apart) is undone too:
+/// the reported error is white. (Measured before the bridge used that part:
+/// the draws sent unblended came back with 0.8 of their standard deviation and
+/// a fix-to-fix correlation of +0.37.)
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn a_gps_lag_beyond_a_period_is_undone_by_its_part_beyond_whole_periods() {
+    let lease = Instance::lease();
+    let sigma = SimOptions::realistic(7).sensors.gps.pos_sigma_h_m;
+    for lag_ms in [250u64, 400] {
+        let run = rest_run_with(
+            lease.0,
+            &format!("rest-lag-{lag_ms}"),
+            7,
+            true,
+            80.0,
+            vec![telemetry(id::GPS_RAW_INT, 10.0, 4_000)],
+            |c| {
+                c.gps_error.lag_us = lag_ms * 1000;
+                c.extra_params
+                    .push(("SIM_GPS1_LAG_MS".into(), lag_ms as f64));
+            },
+        );
+        let all = fixes(&run.audit);
+        let reference = *all
+            .iter()
+            .rev()
+            .find(|f| f.at_us < run.flight_start_us)
+            .expect("a fix in the pre-roll");
+        let v: Vec<f64> = all
+            .iter()
+            .filter(|f| f.at_us >= run.flight_start_us + 2_000_000)
+            .map(|f| north_east(f, &reference).0)
+            .collect();
+        let n = v.len() as f64;
+        let (sd, r) = (std_dev(&v), lag1(&v));
+        println!(
+            "MEASURED GPS lag {lag_ms} ms: {} fixes, north sd {sd:.4} +- {:.4} m (model {sigma}), \
+             fix-to-fix correlation {r:+.3} +- {:.3}",
+            v.len(),
+            sd / Real::sqrt(2.0 * n),
+            1.0 / Real::sqrt(n)
+        );
+        assert!(v.len() >= 330, "{}", v.len());
+        assert!((sd - sigma).abs() <= 0.15 * sigma, "lag {lag_ms}: sd {sd}");
+        assert!(r.abs() <= 0.2, "lag {lag_ms}: correlation {r}");
+    }
+}
+
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_gps_error_reaches_arducopters_gps_and_nothing_else() {
