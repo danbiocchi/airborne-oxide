@@ -808,7 +808,7 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        9.4,
+        11.0,
         0.5,
     );
     assert_eq!(class_of(o), Class::Crash);
@@ -1081,7 +1081,7 @@ fn battery_low_arms_and_returns_10_s_after_the_threshold_and_is_still_coming_dow
     near(
         "time from the pack crossing BATT_LOW_VOLT to the failsafe",
         t - crossed,
-        10.0,
+        11.18,
         0.3,
     );
     near("BATT_LOW_VOLT", low, 20.767, 0.005);
@@ -1124,13 +1124,13 @@ fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() 
         &run,
         9.0,
         &[
-            ("Battery 1 is low", 21.72, 0.05),
-            ("Battery Failsafe", 21.72, 0.05),
+            ("Battery 1 is low", 21.62, 0.05),
+            ("Battery Failsafe", 21.62, 0.05),
             ("Battery 1 is critical", 27.32, 0.05),
             ("Battery Failsafe", 27.32, 0.05),
-            ("Disarming motors", 44.05, 0.3),
-            ("PreArm: Battery 1 low voltage failsafe", 45.93, 0.3),
-            ("PreArm: Battery failsafe", 45.93, 0.3),
+            ("Disarming motors", 43.88, 0.3),
+            ("PreArm: Battery 1 low voltage failsafe", 44.93, 0.3),
+            ("PreArm: Battery failsafe", 44.93, 0.3),
         ],
     );
     let (low, crit) = battery_names();
@@ -1164,7 +1164,7 @@ fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() 
     );
     let o = run.outcome();
     assert!(!o.armed_at_end);
-    near("disarmed", o.disarmed_at_s.expect("disarmed"), 44.05, 0.3);
+    near("disarmed", o.disarmed_at_s.expect("disarmed"), 43.88, 0.3);
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
@@ -1172,7 +1172,7 @@ fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() 
         0.15,
     );
     assert_eq!(class_of(o), Class::Safe);
-    assert_violations(&run, &["disarmed at 44.05 s, later than 40 s"]);
+    assert_violations(&run, &["disarmed at 43.88 s, later than 40 s"]);
 }
 
 // ---- The brain --------------------------------------------------------------

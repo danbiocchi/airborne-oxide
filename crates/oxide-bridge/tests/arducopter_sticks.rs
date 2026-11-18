@@ -623,7 +623,10 @@ fn brain_commands(a: &FlightAudit) -> Vec<(f64, SentKind)> {
 
 /// Test 3. Offboard flights are what they were: the same three hashes as
 /// before the brain acted only in offboard and before the radio was set up
-/// (measured on the commit before this part, `oxide-bridge fly` run 0).
+/// (measured on the commit before that part, `oxide-bridge fly` run 0), until
+/// the tuned parameter set (ADR-0007 section 2) changed the flown set: the
+/// hashes are now those of run 0 on that set (every other change since the
+/// first pin is a parameter, so the flights still say nothing but their set).
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_offboard_flights_have_the_hashes_they_had_before_stick_flying() {
@@ -632,17 +635,17 @@ fn the_offboard_flights_have_the_hashes_they_had_before_stick_flying() {
         (
             "gust-hold",
             (
-                0xf23a_5e81_1900_9518u64,
-                0x1bd9_3a2c_e236_7901u64,
-                0xfdfc_13b6_2c89_ddf5u64,
+                0xd9a6_8d1d_9586_0d72u64,
+                0xe967_c25f_893b_ca4cu64,
+                0x30ee_7b05_aa5f_2860u64,
             ),
         ),
         (
             "hover-step",
             (
-                0x0e92_990b_da95_5f43,
-                0x0d52_0598_9df1_54c2,
-                0x6e43_aefd_729b_b94a,
+                0x3847_0a8e_a846_b9d9,
+                0x6f68_a918_ea4b_46c2,
+                0x8cc0_ab58_6c26_2ce6,
             ),
         ),
     ] {
@@ -675,7 +678,7 @@ fn rc_loss_position_lifts_on_the_delayed_throttle_flies_out_returns_and_lands() 
                 "reasons: needs the flight core's status",
                 "ending landed: disarm reason Touchdown: needs the flight core's status",
             ],
-            last_motor_on_s: Some(73.7905),
+            last_motor_on_s: Some(73.8705),
             modes: &[(0.2, 5), (25.98, 6)],
             texts: &[
                 (0.0, "RCInput: decoding FDM (Pulses)"),
@@ -683,16 +686,16 @@ fn rc_loss_position_lifts_on_the_delayed_throttle_flies_out_returns_and_lands() 
                 (8.17, "EKF3 IMU0 MAG0 in-flight yaw alignment complete"),
                 (8.17, "EKF3 IMU1 MAG0 in-flight yaw alignment complete"),
                 (25.98, "Radio Failsafe"),
-                (73.79, "Disarming motors"),
+                (73.87, "Disarming motors"),
                 (74.93, "PreArm: Radio failsafe on"),
             ],
             armed_at_end: false,
-            disarmed_at_s: Some(73.7935),
-            touchdown_mps: Some(0.4966),
-            max_height_m: 14.982,
-            max_distance_m: 25.022,
-            max_tilt_deg: 19.57,
-            end_m: [0.2946, 0.1524, 0.0],
+            disarmed_at_s: Some(73.8735),
+            touchdown_mps: Some(0.5045),
+            max_height_m: 14.984,
+            max_distance_m: 25.086,
+            max_tilt_deg: 19.21,
+            end_m: [0.297, 0.147, 0.0],
         },
     );
     // The pilot's script, the track: the same flight again with its log.
@@ -824,8 +827,8 @@ fn gps_loss_pilot_ends_in_an_ekf_failsafe_land_and_a_disarm() {
         &Pin {
             class: FlightClass::Safe,
             violations: &[
-                "only reached 3.40 m high, required 4 m",
-                "not armed at the end (disarmed None at Some(40.738499999999995) s)",
+                "only reached 3.39 m high, required 4 m",
+                "not armed at the end (disarmed None at Some(40.731) s)",
                 "ended at 0.00 m, 5.00 m off 5 m (limit 3 m)",
             ],
             not_judged: &[
@@ -837,7 +840,7 @@ fn gps_loss_pilot_ends_in_an_ekf_failsafe_land_and_a_disarm() {
                 "events: needs the flight core's status",
                 "ending flying: navigation not Terminated: needs the flight core's status",
             ],
-            last_motor_on_s: Some(40.7355),
+            last_motor_on_s: Some(40.728),
             modes: &[(0.2, 5), (28.02, 9)],
             texts: &[
                 (0.0, "RCInput: decoding FDM (Pulses)"),
@@ -848,15 +851,15 @@ fn gps_loss_pilot_ends_in_an_ekf_failsafe_land_and_a_disarm() {
                 (28.02, "EKF Failsafe: changed to Land Mode"),
                 (35.09, "EKF3 IMU0 stopped aiding"),
                 (35.10, "EKF3 IMU1 stopped aiding"),
-                (40.74, "Disarming motors"),
+                (40.73, "Disarming motors"),
             ],
             armed_at_end: false,
-            disarmed_at_s: Some(40.7385),
-            touchdown_mps: Some(0.4856),
-            max_height_m: 3.401,
-            max_distance_m: 5.733,
-            max_tilt_deg: 2.59,
-            end_m: [0.0555, 5.733, 0.0],
+            disarmed_at_s: Some(40.731),
+            touchdown_mps: Some(0.4944),
+            max_height_m: 3.393,
+            max_distance_m: 5.771,
+            max_tilt_deg: 2.53,
+            end_m: [0.033, 5.771, 0.0],
         },
     );
 }
@@ -899,10 +902,10 @@ fn rc_loss_override_leaves_the_return_for_guided_and_flies_to_the_brains_setpoin
             armed_at_end: true,
             disarmed_at_s: None,
             touchdown_mps: None,
-            max_height_m: 14.798,
-            max_distance_m: 24.810,
-            max_tilt_deg: 21.11,
-            end_m: [6.8324, 0.2095, 10.0702],
+            max_height_m: 14.791,
+            max_distance_m: 24.876,
+            max_tilt_deg: 20.74,
+            end_m: [6.832, 0.208, 10.069],
         },
     );
     let a = f.audit.as_ref().expect("audit");
@@ -927,7 +930,7 @@ fn rc_loss_override_leaves_the_return_for_guided_and_flies_to_the_brains_setpoin
         "{:?}",
         sent[0]
     );
-    // Where the vehicle was at the switch: 14.8 m up, 14.5 m north, flying
+    // Where the vehicle was at the switch: 14.8 m up, 15.2 m north, flying
     // home at 5 m/s.
     let text = file_text("rc-loss-override");
     let (log, _) = fly_theirs(&text, lease.0, "rco-track", &[]);
@@ -937,7 +940,7 @@ fn rc_loss_override_leaves_the_return_for_guided_and_flies_to_the_brains_setpoin
         r.position.x, r.position.y, -r.position.z, r.velocity.x
     );
     near("height at the switch", -r.position.z, 14.77, 0.2);
-    near("north at the switch", r.position.x, 14.5, 0.5);
+    near("north at the switch", r.position.x, 15.2, 0.5);
 }
 
 /// Test 9. kill-in-rtl (not scored by the gate): the motor-stop switch at
@@ -970,23 +973,23 @@ fn kill_in_rtl_stops_the_motors_a_fifth_of_a_second_after_the_switch_and_the_veh
                 (25.98, "Radio Failsafe"),
                 (32.0, "Radio Failsafe Cleared"),
                 (34.22, "RC7: MotorEStop HIGH"),
-                (35.24, "Potential Thrust Loss (4)"),
-                (36.09, "EKF3 lane switch 1"),
-                (36.09, "EKF primary changed:1"),
+                (35.26, "Potential Thrust Loss (4)"),
+                (36.29, "EKF3 lane switch 1"),
+                (36.29, "EKF primary changed:1"),
                 (36.69, "EKF3 lane switch 0"),
                 (36.69, "EKF primary changed:0"),
-                (37.10, "Potential Thrust Loss (4)"),
+                (37.12, "Potential Thrust Loss (4)"),
                 (37.33, "Vibration compensation ON"),
                 (39.22, "Disarming motors"),
                 (40.93, "PreArm: Motors Emergency Stopped"),
             ],
             armed_at_end: false,
             disarmed_at_s: Some(34.226),
-            touchdown_mps: Some(15.4778),
-            max_height_m: 14.774,
-            max_distance_m: 24.850,
-            max_tilt_deg: 22.34,
-            end_m: [20.736, 0.514, 0.0],
+            touchdown_mps: Some(15.4662),
+            max_height_m: 14.763,
+            max_distance_m: 24.911,
+            max_tilt_deg: 21.95,
+            end_m: [21.001, 0.522, 0.0],
         },
     );
     let off = f.last_motor_on_s.expect("motors were on") - 34.0;
