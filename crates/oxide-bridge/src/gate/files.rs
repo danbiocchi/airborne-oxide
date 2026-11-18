@@ -305,6 +305,20 @@ pub fn differences_from_build<'a>(
     out
 }
 
+/// The refusal of `gate fly` to fly the gate with files that are not the
+/// commit's (`differences` from [`differences_from_build`]); a trial, which
+/// may, passes.
+pub fn refuse_others_for_the_gate(differences: &[String], trial: bool) -> Result<(), String> {
+    if differences.is_empty() || trial {
+        return Ok(());
+    }
+    Err(format!(
+        "the gate is flown with the commit's own files only, and these are not ({}): restore \
+         them, or give --reduced for a trial, which is never a pass",
+        differences.join("; ")
+    ))
+}
+
 /// How the facts `gate.txt` states about its plan (what is in each pair, the
 /// start of the failure that a time to motors off counts from) are not the
 /// facts of the commit's own scenario files, as sentences. They decide
@@ -426,6 +440,24 @@ mod tests {
             assert_eq!(expected_params_sha256(s).as_deref(), Ok(fenced), "{s}");
         }
         assert!(expected_params_sha256("no-such-scenario").is_err());
+    }
+
+    #[test]
+    fn the_gate_is_not_flown_with_other_files_and_a_trial_may_be() {
+        let d =
+            vec!["the scenario file gust-hold has SHA-256 00 and the commit's is 11".to_string()];
+        let e = refuse_others_for_the_gate(&d, false).expect_err("refused");
+        assert!(e.contains("gust-hold") && e.contains("--reduced"), "{e}");
+        assert_eq!(refuse_others_for_the_gate(&d, true), Ok(()));
+        assert_eq!(refuse_others_for_the_gate(&[], false), Ok(()));
+        // What it is given for the commit's own files is no difference.
+        let params = param_hashes().expect("hashes");
+        let one = [(
+            "gust-hold".to_string(),
+            scenario_sha256("gust-hold").expect("sha"),
+        )];
+        let own = differences_from_build(Some(PINNED.sha256), &params, &one, ["gust-hold"]);
+        assert_eq!(refuse_others_for_the_gate(&own, false), Ok(()));
     }
 
     #[test]

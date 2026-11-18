@@ -301,6 +301,17 @@ impl Reader<'_> {
                 return Vec::new();
             }
         };
+        // `gate fly` writes one row per line, each ended by a line feed: a
+        // table with other line ends or an unended last line was not written
+        // by it (or has been through an editor).
+        if text.contains('\r') || !text.ends_with('\n') {
+            self.problems.push(format!(
+                "{label} ({}) is not as `gate fly` writes a table: its lines end otherwise than \
+                 by a line feed, or the last one does not end",
+                path.display()
+            ));
+            return Vec::new();
+        }
         let mut lines = text.lines();
         if lines.next() != Some(header().as_str()) {
             self.problems.push(format!(

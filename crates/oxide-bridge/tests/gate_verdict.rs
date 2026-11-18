@@ -1496,3 +1496,33 @@ fn what_gate_txt_says_of_a_pair_or_a_failure_start_is_the_commits_files_or_exit_
     let e = eval(&f);
     assert!(!e.passed, "a trial is never a pass");
 }
+
+#[test]
+fn a_table_with_other_line_ends_or_an_unended_last_line_is_exit_2() {
+    // Not forgeries (the values are the genuine ones) but not what `gate fly`
+    // wrote either: refused rather than passed.
+    for (tag, edit) in [
+        (
+            "crlf",
+            (|t: &str| t.replace('\n', "\r\n")) as fn(&str) -> String,
+        ),
+        ("no-final-newline", |t: &str| {
+            t.trim_end_matches('\n').to_string()
+        }),
+    ] {
+        let f = Fixture::small(tag);
+        f.write();
+        let path = table_dir(&f.dir, "gps-loss", F405).join("flights.csv");
+        let text = std::fs::read_to_string(&path).expect("table");
+        std::fs::write(&path, edit(&text)).expect("write");
+        let v = verdict(&f.dir);
+        f.remove();
+        let Verdict::Incomplete(i) = v else {
+            panic!("{tag}: the table should be refused");
+        };
+        assert!(
+            mentions(&i.0, &["gps-loss", "core-f405", "line feed"]),
+            "{tag}: {i:?}"
+        );
+    }
+}

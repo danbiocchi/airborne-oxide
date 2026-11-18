@@ -283,38 +283,25 @@ pub fn fly(s: &Settings) -> Result<u8, String> {
     let binary_sha = sha_of(&binary).map_err(|e| format!("the simulator program: {e}"))?;
     let airframe = oxide_sim::Airframe::reference_quad().map_err(|e| e.to_string())?;
     let params = param_hashes(&airframe)?;
-    // The children read the parameter files from the source tree: they must
-    // be the ones this program was built with, which are the commit's (the
-    // build refuses a dirty tree's hash above).
-    let built_params = files::param_hashes()?;
-    if params != built_params {
-        return Err(format!(
-            "the parameter files on disk ({}) are not the ones this program was built with ({}): \
-             build it again at the commit that is to be flown",
-            params
-                .iter()
-                .map(|(n, h)| format!("{n} {}", h.get(..12).unwrap_or(h)))
-                .collect::<Vec<_>>()
-                .join(", "),
-            built_params
-                .iter()
-                .map(|(n, h)| format!("{n} {}", h.get(..12).unwrap_or(h)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
     let mut scenario_files = Vec::new();
     for e in &plan.entries {
         let path = s.scenarios.join(format!("{}.toml", e.scenario));
         scenario_files.push((e.scenario.clone(), sha_of(&path)?));
     }
-    let mut deviations = plan.deviations_from_the_record();
-    deviations.extend(files::differences_from_build(
+    // The children read the parameter files from the source tree and the
+    // scenario files from `--scenarios`: for the gate they must be the ones
+    // this program was built with, which are the commit's (ADR-0007 section
+    // 7). A trial (`--reduced`, `--allow-dirty`) may fly others and is never
+    // a pass.
+    let others = files::differences_from_build(
         Some(&binary_sha),
         &params,
         &scenario_files,
         plan.entries.iter().map(|e| e.scenario.as_str()),
-    ));
+    );
+    files::refuse_others_for_the_gate(&others, s.reduced || s.allow_dirty)?;
+    let mut deviations = plan.deviations_from_the_record();
+    deviations.extend(others);
     let reduced = s.reduced || !deviations.is_empty();
     if reduced {
         eprintln!(
