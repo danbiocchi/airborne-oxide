@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use oxide_core::math::Real;
 use oxide_sim::rng::run_seed;
 
 use crate::batch::run_dir;
@@ -124,6 +125,13 @@ pub struct Flight {
     pub rms_v_m: Option<f64>,
     pub max_tilt_deg: Option<f64>,
     pub last_motor_on_s: Option<f64>,
+    /// Speed at touchdown, m/s; none when the flight did not touch down.
+    pub touchdown_mps: Option<f64>,
+    /// Flight time at which the autopilot disarmed, s; none when it never did.
+    pub disarmed_at_s: Option<f64>,
+    /// End position north and east of the arming point, m.
+    pub end_n_m: Option<f64>,
+    pub end_e_m: Option<f64>,
     pub repeats: Option<bool>,
     pub trace_hash: String,
     pub packet_hash: String,
@@ -138,6 +146,13 @@ impl Flight {
 
     fn hashes(&self) -> (&str, &str, &str) {
         (&self.trace_hash, &self.packet_hash, &self.reply_hash)
+    }
+
+    /// Distance of the end position from the arming point, m: the horizontal
+    /// distance, `sqrt(end_n_m^2 + end_e_m^2)`. None when either is empty.
+    pub fn landing_distance_m(&self) -> Option<f64> {
+        let (n, e) = (self.end_n_m?, self.end_e_m?);
+        Some(Real::sqrt(n * n + e * e))
     }
 }
 
@@ -532,18 +547,24 @@ impl Reader<'_> {
             "max_v_m",
             "max_height_m",
             "max_distance_m",
-            "touchdown_mps",
-            "disarmed_at_s",
             "wall_s",
         ] {
             num(column, false);
         }
+        let touchdown_mps = num("touchdown_mps", false);
+        let disarmed_at_s = num("disarmed_at_s", false);
         // The end position is a position: it may be negative.
-        for column in ["end_n_m", "end_e_m", "end_d_m"] {
-            if let Err(e) = number(row, column) {
-                whys.push(e);
+        let mut position = |column: &str| -> Option<f64> {
+            match number(row, column) {
+                Ok(v) => v,
+                Err(e) => {
+                    whys.push(e);
+                    None
+                }
             }
-        }
+        };
+        let (end_n_m, end_e_m) = (position("end_n_m"), position("end_e_m"));
+        position("end_d_m");
         let audit_dir = run_dir(dir, index);
         match read_row_file(&audit_dir) {
             Err(e) => whys.push(e),
@@ -598,6 +619,10 @@ impl Reader<'_> {
             rms_v_m,
             max_tilt_deg,
             last_motor_on_s,
+            touchdown_mps,
+            disarmed_at_s,
+            end_n_m,
+            end_e_m,
             repeats: match row.get("repeats") {
                 "yes" => Some(true),
                 "no" => Some(false),
@@ -1186,6 +1211,65 @@ pub struct ScenarioSummary {
     pub core_h743: Classes,
 }
 
+/// What the report holds for one scenario and one autopilot and decides
+/// nothing with (ADR-0007 section 6): every flight of the table, crashes and
+/// fly-aways included. A median or a worst is `None` when no flight has the
+/// value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reported {
+    pub scenario: String,
+    pub autopilot: String,
+    pub flights: usize,
+    /// Flights with a `touchdown_mps`.
+    pub touched_down: usize,
+    /// Median and largest touchdown speed, m/s.
+    pub touchdown_median: Option<f64>,
+    pub touchdown_worst: Option<f64>,
+    /// Median and largest distance of the end position from the arming
+    /// point, m.
+    pub distance_median: Option<f64>,
+    pub distance_worst: Option<f64>,
+    /// Median and largest `max_tilt_deg`.
+    pub tilt_median: Option<f64>,
+    pub tilt_worst: Option<f64>,
+    /// Flights with a `disarmed_at_s`.
+    pub disarmed: usize,
+    /// Median and latest flight time of the disarm, s.
+    pub disarmed_median: Option<f64>,
+    pub disarmed_latest: Option<f64>,
+}
+
+/// The largest of `values`; `None` for none.
+fn largest(values: &[f64]) -> Option<f64> {
+    values.iter().copied().max_by(f64::total_cmp)
+}
+
+/// [`Reported`] of the flights of one table.
+pub fn reported_of(scenario: &str, autopilot: &str, flights: &[Flight]) -> Reported {
+    let touch: Vec<f64> = flights.iter().filter_map(|f| f.touchdown_mps).collect();
+    let dist: Vec<f64> = flights
+        .iter()
+        .filter_map(Flight::landing_distance_m)
+        .collect();
+    let tilt: Vec<f64> = flights.iter().filter_map(|f| f.max_tilt_deg).collect();
+    let disarmed: Vec<f64> = flights.iter().filter_map(|f| f.disarmed_at_s).collect();
+    Reported {
+        scenario: scenario.to_string(),
+        autopilot: autopilot.to_string(),
+        flights: flights.len(),
+        touched_down: touch.len(),
+        touchdown_median: median(&touch),
+        touchdown_worst: largest(&touch),
+        distance_median: median(&dist),
+        distance_worst: largest(&dist),
+        tilt_median: median(&tilt),
+        tilt_worst: largest(&tilt),
+        disarmed: disarmed.len(),
+        disarmed_median: median(&disarmed),
+        disarmed_latest: largest(&disarmed),
+    }
+}
+
 /// The time to motors off of one scenario (criterion B3), s.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MotorsSummary {
@@ -1222,6 +1306,9 @@ pub struct Evaluation {
     pub wins: Wins,
     pub scenarios: Vec<ScenarioSummary>,
     pub motors: Vec<MotorsSummary>,
+    /// One row for each scenario of the plan but the gust one and each of
+    /// core-f405, core-h743 and arducopter, in the plan's order.
+    pub reported: Vec<Reported>,
     pub twice: Vec<TwiceSummary>,
     /// ArduCopter's and our F405 core's `rms_h_m` of each gust index where
     /// ArduCopter's flight is safe, for the plots.
@@ -1415,6 +1502,7 @@ pub fn evaluate(gate: &Gate) -> Evaluation {
     let mut b3 = Check::new(Status::Holds);
     let mut scenarios = Vec::new();
     let mut motors = Vec::new();
+    let mut reported = Vec::new();
     let (mut any_outcome, mut any_motors) = (false, false);
     for e in &info.plan.entries {
         let s = e.scenario.as_str();
@@ -1493,6 +1581,9 @@ pub fn evaluate(gate: &Gate) -> Evaluation {
                 }
                 motors.push(m);
             }
+        }
+        for who in [f405, h743, ac] {
+            reported.push(reported_of(s, who, gate.flights(s, who)));
         }
         scenarios.push(ScenarioSummary {
             scenario: s.to_string(),
@@ -1574,6 +1665,7 @@ pub fn evaluate(gate: &Gate) -> Evaluation {
         wins,
         scenarios,
         motors,
+        reported,
         twice,
         paired,
         curves,

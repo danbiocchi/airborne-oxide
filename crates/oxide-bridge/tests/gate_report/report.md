@@ -116,6 +116,22 @@ Classes are safe / crash / fly-away. "Passed" counts the rows whose verdict colu
 |---|---|---|---|---|
 | motor-loss | 15 | 0.2000 | 0.2000 | 2.0000 |
 
+## Reported for each scenario, deciding nothing
+
+One row for each scenario but gust-hold and each autopilot, over every flight of that table: crashes and fly-aways are in these rows. "flights" is the rows of the table; "touched down" the rows that have a touchdown speed (m/s), and the median and worst (the largest) are over those. The landing distance (m) is the distance of the end position from the arming point, sqrt(end north squared + end east squared), of every row. The greatest tilt (deg) is `max_tilt_deg` of every row. "disarmed" counts the rows that have a disarm time, and the median and latest are over those; the times are flight time, and each scenario file names when its failure begins. The modes each flight went through are in its `audit.txt`. A `-` is a value that no row has. These numbers decide nothing.
+
+| scenario | autopilot | flights | touched down | touchdown speed median (m/s) | touchdown speed worst (m/s) | landing distance median (m) | landing distance worst (m) | greatest tilt median (deg) | greatest tilt worst (deg) | disarmed | disarmed at median (s) | disarmed at latest (s) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gps-loss | core-f405 | 3 | 2 | 1.0000 | 1.5000 | 5.0000 | 10.0000 | 20.0000 | 35.2500 | 2 | 13.2500 | 14.0000 |
+| gps-loss | core-h743 | 3 | 0 | - | - | - | - | - | - | 0 | - | - |
+| gps-loss | arducopter | 3 | 0 | - | - | - | - | - | - | 0 | - | - |
+| motor-loss | core-f405 | 5 | 0 | - | - | - | - | - | - | 0 | - | - |
+| motor-loss | core-h743 | 5 | 0 | - | - | - | - | - | - | 0 | - | - |
+| motor-loss | arducopter | 5 | 0 | - | - | - | - | - | - | 0 | - | - |
+| hover-step | core-f405 | 2 | 0 | - | - | - | - | - | - | 0 | - | - |
+| hover-step | core-h743 | 2 | 0 | - | - | - | - | - | - | 0 | - | - |
+| hover-step | arducopter | 2 | 0 | - | - | - | - | - | - | 0 | - | - |
+
 ## Flights flown twice
 
 | scenario | index | repeats | hashes as in the main table |

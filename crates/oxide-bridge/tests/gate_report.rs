@@ -35,6 +35,24 @@ fn small() -> Evaluation {
     f.row("gust-hold", AC, 4).set("class", "crash");
     f.row("gps-loss", AC, 0).set("class", "fly-away");
     f.row("motor-loss", AC, 1).set("last_motor_on_s", "59.995");
+    // What the report holds and decides nothing with: a landing 5 m away
+    // (3 north, 4 east), one 10 m away (6 south, 8 west), one 1 m away with no
+    // touchdown, one never disarmed.
+    for (i, (n, e, tilt, touch, disarmed)) in [
+        ("3", "4", "10", "0.5", "12.5"),
+        ("-6", "-8", "20", "1.5", "14"),
+        ("0", "-1", "35.25", "", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = f.row("gps-loss", F405, i as u64);
+        r.set("end_n_m", n);
+        r.set("end_e_m", e);
+        r.set("max_tilt_deg", tilt);
+        r.set("touchdown_mps", touch);
+        r.set("disarmed_at_s", disarmed);
+    }
     f.write();
     let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
@@ -149,4 +167,125 @@ fn write_makes_the_report_and_two_figures_beside_it() {
     let md = std::fs::read_to_string(dir.join("gate-report.md")).expect("md");
     assert!(md.contains("(gate-report-cumulative.svg)"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- what the report holds for each scenario and decides nothing with -----
+
+use oxide_bridge::gate::verdict::{Class, Flight, Judged, reported_of};
+
+/// A flight with the cells the table of "reported" reads.
+fn flight(
+    tilt: Option<f64>,
+    touchdown: Option<f64>,
+    disarmed: Option<f64>,
+    end: (f64, f64),
+) -> Flight {
+    Flight {
+        scenario: "s".into(),
+        autopilot: "a".into(),
+        index: 0,
+        class: Class::Crash,
+        judged: Judged::Fail,
+        rms_h_m: None,
+        rms_v_m: None,
+        max_tilt_deg: tilt,
+        last_motor_on_s: None,
+        touchdown_mps: touchdown,
+        disarmed_at_s: disarmed,
+        end_n_m: Some(end.0),
+        end_e_m: Some(end.1),
+        repeats: None,
+        trace_hash: String::new(),
+        packet_hash: String::new(),
+        reply_hash: String::new(),
+    }
+}
+
+#[test]
+fn the_reported_numbers_of_an_odd_count_are_the_middle_value_and_the_largest() {
+    // Distances 5, 13 (negative north), 10 (negative east): median 10, worst 13.
+    // Touchdown speeds 1, 2, 6 and a flight with none: median 2, worst 6, 3 of 4.
+    // Tilts 30, 5, 12: median 12, worst 30. One flight never disarmed.
+    let flights = [
+        flight(Some(30.0), Some(1.0), Some(20.0), (3.0, 4.0)),
+        flight(Some(5.0), Some(2.0), Some(10.0), (-5.0, 12.0)),
+        flight(Some(12.0), Some(6.0), None, (0.0, -10.0)),
+        flight(Some(5.0), None, Some(15.0), (0.0, 0.0)),
+    ];
+    let r = reported_of("s", "a", &flights[..3]);
+    assert_eq!(r.flights, 3);
+    assert_eq!(
+        (r.touched_down, r.touchdown_median, r.touchdown_worst),
+        (3, Some(2.0), Some(6.0))
+    );
+    assert_eq!(
+        (r.distance_median, r.distance_worst),
+        (Some(10.0), Some(13.0))
+    );
+    assert_eq!((r.tilt_median, r.tilt_worst), (Some(12.0), Some(30.0)));
+    assert_eq!(
+        (r.disarmed, r.disarmed_median, r.disarmed_latest),
+        (2, Some(15.0), Some(20.0))
+    );
+    // All four: a row without a touchdown is not a zero speed, and the even
+    // counts take the mean of the two middle values.
+    let r = reported_of("s", "a", &flights);
+    assert_eq!(r.flights, 4);
+    assert_eq!(
+        (r.touched_down, r.touchdown_median, r.touchdown_worst),
+        (3, Some(2.0), Some(6.0))
+    );
+    assert_eq!(
+        (r.distance_median, r.distance_worst),
+        (Some(7.5), Some(13.0))
+    );
+    assert_eq!((r.tilt_median, r.tilt_worst), (Some(8.5), Some(30.0)));
+    assert_eq!(
+        (r.disarmed, r.disarmed_median, r.disarmed_latest),
+        (3, Some(15.0), Some(20.0))
+    );
+}
+
+#[test]
+fn a_table_with_no_value_reports_none() {
+    let r = reported_of("s", "a", &[]);
+    assert_eq!((r.flights, r.touched_down, r.disarmed), (0, 0, 0));
+    assert_eq!(r.touchdown_median, None);
+    assert_eq!(r.distance_worst, None);
+    assert_eq!(r.tilt_median, None);
+    assert_eq!(r.disarmed_latest, None);
+    let mut f = flight(None, None, None, (1.0, 1.0));
+    f.end_e_m = None;
+    let r = reported_of("s", "a", &[f]);
+    assert_eq!(r.flights, 1);
+    assert_eq!(r.distance_median, None, "a distance needs both coordinates");
+}
+
+#[test]
+fn the_report_has_a_row_for_every_scenario_but_the_gust_one_and_each_core_and_arducopter() {
+    let e = small();
+    let rows: Vec<(&str, &str)> = e
+        .reported
+        .iter()
+        .map(|r| (r.scenario.as_str(), r.autopilot.as_str()))
+        .collect();
+    let who = ["core-f405", "core-h743", "arducopter"];
+    let mut want = Vec::new();
+    for s in ["gps-loss", "motor-loss", "hover-step"] {
+        for a in who {
+            want.push((s, a));
+        }
+    }
+    assert_eq!(rows, want);
+    let md = markdown(&e, "r");
+    let at = |h: &str| {
+        md.find(h)
+            .unwrap_or_else(|| panic!("{h} is not in the report"))
+    };
+    assert!(
+        at("## Time from the failure to motors off")
+            < at("## Reported for each scenario, deciding nothing")
+    );
+    assert!(at("## Reported for each scenario, deciding nothing") < at("## Flights flown twice"));
+    assert!(md.contains("| gps-loss | core-f405 | 3 | 2 | 1.0000 | 1.5000 | 5.0000 | 10.0000 | 20.0000 | 35.2500 | 2 | 13.2500 | 14.0000 |"));
 }
