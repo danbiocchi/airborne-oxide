@@ -689,6 +689,23 @@ fn a_row_with_another_seed_is_exit_2_and_names_the_row() {
 }
 
 #[test]
+fn a_seed_that_every_autopilot_shares_is_still_the_seed_of_the_scenario_and_index() {
+    let mut f = Fixture::small("seed-all");
+    for who in [AC, F405, H743, TRUTH] {
+        f.row("gust-hold", who, 5).set("seed", "777");
+    }
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gust-hold core-f405 index 5", "seed"]),
+        "{p:?}"
+    );
+    assert!(
+        mentions(&p, &["gust-hold arducopter index 5", "seed"]),
+        "{p:?}"
+    );
+}
+
+#[test]
 fn a_table_from_another_commit_is_exit_2() {
     let mut f = Fixture::small("commit");
     f.flown("gps-loss", F405, 2).commit = "f".repeat(40);

@@ -200,8 +200,6 @@ fn number(row: &Row, column: &str) -> Result<Option<f64>, String> {
 struct Reader<'a> {
     info: &'a GateInfo,
     problems: &'a mut Vec<String>,
-    /// The seeds of the first table that had each scenario and index.
-    seeds: BTreeMap<(String, u64), (u64, String)>,
     /// The parameter hashes seen by ArduCopter's tables.
     params: BTreeMap<(String, bool), BTreeSet<String>>,
 }
@@ -319,6 +317,8 @@ impl Reader<'_> {
         if row.get("note").contains(DIRTY_NOTE) {
             whys.push("it was flown on a dirty tree (its note says so)".into());
         }
+        // Every seed is the seed of its scenario and index, so the rows of one
+        // index have the same seed whoever flew them.
         match row.get("seed").parse::<u64>() {
             Ok(seed) => {
                 let want = run_seed(scenario, index);
@@ -326,16 +326,6 @@ impl Reader<'_> {
                     whys.push(format!(
                         "its seed is {seed} and the seed of {scenario} index {index} is {want}"
                     ));
-                }
-                let key = (scenario.to_string(), index);
-                match self.seeds.get(&key) {
-                    Some((first, by)) if *first != seed => whys.push(format!(
-                        "its seed {seed} is not the seed {first} of the same index flown by {by}"
-                    )),
-                    Some(_) => {}
-                    None => {
-                        self.seeds.insert(key, (seed, autopilot.to_string()));
-                    }
                 }
             }
             Err(_) => whys.push(format!("its seed is {:?}", row.get("seed"))),
@@ -495,7 +485,6 @@ pub fn read(out: &Path) -> Result<Gate, Incomplete> {
     let mut reader = Reader {
         info: &info,
         problems: &mut problems,
-        seeds: BTreeMap::new(),
         params: BTreeMap::new(),
     };
     let mut tables = BTreeMap::new();
