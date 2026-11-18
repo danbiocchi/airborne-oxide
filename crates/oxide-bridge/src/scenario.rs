@@ -4,13 +4,16 @@
 //!
 //! [`translate`] decides. The file's `[params]` are our core's parameters and
 //! never reach ArduCopter as they are: [`PARAMS`] says what each name
-//! becomes. The pilot must be offboard throughout (stick flying is a later
-//! part). Faults are translated: the fault translator writes them to
-//! the program ([`FAULTS_TRANSLATABLE`]).
+//! becomes. The pilot's script is flown as it is, except that every stick
+//! frame and mode switch change after the arm switch is delayed by
+//! [`ARM_DELAY_S`], the time ArduCopter keeps its motors still after it arms
+//! ([`for_arducopter`]). Faults are translated: the fault translator writes
+//! them to the program ([`FAULTS_TRANSLATABLE`]).
 
 use core::fmt;
 use std::path::{Path, PathBuf};
 
+use oxide_sim::scenario::Script;
 use oxide_sim::scenario_file::{self, ScenarioFile};
 
 use crate::arducopter::BrainLink;
@@ -22,6 +25,44 @@ pub const AIRFRAME: &str = "quad-x-5in";
 
 /// The value of the pilot's mode switch that means offboard.
 pub const MODE_OFFBOARD: u8 = 2;
+
+/// How long the pilot's script waits for ArduCopter's motors after the arm
+/// switch, s. ArduCopter keeps its motors still for 2.0 s after it arms
+/// (measured on V4.7.2: live 2.233 s after the switch), and a throttle raised
+/// and centred again during that time lifts nothing, while our core's motors
+/// run at once. The measured time is rounded up to a whole radio period
+/// (20 ms). The rule of the gate: for ArduCopter every event of the pilot
+/// that comes later than the arm switch (a stick frame, a mode switch change)
+/// is delayed by this much.
+pub const ARM_DELAY_S: f64 = 2.24;
+
+/// The pilot's script as ArduCopter is flown by it: every stick frame and
+/// mode switch change later than the arm switch is delayed by
+/// [`ARM_DELAY_S`]. The arm switch itself, the kill and disarm switches, the
+/// brain's setpoints, the duration and (they are not in the script) every
+/// fault keep their times. An entry at the arm switch's own time is not later
+/// than it and stays. A script that never arms is unchanged.
+pub fn for_arducopter(script: &Script) -> Script {
+    // Snapped to the microsecond, so that 3.5 + 2.24 is the 5.74 s of the file
+    // format and not one rounding error above it (which would be the next
+    // radio frame).
+    let delayed = |t: f64| {
+        if t > script.arm_at_s {
+            ((t + ARM_DELAY_S) * 1e6).round() / 1e6
+        } else {
+            t
+        }
+    };
+    Script {
+        mode: script.mode.iter().map(|&(t, m)| (delayed(t), m)).collect(),
+        sticks: script
+            .sticks
+            .iter()
+            .map(|&(t, s)| (delayed(t), s))
+            .collect(),
+        ..script.clone()
+    }
+}
 
 /// Whether a scenario with faults is translatable: the faults are applied to
 /// the program as parameter writes (`faults::FaultTranslator`). This flag is
@@ -64,12 +105,6 @@ pub fn fence_params(radius_m: f64) -> Vec<(String, f64)> {
 pub enum Untranslatable {
     /// The file names another airframe.
     Airframe(String),
-    /// The pilot's mode switch is at some time anything but offboard.
-    StickFlying {
-        /// The first mode switch position that is not offboard, and when it
-        /// starts, s (`None` for no mode switch at all, which is stabilized).
-        first: Option<(f64, u8)>,
-    },
     /// A parameter that is not in the table.
     Param(String),
     /// A parameter whose value cannot be used.
@@ -84,16 +119,6 @@ impl fmt::Display for Untranslatable {
             Self::Airframe(a) => write!(
                 f,
                 "the airframe {a:?} is not {AIRFRAME:?}, the only one the bridge flies"
-            ),
-            Self::StickFlying { first: None } => write!(
-                f,
-                "stick flying: a later part (the file has no mode switch, which is stabilized)"
-            ),
-            Self::StickFlying {
-                first: Some((t, m)),
-            } => write!(
-                f,
-                "stick flying: a later part (the mode switch is {m} from {t} s, not offboard)"
             ),
             Self::Param(name) => write!(
                 f,
@@ -121,20 +146,16 @@ pub struct Translation {
     pub ours_only: Vec<(String, f64)>,
     /// Where the brain's commands go: nowhere when the file has no brain.
     pub brain: BrainLink,
+    /// The pilot's script as ArduCopter is flown by it ([`for_arducopter`]).
+    pub pilot: Script,
 }
 
 /// Decides what of `file` ArduCopter is given, or why it cannot fly it. The
-/// first reason is returned, checked in this order: airframe, mode switch,
-/// parameters, faults.
+/// first reason is returned, checked in this order: airframe, parameters,
+/// faults. Any mode switch and any sticks are translated.
 pub fn translate(file: &ScenarioFile) -> Result<Translation, Untranslatable> {
     if file.airframe != AIRFRAME {
         return Err(Untranslatable::Airframe(file.airframe.clone()));
-    }
-    let off = file.pilot.mode.iter().find(|(_, m)| *m != MODE_OFFBOARD);
-    if file.pilot.mode.is_empty() || off.is_some() {
-        return Err(Untranslatable::StickFlying {
-            first: off.copied(),
-        });
     }
     let mut extra_params = Vec::new();
     let mut ours_only = Vec::new();
@@ -173,6 +194,7 @@ pub fn translate(file: &ScenarioFile) -> Result<Translation, Untranslatable> {
         } else {
             BrainLink::None
         },
+        pilot: for_arducopter(&file.pilot),
     })
 }
 
@@ -350,26 +372,125 @@ mod tests {
     }
 
     #[test]
-    fn a_stick_scenario_is_not_translatable_in_this_part() {
+    fn every_mode_switch_and_every_stick_script_translates() {
         for pilot in [
             "[pilot]\narm_at_s = 1.0\n[[pilot.mode]]\nt = 0.0\nswitch = \"stabilized\"\n",
             "[pilot]\narm_at_s = 1.0\n[[pilot.mode]]\nt = 0.0\nswitch = \"offboard\"\n[[pilot.mode]]\nt = 5.0\nswitch = \"position\"\n",
             "[pilot]\narm_at_s = 1.0\n",
         ] {
-            let e = translate(&load(&format!("{HEAD}{pilot}"))).unwrap_err();
-            assert!(matches!(e, Untranslatable::StickFlying { .. }), "{e:?}");
-            assert!(e.to_string().contains("stick flying: a later part"), "{e}");
+            let t = translate(&load(&format!("{HEAD}{pilot}"))).expect("translatable");
+            assert_eq!(t.brain, BrainLink::Serial1);
         }
-        let e = translate(&load(&format!(
-            "{HEAD}[pilot]\narm_at_s = 1.0\n[[pilot.mode]]\nt = 0.0\nswitch = \"offboard\"\n[[pilot.mode]]\nt = 5.0\nswitch = \"position\"\n"
-        )))
-        .unwrap_err();
+    }
+
+    fn script_of(name: &str) -> (Script, Script) {
+        let loaded = LoadedScenario::load(scenarios_dir().join(format!("{name}.toml")))
+            .expect("the scenario");
+        let t = translate(&loaded.file).expect("translatable");
+        (loaded.file.pilot, t.pilot)
+    }
+
+    /// The sticks of the files that fly Position: centred, throttle full at
+    /// 3.5 s, half at 5.2 s, then (rc-loss-position and the two with a
+    /// return) 0.6 forward at 8 s and centred at 13 s.
+    fn delayed_sticks(from: &[(f64, [f32; 4])]) -> Vec<(f64, [f32; 4])> {
+        from.iter()
+            .map(|&(t, s)| (if t > 3.0 { t + 2.24 } else { t }, s))
+            .collect()
+    }
+
+    #[test]
+    fn rc_loss_position_is_delayed_after_the_arm_switch_and_nothing_else_moves() {
+        let (file, ours) = script_of("rc-loss-position");
+        assert_eq!(file.arm_at_s, 3.0);
+        assert_eq!(ours.arm_at_s, 3.0, "the arm switch keeps its time");
         assert_eq!(
-            e,
-            Untranslatable::StickFlying {
-                first: Some((5.0, 1))
-            }
+            ours.sticks,
+            vec![
+                (0.0, [0.0, 0.0, 0.0, 0.0]),
+                (5.74, [0.0, 0.0, 0.0, 1.0]),
+                (7.44, [0.0, 0.0, 0.0, 0.5]),
+                (10.24, [0.0, 0.6, 0.0, 0.5]),
+                (15.24, [0.0, 0.0, 0.0, 0.5]),
+            ]
         );
+        assert_eq!(ours.sticks, delayed_sticks(&file.sticks));
+        assert_eq!(
+            ours.mode,
+            vec![(0.0, 1)],
+            "the first mode is before the arm"
+        );
+        assert_eq!(ours.setpoints, file.setpoints, "the brain keeps its times");
+        assert_eq!(ours.kill_at_s, None);
+        assert_eq!(ours.duration_s, file.duration_s);
+    }
+
+    #[test]
+    fn the_other_four_stick_files_are_delayed_the_same_way() {
+        // gps-loss-pilot: the throttle up and back.
+        let (file, ours) = script_of("gps-loss-pilot");
+        assert_eq!(
+            ours.sticks.iter().map(|s| s.0).collect::<Vec<_>>(),
+            vec![0.0, 5.74, 7.44]
+        );
+        assert_eq!(ours.sticks, delayed_sticks(&file.sticks));
+        assert_eq!(ours.mode, vec![(0.0, 1)]);
+        // rc-loss-on-ground: no sticks at all, Stabilized throughout.
+        let (file, ours) = script_of("rc-loss-on-ground");
+        assert!(ours.sticks.is_empty());
+        assert_eq!(ours.mode, vec![(0.0, 0)]);
+        assert_eq!(ours, file, "nothing to delay");
+        // rc-loss-override: the switch to offboard at 34 s is after the arm
+        // switch and is delayed, so is every stick frame.
+        let (file, ours) = script_of("rc-loss-override");
+        assert_eq!(ours.mode, vec![(0.0, 1), (36.24, 2)]);
+        assert_eq!(file.mode, vec![(0.0, 1), (34.0, 2)]);
+        assert_eq!(ours.sticks, delayed_sticks(&file.sticks));
+        assert_eq!(ours.setpoints, file.setpoints);
+        // kill-in-rtl: the kill switch is not a stick or a mode change and
+        // keeps its time (the radio's fault times are the file's too).
+        let (file, ours) = script_of("kill-in-rtl");
+        assert_eq!(ours.kill_at_s, Some(34.0));
+        assert_eq!(ours.arm_at_s, 3.0);
+        assert_eq!(ours.sticks, delayed_sticks(&file.sticks));
+    }
+
+    #[test]
+    fn only_what_is_later_than_the_arm_switch_is_delayed() {
+        let script = Script {
+            arm_at_s: 2.0,
+            disarm_at_s: Some(9.0),
+            kill_at_s: Some(8.0),
+            mode: vec![(0.0, 1), (1.0, 0), (2.0, 1), (2.02, 2)],
+            sticks: vec![
+                (0.0, [0.0; 4]),
+                (2.0, [0.0, 0.0, 0.0, 1.0]),
+                (2.02, [0.0; 4]),
+            ],
+            duration_s: 20.0,
+            ..Script::default()
+        };
+        let ours = for_arducopter(&script);
+        assert_eq!(ours.arm_at_s, 2.0);
+        assert_eq!(ours.disarm_at_s, Some(9.0));
+        assert_eq!(ours.kill_at_s, Some(8.0));
+        assert_eq!(ours.mode, vec![(0.0, 1), (1.0, 0), (2.0, 1), (4.26, 2)]);
+        assert_eq!(
+            ours.sticks,
+            vec![
+                (0.0, [0.0; 4]),
+                (2.0, [0.0, 0.0, 0.0, 1.0]),
+                (4.26, [0.0; 4])
+            ]
+        );
+        // No arming: nothing is later than the switch.
+        let never = Script {
+            sticks: vec![(5.0, [0.0, 1.0, 0.0, 0.5])],
+            ..Script::default()
+        };
+        assert_eq!(for_arducopter(&never), never);
+        // The delay lands on the radio's period.
+        assert_eq!((ARM_DELAY_S * 1e6).round() as u64 % 20_000, 0);
     }
 
     #[test]
@@ -398,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scenarios_of_the_repository_translate_or_say_why() {
+    fn the_scenarios_of_the_repository_all_translate() {
         let mut ok = Vec::new();
         let mut why = Vec::new();
         let mut names: Vec<_> = std::fs::read_dir(scenarios_dir())
@@ -430,17 +551,19 @@ mod tests {
         ] {
             assert!(ok.iter().any(|n| n == must), "{must}: {why:?}");
         }
-        // Every refusal is for sticks (the pilot files); none is for a fault
-        // or for a parameter name outside the table.
-        for (name, e) in &why {
-            assert!(
-                matches!(e, Untranslatable::StickFlying { .. }),
-                "{name}: {e}"
-            );
+        // Every file of the repository translates: the five stick files
+        // included, none is refused for a fault or a parameter outside the
+        // table.
+        assert!(why.is_empty(), "{why:?}");
+        for must in [
+            "rc-loss-position",
+            "rc-loss-on-ground",
+            "rc-loss-override",
+            "gps-loss-pilot",
+            "kill-in-rtl",
+        ] {
+            assert!(ok.iter().any(|n| n == must), "{must} did not translate");
         }
-        assert!(why.iter().any(
-            |(n, e)| n == "rc-loss-position" && matches!(e, Untranslatable::StickFlying { .. })
-        ));
     }
 
     #[test]

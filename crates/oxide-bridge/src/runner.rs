@@ -292,7 +292,7 @@ pub fn fly_scenario(
     let wall = Instant::now();
     let flown = fly(
         &airframe,
-        file.pilot.clone(),
+        translation.pilot.clone(),
         options,
         config,
         file.end(),

@@ -62,20 +62,24 @@ fn a_wrong_use_ends_with_a_sentence_and_exit_code_1() {
 
 #[test]
 fn a_scenario_the_bridge_cannot_translate_is_a_wrong_use_that_says_why() {
-    let sticks = scenario("rc-loss-position");
+    // A parameter of our core's that ArduCopter has no counterpart for.
+    let dir = scratch("untranslatable");
+    std::fs::create_dir_all(&dir).expect("directory");
+    let file = dir.join("gain.toml");
+    let body = std::fs::read_to_string(scenario("hover-step")).expect("hover-step");
+    std::fs::write(&file, format!("{body}\n[params]\nRATE_ROLL_P = 30.0\n")).expect("write");
     let o = bridge(&[
         "fly",
         "--scenario",
-        path(&sticks),
+        path(&file),
         "--binary",
         "/no/such/arducopter",
     ]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o.stderr));
-    assert!(
-        text(&o.stderr).contains("stick flying"),
-        "{}",
-        text(&o.stderr)
-    );
+    let e = text(&o.stderr);
+    assert!(e.contains("RATE_ROLL_P"), "{e}");
+    assert!(e.contains("cannot be flown through the bridge"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
