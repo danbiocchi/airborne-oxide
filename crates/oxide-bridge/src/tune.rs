@@ -1421,6 +1421,18 @@ pub fn check(
     }
 }
 
+/// The whole check of a finished procedure: [`check`] on the last flight and
+/// [`check_setup`] on what the first read back before it flew.
+pub fn check_run(
+    texts: &[(f64, String)],
+    before: &BTreeMap<String, f32>,
+    after: &BTreeMap<String, f32>,
+    pack_before_landing_v: Option<f64>,
+    low_battery_v: f64,
+) -> Result<(), String> {
+    check(texts, after, pack_before_landing_v, low_battery_v).and_then(|()| check_setup(before))
+}
+
 /// The check that the program took `setup.parm`: every name of it, read back
 /// before the flight (`before`), has the file's value. A program that ignored a
 /// line of the guide's set-up (the 80 Hz gyro filter, say) would otherwise
@@ -1651,13 +1663,13 @@ pub fn tune(cfg: &TuneConfig) -> Result<Outcome, TuneError> {
     let texts_all = texts(&last.audit);
     let mut problem = last.failure.clone();
     if problem.is_none() {
-        problem = check(
+        problem = check_run(
             &texts_all,
+            &before,
             &after,
             last.stats.pack_before_landing_v,
             low_battery_volt(),
         )
-        .and_then(|()| check_setup(&before))
         .err();
     }
     let flight_s: f64 = flights.iter().map(|f| f.sim_s).sum();
@@ -2799,6 +2811,20 @@ mod tests {
         }
         // The guide's 80 Hz gyro filter, by name.
         assert_eq!(all.get("INS_GYRO_FILTER"), Some(&80.0));
+        // The procedure's check holds the program to it.
+        let low = low_battery_volt();
+        assert_eq!(
+            check_run(&texts_ok(), &all, &all_gains(), Some(low + 1.0), low),
+            Ok(())
+        );
+        let mut ignored = all.clone();
+        ignored.insert("INS_GYRO_FILTER".into(), 20.0);
+        let e = check_run(&texts_ok(), &ignored, &all_gains(), Some(low + 1.0), low)
+            .expect_err("a program that kept its 20 Hz filter");
+        assert!(
+            e.contains("INS_GYRO_FILTER") && e.contains("setup.parm"),
+            "{e}"
+        );
     }
 
     /// The decision path never reads what came from MAVLink, and takes the

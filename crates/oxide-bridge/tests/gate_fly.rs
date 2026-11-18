@@ -426,16 +426,17 @@ fn the_gate_is_not_flown_from_scenario_files_that_are_not_the_commits() {
     // The refusal comes before the simulator program is started, so a file
     // that is not one is enough. It needs a program built at a commit: on a
     // tree with changes the working-tree check refuses first, as it should.
-    if oxide_bridge::gate::verdict::own_commit().is_none() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let clean = tree_state(&root).is_ok_and(|t| !t.dirty);
+    if oxide_bridge::gate::verdict::own_commit().is_none() || !clean {
         return;
     }
     let scen = edited_scenarios("edited-scen");
     let out = temp("edited-out").join("gate-out");
     let dummy = temp("edited-bin").join("arducopter");
     std::fs::write(&dummy, "not a simulator\n").expect("dummy");
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let o = Command::new(env!("CARGO_BIN_EXE_oxide-bridge"))
-        .current_dir(root)
+        .current_dir(&root)
         .args(["gate", "fly", "--scenarios"])
         .arg(&scen)
         .arg("--out")
@@ -452,7 +453,7 @@ fn the_gate_is_not_flown_from_scenario_files_that_are_not_the_commits() {
     assert!(!out.exists(), "nothing was written before the refusal");
     // The same files as a trial are let through the refusal (and stop later).
     let o = Command::new(env!("CARGO_BIN_EXE_oxide-bridge"))
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .current_dir(&root)
         .args(["gate", "fly", "--reduced", "--scenarios"])
         .arg(&scen)
         .arg("--out")

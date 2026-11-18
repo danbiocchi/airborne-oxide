@@ -1800,3 +1800,31 @@ fn hover_step_left_out_of_a_gate_that_says_it_is_the_whole_plan_is_exit_2() {
     let p = refused(&f);
     assert!(mentions(&p, &["hover-step", "not in the plan"]), "{p:?}");
 }
+
+#[test]
+fn a_command_line_that_only_ends_like_the_flights_own_directory_is_not_its_directory() {
+    // `.../mytwice/gps-loss/...` ends with the characters of `twice/gps-loss/...`
+    // and is not below a directory called twice.
+    let f = Fixture::small("suffix-only");
+    f.write();
+    let run = run_dir(&twice_dir(&f.dir, "gps-loss"), 0);
+    let audit = std::fs::read_to_string(run.join("audit.txt")).expect("audit");
+    let own = format!("/twice/gps-loss/{}/sitl/defaults.parm", "run-0000");
+    assert!(audit.contains(&own), "{audit}");
+    std::fs::write(
+        run.join("audit.txt"),
+        audit.replace(&own, "/mytwice/gps-loss/run-0000/sitl/defaults.parm"),
+    )
+    .expect("audit");
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
+    f.remove();
+    assert_eq!(v.exit_code(), EXIT_INCOMPLETE, "{}", v.text());
+    assert!(
+        mentions(
+            &incomplete(&v),
+            &["gps-loss arducopter index 0 (flown twice)", "command line"]
+        ),
+        "{}",
+        v.text()
+    );
+}
