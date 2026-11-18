@@ -48,7 +48,11 @@ Its failsafes are switched on, each with the action its documentation gives as t
 | Geofence | `FENCE_ENABLE 1`, a circle of the scenario's radius, `FENCE_ACTION 1` (return or land) |
 | Ground station lost | `FS_GCS_ENABLE 1` (return) |
 
-This file is committed with the report. No other parameter is set to make ArduCopter's response resemble ours.
+The file is `crates/oxide-bridge/arducopter/failsafes.parm`; the runner adds the two battery thresholds and, for a scenario with a fence, the fence. No other parameter is set to make ArduCopter's response resemble ours.
+
+**The battery thresholds.** Our core compares the pack voltage with the load taken out (voltage plus current times the pack's resistance) against 3.5 V and 3.3 V per cell. ArduCopter compares the voltage as it sags under load. So that both act at the same state of the pack, ArduCopter's thresholds are the loaded pack voltages at which our compensated voltage reaches ours in a hover: `BATT_LOW_VOLT` 20.767 V and `BATT_CRT_VOLT` 19.553 V on this pack, not 21.0 and 19.8 (derived twice, by the code and by hand from our core's own flights). The timers stay each autopilot's own: ArduCopter acts 10 s after the crossing, our core after about 4 s of filtering and debounce.
+
+**Parameters in a scenario file** are our core's and never reach ArduCopter as they are. `FS_FENCE_RAD` becomes ArduCopter's circle fence of that radius. `FS_GPS_LAND` and `FS_NOLINK_RTL` set the timing of our core's own responses and have no counterpart; they are listed in the flight's record as ours only. A scenario with any other parameter is not flown with ArduCopter.
 
 ### 4. The outcome of a flight, from the physics alone
 
@@ -59,6 +63,8 @@ Every flight of either autopilot is classed from the true state, by the same cod
 - **Safe:** neither.
 
 A flight that did not start (ArduCopter not ready to arm after the pre-roll, a dead process) is not an outcome. It is flown again once; if it fails to start again, the gate stops until the cause is known.
+
+The scenario files' own expectations are a second, stricter judgement that was written for our core. For ArduCopter, the ones that need our core's states are not judged, and the ones that can be judged from the physics describe our core's designed response (land at home, be disarmed by a given time). ArduCopter is not scored on them: it is scored on the class.
 
 ### 5. Criterion A: holding position in gusts
 
@@ -79,6 +85,7 @@ ArduCopter starts later than our core in this scenario. It holds its motors stil
 - Scored on the time to motors off, not on the outcome: `motor-loss` and `imu-loss`. A quadrotor cannot fly on with either, and our core's designed response is to stop the motors.
 - Scored, because the companion link of ADR-0006 §6 works (proven on the binary when the bridge was built): `brain-crash`, `brain-hang`, `setpoint-gap` and the pairs with a brain failure.
 - Not scored: `kill-in-rtl` (the pilot's kill switch has no agreed ArduCopter counterpart). `hover-step` has no failure and is flown as a check of the bridge.
+- Four scored scenarios have a pilot who moves the sticks: `gps-loss-pilot`, `rc-loss-position`, `rc-loss-override` and `rc-loss-on-ground`. They are scored once the bridge can fly sticks; how their stick scripts are timed for ArduCopter, which starts its motors 2.2 s after the arm switch, is written into this record before they are flown.
 
 A scenario may leave the scored list only for a technical reason found while the bridge is built, written into this record before the run.
 
@@ -99,6 +106,13 @@ If the gate fails, the criteria stay. The core is improved and the whole gate is
 ### 8. The report
 
 The gate report holds: the verdict, criterion by criterion; ArduCopter's parameter files and the tuning script; the binary's checksum and our commit; every flight's seed, outcome and measures as a table; the distributions as plots; what could not be made equal between the two (ADR-0006 §4), and which way each difference leans.
+
+## First looks taken before the run
+
+While the bridge was built, flights were flown that show how the two compare. They are recorded here so that nobody has to wonder what was known when. The criteria above were written before them and are unchanged by them.
+
+- **Gusts, 100 runs** (gust-hold, indices 0 to 99, ArduCopter on its hand-set starting gains, before its automatic tuner): our F405 core's RMS error had a median of 0.170 m and a 95th percentile of 0.221 m; ArduCopter's 0.176 m and 0.222 m. Our core had the lower error in 57 runs. All 200 flights were safe. The two are close, and the tuned ArduCopter may come out either side.
+- **Failures, run 0 of each file that can be flown** (38 of 43): ArduCopter ended 30 safe, 4 in a fly-away (`baro-loss` and three pairs with it: with every barometer gone it climbs without limit) and 4 in a crash (`imu-loss`, `motor-loss`, and two pairs with a barometer loss that landed at 3.1 and 2.6 m/s). Our core ended every flight that is scored on its outcome safe; in `imu-loss` and `motor-loss`, which are scored on the time to motors off, it stopped its motors 0.14 s and 1.0 s after the failure, ArduCopter 2.0 s after and never.
 
 ## Consequences
 
