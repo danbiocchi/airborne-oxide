@@ -72,10 +72,10 @@ The scenario files' own expectations are a second, stricter judgement that was w
 
 ### 5. Criterion A: holding position in gusts
 
-The scenario is `gust-hold`, seeds 0 to 499. The measure of a flight is the simulator's own: the RMS of the horizontal distance between the true position and the hold point, from 15 s to the end.
+The scenario is `gust-hold`, runs 0 to 499 (the file itself names 200, its acceptance count from an earlier milestone; the gate flies 500). The measure of a flight is the simulator's own: the RMS of the horizontal distance between the true position and the hold point, from 15 s to the end.
 
 - **A1.** Every one of our core's 500 flights is safe, and passes the limits the scenario file already sets for the hold (among them a maximum horizontal error of 1.5 m, an RMS of 0.5 m and a tilt of 35°).
-- **A2.** Over the 500 seeds, the **median** of our core's RMS error is at most 1.0 times the median of ArduCopter's, **and** the **95th percentile** of ours is at most 1.0 times ArduCopter's 95th percentile. Only ArduCopter's safe flights enter its statistics; its crashes and fly-aways are reported. The 95th percentile is taken by linear interpolation between the two nearest ordered values (position 0.95 × (n − 1), counted from 0), and the comparison is made on the values as computed, without rounding.
+- **A2.** Over the 500 seeds, the **median** of our core's RMS error is at most 1.0 times the median of ArduCopter's, **and** the **95th percentile** of ours is at most 1.0 times ArduCopter's 95th percentile. Only ArduCopter's safe flights enter its statistics; its crashes and fly-aways are reported. The 95th percentile is taken by linear interpolation between the two nearest ordered values (position 0.95 × (n − 1), counted from 0), and the comparison is made on the values as computed, without rounding. If ArduCopter had no safe flight there would be nothing to compare with, and A2 would not hold.
 
 Reported beside it and deciding nothing: our core on the true state; the vertical error and the tilt of both; the same statistics for the H743 profile; the number of seeds in which each was the better.
 
@@ -95,7 +95,7 @@ A scenario may leave the scored list only for a technical reason found while the
 
 - **B1. No worse, scenario by scenario.** In every scored scenario, the number of our core's flights that end in a crash or a fly-away is at most ArduCopter's number.
 - **B2. Zero crashes.** Our core has no crash and no fly-away in any scored scenario, and every one of its flights passes the scenario file's own expectations, which are stricter (a touchdown under 1.5 m/s, a tilt under 40°).
-- **B3. Motors off.** In `motor-loss` and `imu-loss`, the median time from the failure to all motor commands at zero is at most ArduCopter's. A flight in which the motors never stop counts as the length of the flight. Exactly: the time of the last motor command above zero, less the failure's start; when the motors never stop that is the rest of the flight.
+- **B3. Motors off.** In `motor-loss` and `imu-loss`, the median time from the failure to all motor commands at zero is at most ArduCopter's. A flight in which the motors never stop counts as the length of the flight. Exactly: the time of the last motor command above zero, less the failure's start; when the motors never stop that is the rest of the flight. The median of the ten flights is the mean of the two middle values, and each of the two scenarios must hold.
 
 Reported and deciding nothing: for each scenario and autopilot, the time from the failure to touchdown, the touchdown speed, the distance of the landing from the arming point, the greatest tilt, and the modes each went through.
 
@@ -105,7 +105,7 @@ Gate 1 is passed when A1, A2, B1, B2 and B3 all hold.
 
 Before the result is accepted, ten bridged flights chosen before the run are flown twice: gust-hold runs 0 to 4, and run 0 of `gps-loss`, `battery-low`, `rc-loss-offboard-gcs`, `imu-loss` and `pair-gps-loss+baro-loss`. All ten must repeat bit for bit. If one does not, the result waits until the cause is known.
 
-The verdict is computed from the runner's tables by a committed program, not by hand.
+The verdict is computed from the runner's tables by a committed program, not by hand (`oxide-bridge gate`). The program flies the gate only from a clean commit, the one it was built at. It gives no verdict when a planned flight is missing or doubled, when a row's seed is not the seed of its scenario and run, or when the tables come from more than one commit, binary or parameter set; and it never passes a plan that is not this record's (fewer runs, a scenario left out, a trial). A pair scenario is scored by the failures its file holds, not by its name; one with a failure that is on no list of §6 stops the gate before it is flown. The ten flights flown twice are extra flights beside the tables: both of each pair must agree with each other and with the same flight in the tables.
 
 If the gate fails, the criteria stay. The core is improved and the whole gate is flown again. Changing a criterion takes a new record that gives the reason, before the next run.
 
