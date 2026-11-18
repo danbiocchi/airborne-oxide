@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The statistics of the gate: the percentile by linear interpolation
-//! (ADR-0007 section 5), the median as its special case, and the mean.
+//! (ADR-0007 section 5), the median (its own formula for an even count), and
+//! the mean.
 //! Values are compared as computed, never rounded.
 
 /// The `p`-quantile of `values` (0 to 1) by linear interpolation at position
@@ -31,10 +32,23 @@ pub fn percentile_95(values: &[f64]) -> Option<f64> {
     percentile(values, 0.95)
 }
 
-/// The median: the middle value, or the mean of the two middle values of an
-/// even count (the quantile at position `0.5 * (n - 1)`).
+/// The median: the middle value, or for an even count `(a + b) / 2` of the two
+/// middle values, computed exactly so (ADR-0007 sections 5 and 6, D7.1): not
+/// the interpolation `a + 0.5 * (b - a)`, which differs from it in the last
+/// bit for some pairs.
 pub fn median(values: &[f64]) -> Option<f64> {
-    percentile(values, 0.5)
+    if values.is_empty() || values.iter().any(|v| v.is_nan()) {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    let hi = *sorted.get(n / 2)?;
+    if n % 2 == 1 {
+        return Some(hi);
+    }
+    let lo = *sorted.get(n / 2 - 1)?;
+    Some((lo + hi) / 2.0)
 }
 
 /// The arithmetic mean; `None` for no values.

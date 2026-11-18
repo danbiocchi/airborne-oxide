@@ -60,3 +60,15 @@ fn no_values_has_no_percentile_and_a_non_number_is_refused() {
     assert_eq!(mean(&[]), None);
     assert_eq!(mean(&[1.0, 2.0, 6.0]), Some(3.0));
 }
+
+#[test]
+fn the_median_of_an_even_count_is_a_plus_b_over_two_to_the_last_bit() {
+    // For this pair a + 0.5 * (b - a) is 7.451453544440603 and (a + b) / 2 is
+    // 7.451453544440604 (ADR-0007 sections 5 and 6: "(a + b) / 2").
+    let (a, b) = (0.686_286_663_811_357_9_f64, 14.216_620_425_069_848_f64);
+    assert_ne!(a + 0.5 * (b - a), (a + b) / 2.0);
+    assert_eq!(median(&[b, a]), Some((a + b) / 2.0));
+    assert_eq!(median(&[a, b, 20.0, 30.0]), Some((b + 20.0) / 2.0));
+    // The 95th percentile is still the interpolation.
+    assert_eq!(percentile(&[a, b], 0.5), Some(a + 0.5 * (b - a)));
+}
