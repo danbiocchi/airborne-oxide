@@ -58,6 +58,12 @@ pub struct FlightOutcome {
     /// Downward speed (truth) at the first ground contact after having been
     /// above 0.3 m; None if it never came down.
     pub touchdown_speed_mps: Option<f64>,
+    /// The greatest downward speed (truth) at any entry into ground contact,
+    /// m/s: the first touchdown, a later one after taking off again, and a
+    /// contact after a hop that never rose above 0.3 m. `None` if the vehicle
+    /// never came into contact from the air. The crash class reads this,
+    /// not only the first touchdown.
+    pub worst_impact_mps: Option<f64>,
     /// When the vehicle was last disarmed, s. With the core part it is the
     /// time of the core's last Disarmed event (the supervisor decides at that
     /// tick, and the status shows it one supervisor period later: the flag's
@@ -79,6 +85,9 @@ pub struct FlightOutcome {
     touched_down: bool,
     prev_down_speed: f64,
     prev_armed: bool,
+    /// The previous record was in ground contact (the vehicle starts on the
+    /// ground).
+    prev_in_contact: bool,
 }
 
 /// The part of a [`FlightOutcome`] that comes from our flight core's status
@@ -187,6 +196,7 @@ impl FlightOutcome {
             max_distance_from_home_m: 0.0,
             max_tilt_deg: 0.0,
             touchdown_speed_mps: None,
+            worst_impact_mps: None,
             disarmed_at_s: None,
             motor_ticks_while_disarmed: 0,
             non_finite: false,
@@ -197,6 +207,7 @@ impl FlightOutcome {
             touched_down: false,
             prev_down_speed: 0.0,
             prev_armed: false,
+            prev_in_contact: true,
         }
     }
 
@@ -265,6 +276,14 @@ impl FlightOutcome {
                 self.touchdown_speed_mps = Some(self.prev_down_speed.max(r.velocity.z).max(0.0));
             }
         }
+        // Every entry into ground contact, whatever happened before it: the
+        // downward speed of the record before it or of its own.
+        let in_contact = height < ground_m();
+        if in_contact && !self.prev_in_contact {
+            let v = self.prev_down_speed.max(r.velocity.z).max(0.0);
+            self.worst_impact_mps = Some(self.worst_impact_mps.map_or(v, |w| w.max(v)));
+        }
+        self.prev_in_contact = in_contact;
         self.prev_down_speed = r.velocity.z;
     }
 }
@@ -312,10 +331,21 @@ impl core::fmt::Display for FlightClass {
 impl FlightOutcome {
     /// The class of the flight. A flight that is both a crash and a fly-away
     /// is a crash. It uses only fields every autopilot's flight has.
+    ///
+    /// A flight whose truth became non-finite, or that has physics faults, is
+    /// a crash: the vehicle is not in a state the other rules can read.
+    ///
+    /// The tilt rule counts only while armed, as ADR-0007 section 4 says. A
+    /// vehicle that tumbles after its motors stopped (for ArduCopter: its
+    /// pulses at 1000) is caught by the impact rule, not by the tilt.
     pub fn class(&self) -> FlightClass {
-        if self
-            .touchdown_speed_mps
-            .is_some_and(|v| v > CRASH_TOUCHDOWN_MPS)
+        if self.non_finite
+            || self.physics_faults > 0
+            || self
+                .touchdown_speed_mps
+                .into_iter()
+                .chain(self.worst_impact_mps)
+                .any(|v| v > CRASH_TOUCHDOWN_MPS)
             || self.max_tilt_deg > CRASH_TILT_DEG
         {
             FlightClass::Crash
@@ -1129,6 +1159,77 @@ mod tests {
         assert_eq!(o.touchdown_speed_mps, None);
     }
 
+    /// Adds a record at height `h_m` with downward speed `vz`.
+    fn at(o: &mut FlightOutcome, t: f64, h_m: f64, vz: f64) {
+        let mut r = flying(t, up(h_m), Action::None);
+        r.velocity = Vec3::new(0.0, 0.0, vz);
+        o.add(&r);
+    }
+
+    #[test]
+    fn a_hard_impact_after_a_soft_first_landing_is_a_crash() {
+        let mut o = FlightOutcome::new();
+        at(&mut o, 0.0, 0.0, 0.0);
+        for (k, h) in [1.0, 2.0, 1.0, 0.2].into_iter().enumerate() {
+            at(
+                &mut o,
+                1.0 + k as f64 * 0.1,
+                h,
+                if h < 0.5 { 0.5 } else { 0.0 },
+            );
+        }
+        at(&mut o, 2.0, 0.0, 0.0);
+        assert_eq!(o.touchdown_speed_mps, Some(0.5));
+        assert_eq!(o.worst_impact_mps, Some(0.5));
+        assert_eq!(o.class(), FlightClass::Safe, "a soft landing so far");
+        // Up again to 3 m, then down at 6 m/s.
+        for (k, h) in [1.0, 3.0, 1.0, 0.1].into_iter().enumerate() {
+            at(
+                &mut o,
+                3.0 + k as f64 * 0.1,
+                h,
+                if h < 0.5 { 6.0 } else { 0.0 },
+            );
+        }
+        at(&mut o, 4.0, 0.0, 0.0);
+        assert_eq!(
+            o.touchdown_speed_mps,
+            Some(0.5),
+            "the first touchdown is what it was"
+        );
+        assert_eq!(o.worst_impact_mps, Some(6.0));
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_hop_that_never_rose_above_30_cm_and_then_hits_hard_is_a_crash() {
+        let mut o = FlightOutcome::new();
+        at(&mut o, 0.0, 0.0, 0.0);
+        at(&mut o, 0.1, 0.25, 0.0);
+        at(&mut o, 0.2, 0.0, 8.0);
+        assert_eq!(o.touchdown_speed_mps, None, "never above 0.3 m");
+        assert_eq!(o.worst_impact_mps, Some(8.0));
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_vehicle_that_stays_on_the_ground_has_no_impact_and_the_worst_of_several_counts() {
+        let mut o = FlightOutcome::new();
+        for k in 0..20 {
+            at(&mut o, f64::from(k) * 0.1, 0.0, 0.0);
+        }
+        assert_eq!(o.worst_impact_mps, None);
+        // Three landings, 1.5, 2.5 and 1.0 m/s: the worst is 2.5.
+        for (n, v) in [1.5, 2.5, 1.0].into_iter().enumerate() {
+            let t0 = 10.0 + n as f64 * 10.0;
+            at(&mut o, t0, 2.0, 0.0);
+            at(&mut o, t0 + 1.0, 0.1, v);
+            at(&mut o, t0 + 1.1, 0.0, 0.0);
+        }
+        assert_eq!(o.worst_impact_mps, Some(2.5));
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
     #[test]
     fn disarm_events_and_motors() {
         let mut o = FlightOutcome::new();
@@ -1712,6 +1813,39 @@ mod tests {
         assert_eq!(at(0.0), FlightClass::Safe);
         assert_eq!(at(9.0), FlightClass::Crash);
         assert_eq!(outcome_with(|_| {}).class(), FlightClass::Safe);
+    }
+
+    #[test]
+    fn the_worst_impact_is_a_crash_only_above_two_metres_per_second_too() {
+        let at = |v| outcome_with(|o| o.worst_impact_mps = Some(v)).class();
+        assert_eq!(at(2.0), FlightClass::Safe);
+        assert_eq!(at(2.01), FlightClass::Crash);
+        // The first touchdown soft, a later impact hard.
+        let o = outcome_with(|o| {
+            o.touchdown_speed_mps = Some(0.5);
+            o.worst_impact_mps = Some(6.0);
+        });
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_state_that_is_not_finite_or_a_physics_fault_is_a_crash() {
+        assert_eq!(
+            outcome_with(|o| o.non_finite = true).class(),
+            FlightClass::Crash
+        );
+        assert_eq!(
+            outcome_with(|o| o.physics_faults = 1).class(),
+            FlightClass::Crash
+        );
+        // Through the records: a NaN position after an airborne armed record.
+        let mut o = FlightOutcome::new();
+        at(&mut o, 0.0, 2.0, 0.0);
+        let mut r = flying(1.0, up(2.0), Action::None);
+        r.position = Vec3::new(f64::NAN, 0.0, -2.0);
+        o.add(&r);
+        assert!(o.non_finite);
+        assert_eq!(o.class(), FlightClass::Crash);
     }
 
     #[test]
