@@ -2347,6 +2347,27 @@ mod tests {
         assert!(e.to_string().contains("half"), "{e}");
     }
 
+    /// ADR-0007 section 2: the default files are the gains of the flown set,
+    /// in the order of the runner's list, which adds the failsafes after them;
+    /// the starting gains are the tuning flights' own.
+    #[test]
+    fn the_default_parameter_files_are_base_setup_and_the_tuned_gains_in_the_runners_order() {
+        let names = |v: &[PathBuf]| -> Vec<String> {
+            v.iter()
+                .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+                .collect()
+        };
+        let c = ArduCopterConfig::new("/nonexistent", "/nonexistent", 0);
+        assert_eq!(
+            names(&c.param_files),
+            ["base.parm", "setup.parm", "tuned-gains.parm"]
+        );
+        let airframe = oxide_sim::Airframe::reference_quad().expect("airframe");
+        let runner = names(&crate::runner::committed_params(&airframe).0);
+        assert_eq!(runner[..3], names(&c.param_files)[..]);
+        assert_eq!(runner[3..], ["failsafes.parm"]);
+    }
+
     #[test]
     fn the_lag_the_bridge_assumes_must_be_the_programs() {
         // The committed files set 150 ms: the default configuration passes.
