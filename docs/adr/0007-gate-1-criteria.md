@@ -1,6 +1,6 @@
 # ADR-0007: The criteria of benchmark gate 1
 
-Status: accepted, before the run (DESIGN §8 rule 4). The gate has not been flown.
+Status: accepted, before the run (DESIGN §8 rule 4). The gate was flown once, on 18 November 2026 at commit `2c2fedb`, and was **not passed**: criterion A2 failed on the 95th percentile. The result is at the end of this record and the report is [`docs/gates/gate-1/`](../gates/gate-1/README.md). The criteria stand.
 
 ## Context
 
@@ -165,6 +165,33 @@ While the bridge was built, flights were flown that show how the two compare. Th
 - **A tuned file that the procedure did not accept.** While the tuning script was built, one tuning flight was flown with the position check switched off; it also landed on the empty pack described in §2. Its file was flown as information: in the same 100 gust runs ArduCopter's median was 0.1759 m and its 95th percentile 0.2214 m (0.1761 m and 0.2218 m on the starting gains; our core 0.1700 m and 0.2211 m), and run 0 of all 43 files ended in the same class as on the starting gains. The two changes to the procedure in §2 were made after these numbers were seen. Neither was chosen for its effect on them: the first keeps the start mode ArduPilot's page recommends, and the second removes an empty pack.
 - **The tuned file, flown before the gate** (the file of §2, at the commit that added it). The same 100 gust runs: ArduCopter's median was 0.1761 m, the same as on the starting gains to four digits, and its 95th percentile 0.2212 m (0.2218 m on the starting gains); it had the lower error with the tuned file in 79 of the 100 runs, and no run differed by more than 1.5 mm. Our core, as before: 0.1700 m and 0.2211 m, lower than the tuned ArduCopter in 57 runs. All flights were safe. Run 0 of all 43 files: no class changed (34 safe, 4 fly-aways, 5 crashes). Two flights look different. In `motor-loss` the tuned ArduCopter is on the ground 2.2 s after the failure, 24 m from where it armed, with its motors still commanded (on the starting gains it tumbled for 8.9 s and came down 180 m away); its estimator's failsafe switches it to LAND 3.4 s after the failure, when it is already down. In `imu-loss` it meets the ground at 11.0 m/s (9.4 m/s). Both are crashes as before, and the times to motors off are the same.
 - **A second trial of the gate program, on the tuned file** (same reduced plan as the first: gust-hold on 6 runs, 417 flights for each autopilot). ArduCopter's classes were the same as in the first trial, scenario by scenario: 327 safe, 50 crashes, 40 fly-aways, the unsafe ones being all ten runs of the six files with a barometer loss, of `motor-loss`, of `imu-loss` and of `kill-in-rtl`. Our F405 core: all 380 flights of the outcome-scored scenarios safe and passing. Time to motors off as before (1.0 s against never; 0.14 s against 2.0 s). All ten flights flown twice repeated. The program gave "not passed", as it must for a reduced plan.
+
+## The first run
+
+Flown once, on 18 November 2026, at commit `2c2fedb`, with everything above in place before it. The report, the tables of all 3,253 flights and what the program printed are in [`docs/gates/gate-1/`](../gates/gate-1/README.md).
+
+| Criterion | Result | Measured |
+|---|---|---|
+| A1 | holds | 500 of 500 gust flights safe and passing, on each profile |
+| A2 | **fails** | median 0.17141 m against ArduCopter's 0.17545 m (holds); 95th percentile 0.22612 m against 0.22087 m (fails, by 2.4 %) |
+| B1 | holds | our core 0 crashes or fly-aways in each of the 38 scenarios; ArduCopter 10 of 10 in the six with a barometer loss |
+| B2 | holds | 380 of 380 flights safe and passing |
+| B3 | holds | `motor-loss` 0.999 s against 14.9995 s (never); `imu-loss` 0.139 s against 2.0015 s |
+| Repeats | hold | 10 of 10 |
+
+**Gate 1 is not passed.** By §7 the criteria stay, the core is improved, and the whole gate is flown again.
+
+What the run showed about the failure, for whoever improves the core:
+
+- Our core's errors are spread wider than ArduCopter's. It is better up to the 76th flight in a hundred and worse above. Its worst twentieth is 5 mm worse.
+- It is not an accident of the seeds: by hundreds of runs, our 95th percentile is above ArduCopter's in four of five and level in the first, the hundred that the first looks were flown on.
+- The error is the estimate, not the control: on the true state the same core holds within 0.030 m at the median.
+- The H743 profile, reported only, holds within 0.1570 m at the median and 0.2116 m at the 95th percentile, both below ArduCopter's.
+
+Two rules for the improvement, written now, before any is tried:
+
+1. **The 500 gust seeds of the gate are not a tuning set.** A change to the core is chosen and judged on other seeds of `gust-hold` (runs 500 to 999) and on the rest of the scenario files, and only then is the gate flown again on runs 0 to 499. Otherwise the second run would measure how well the core was fitted to those 500 winds.
+2. **A change must be one we would make without the gate:** a fault found, or a setting that is better on its own grounds, with its effect on every other scenario shown. A gain turned until this one number passes is not an improvement.
 
 ## Consequences
 

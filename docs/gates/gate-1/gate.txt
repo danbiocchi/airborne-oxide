@@ -1,0 +1,130 @@
+oxide-bridge gate 1
+commit 2c2fedb1dab3c65f8d52a431b38b369e9ffa4091
+tree clean
+scope full
+binary sha256 caed35e4cb796ec06cac40b09566a18251771486b1cbac5e2bf16b7a5ed5045d
+binary path /tmp/claude-0/-home-user-airborne-oxide/f85058bd-73c8-560d-8ff0-64221580022a/scratchpad/m1d/ardupilot-sitl-4.7.2/arducopter
+command line oxide-bridge gate fly --scenarios scenarios --out /tmp/claude-0/-home-user-airborne-oxide/f85058bd-73c8-560d-8ff0-64221580022a/scratchpad/m1d/gate1 --binary /tmp/claude-0/-home-user-airborne-oxide/f85058bd-73c8-560d-8ff0-64221580022a/scratchpad/m1d/ardupilot-sitl-4.7.2/arducopter --jobs 3
+first started 2026-11-18T14:05:27Z
+started 2026-11-18T14:05:27Z
+ended 2026-11-18T14:32:23Z
+cores 4
+param file base.parm sha256 ee7d4657a954e50ee258400d07f606ecab9a0fd7761879096aab8a57523b11a5
+param file setup.parm sha256 0c5364d91dd6a73c751462096340f58eee29909bbc999535d346abec51e8a108
+param file tuned-gains.parm sha256 e21a80edde40b189a8dc7a1b8f5575a7c76579f29608706ebff96dc09c6f69cc
+param file failsafes.parm sha256 46cae574647ce9e10471c14f797830028044864abbe1826897b387582fd1bab0
+scenario file gust-hold sha256 3482d54e847f3fbff1c9999884df507059e9eb5dc061ff48eb75a01dcb132798
+scenario file gps-loss sha256 22dcc18486497d8b450ee6c5046337a2386712d1c37b60d8de21a95bdec91023
+scenario file gps-loss-pilot sha256 dec00f25674c75f011dff37b5f53353c7628e4be0885829f8e9b704d0469cc0b
+scenario file gps-loss-recovers sha256 82f2b46f16c78975f4ab5e47570ae3f50ee9ab6d24f2e2db852b75f1e0a6a1fd
+scenario file baro-loss sha256 311fbfbb5f4cf757b8f8b02cface000cdcc8f6858375bdfc3ce9da17048e04fc
+scenario file mag-loss sha256 14ea6bf404def353c6b84a2b643d581d85bb5d50c7a8cf68e67ffc3fd427bbe1
+scenario file rc-loss-position sha256 b24b802472a0f71c26c2ed6f27b473f8ec975e9fdca00997e864d0f69b1c77cd
+scenario file rc-loss-override sha256 2dfb3a602dca534acdcf4de2d555dbc25dda1990774a2a942cd700f9a6ccc273
+scenario file rc-loss-on-ground sha256 53850c401fa99a7f3203c159c9c4b82be28ff7ed9eafd48bd5914099513ee00d
+scenario file rc-loss-offboard-gcs sha256 c67cd761bf8d27713b47b4939c0eca2e792b537ed64f9050138045f187ecf12c
+scenario file gcs-loss sha256 5cc64e04e94b63702dcb4bb6c5dd544d5c84b6d64cd81f27a57d0342bb37b7f9
+scenario file no-human-link sha256 cd54047146fff3a6c1196eaf9c38d875f36df44230cb970ac0fc6a9a85cc99e4
+scenario file battery-low sha256 d87b40d8660dc1b7a5d99392f55de1fd16e1758543da02266c79437df3e2cd84
+scenario file battery-critical sha256 c7d26b82787a6125c0b14fa53a12c14d2072bda9c35e5f3a25fa1e1812e77475
+scenario file geofence sha256 3b776affd16aca81dcf68f66d170371e57936a8a57367f557937e7bb850e718b
+scenario file brain-crash sha256 8cdd0e4d72a53d8dde282854e14667f95b4099cc1e6e8b426989472ad543383b
+scenario file brain-hang sha256 b2b012b86fa255d62c270fa5b569b65f7bc25b3b6c19f9470439598ecbe2ed2a
+scenario file setpoint-gap sha256 c49cc1d13447bb21cfc11a101e190ed0a42a87cb06e9804fd8554395d8270987
+scenario file pair-battery-critical+baro-loss sha256 3b09d29fdc7251671dedba1782d55438f8cb068565114c2ec355ec80982a5ad1
+scenario file pair-battery-critical+brain-crash sha256 97072c0e3abc1405d867d47133717d64ba45a16b2f1c392bfecfdf9581b59d14
+scenario file pair-battery-critical+geofence sha256 de6407ecfec042213e937fff8530d0844271782f172bea3eda3e4f064056c3d6
+scenario file pair-battery-low+baro-loss sha256 950dd238982d6df4dfe7b451d0ad64589fa7a8908efce3d66b71e2775182625f
+scenario file pair-battery-low+battery-critical sha256 a459580f118508b6b900f4f23fd74649738b7e78e9dbcc58832dabf8a49ee848
+scenario file pair-battery-low+brain-crash sha256 6bbad8db9f55b444946f0512641be917561331f6142b91a2dfd967c25be3244d
+scenario file pair-battery-low+geofence sha256 faa00d6b64475c4fac40d0157ac5e527cd2b923ec484f6fa6f659d1923bb858e
+scenario file pair-brain-crash+baro-loss sha256 bc77db5368c3c3845bd4201338f987be6d64ec2ffc802c890a3274f65df969f4
+scenario file pair-brain-crash+geofence sha256 8f76176ec9814ee2d49d61148418d142620db9e582ff1809d352014462ce6906
+scenario file pair-geofence+baro-loss sha256 1d71a0c76afa4da026ac628bd1f49843d9ea35c7e981da5e5808e6934f6dd77d
+scenario file pair-gps-loss+baro-loss sha256 4b177197169fdeb6afc1cf7d795b8d8160ece1893c95d50a269b9f8a7d74e68c
+scenario file pair-gps-loss+battery-critical sha256 3475b75b938802c848c6e9c3aa503384d3b6c32406c2818110ee326f9ed7edcc
+scenario file pair-gps-loss+battery-low sha256 f1af89afecfe2cc15d7a07b299eb8788b329b46b20cfc26c59cba70912712427
+scenario file pair-gps-loss+brain-crash sha256 9993d376a440eeeb959aa212c95a3329de3b0e11caf389245345a8371844324b
+scenario file pair-gps-loss+geofence sha256 f481bb997795159e64f09c1e1b655308321125cc1ff845c2418d8358cbda4cb4
+scenario file pair-rc-loss+baro-loss sha256 396e119b6648fca70a9bd24f9a041471109bf3277fdc60d5ece61484f4477ff2
+scenario file pair-rc-loss+battery-critical sha256 aba5b42f3eb037a4c2be71ddae08e29f1f527fed7e701d783c5efd83827b9fb6
+scenario file pair-rc-loss+battery-low sha256 a0d7a1ef996b584cebb203ac87366b2a3ed697781daf6746040898d3e8f4c81d
+scenario file pair-rc-loss+brain-crash sha256 9f9f07863445a659ccc4bd0a2a343311d05ae22d965573f74c9eb48c91727a05
+scenario file pair-rc-loss+geofence sha256 d699e4ce2ea8c83e3767a9287f2d5f74886e98acee8b496e6427eb9cd0973ad5
+scenario file pair-rc-loss+gps-loss sha256 9f76c5bef99f31e3e496762160fa1d0d8607a60408d933f955b7b991054f7577
+scenario file motor-loss sha256 f63afaa7e0854922aa6420b23743f3fafc61cc11175f66cd42f7a00275fd20ca
+scenario file imu-loss sha256 59d42bfc03860c50721af23f6a6700d32a6453129e3584781668e1d356889e89
+scenario file kill-in-rtl sha256 50d79c1167dc94a8eb375f964b2b389dfee944bc75968076e7120a8e9d2dfbdb
+scenario file hover-step sha256 3b9b44bb7e769a410ac70f035e2e9a9910821b2ddf7448d44f87d386e64d2f1d
+plan gust gust-hold 500
+plan outcome gps-loss 10
+plan outcome gps-loss-pilot 10
+plan outcome gps-loss-recovers 10
+plan outcome baro-loss 10
+plan outcome mag-loss 10
+plan outcome rc-loss-position 10
+plan outcome rc-loss-override 10
+plan outcome rc-loss-on-ground 10
+plan outcome rc-loss-offboard-gcs 10
+plan outcome gcs-loss 10
+plan outcome no-human-link 10
+plan outcome battery-low 10
+plan outcome battery-critical 10
+plan outcome geofence 10
+plan outcome brain-crash 10
+plan outcome brain-hang 10
+plan outcome setpoint-gap 10
+plan outcome pair-battery-critical+baro-loss 10
+plan outcome pair-battery-critical+brain-crash 10
+plan outcome pair-battery-critical+geofence 10
+plan outcome pair-battery-low+baro-loss 10
+plan outcome pair-battery-low+battery-critical 10
+plan outcome pair-battery-low+brain-crash 10
+plan outcome pair-battery-low+geofence 10
+plan outcome pair-brain-crash+baro-loss 10
+plan outcome pair-brain-crash+geofence 10
+plan outcome pair-geofence+baro-loss 10
+plan outcome pair-gps-loss+baro-loss 10
+plan outcome pair-gps-loss+battery-critical 10
+plan outcome pair-gps-loss+battery-low 10
+plan outcome pair-gps-loss+brain-crash 10
+plan outcome pair-gps-loss+geofence 10
+plan outcome pair-rc-loss+baro-loss 10
+plan outcome pair-rc-loss+battery-critical 10
+plan outcome pair-rc-loss+battery-low 10
+plan outcome pair-rc-loss+brain-crash 10
+plan outcome pair-rc-loss+geofence 10
+plan outcome pair-rc-loss+gps-loss 10
+plan motors-off motor-loss 10
+plan motors-off imu-loss 10
+plan not-scored kill-in-rtl 10
+plan not-scored hover-step 1
+twice gust-hold 5
+twice gps-loss 1
+twice battery-low 1
+twice rc-loss-offboard-gcs 1
+twice imu-loss 1
+twice pair-gps-loss+baro-loss 1
+pair pair-battery-critical+baro-loss baro-loss,battery
+pair pair-battery-critical+brain-crash battery,brain-crash
+pair pair-battery-critical+geofence battery,geofence
+pair pair-battery-low+baro-loss baro-loss,battery
+pair pair-battery-low+battery-critical battery
+pair pair-battery-low+brain-crash battery,brain-crash
+pair pair-battery-low+geofence battery,geofence
+pair pair-brain-crash+baro-loss baro-loss,brain-crash
+pair pair-brain-crash+geofence brain-crash,geofence
+pair pair-geofence+baro-loss baro-loss,geofence
+pair pair-gps-loss+baro-loss baro-loss,gps-loss
+pair pair-gps-loss+battery-critical battery,gps-loss
+pair pair-gps-loss+battery-low battery,gps-loss
+pair pair-gps-loss+brain-crash brain-crash,gps-loss
+pair pair-gps-loss+geofence geofence,gps-loss
+pair pair-rc-loss+baro-loss baro-loss,rc-loss
+pair pair-rc-loss+battery-critical battery,rc-loss
+pair pair-rc-loss+battery-low battery,rc-loss
+pair pair-rc-loss+brain-crash brain-crash,rc-loss
+pair pair-rc-loss+geofence geofence,rc-loss
+pair pair-rc-loss+gps-loss gps-loss,rc-loss
+failure imu-loss 15
+failure motor-loss 15

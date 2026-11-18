@@ -1,0 +1,418 @@
+oxide-bridge tune: report
+  commit d6a21258a3f34c68d8478cfcc356f9192fe485ec
+  seed 0, instance 0
+  binary sha256 caed35e4cb796ec06cac40b09566a18251771486b1cbac5e2bf16b7a5ed5045d
+  RESULT: the tuner ran to its success and saved-gains messages
+  the tuner's settings as read back from the program: AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 7, AUTOTUNE_MIN_D 0.0005
+  simulated flight time of the procedure 597.4 s (and 45 s of pre-roll per flight), wall time 66.6 s
+flight 1 (flight-1)
+  parameter files base.parm setup.parm starting-gains.parm
+  trace hash 5bd8dec24e88c165, simulated 597.429 s, wall 66.6 s
+  stages (flight time): ALT_HOLD command 2.000 s, arm switch 13.000 s, throttle up 16.000 s, hover 24.759 s, spectrum 84.760 s, AUTOTUNE 85.760 s, descent 565.760 s, on the ground (throttle low) 581.574 s, disarmed (pulses) 583.429 s, read-back 588.429 s, end 597.429 s
+  furthest 28.82 m out (at 583.5 s), highest 10.65 m; hover (last 20 s): tilt rms 0.223 deg, position rms 1.482 m about its mean, height rms 0.043 m; in AUTOTUNE: furthest 17.67 m from where it began, height change up to 0.21 m, tilt up to 15.58 deg
+  physics outcome (the gate's own): furthest from where it armed 28.82 m (limit 100 m), highest 10.65 m (limit 60 m), largest tilt while armed 15.58 deg, touchdown speed Some(0.734748419800858) m/s, worst impact Some(0.734748419800858) m/s
+  class of the flight: safe
+  the descent (throttle stick 0.3): began at 565.760 s from 10.51 m, on the ground (height at most 0.05 m) 15.815 s later, mean rate 0.665 m/s, greatest downward speed 0.747 m/s, downward speed at the first tick on the ground Some(0.734270919279738) m/s (height Some(0.04979011925435304) m), touchdown speed Some(0.734748419800858) m/s
+  pack voltage under load, mean of the last second before the descent began: 21.655 V (the low-battery threshold is 20.767 V)
+  pack at the marks (flight time; voltage under load, current, state of charge):
+    hover reached             24.759 s  24.880 V   8.03 A   98.8 %
+    spectrum window start     54.759 s  24.488 V   8.03 A   94.4 %
+    spectrum taken            84.760 s  24.244 V   7.97 A   90.1 %
+    AUTOTUNE start            85.760 s  24.230 V   8.19 A   89.9 %
+    descent start            565.760 s  21.643 V   9.15 A   14.5 %
+    on the ground            581.574 s  21.495 V   8.88 A   11.9 %
+    disarmed                 583.429 s  21.713 V   0.09 A   11.9 %
+  track every 10 s (flight time, north, east, up in m from where it started):
+        0.0 s      0.00     0.00   -0.00
+       10.0 s      0.00     0.00   -0.00
+       20.0 s      0.02    -0.02    3.64
+       30.0 s     -0.18     0.11   10.38
+       40.0 s      1.08     0.35   10.43
+       50.0 s      2.60     0.32   10.51
+       60.0 s      3.69    -2.19   10.63
+       70.0 s      5.02    -5.10   10.33
+       80.0 s      5.62    -7.56   10.31
+       90.0 s      6.67   -10.11   10.54
+      100.0 s      8.85   -11.34   10.48
+      110.0 s     10.69   -11.37   10.44
+      120.0 s     12.14   -11.47   10.55
+      130.0 s     12.92   -14.08   10.51
+      140.0 s     13.55   -15.01   10.46
+      150.0 s     13.77   -15.46   10.51
+      160.0 s     15.33   -15.07   10.43
+      170.0 s     17.29   -15.01   10.50
+      180.0 s     18.69   -15.26   10.51
+      190.0 s     19.51   -14.78   10.43
+      200.0 s     20.43   -14.42   10.44
+      210.0 s     21.33   -14.48   10.47
+      220.0 s     21.27   -14.93   10.43
+      230.0 s     17.94   -15.39   10.45
+      240.0 s     18.26   -15.53   10.42
+      250.0 s     18.70   -15.04   10.42
+      260.0 s     18.53   -14.40   10.40
+      270.0 s     18.22   -13.74   10.35
+      280.0 s     19.06   -13.56   10.55
+      290.0 s     19.91   -12.48   10.43
+      300.0 s     20.19   -11.86   10.51
+      310.0 s     20.46   -12.01   10.59
+      320.0 s     21.72   -11.14   10.46
+      330.0 s     22.96   -10.55   10.34
+      340.0 s     23.47   -10.14   10.42
+      350.0 s     23.38   -10.03   10.45
+      360.0 s     23.53   -10.47   10.56
+      370.0 s     23.18   -12.36   10.39
+      380.0 s     21.74   -13.28   10.46
+      390.0 s     20.23   -13.80   10.54
+      400.0 s     18.91   -14.07   10.37
+      410.0 s     18.43   -13.20   10.55
+      420.0 s     18.35   -12.05   10.42
+      430.0 s     17.72   -10.68   10.48
+      440.0 s     18.18    -9.63   10.43
+      450.0 s     18.64    -8.02   10.42
+      460.0 s     19.03    -7.57   10.36
+      470.0 s     19.62    -7.68   10.41
+      480.0 s     20.68    -7.48   10.47
+      490.0 s     22.27    -8.22   10.45
+      500.0 s     22.85    -8.14   10.40
+      510.0 s     22.61    -8.85   10.34
+      520.0 s     22.95    -9.40   10.40
+      530.0 s     23.14   -10.14   10.48
+      540.0 s     23.24   -10.82   10.54
+      550.0 s     22.89   -12.04   10.51
+      560.0 s     21.99   -14.00   10.54
+      570.0 s     21.41   -15.98    7.97
+      580.0 s     22.44   -17.58    1.18
+      590.0 s     22.74   -17.72   -0.00
+  spectrum: 30000 gyro samples as sent, 57 segments of 1024, bin 0.9766 Hz; band 40-400 Hz
+    axis x: largest line 203.12 Hz at 1.43 times the band's median power
+    axis y: largest line 223.63 Hz at 1.61 times the band's median power
+    axis z: largest line 149.41 Hz at 1.38 times the band's median power
+    verdict: no peak (the rule: a line of 40 to 400 Hz at 10 times the band's median power or more)
+  learned hover thrust (MOT_THST_HOVER read at the end of the hover): 0.14948809
+  commands sent by the script:
+        2.000 s  set mode 2
+        3.000 s  read ATC_ACC_P_MAX ATC_ACC_R_MAX ATC_ACC_Y_MAX ATC_ANG_PIT_P ATC_ANG_RLL_P ATC_ANG_YAW_P
+        4.000 s  read ATC_RATE_FF_ENAB ATC_RAT_PIT_D ATC_RAT_PIT_FF ATC_RAT_PIT_FLTD ATC_RAT_PIT_FLTE ATC_RAT_PIT_FLTT
+        5.000 s  read ATC_RAT_PIT_I ATC_RAT_PIT_P ATC_RAT_RLL_D ATC_RAT_RLL_FF ATC_RAT_RLL_FLTD ATC_RAT_RLL_FLTE
+        6.000 s  read ATC_RAT_RLL_FLTT ATC_RAT_RLL_I ATC_RAT_RLL_P ATC_RAT_YAW_D ATC_RAT_YAW_FF ATC_RAT_YAW_FLTD
+        7.000 s  read ATC_RAT_YAW_FLTE ATC_RAT_YAW_FLTT ATC_RAT_YAW_I ATC_RAT_YAW_P AUTOTUNE_AGGR AUTOTUNE_AXES
+        8.000 s  read AUTOTUNE_MIN_D INS_ACCEL_FILTER INS_GYRO_FILTER MOT_BAT_VOLT_MAX MOT_BAT_VOLT_MIN MOT_HOVER_LEARN
+        9.000 s  read MOT_SPIN_ARM MOT_SPIN_MAX MOT_SPIN_MIN MOT_THST_EXPO MOT_THST_HOVER
+       84.760 s  read MOT_THST_HOVER
+       85.760 s  set mode 15
+      588.429 s  read ATC_ACC_P_MAX ATC_ACC_R_MAX ATC_ACC_Y_MAX ATC_ANG_PIT_P ATC_ANG_RLL_P ATC_ANG_YAW_P
+      589.429 s  read ATC_RATE_FF_ENAB ATC_RAT_PIT_D ATC_RAT_PIT_FF ATC_RAT_PIT_FLTD ATC_RAT_PIT_FLTE ATC_RAT_PIT_FLTT
+      590.429 s  read ATC_RAT_PIT_I ATC_RAT_PIT_P ATC_RAT_RLL_D ATC_RAT_RLL_FF ATC_RAT_RLL_FLTD ATC_RAT_RLL_FLTE
+      591.429 s  read ATC_RAT_RLL_FLTT ATC_RAT_RLL_I ATC_RAT_RLL_P ATC_RAT_YAW_D ATC_RAT_YAW_FF ATC_RAT_YAW_FLTD
+      592.429 s  read ATC_RAT_YAW_FLTE ATC_RAT_YAW_FLTT ATC_RAT_YAW_I ATC_RAT_YAW_P MOT_THST_HOVER
+  status texts of the program:
+      -44.785 s  RCInput: decoding UDP (Pulses)
+      -44.675 s  Calibrating barometer
+      -43.075 s  Barometer 1 calibration complete
+      -43.075 s  Barometer 2 calibration complete
+      -43.073 s  ArduPilot Ready
+      -43.073 s  AHRS: DCM active
+      -42.776 s  RC7: MotorEStop LOW
+      -41.070 s  EKF3 IMU0 initialised
+      -41.070 s  EKF3 IMU1 initialised
+      -41.068 s  AHRS: EKF3 active
+      -39.723 s  EKF3 IMU0 tilt alignment complete
+      -39.723 s  EKF3 IMU1 tilt alignment complete
+      -39.625 s  EKF3 IMU0 MAG0 initial yaw alignment complete
+      -39.625 s  EKF3 IMU1 MAG0 initial yaw alignment complete
+      -35.715 s  GPS 1: probing for u-blox at 230400 baud
+      -35.695 s  GPS 1: detected u-blox
+      -25.503 s  EKF3 IMU1 origin set
+      -25.476 s  Field Elevation Set: 584m
+      -25.313 s  EKF3 IMU0 origin set
+      -14.073 s  PreArm: Need Position Estimate
+       -3.910 s  EKF3 IMU0 is using GPS
+       -3.900 s  EKF3 IMU1 is using GPS
+        0.002 s  RCInput: decoding FDM (Pulses)
+       13.224 s  Arming motors
+       19.169 s  EKF3 IMU1 MAG0 in-flight yaw alignment complete
+       19.174 s  EKF3 IMU0 MAG0 in-flight yaw alignment complete
+       85.762 s  AutoTune: Started
+       85.764 s  AutoTune: Roll Rate D Up 0%
+       87.764 s  AutoTune: Roll Rate D Up 0%
+       89.764 s  AutoTune: Roll Rate D Up 0%
+       91.764 s  AutoTune: Roll Rate D Up 0%
+       93.764 s  AutoTune: Roll Rate D Up 50%
+       95.764 s  AutoTune: Roll Rate D Up 75%
+       97.764 s  AutoTune: Roll Rate D Down 0%
+       99.764 s  AutoTune: Roll Rate D Down 50%
+      101.764 s  AutoTune: Roll Rate P Up 0%
+      103.764 s  AutoTune: Roll Rate P Up 0%
+      105.764 s  AutoTune: Roll Rate P Up 0%
+      107.764 s  AutoTune: Roll Rate P Up 0%
+      109.764 s  AutoTune: Roll Rate P Up 0%
+      111.764 s  AutoTune: Roll Rate P Up 0%
+      113.764 s  AutoTune: Roll Rate P Up 0%
+      115.764 s  AutoTune: Roll Rate P Up 0%
+      117.764 s  AutoTune: Roll Rate P Up 0%
+      119.764 s  AutoTune: Roll Rate P Up 0%
+      121.764 s  AutoTune: Roll Rate P Up 50%
+      123.764 s  AutoTune: Roll Rate P Up 75%
+      125.764 s  AutoTune: Roll Angle P Down 0%
+      127.764 s  AutoTune: Roll Angle P Down 25%
+      129.764 s  AutoTune: Roll Angle P Down 50%
+      131.764 s  AutoTune: Roll Angle P Up 0%
+      133.764 s  AutoTune: Roll Angle P Up 0%
+      135.764 s  AutoTune: Roll Angle P Up 0%
+      137.764 s  AutoTune: Roll Angle P Up 0%
+      139.764 s  AutoTune: Roll Angle P Up 0%
+      141.764 s  AutoTune: Roll Angle P Up 0%
+      143.764 s  AutoTune: Roll Angle P Up 0%
+      145.764 s  AutoTune: Roll Angle P Up 0%
+      147.764 s  AutoTune: Roll Angle P Up 0%
+      149.764 s  AutoTune: Roll Angle P Up 0%
+      151.764 s  AutoTune: Roll Angle P Up 0%
+      153.764 s  AutoTune: Roll Angle P Up 0%
+      155.764 s  AutoTune: Roll Angle P Up 0%
+      157.764 s  AutoTune: Roll Angle P Up 0%
+      159.764 s  AutoTune: Roll Angle P Up 0%
+      161.764 s  AutoTune: Roll Angle P Up 0%
+      163.764 s  AutoTune: Roll Angle P Up 0%
+      165.764 s  AutoTune: Roll Angle P Up 0%
+      167.764 s  AutoTune: Roll Angle P Up 0%
+      169.764 s  AutoTune: Roll Angle P Up 0%
+      171.764 s  AutoTune: Roll Angle P Up 0%
+      173.764 s  AutoTune: Roll Angle P Up 0%
+      175.764 s  AutoTune: Roll Angle P Up 0%
+      177.764 s  AutoTune: Roll Angle P Up 0%
+      179.764 s  AutoTune: Roll Angle P Up 0%
+      181.764 s  AutoTune: Roll Angle P Up 0%
+      183.764 s  AutoTune: Roll Angle P Up 50%
+      185.165 s  AutoTune: Roll complete
+      185.165 s  AutoTune: Roll Rate: P:0.054, I:0.054, D:0.0011
+      185.165 s  AutoTune: Roll Angle P:25.442, Max Accel:487469
+      185.764 s  AutoTune: Pitch Rate D Up 0%
+      187.764 s  AutoTune: Pitch Rate D Up 0%
+      189.764 s  AutoTune: Pitch Rate D Up 0%
+      191.764 s  AutoTune: Pitch Rate D Up 0%
+      193.764 s  AutoTune: Pitch Rate D Up 50%
+      195.764 s  AutoTune: Pitch Rate D Down 0%
+      197.764 s  AutoTune: Pitch Rate D Down 0%
+      199.764 s  AutoTune: Pitch Rate D Down 50%
+      201.764 s  AutoTune: Pitch Rate P Up 0%
+      203.764 s  AutoTune: Pitch Rate P Up 0%
+      205.764 s  AutoTune: Pitch Rate P Up 0%
+      207.764 s  AutoTune: Pitch Rate P Up 0%
+      209.764 s  AutoTune: Pitch Rate P Up 0%
+      211.764 s  AutoTune: Pitch Rate P Up 0%
+      213.764 s  AutoTune: Pitch Rate P Up 0%
+      215.764 s  AutoTune: Pitch Rate P Up 0%
+      217.764 s  AutoTune: Pitch Rate P Up 50%
+      219.764 s  AutoTune: Pitch Angle P Down 0%
+      221.764 s  AutoTune: Pitch Angle P Down 0%
+      223.764 s  AutoTune: Pitch Angle P Down 50%
+      225.764 s  AutoTune: Pitch Angle P Down 75%
+      227.764 s  AutoTune: Pitch Angle P Up 0%
+      229.764 s  AutoTune: Pitch Angle P Up 0%
+      231.764 s  AutoTune: Pitch Angle P Up 0%
+      233.764 s  AutoTune: Pitch Angle P Up 0%
+      235.764 s  AutoTune: Pitch Angle P Up 0%
+      237.764 s  AutoTune: Pitch Angle P Up 0%
+      239.764 s  AutoTune: Pitch Angle P Up 0%
+      241.764 s  AutoTune: Pitch Angle P Up 0%
+      243.764 s  AutoTune: Pitch Angle P Up 0%
+      245.764 s  AutoTune: Pitch Angle P Up 0%
+      247.764 s  AutoTune: Pitch Angle P Up 0%
+      249.764 s  AutoTune: Pitch Angle P Up 0%
+      251.764 s  AutoTune: Pitch Angle P Up 0%
+      253.764 s  AutoTune: Pitch Angle P Up 0%
+      255.764 s  AutoTune: Pitch Angle P Up 0%
+      257.764 s  AutoTune: Pitch Angle P Up 0%
+      259.764 s  AutoTune: Pitch Angle P Up 0%
+      261.764 s  AutoTune: Pitch Angle P Up 0%
+      263.764 s  AutoTune: Pitch Angle P Up 0%
+      265.764 s  AutoTune: Pitch Angle P Up 0%
+      267.764 s  AutoTune: Pitch Angle P Up 0%
+      269.764 s  AutoTune: Pitch Angle P Up 0%
+      271.764 s  AutoTune: Pitch Angle P Up 0%
+      273.764 s  AutoTune: Pitch Angle P Up 0%
+      275.764 s  AutoTune: Pitch Angle P Up 0%
+      277.137 s  AutoTune: Pitch complete
+      277.137 s  AutoTune: Pitch Rate: P:0.054, I:0.054, D:0.0012
+      277.137 s  AutoTune: Pitch Angle P:27.750, Max Accel:500883
+      277.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      279.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      281.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      283.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      285.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      287.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      289.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      291.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      293.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      295.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      297.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      299.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      301.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      303.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      305.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      307.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      309.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      311.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      313.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      315.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      317.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      319.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      321.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      323.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      325.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      327.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      329.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      331.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      333.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      335.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      337.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      339.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      341.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      343.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      345.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      347.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      349.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      351.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      353.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      355.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      357.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      359.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      361.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      363.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      365.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      367.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      369.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      371.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      373.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      375.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      377.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      379.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      381.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      383.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      385.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      387.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      389.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      391.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      393.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      395.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      397.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      399.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      401.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      403.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      405.764 s  AutoTune: Yaw(E) Rate D Up 0%
+      407.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      409.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      411.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      413.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      415.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      417.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      419.764 s  AutoTune: Yaw(E) Rate D Down 0%
+      421.764 s  AutoTune: Yaw(E) Rate D Down 25%
+      423.764 s  AutoTune: Yaw(E) Rate D Down 25%
+      425.764 s  AutoTune: Yaw(E) Rate D Down 50%
+      427.764 s  AutoTune: Yaw(E) Rate D Down 50%
+      429.764 s  AutoTune: Yaw(E) Rate D Down 50%
+      431.764 s  AutoTune: Yaw(E) Rate D Down 75%
+      433.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      435.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      437.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      439.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      441.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      443.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      445.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      447.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      449.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      451.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      453.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      455.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      457.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      459.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      461.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      463.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      465.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      467.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      469.764 s  AutoTune: Yaw(E) Rate P Up 0%
+      471.764 s  AutoTune: Yaw(E) Rate P Up 25%
+      473.764 s  AutoTune: Yaw(E) Rate P Up 25%
+      475.764 s  AutoTune: Yaw(E) Rate P Up 50%
+      477.764 s  AutoTune: Yaw(E) Rate P Up 50%
+      479.764 s  AutoTune: Yaw(E) Rate P Up 75%
+      481.764 s  AutoTune: Yaw(E) Rate P Up 75%
+      483.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      485.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      487.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      489.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      491.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      493.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      495.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      497.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      499.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      501.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      503.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      505.764 s  AutoTune: Yaw(E) Angle P Down 0%
+      507.764 s  AutoTune: Yaw(E) Angle P Down 25%
+      509.764 s  AutoTune: Yaw(E) Angle P Down 50%
+      511.764 s  AutoTune: Yaw(E) Angle P Down 75%
+      513.764 s  AutoTune: Yaw(E) Angle P Up 0%
+      515.764 s  AutoTune: Yaw(E) Angle P Up 0%
+      517.764 s  AutoTune: Yaw(E) Angle P Up 0%
+      519.764 s  AutoTune: Yaw(E) Angle P Up 25%
+      521.764 s  AutoTune: Yaw(E) Angle P Up 50%
+      523.764 s  AutoTune: Yaw(E) Angle P Up 75%
+      524.564 s  AutoTune: Yaw(E) complete
+      524.564 s  AutoTune: Yaw(E) Rate: P:0.048, I:0.004, D:0.0000
+      524.564 s  AutoTune: Yaw(E) Angle P:1.958, Max Accel:20629
+      524.564 s  AutoTune: Success
+      583.427 s  Disarming motors
+      583.427 s  AutoTune: Saved gains for Roll Pitch Yaw(E)
+  mode changes read from the heartbeat:
+      -43.998 s  mode 0
+      -42.873 s  mode 4
+        0.202 s  mode 0
+        2.002 s  mode 2
+       85.762 s  mode 15
+      -43.998 s  armed false
+       14.027 s  armed true
+      584.027 s  armed false
+gains: before the flight, and after the tuner's save
+  ATC_ACC_P_MAX              1100     5008.833  *
+  ATC_ACC_R_MAX              1100    4874.6885  *
+  ATC_ACC_Y_MAX               270    206.29211  *
+  ATC_ANG_PIT_P               4.5        27.75  *
+  ATC_ANG_RLL_P               4.5    25.442236  *
+  ATC_ANG_YAW_P               4.5    1.9577342  *
+  ATC_RATE_FF_ENAB              1            1
+  ATC_RAT_PIT_D            0.0012 0.0012337201  *
+  ATC_RAT_PIT_FF                0            0
+  ATC_RAT_PIT_FLTD             40           40
+  ATC_RAT_PIT_FLTE              0            0
+  ATC_RAT_PIT_FLTT             40           40
+  ATC_RAT_PIT_I              0.05  0.054852616  *
+  ATC_RAT_PIT_P              0.05  0.054852616  *
+  ATC_RAT_RLL_D            0.0012 0.0011720341  *
+  ATC_RAT_RLL_FF                0            0
+  ATC_RAT_RLL_FLTD             40           40
+  ATC_RAT_RLL_FLTE              0            0
+  ATC_RAT_RLL_FLTT             40           40
+  ATC_RAT_RLL_I              0.05  0.054715484  *
+  ATC_RAT_RLL_P              0.05  0.054715484  *
+  ATC_RAT_YAW_D                 0            0
+  ATC_RAT_YAW_FF                0            0
+  ATC_RAT_YAW_FLTD             20           20
+  ATC_RAT_YAW_FLTE              2            5  *
+  ATC_RAT_YAW_FLTT             40           40
+  ATC_RAT_YAW_I            0.0065  0.004832374  *
+  ATC_RAT_YAW_P             0.065   0.04832374  *
+  AUTOTUNE_AGGR             0.075            -
+  AUTOTUNE_AXES                 7            -
+  AUTOTUNE_MIN_D           0.0005            -
+  INS_ACCEL_FILTER             10            -
+  INS_GYRO_FILTER              80            -
+  MOT_BAT_VOLT_MAX           25.2            -
+  MOT_BAT_VOLT_MIN           19.8            -
+  MOT_HOVER_LEARN               2            -
+  MOT_SPIN_ARM                0.1            -
+  MOT_SPIN_MAX               0.95            -
+  MOT_SPIN_MIN               0.15            -
+  MOT_THST_EXPO                 1            -
+  MOT_THST_HOVER             0.16    0.1499654  *
