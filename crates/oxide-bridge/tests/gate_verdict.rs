@@ -1697,6 +1697,25 @@ fn a_negative_error_or_time_or_a_word_in_any_number_column_is_exit_2() {
     assert_eq!(eval(&f).a1.status, Status::Holds);
 }
 
+#[test]
+fn the_reasons_of_one_bad_row_come_in_the_order_of_its_columns() {
+    let mut f = Fixture::small("bad-order");
+    {
+        let r = f.row("gps-loss", F405, 0);
+        r.set("wall_s", "abc");
+        r.set("touchdown_mps", "zzz");
+        r.set("disarmed_at_s", "-5");
+    }
+    let p = refused(&f);
+    let at = |word: &str| {
+        p.iter()
+            .position(|l| l.contains(word))
+            .unwrap_or_else(|| panic!("no reason names {word}: {p:?}"))
+    };
+    assert!(at("touchdown_mps") < at("disarmed_at_s"), "{p:?}");
+    assert!(at("disarmed_at_s") < at("wall_s"), "{p:?}");
+}
+
 /// Copies a directory with everything in it.
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).expect("dir");

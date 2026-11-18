@@ -542,17 +542,13 @@ impl Reader<'_> {
         // Every other number of the row is read too: a value that cannot be
         // (a word, a negative error or time) is no verdict (ADR-0007
         // section 7), whether or not a criterion reads it.
-        for column in [
-            "max_h_m",
-            "max_v_m",
-            "max_height_m",
-            "max_distance_m",
-            "wall_s",
-        ] {
+        for column in ["max_h_m", "max_v_m", "max_height_m", "max_distance_m"] {
             num(column, false);
         }
+        // In the order of the columns, so the reasons of a refusal keep it.
         let touchdown_mps = num("touchdown_mps", false);
         let disarmed_at_s = num("disarmed_at_s", false);
+        num("wall_s", false);
         // The end position is a position: it may be negative.
         let mut position = |column: &str| -> Option<f64> {
             match number(row, column) {
