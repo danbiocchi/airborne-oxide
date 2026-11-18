@@ -11,6 +11,9 @@ use std::path::PathBuf;
 /// `arducopter/base.parm`: frame, thrust curve, sensors, battery, log, radio
 /// and mode mapping. No gains.
 pub const BASE: &str = include_str!("../arducopter/base.parm");
+/// `arducopter/setup.parm`: the settings of ArduPilot's tuning guide that are
+/// not in `base.parm`.
+pub const SETUP: &str = include_str!("../arducopter/setup.parm");
 /// `arducopter/starting-gains.parm`: the hand step before the tuner.
 pub const STARTING_GAINS: &str = include_str!("../arducopter/starting-gains.parm");
 /// `arducopter/failsafes.parm`: ADR-0007 section 3, each failsafe switched on
@@ -21,6 +24,11 @@ pub const FAILSAFES: &str = include_str!("../arducopter/failsafes.parm");
 /// The path of `base.parm` in the source tree this crate was built from.
 pub fn base_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/base.parm")
+}
+
+/// The path of `setup.parm` in the source tree this crate was built from.
+pub fn setup_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/setup.parm")
 }
 
 /// The path of `starting-gains.parm` in the source tree this crate was built
@@ -93,6 +101,7 @@ mod tests {
 
     fn all() -> Vec<(String, f64)> {
         let mut v = parse(BASE).expect("base.parm parses");
+        v.extend(parse(SETUP).expect("setup.parm parses"));
         v.extend(parse(STARTING_GAINS).expect("starting-gains.parm parses"));
         v
     }
@@ -100,6 +109,7 @@ mod tests {
     #[test]
     fn the_files_on_disk_are_the_ones_compiled_in() {
         assert_eq!(std::fs::read_to_string(base_path()).expect("base"), BASE);
+        assert_eq!(std::fs::read_to_string(setup_path()).expect("setup"), SETUP);
         assert_eq!(
             std::fs::read_to_string(starting_gains_path()).expect("gains"),
             STARTING_GAINS
@@ -142,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn no_name_appears_twice_across_the_two_files() {
+    fn no_name_appears_twice_across_base_setup_and_starting_gains() {
         let mut seen = BTreeMap::new();
         for (name, value) in all() {
             assert!(
@@ -204,7 +214,58 @@ mod tests {
             !base.keys().any(|n| n.starts_with("ATC_")),
             "no gain in base.parm"
         );
-        assert_eq!(map.len(), base.len() + gains.len());
+        assert_eq!(map.len(), base.len() + gains.len() + 10);
+    }
+
+    #[test]
+    fn setup_parm_holds_the_tuning_guides_settings_each_with_a_comment() {
+        let want = [
+            ("MOT_BAT_VOLT_MAX", 25.2),
+            ("MOT_BAT_VOLT_MIN", 19.8),
+            ("INS_ACCEL_FILTER", 10.0),
+            ("INS_GYRO_FILTER", 80.0),
+            ("ATC_RAT_RLL_FLTT", 40.0),
+            ("ATC_RAT_RLL_FLTD", 40.0),
+            ("ATC_RAT_PIT_FLTT", 40.0),
+            ("ATC_RAT_PIT_FLTD", 40.0),
+            ("ATC_RAT_YAW_FLTT", 40.0),
+            ("ATC_RAT_YAW_FLTE", 2.0),
+        ];
+        let got: Vec<(String, f64)> = parse(SETUP).expect("setup.parm parses");
+        let got: Vec<(&str, f64)> = got.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        assert_eq!(got, want);
+        // Each is in a block that has a comment line above it.
+        for (name, _) in want {
+            let at = SETUP
+                .find(&format!("\n{name} "))
+                .expect("the name is in the text");
+            let before = &SETUP[..at];
+            let block: Vec<&str> = before
+                .lines()
+                .rev()
+                .take_while(|l| !l.trim().is_empty())
+                .collect();
+            assert!(
+                block.iter().any(|l| l.starts_with('#')),
+                "{name} has no comment"
+            );
+        }
+        // What the guide leaves to the defaults or to the airframe is not set.
+        let names: Vec<&str> = want.iter().map(|(n, _)| *n).collect();
+        for left in [
+            "MOT_THST_EXPO",
+            "MOT_THST_HOVER",
+            "MOT_SPIN_ARM",
+            "MOT_SPIN_MIN",
+            "MOT_SPIN_MAX",
+            "ATC_ACC_R_MAX",
+            "ATC_ACC_P_MAX",
+            "ATC_ACC_Y_MAX",
+            "AUTOTUNE_AGGR",
+            "AUTOTUNE_MIN_D",
+        ] {
+            assert!(!names.contains(&left), "{left} stays out of setup.parm");
+        }
     }
 
     #[test]
