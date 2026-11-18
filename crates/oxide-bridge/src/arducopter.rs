@@ -458,7 +458,17 @@ impl fmt::Display for ArduCopterError {
                 write!(f, "start: {}: {source}", path.display())
             }
             Self::Bind { port, source } => {
-                write!(f, "start: cannot bind UDP port {port}: {source}")
+                write!(f, "start: cannot bind UDP port {port}: {source}")?;
+                if source.kind() == io::ErrorKind::AddrInUse {
+                    let instance = port.saturating_sub(9002) / 10;
+                    write!(
+                        f,
+                        " (instance number {instance} is in use by another program, perhaps \
+                         another batch with an overlapping --instances range: give each its own \
+                         instance numbers)"
+                    )?;
+                }
+                Ok(())
             }
             Self::Start(e) => write!(f, "start: the simulator program did not start: {e}"),
             Self::Connect { link, source } => {
@@ -2035,6 +2045,26 @@ mod tests {
             g.at(200_000),
             [(n1 - 0.25 * s0[0]) / 0.75, (e1 - 0.25 * s0[1]) / 0.75]
         );
+    }
+
+    #[test]
+    fn a_port_in_use_names_the_instance_number_and_the_overlap() {
+        let in_use = ArduCopterError::Bind {
+            port: 9052,
+            source: io::Error::from(io::ErrorKind::AddrInUse),
+        }
+        .to_string();
+        assert!(
+            in_use.contains("instance number 5 is in use by another program")
+                && in_use.contains("overlapping --instances"),
+            "{in_use}"
+        );
+        let other = ArduCopterError::Bind {
+            port: 9052,
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        }
+        .to_string();
+        assert!(!other.contains("instance number"), "{other}");
     }
 
     #[test]
