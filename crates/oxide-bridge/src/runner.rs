@@ -7,7 +7,7 @@ use core::fmt;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use oxide_core::config::FailsafeParams;
+use oxide_core::config::{EstimatorSource, FailsafeParams};
 use oxide_core::math::Real;
 use oxide_sim::outcome::FlightClass;
 use oxide_sim::scenario_file::{Checker, RunProfile, ScenarioFile, Verdict};
@@ -25,6 +25,10 @@ pub enum Autopilot {
     ArduCopter,
     /// Our flight core, on a profile.
     Core(RunProfile),
+    /// Our F405 core on the true state: the same file and index as
+    /// `core-f405` with the estimator source set to the true state. Reported
+    /// beside the gate and deciding nothing (ADR-0007 section 5).
+    CoreTruth,
 }
 
 impl Autopilot {
@@ -33,15 +37,17 @@ impl Autopilot {
         match self {
             Self::ArduCopter => "arducopter".into(),
             Self::Core(p) => format!("core-{}", p.name()),
+            Self::CoreTruth => "core-f405-truth".into(),
         }
     }
 
-    /// `arducopter`, `core-f405` or `core-h743`.
+    /// `arducopter`, `core-f405`, `core-h743` or `core-f405-truth`.
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "arducopter" => Some(Self::ArduCopter),
             "core-f405" => Some(Self::Core(RunProfile::F405)),
             "core-h743" => Some(Self::Core(RunProfile::H743)),
+            "core-f405-truth" => Some(Self::CoreTruth),
             _ => None,
         }
     }
@@ -344,6 +350,24 @@ pub fn fly_core(
     index: u64,
     profile: RunProfile,
 ) -> Result<ScenarioFlight, RunError> {
+    fly_core_as(src, index, profile, Autopilot::Core(profile))
+}
+
+/// Flies run `index` of `src` on our F405 core with the estimator source set
+/// to the true state (`core-f405-truth`): the file is otherwise as it is, so
+/// the seed and the wind are those of the `core-f405` flight.
+pub fn fly_core_truth(src: &LoadedScenario, index: u64) -> Result<ScenarioFlight, RunError> {
+    let mut truth = src.clone();
+    truth.file.estimator = EstimatorSource::External;
+    fly_core_as(&truth, index, RunProfile::F405, Autopilot::CoreTruth)
+}
+
+fn fly_core_as(
+    src: &LoadedScenario,
+    index: u64,
+    profile: RunProfile,
+    autopilot: Autopilot,
+) -> Result<ScenarioFlight, RunError> {
     let file = &src.file;
     let mut sim = file
         .build_with_params(profile.profile(), index, &[])
@@ -360,7 +384,7 @@ pub fn fly_core(
         scenario: file.name.clone(),
         index,
         seed: file.seed(index),
-        autopilot: Autopilot::Core(profile),
+        autopilot,
         class: verdict.outcome.class(),
         verdict,
         rms_v_m,

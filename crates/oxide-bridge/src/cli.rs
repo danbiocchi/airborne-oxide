@@ -567,6 +567,7 @@ fn print_flight(f: &ScenarioFlight, dir: &Path, repeats: Option<bool>) {
 #[derive(Clone, Debug)]
 enum Plan {
     Core(oxide_sim::scenario_file::RunProfile),
+    CoreTruth,
     Bridge(Setup),
 }
 
@@ -578,6 +579,7 @@ fn fly_once(
 ) -> Result<ScenarioFlight, RunError> {
     match plan {
         Plan::Core(profile) => runner::fly_core(src, index, *profile),
+        Plan::CoreTruth => runner::fly_core_truth(src, index),
         Plan::Bridge(setup) => {
             let mut setup = setup.clone();
             setup.out = out.to_path_buf();
@@ -615,6 +617,7 @@ pub fn run_fly(args: &FlyArgs) -> ExitCode {
     });
     let plan = match (autopilot, binary) {
         (Autopilot::Core(profile), _) => Plan::Core(profile),
+        (Autopilot::CoreTruth, _) => Plan::CoreTruth,
         (Autopilot::ArduCopter, binary) => {
             let mut s = Setup::new(binary.unwrap_or_default(), &out, args.instance);
             s.speedup = args.common.speedup;
