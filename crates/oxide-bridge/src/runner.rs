@@ -411,8 +411,10 @@ mod tests {
         );
         let bridged = bridged_scenario_options(&src.file, &af, 0);
         assert!(bridged.params.is_empty(), "{:?}", bridged.params);
-        // Nothing else of the options is touched.
+        // Nothing else of the options is touched: the faults keep the file's
+        // times (the pilot's script is the only thing delayed).
         assert_eq!(bridged.seed, ours.seed);
+        assert_eq!(bridged.faults, ours.faults);
     }
 
     #[test]
