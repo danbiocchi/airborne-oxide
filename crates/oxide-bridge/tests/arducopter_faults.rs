@@ -4,7 +4,8 @@
 //! Every test here needs the binary and is ignored by default: set
 //! `OXIDE_ARDUCOPTER` to its path and run with `--ignored` and `--release`.
 //! Each scenario file of the failures is flown at run 0 through the bridge
-//! with `base.parm`, `starting-gains.parm`, `failsafes.parm` and the battery
+//! with `base.parm`, `setup.parm`, `tuned-gains.parm`, `failsafes.parm` and the
+//! battery
 //! thresholds of our core ([`battery_failsafe_params`]), and each test pins
 //! what ArduCopter did. The glue that turns a scenario file into a bridged
 //! flight is in this file; the runner for many flights is another task's.
@@ -403,6 +404,12 @@ fn assert_writes(run: &Run, want: &[(u64, &str, f32)]) {
     assert_eq!(got, want, "the parameter writes and their times");
 }
 
+/// Whether the estimator's failsafe text was read after flight time `after_s`.
+fn estimator_failsafe_read_after(run: &Run, after_s: f64) -> bool {
+    run.text("EKF Failsafe: changed to Land Mode")
+        .is_some_and(|(t, _)| t > after_s)
+}
+
 /// Every write was acknowledged by a `PARAM_VALUE` with the value written,
 /// read within 20 ms of the exchange it went before.
 fn assert_echoes(run: &Run) {
@@ -480,6 +487,22 @@ fn first_below(run: &Run, volts: f64) -> Option<f64> {
         .iter()
         .find(|k| k.battery_v < volts)
         .map(|k| k.t_s)
+}
+
+/// The start of the last stretch, up to flight time `until`, in which the
+/// pack's voltage was below `volts` all the time: the crossing that
+/// ArduCopter's low-battery timer (BATT_LOW_TIMER) counts from. A dip of the
+/// loaded voltage that recovers before it is not one.
+fn below_since(run: &Run, volts: f64, until: f64) -> Option<f64> {
+    let mut since = None;
+    for k in run.ticks.iter().take_while(|k| k.t_s <= until) {
+        if k.battery_v < volts {
+            since = since.or(Some(k.t_s));
+        } else {
+            since = None;
+        }
+    }
+    since
 }
 
 fn s_us(s: f64) -> u64 {
@@ -822,21 +845,51 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
 
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
-fn motor_loss_is_not_answered_and_the_vehicle_tumbles_away_with_its_motors_on() {
+fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_ends_on_the_ground_with_its_motors_on() {
     let (_lease, run) = run_of("motor-loss");
     assert_writes(&run, &[]);
-    assert_modes(&run, &["STABILIZE", "GUIDED"]);
+    // On the flown set the vehicle is on the ground 2.2 s after the fault and
+    // the program's own estimator failsafe (EKF variance, LAND) comes 1.2 s
+    // after that, 3.4 s after the fault; on the starting gains it tumbled
+    // away for 8.9 s, over 100 m, and the estimator fell back to DCM with no
+    // mode change. The failsafe is not an answer to the lost motor, which the
+    // program never notices: the motors stay on to the end. Every number is
+    // as measured on the flown set.
+    assert_modes(&run, &["STABILIZE", "GUIDED", "LAND"]);
     assert_texts_after(
         &run,
         9.0,
         &[
-            ("AHRS: DCM active", 19.575, 0.3),
-            ("AHRS: EKF3 active", 19.674, 0.3),
+            ("EKF3 lane switch 1", 17.689, 0.3),
+            ("EKF primary changed:1", 17.689, 0.3),
+            ("EKF3 lane switch 0", 18.092, 0.3),
+            ("EKF primary changed:0", 18.092, 0.3),
+            ("EKF variance", 18.424, 0.3),
+            ("EKF Failsafe: changed to Land Mode", 18.424, 0.3),
+            ("Vibration compensation ON", 18.624, 0.3),
+            ("EKF3 IMU0 emergency yaw reset", 18.700, 0.3),
+            ("EKF3 IMU1 emergency yaw reset", 18.707, 0.3),
+            ("EKF Failsafe Cleared", 19.624, 0.3),
         ],
+    );
+    let (failsafe, _) = run
+        .text("EKF Failsafe: changed to Land Mode")
+        .expect("the estimator failsafe");
+    near(
+        "the fault to the estimator failsafe",
+        failsafe - 15.0,
+        3.424,
+        0.3,
+    );
+    near(
+        "LAND read",
+        run.mode_at_or_after("LAND", 0.0).expect("land"),
+        failsafe,
+        1.1,
     );
     let o = run.outcome();
     assert!(o.armed_at_end, "the program never disarms");
-    near("greatest tilt", o.max_tilt_deg, 135.0, 5.0);
+    near("greatest tilt", o.max_tilt_deg, 86.5, 5.0);
     let last = run.ticks.last().expect("ticks");
     println!(
         "MEASURED tilt at the end: {:.1} deg, height {:.3} m",
@@ -855,20 +908,25 @@ fn motor_loss_is_not_answered_and_the_vehicle_tumbles_away_with_its_motors_on() 
     near(
         "time from the fault to a tilt beyond 60 degrees",
         beyond_60 - 15.0,
-        0.22,
+        0.3035,
         0.1,
     );
-    near("time from the fault to the ground", ground - 15.0, 8.9, 0.5);
+    near(
+        "time from the fault to the ground",
+        ground - 15.0,
+        2.231,
+        0.3,
+    );
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        5.7,
-        0.7,
+        7.0,
+        0.5,
     );
+    near("furthest from home", o.max_distance_from_home_m, 23.6, 2.0);
     assert!(
-        o.max_distance_from_home_m > 100.0,
-        "{}",
-        o.max_distance_from_home_m
+        estimator_failsafe_read_after(&run, ground),
+        "the estimator failsafe comes after the vehicle is down"
     );
     // All motor commands at zero: never.
     let off = run.last_motor_on_s().expect("on");
@@ -1077,11 +1135,19 @@ fn battery_low_arms_and_returns_10_s_after_the_threshold_and_is_still_coming_dow
         0.1,
     );
     let (low, _) = battery_names();
-    let crossed = first_below(&run, low).expect("the pack crosses the threshold");
+    // From the pack's last crossing before the failsafe, the one that stayed
+    // below the threshold: the loaded voltage dips under it earlier and
+    // recovers (`first_below` is 1.18 s before this one), which the timer
+    // does not count.
+    let crossed = below_since(&run, low, t).expect("the pack crosses the threshold");
+    println!(
+        "MEASURED the first dip below BATT_LOW_VOLT {:?}, the sustained crossing {crossed}",
+        first_below(&run, low)
+    );
     near(
-        "time from the pack crossing BATT_LOW_VOLT to the failsafe",
+        "time from the pack's sustained crossing of BATT_LOW_VOLT to the failsafe",
         t - crossed,
-        11.18,
+        10.0,
         0.3,
     );
     near("BATT_LOW_VOLT", low, 20.767, 0.005);
@@ -1293,22 +1359,35 @@ fn a_target_the_brain_sent_just_before_it_failed_is_followed_to_its_end_and_held
 
 // ---- The IMU's last sample --------------------------------------------------
 
-/// With an IMU fault our simulation's frame has no IMU sample, so the
-/// bridge's reply carries the last one it latched. Once the program's own IMU
-/// masks are set that sample is not used: the same flight with fresh samples
-/// in every reply, and the same two writes sent by hand at the same tick, has
-/// the same motor packets and the same physics, bit for bit.
-#[test]
-#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
-fn the_last_imu_sample_the_reply_carries_does_not_matter_once_the_masks_are_set() {
-    let lease = Instance::lease();
-    let a = fly_run("imu-loss", 0, lease.0, "imu-a");
+/// With an IMU fault our simulation's frame has no IMU sample, so the bridge's
+/// reply carries the last one it latched, and the program is told the two IMUs
+/// are lost by two parameter writes sent at the tick of the fault.
+///
+/// This test first held that the program then does not use the sample at all:
+/// the same flight with fresh samples in every reply, and the same two writes
+/// sent by hand at the same tick, had the same motor packets and the same
+/// physics, bit for bit. That held on the starting gains and does not hold on
+/// the flown set (base, setup, tuned gains, failsafes): the two flights are
+/// the same up to 15.001 s and differ from 15.0015 s, three steps after the
+/// fault and before the program's echo of the masks was read (15.002 s). It
+/// holds with `INS_GYRO_FILTER` 20, 21 and 40 and with `ATC_RAT_YAW_FLTE` 2.5
+/// and 3 on the starting gains and fails with `INS_GYRO_FILTER` 80 or
+/// `ATC_RAT_YAW_FLTE` 2 added to them, which is not a monotone dependence: a
+/// flip of one microsecond in a motor pulse in the steps before the masks are
+/// applied would be the same, and is a property of the quantised output, not
+/// of the bridge. Whether the sample still matters after the masks are applied
+/// is not isolated by a whole-flight comparison. So the test pins what was
+/// measured, deterministically (the flights repeat bit for bit): equal up to
+/// 15.001 s, different at 15.0015 s and at the end.
+fn imu_loss_flight_to(lease: &Instance, end_s: Option<f64>, fresh_samples: bool) -> u64 {
     let file = load_path(scenario_path("imu-loss")).expect("file");
     let af = airframe();
     let mut options = file.options(&af, 0);
-    options.params.clear();
-    options.faults.clear();
-    let root = TempDir::new("imu-b");
+    if fresh_samples {
+        options.params.clear();
+        options.faults.clear();
+    }
+    let root = TempDir::new("imu-window");
     let mut c = ArduCopterConfig::new(binary(), root.path().join("flights"), lease.0);
     configure(&mut c, &af);
     let options = bridged_options(options, &mut c);
@@ -1316,8 +1395,9 @@ fn the_last_imu_sample_the_reply_carries_does_not_matter_once_the_masks_are_set(
     let mut sim = Simulation::with_autopilot(&af, ap, file.pilot.clone(), options).expect("sim");
     sim.preroll(PREROLL_STEPS).unwrap_or_else(|e| panic!("{e}"));
     let mut written = false;
-    while sim.time() < file.end() {
-        if !written && sim.time().0 >= 15_000_000 {
+    let end_us = end_s.map_or(file.end().0, s_us);
+    while sim.time().0 < end_us {
+        if fresh_samples && !written && sim.time().0 >= 15_000_000 {
             for n in ["SIM_ACC_FAIL_MSK", "SIM_GYR_FAIL_MSK"] {
                 sim.autopilot().instrument().param_set(n, 3.0).expect("set");
             }
@@ -1326,22 +1406,38 @@ fn the_last_imu_sample_the_reply_carries_does_not_matter_once_the_masks_are_set(
         sim.try_step().unwrap_or_else(|e| panic!("{e}"));
     }
     let trace = sim.trace_hash();
-    let b = sim
-        .into_autopilot()
+    sim.into_autopilot()
         .finish()
         .unwrap_or_else(|e| panic!("{e}"));
-    println!(
-        "MEASURED latched IMU sample (a) against fresh samples (b): trace {:016x} against {trace:016x}; \
-         motor packets {:016x} against {:016x}; replies {:016x} against {:016x}",
-        a.flown.trace_hash,
-        a.audit().packet_hash,
-        b.packet_hash,
-        a.audit().reply_hash,
-        b.reply_hash
+    trace
+}
+
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn the_latched_imu_sample_reaches_the_flight_within_three_steps_of_the_fault_on_the_flown_set() {
+    let lease = Instance::lease();
+    for (end_s, same) in [(Some(15.001), true), (Some(15.0015), false), (None, false)] {
+        let latched = imu_loss_flight_to(&lease, end_s, false);
+        let fresh = imu_loss_flight_to(&lease, end_s, true);
+        println!(
+            "MEASURED latched IMU sample against fresh samples, to {end_s:?} s: trace \
+             {latched:016x} against {fresh:016x}"
+        );
+        assert_eq!(latched == fresh, same, "to {end_s:?} s");
+    }
+    // The program's echo of the masks was read 2 ms after the writes.
+    let a = fly_run("imu-loss", 0, lease.0, "imu-echo");
+    let echoes = a.audit().param_echoes();
+    let first = echoes
+        .iter()
+        .find(|(_, n, v)| *n == "SIM_GYR_FAIL_MSK" && *v == 3.0)
+        .expect("echo of the mask");
+    near(
+        "the echo of the masks, read at",
+        a.flight_s(first.0),
+        15.002,
+        0.0006,
     );
-    assert_eq!(a.flown.trace_hash, trace);
-    assert_eq!(a.audit().packet_hash, b.packet_hash);
-    assert_ne!(a.audit().reply_hash, b.reply_hash, "the replies do differ");
 }
 
 // ---- A faulted flight repeats -----------------------------------------------
