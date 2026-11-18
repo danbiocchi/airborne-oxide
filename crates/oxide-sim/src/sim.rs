@@ -723,6 +723,10 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
     pub fn wind(&self) -> &Wind {
         &self.wind
     }
+    /// The pack's state of charge, 0 to 1 (read-only).
+    pub fn battery_state_of_charge(&self) -> f64 {
+        self.battery.state_of_charge
+    }
     /// Physics steps so far that produced a non-finite state.
     pub fn physics_faults(&self) -> u32 {
         self.physics_faults

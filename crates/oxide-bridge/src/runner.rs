@@ -243,6 +243,17 @@ pub fn committed_params(airframe: &Airframe) -> (Vec<PathBuf>, Vec<(String, f64)
     (files, extras)
 }
 
+/// The gate's low-battery threshold, V: the `BATT_LOW_VOLT` every bridged
+/// flight is given ([`committed_params`]).
+pub fn battery_low_volt() -> f64 {
+    let airframe = Airframe::reference_quad().expect("the reference airframe loads");
+    committed_params(&airframe)
+        .1
+        .iter()
+        .find(|(n, _)| n == "BATT_LOW_VOLT")
+        .map_or(f64::NAN, |(_, v)| *v)
+}
+
 /// The parameter files and the extra parameters of a bridged flight, in the
 /// order they are applied: the committed files, then the setup's own files,
 /// then the battery thresholds, then the scenario's (the fence).

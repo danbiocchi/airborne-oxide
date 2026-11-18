@@ -41,7 +41,7 @@
 //! [`Outcome::notch_reference`]).
 
 use core::fmt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -50,6 +50,10 @@ use oxide_core::io::{RcSample, Stamped};
 use oxide_core::math::{Real, Vec3};
 use oxide_core::time::Micros;
 use oxide_sim::autopilot::{Autopilot, AutopilotInput, AutopilotOutput, PrerollInput};
+use oxide_sim::outcome::{
+    CRASH_TILT_DEG, CRASH_TOUCHDOWN_MPS, FLY_AWAY_DISTANCE_M, FLY_AWAY_HEIGHT_M, FlightClass,
+    FlightOutcome,
+};
 use oxide_sim::scenario::{COMMAND_PERIOD_US, Pilot};
 use oxide_sim::sim::{PrerollError, SimOptions, StepRecord};
 use oxide_sim::{Airframe, SimError, Simulation};
@@ -91,8 +95,11 @@ pub const SPECTRUM_S: u64 = 30;
 pub const QUALITY_S: u64 = 20;
 /// From the end of the hover (the spectrum) to the mode change.
 const AFTER_SPECTRUM_US: u64 = S;
-/// How long AUTOTUNE is given before the throttle goes low, s.
-pub const AUTOTUNE_S: u64 = 900;
+/// How long AUTOTUNE is given before the throttle goes low, s. The tuner
+/// needed 439 s on seed 0; the pack is empty about 650 s into the flight
+/// (ADR-0007 section 2). A fixed number: nothing read from MAVLink decides
+/// when the pilot lands.
+pub const AUTOTUNE_S: u64 = 480;
 /// The vehicle must be disarmed (by its pulses) within this time of the
 /// throttle going low.
 const LAND_LIMIT_US: u64 = 180 * S;
@@ -100,10 +107,9 @@ const LAND_LIMIT_US: u64 = 180 * S;
 const DISARM_SETTLE_US: u64 = 5 * S;
 /// After the last read-back group, before the flight ends.
 const READ_END_US: u64 = 4 * S;
-/// The box: the vehicle may not go further than this from where it started,
-/// m, nor higher.
-pub const BOX_HORIZONTAL_M: f64 = 20.0;
-pub const BOX_UP_M: f64 = 30.0;
+/// The pack voltage under load is averaged over this long before the throttle
+/// goes low.
+pub const PACK_WINDOW_US: u64 = S;
 
 // ---- The names -------------------------------------------------------------
 
@@ -858,11 +864,43 @@ pub struct Stats {
     pub tune_max_horizontal_m: f64,
     pub tune_max_height_change_m: f64,
     pub tune_max_tilt_deg: f64,
-    /// The first time the vehicle was outside the box, s, if it was.
-    pub box_exit_s: Option<f64>,
+    /// The first time the flight was not class safe (ADR-0007 section 4), s,
+    /// if it was, and its class.
+    pub class_exit_s: Option<f64>,
+    /// The class of the flight so far (`None` before the first record).
+    pub class: Option<FlightClass>,
+    /// From the physics outcome (the gate's own): the furthest from where the
+    /// vehicle armed, m, the highest, m, and the largest tilt while armed,
+    /// deg.
+    pub furthest_from_home_m: f64,
+    pub highest_m: f64,
+    pub largest_tilt_deg: f64,
+    /// The downward speed at the first ground contact after the vehicle had
+    /// been in the air, and the greatest at any entry into contact, m/s.
+    pub touchdown_speed_mps: Option<f64>,
+    pub worst_impact_mps: Option<f64>,
+    /// The pack voltage under load, V, averaged over the last
+    /// [`PACK_WINDOW_US`] before the throttle went low.
+    pub pack_before_landing_v: Option<f64>,
 }
 
-/// Accumulates [`Stats`] and watches the box.
+/// The pack at one mark of the flight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PackAt {
+    pub t_s: f64,
+    pub volts: f64,
+    pub amps: f64,
+    pub state_of_charge: f64,
+}
+
+/// What a [`Tracker`] ends with: the stats, the track and the pack at the marks.
+type TrackerResult = (
+    Stats,
+    Vec<(f64, f64, f64, f64)>,
+    Vec<(&'static str, PackAt)>,
+);
+
+/// Accumulates [`Stats`] and watches the class.
 #[derive(Debug, Default)]
 struct Tracker {
     start: Option<Vec3<f64>>,
@@ -871,6 +909,27 @@ struct Tracker {
     tune_origin: Option<Vec3<f64>>,
     /// Flight time s, north, east, up in m from the start, every 10 s.
     track: Vec<(f64, f64, f64, f64)>,
+    /// The gate's own judgement of the flight (ADR-0007 section 4).
+    outcome: FlightOutcome,
+    /// The last [`PACK_WINDOW_US`] of (flight microseconds, pack volts).
+    volts: VecDeque<(u64, f64)>,
+    /// The pack at each mark, in the order the marks came.
+    pack: Vec<(&'static str, PackAt)>,
+}
+
+/// The marks the pack is reported at: a name and the flight time of the mark.
+fn pack_marks(m: &Marks) -> [(&'static str, Option<u64>); 6] {
+    [
+        ("hover reached", m.hover),
+        (
+            "spectrum window start",
+            m.hover.map(|h| h + (HOVER_S - SPECTRUM_S) * S),
+        ),
+        ("spectrum taken", m.spectrum),
+        ("AUTOTUNE start", m.autotune),
+        ("throttle low", m.throttle_low),
+        ("disarmed", m.disarmed),
+    ]
 }
 
 impl Tracker {
@@ -880,13 +939,61 @@ impl Tracker {
         Real::atan2(h, z.z).to_degrees()
     }
 
-    /// Adds a record; an error is the sentence of a box violation.
-    fn add(&mut self, r: &StepRecord<4>, m: &Marks) -> Result<(), String> {
+    /// Adds a record (`soc`: the pack's state of charge at it); an error is
+    /// the sentence of the flight leaving class safe.
+    fn add(&mut self, r: &StepRecord<4>, m: &Marks, soc: f64) -> Result<(), String> {
         let start = *self.start.get_or_insert(r.position);
         let d = r.position - start;
         let horizontal = Real::sqrt(d.x * d.x + d.y * d.y);
         let up = -d.z;
         let t_s = r.t.as_secs_f64();
+        self.outcome.add(r);
+        let class = self.outcome.class();
+        self.stats.class = Some(class);
+        self.stats.furthest_from_home_m = self.outcome.max_distance_from_home_m;
+        self.stats.highest_m = self.outcome.max_height_m;
+        self.stats.largest_tilt_deg = self.outcome.max_tilt_deg;
+        self.stats.touchdown_speed_mps = self.outcome.touchdown_speed_mps;
+        self.stats.worst_impact_mps = self.outcome.worst_impact_mps;
+        // The pack under load: the window before the throttle goes low, the
+        // sample of the tick itself not included.
+        if let Some(low) = m.throttle_low
+            && self.stats.pack_before_landing_v.is_none()
+        {
+            let from = low.saturating_sub(PACK_WINDOW_US);
+            let (sum, n) = self
+                .volts
+                .iter()
+                .filter(|(t, _)| *t >= from && *t < low)
+                .fold((0.0, 0u32), |(s, n), (_, v)| (s + v, n + 1));
+            if n > 0 {
+                self.stats.pack_before_landing_v = Some(sum / f64::from(n));
+            }
+        }
+        self.volts.push_back((r.t.0, r.battery_v));
+        while self
+            .volts
+            .front()
+            .is_some_and(|(t, _)| *t + 2 * PACK_WINDOW_US < r.t.0)
+        {
+            self.volts.pop_front();
+        }
+        for (name, at) in pack_marks(m) {
+            if let Some(at) = at
+                && r.t.0 >= at
+                && !self.pack.iter().any(|(n, _)| *n == name)
+            {
+                self.pack.push((
+                    name,
+                    PackAt {
+                        t_s,
+                        volts: r.battery_v,
+                        amps: r.battery_a,
+                        state_of_charge: soc,
+                    },
+                ));
+            }
+        }
         if horizontal > self.stats.max_horizontal_m {
             self.stats.max_horizontal_m = horizontal;
             self.stats.max_horizontal_at_s = t_s;
@@ -897,11 +1004,20 @@ impl Tracker {
             self.track.push((t_s, d.x, d.y, up));
         }
         let mut violation = None;
-        if (horizontal > BOX_HORIZONTAL_M || up > BOX_UP_M) && self.stats.box_exit_s.is_none() {
-            self.stats.box_exit_s = Some(t_s);
+        if class != FlightClass::Safe && self.stats.class_exit_s.is_none() {
+            self.stats.class_exit_s = Some(t_s);
             violation = Some(format!(
-                "the vehicle left the box ({BOX_HORIZONTAL_M} m out, {BOX_UP_M} m up) at flight \
-                 time {t_s:.3} s: {horizontal:.2} m from where it started, {up:.2} m up"
+                "the flight is not class safe (ADR-0007 section 4: no crash, never more than \
+                 {FLY_AWAY_DISTANCE_M} m from where it armed, never more than {FLY_AWAY_HEIGHT_M} m \
+                 high): class {class} at flight time {t_s:.3} s, {:.2} m from where it armed, \
+                 {:.2} m up, tilt up to {:.1} deg, touchdown speed {:?} m/s, worst impact {:?} m/s \
+                 (a crash is more than {CRASH_TOUCHDOWN_MPS} m/s or more than {CRASH_TILT_DEG} deg \
+                 of tilt while armed)",
+                self.outcome.max_distance_from_home_m,
+                self.outcome.max_height_m,
+                self.outcome.max_tilt_deg,
+                self.outcome.touchdown_speed_mps,
+                self.outcome.worst_impact_mps
             ));
         }
         if let Some(h0) = m.hover
@@ -924,7 +1040,7 @@ impl Tracker {
         violation.map_or(Ok(()), Err)
     }
 
-    fn finish(mut self) -> (Stats, Vec<(f64, f64, f64, f64)>) {
+    fn finish(mut self) -> TrackerResult {
         let n = self.hover_samples.len() as f64;
         if n > 0.0 {
             let mean = |f: fn(&(f64, f64, f64, f64)) -> f64| {
@@ -948,7 +1064,7 @@ impl Tracker {
             self.stats.hover_height_rms_m = Real::sqrt(height);
             self.stats.hover_tilt_rms_deg = Real::sqrt(tilt);
         }
-        (self.stats, self.track)
+        (self.stats, self.track, self.pack)
     }
 }
 
@@ -969,8 +1085,8 @@ pub struct FlightPlan {
     pub stop_after_hover: bool,
     /// How long AUTOTUNE is given, s ([`AUTOTUNE_S`] in the procedure).
     pub autotune_s: u64,
-    /// Whether leaving the box ends the flight (it does in the procedure).
-    pub enforce_box: bool,
+    /// Whether leaving class safe ends the flight (it does in the procedure).
+    pub enforce_class: bool,
 }
 
 /// What a flight left behind. `failure` is the sentence of a flight that
@@ -985,6 +1101,9 @@ pub struct FlightResult {
     pub commands: Vec<(u64, String)>,
     pub spectrum: Option<(Spectrum, Verdict)>,
     pub stats: Stats,
+    /// The pack at the marks of the flight: voltage under load, current and
+    /// state of charge.
+    pub pack: Vec<(&'static str, PackAt)>,
     /// Flight time s, then north, east and up in m from where the flight
     /// started, every 10 s.
     pub track: Vec<(f64, f64, f64, f64)>,
@@ -1061,8 +1180,9 @@ pub fn fly_flight(plan: &FlightPlan) -> Result<FlightResult, TuneError> {
         match sim.try_step() {
             Ok(r) => {
                 let marks = sim.autopilot().script.marks();
-                if let Err(e) = tracker.add(&r, &marks)
-                    && plan.enforce_box
+                let soc = sim.battery_state_of_charge();
+                if let Err(e) = tracker.add(&r, &marks, soc)
+                    && plan.enforce_class
                 {
                     failure = Some(e);
                     let now = sim.time().0;
@@ -1093,7 +1213,7 @@ pub fn fly_flight(plan: &FlightPlan) -> Result<FlightResult, TuneError> {
         ..
     } = tuner;
     let audit = inner.finish();
-    let (stats, track) = tracker.finish();
+    let (stats, track, pack) = tracker.finish();
     if let Some(e) = error {
         return Err(TuneError::Flight(e.to_string()));
     }
@@ -1106,6 +1226,7 @@ pub fn fly_flight(plan: &FlightPlan) -> Result<FlightResult, TuneError> {
         commands,
         spectrum,
         stats,
+        pack,
         track,
         sim_s,
         wall_s: wall.elapsed().as_secs_f64(),
@@ -1167,10 +1288,23 @@ pub fn read_back(r: &FlightResult) -> (BTreeMap<String, f32>, BTreeMap<String, f
 /// The tuner's messages the check wants, as the program printed them.
 pub const AXES: [&str; 3] = ["Roll", "Pitch", "Yaw"];
 
+/// The gate's low-battery threshold, V: the runner's `BATT_LOW_VOLT` (a pilot
+/// lands before the low-battery alarm).
+pub fn low_battery_volt() -> f64 {
+    crate::runner::battery_low_volt()
+}
+
 /// The check on a finished procedure's texts and read-back: the tuner's
-/// success message for each axis and its saved-gains message, and a value for
-/// every name of [`GAIN_NAMES`]. An error is a sentence.
-pub fn check(texts: &[(f64, String)], after: &BTreeMap<String, f32>) -> Result<(), String> {
+/// success message for each axis and its saved-gains message, a value for
+/// every name of [`GAIN_NAMES`], and the pack: its voltage under load,
+/// averaged over the last second before the throttle went low
+/// (`pack_before_landing_v`), above `low_battery_v`. An error is a sentence.
+pub fn check(
+    texts: &[(f64, String)],
+    after: &BTreeMap<String, f32>,
+    pack_before_landing_v: Option<f64>,
+    low_battery_v: f64,
+) -> Result<(), String> {
     for axis in AXES {
         // The yaw axis names its stage: "AutoTune: Yaw(E) complete".
         let head = format!("AutoTune: {axis}");
@@ -1203,35 +1337,55 @@ pub fn check(texts: &[(f64, String)], after: &BTreeMap<String, f32>) -> Result<(
             missing.join(", ")
         ));
     }
-    Ok(())
+    match pack_before_landing_v {
+        None => Err("the pack voltage before the landing was not measured".into()),
+        Some(v) if v.is_nan() || low_battery_v.is_nan() || v <= low_battery_v => Err(format!(
+            "the pack voltage under load, averaged over the last second before the throttle went \
+             low, was {v:.3} V: not above the low-battery threshold {low_battery_v:.3} V (the \
+             vehicle landed on a pack that was too empty)"
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
-/// The text of `tuned-gains.parm`: a header that says where it came from, and
-/// every name of the read-back with its value as the program reported it (the
+/// The text of `tuned-gains.parm`: a header that says what made it, and every
+/// name of the read-back with its value as the program reported it (the
 /// shortest decimal that gives the same 32-bit float), sorted by name, one
 /// per line.
+///
+/// The header holds nothing that differs between runs of the same procedure
+/// (no commit, no wall time), so a fresh run writes the committed file byte
+/// for byte, header included.
 pub fn tuned_file(
     after: &BTreeMap<String, f32>,
-    commit: &str,
+    binary_version: &str,
     binary_sha256: &str,
     seed: u64,
+    flight_s: f64,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "# ArduCopter V4.7.2 parameters after the tuning of ADR-0007 section 2."
+        "# ArduCopter {binary_version} parameters after the tuning of ADR-0007 section 2."
     );
     let _ = writeln!(
         s,
-        "# The output of `oxide-bridge tune` (crates/oxide-bridge/src/tune.rs): the"
+        "# Written by `oxide-bridge tune --seed {seed}` (crates/oxide-bridge/src/tune.rs): the"
     );
     let _ = writeln!(
         s,
         "# values read back from the program after the automatic tuner saved its gains."
     );
-    let _ = writeln!(s, "# commit {commit}");
     let _ = writeln!(s, "# binary sha256 {binary_sha256}");
     let _ = writeln!(s, "# seed {seed}");
+    let _ = writeln!(
+        s,
+        "# simulated flight time of the procedure {flight_s:.3} s"
+    );
+    let _ = writeln!(
+        s,
+        "# Never edited by hand: a test flies the procedure again and compares."
+    );
     for (name, value) in after {
         let _ = writeln!(s, "{name} {value}");
     }
@@ -1300,7 +1454,7 @@ pub fn hover_check(
         stop_on_peak: false,
         stop_after_hover: true,
         autotune_s: AUTOTUNE_S,
-        enforce_box: true,
+        enforce_class: true,
     })?;
     let cfg = TuneConfig {
         binary: binary.to_path_buf(),
@@ -1348,7 +1502,7 @@ pub fn tune(cfg: &TuneConfig) -> Result<Outcome, TuneError> {
         stop_on_peak: true,
         stop_after_hover: false,
         autotune_s: AUTOTUNE_S,
-        enforce_box: true,
+        enforce_class: true,
     };
     let mut notch_reference = None;
     for n in 1..=2 {
@@ -1398,10 +1552,22 @@ pub fn tune(cfg: &TuneConfig) -> Result<Outcome, TuneError> {
     let texts_all = texts(&last.audit);
     let mut problem = last.failure.clone();
     if problem.is_none() {
-        problem = check(&texts_all, &after).err();
+        problem = check(
+            &texts_all,
+            &after,
+            last.stats.pack_before_landing_v,
+            low_battery_volt(),
+        )
+        .err();
     }
-    let commit = env!("OXIDE_GIT_HASH");
-    let tuned = tuned_file(&after, commit, &last.audit.binary_sha256, cfg.seed);
+    let flight_s: f64 = flights.iter().map(|f| f.sim_s).sum();
+    let tuned = tuned_file(
+        &after,
+        crate::sitl::PINNED.version,
+        &last.audit.binary_sha256,
+        cfg.seed,
+        flight_s,
+    );
     let report = report_text(
         cfg,
         &flights,
@@ -1479,6 +1645,21 @@ fn report_text(
             );
         }
     }
+    let _ = writeln!(
+        s,
+        "  the tuner's settings as read back from the program: {}",
+        DEFAULT_NAMES
+            .iter()
+            .filter(|n| n.starts_with("AUTOTUNE_"))
+            .map(|n| format!(
+                "{n} {}",
+                before
+                    .get(*n)
+                    .map_or_else(|| "-".to_string(), ToString::to_string)
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let sim: f64 = flights.iter().map(|f| f.sim_s).sum();
     let _ = writeln!(
         s,
@@ -1535,7 +1716,7 @@ fn report_text(
         let st = &f.stats;
         let _ = writeln!(
             s,
-            "  box: furthest {:.2} m out (at {:.1} s), highest {:.2} m; hover (last {QUALITY_S} s): tilt rms {:.3} deg, \
+            "  furthest {:.2} m out (at {:.1} s), highest {:.2} m; hover (last {QUALITY_S} s): tilt rms {:.3} deg, \
              position rms {:.3} m about its mean, height rms {:.3} m; in AUTOTUNE: furthest {:.2} m from where it began, \
              height change up to {:.2} m, tilt up to {:.2} deg",
             st.max_horizontal_m,
@@ -1548,13 +1729,54 @@ fn report_text(
             st.tune_max_height_change_m,
             st.tune_max_tilt_deg
         );
-        match st.box_exit_s {
-            Some(t) => {
-                let _ = writeln!(s, "  the vehicle first left the box at {t:.3} s");
+        let _ = writeln!(
+            s,
+            "  physics outcome (the gate's own): furthest from where it armed {:.2} m (limit {FLY_AWAY_DISTANCE_M} m), \
+             highest {:.2} m (limit {FLY_AWAY_HEIGHT_M} m), largest tilt while armed {:.2} deg, \
+             touchdown speed {:?} m/s, worst impact {:?} m/s",
+            st.furthest_from_home_m,
+            st.highest_m,
+            st.largest_tilt_deg,
+            st.touchdown_speed_mps,
+            st.worst_impact_mps
+        );
+        match (st.class_exit_s, st.class) {
+            (Some(t), Some(c)) => {
+                let _ = writeln!(
+                    s,
+                    "  the flight first left class safe at {t:.3} s (class {c})"
+                );
+            }
+            (None, Some(c)) => {
+                let _ = writeln!(s, "  class of the flight: {c}");
+            }
+            _ => {}
+        }
+        match st.pack_before_landing_v {
+            Some(v) => {
+                let _ = writeln!(
+                    s,
+                    "  pack voltage under load, mean of the last second before the throttle went low: {v:.3} V (the low-battery threshold is {:.3} V)",
+                    low_battery_volt()
+                );
             }
             None => {
-                let _ = writeln!(s, "  the vehicle stayed inside the box");
+                let _ = writeln!(s, "  pack voltage before the landing: not measured");
             }
+        }
+        let _ = writeln!(
+            s,
+            "  pack at the marks (flight time; voltage under load, current, state of charge):"
+        );
+        for (name, p) in &f.pack {
+            let _ = writeln!(
+                s,
+                "    {name:<22} {:9.3} s  {:6.3} V  {:5.2} A  {:5.1} %",
+                p.t_s,
+                p.volts,
+                p.amps,
+                100.0 * p.state_of_charge
+            );
         }
         let _ = writeln!(
             s,
@@ -1893,9 +2115,10 @@ mod tests {
 
     #[test]
     fn the_script_flies_its_stages_at_the_times_it_states() {
-        let sc = Script::new(true, false, 900);
+        assert_eq!(AUTOTUNE_S, 480, "ADR-0007 section 2: the wait is 480 s");
+        let sc = Script::new(true, false, AUTOTUNE_S);
         let arm = sc.marks().arm;
-        let run = drive(sc, false, Some(1_000 * S));
+        let run = drive(sc, false, Some(600 * S));
         assert!(run.error.is_none(), "{:?}", run.error);
         // The mode command: ALT_HOLD once at 2 s; AUTOTUNE once, 61 s after
         // the hover began.
@@ -1916,7 +2139,7 @@ mod tests {
             "{hover_at}"
         );
         // The spectrum is taken 60 s into the hover, the tuner started 1 s
-        // after, and the throttle goes low 900 s after.
+        // after, and the throttle goes low 480 s after.
         assert_eq!(run.analysed, vec![hover_at + HOVER_S * S]);
         assert_eq!(m[1], (hover_at + (HOVER_S + 1) * S, 15));
         let low = hover_at + (HOVER_S + 1 + AUTOTUNE_S) * S;
@@ -1930,23 +2153,23 @@ mod tests {
         assert!(run.reads.iter().all(|(_, g)| g.len() <= READ_GROUP));
         let asked: Vec<&str> = before.iter().flat_map(|(_, g)| g.iter().copied()).collect();
         assert_eq!(asked, before_names());
-        // After the disarm (1000 s): nothing read between the throttle going
+        // After the disarm (600 s): nothing read between the throttle going
         // low and 5 s after the pulses said disarmed; then the five groups.
         let after: Vec<_> = run.reads.iter().filter(|(t, _)| *t > low).collect();
         assert!(
             after
                 .iter()
                 .filter(|(t, _)| *t > hover_at + 100 * S)
-                .all(|(t, _)| *t >= 1_005 * S),
+                .all(|(t, _)| *t >= 605 * S),
             "{after:?}"
         );
         let names: Vec<&str> = after.iter().flat_map(|(_, g)| g.iter().copied()).collect();
         assert_eq!(names, GAIN_NAMES.to_vec());
-        assert_eq!(after[0].0, 1_005 * S);
+        assert_eq!(after[0].0, 605 * S);
         for w in after.windows(2) {
             assert_eq!(w[1].0 - w[0].0, S);
         }
-        assert_eq!(run.end, Some(1_005 * S + 5 * S + READ_END_US));
+        assert_eq!(run.end, Some(605 * S + 5 * S + READ_END_US));
     }
 
     #[test]
@@ -1972,7 +2195,7 @@ mod tests {
 
     #[test]
     fn a_peak_lands_and_ends_the_first_flight_and_a_hover_check_ends_at_the_spectrum() {
-        let run = drive(Script::new(true, false, 900), true, Some(200 * S));
+        let run = drive(Script::new(true, false, AUTOTUNE_S), true, Some(200 * S));
         assert!(run.error.is_none(), "{:?}", run.error);
         assert_eq!(
             run.modes.len(),
@@ -1996,7 +2219,7 @@ mod tests {
         let run = drive(Script::new(false, false, 5), true, Some(400 * S));
         assert_eq!(run.modes.len(), 2);
         // A hover check ends after the spectrum.
-        let run = drive(Script::new(false, true, 900), false, None);
+        let run = drive(Script::new(false, true, AUTOTUNE_S), false, None);
         assert_eq!(run.modes.len(), 1);
         assert!(run.end.expect("ends") - run.analysed[0] <= S);
     }
@@ -2061,7 +2284,8 @@ mod tests {
 
     #[test]
     fn the_check_wants_every_axis_the_success_the_save_and_every_value() {
-        assert_eq!(check(&texts_ok(), &all_gains()), Ok(()));
+        let low = 20.767;
+        assert_eq!(check(&texts_ok(), &all_gains(), Some(21.5), low), Ok(()));
         for missing in [
             "AutoTune: Roll complete",
             "AutoTune: Pitch complete",
@@ -2073,13 +2297,13 @@ mod tests {
                 .into_iter()
                 .filter(|(_, x)| x != missing)
                 .collect();
-            let e = check(&t, &all_gains()).expect_err(missing);
+            let e = check(&t, &all_gains(), Some(21.5), low).expect_err(missing);
             assert!(e.contains("did not print"), "{e}");
         }
         for name in GAIN_NAMES {
             let mut g = all_gains();
             g.remove(name);
-            let e = check(&texts_ok(), &g).expect_err(name);
+            let e = check(&texts_ok(), &g, Some(21.5), low).expect_err(name);
             assert!(e.contains(name), "{e}");
         }
         // The tuner started and stopped is not a success.
@@ -2087,7 +2311,7 @@ mod tests {
             (0.0, "AutoTune: Started".to_string()),
             (1.0, "AutoTune: Stopped".to_string()),
         ];
-        assert!(check(&t, &all_gains()).is_err());
+        assert!(check(&t, &all_gains(), Some(21.5), low).is_err());
     }
 
     #[test]
@@ -2103,17 +2327,23 @@ mod tests {
         ] {
             g.insert(n.to_string(), v);
         }
-        let text = tuned_file(&g, "abc123", "ff00", 7);
+        let text = tuned_file(&g, "V4.7.2", "ff00", 7, 1022.5);
         let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
         let mut sorted = lines.clone();
         sorted.sort_unstable();
         assert_eq!(lines, sorted, "sorted by name");
         assert!(
-            text.contains("# commit abc123")
-                && text.contains("# binary sha256 ff00")
+            text.contains("# binary sha256 ff00")
                 && text.contains("# seed 7")
+                && text.contains("ArduCopter V4.7.2")
+                && text.contains("simulated flight time of the procedure 1022.500 s")
+                && text.contains("Never edited by hand")
         );
-        assert!(text.contains("oxide-bridge tune"));
+        assert!(text.contains("`oxide-bridge tune --seed 7`"));
+        assert!(
+            !text.contains("commit"),
+            "nothing that differs between runs"
+        );
         let parsed = parm::parse(&text).expect("it is a parameter file");
         assert_eq!(parsed.len(), g.len());
         for (n, v) in parsed {
@@ -2125,6 +2355,148 @@ mod tests {
         assert!(text.contains("ATC_ACC_P_MAX 4839.1997\n"), "{text}");
         assert!(text.contains("ATC_RAT_RLL_P 0.05499008\n"), "{text}");
         assert!(text.contains("ATC_RAT_YAW_FLTE 5\n"), "{text}");
+    }
+
+    fn rec(t_s: f64, north: f64, up: f64, volts: f64, armed: bool) -> StepRecord<4> {
+        StepRecord {
+            t: Micros((t_s * 1e6).round() as u64),
+            position: Vec3::new(north, 0.0, -up),
+            velocity: Vec3::zero(),
+            attitude: oxide_core::math::Quat::identity(),
+            rate: Vec3::zero(),
+            motors: [0.2; 4],
+            rotor_speed: [0.0; 4],
+            battery_v: volts,
+            battery_a: 8.0,
+            armed,
+            setpoint: None,
+            wind: Vec3::zero(),
+            physics_faults: 0,
+            core: None,
+        }
+    }
+
+    #[test]
+    fn the_flight_is_stopped_by_the_gates_class_limits_and_not_before() {
+        let marks = Marks::default();
+        // Just inside the fly-away limits: still safe, no violation.
+        let mut t = Tracker::default();
+        t.add(&rec(0.0, 0.0, 0.0, 25.0, false), &marks, 1.0)
+            .expect("ground");
+        t.add(&rec(1.0, 0.0, 10.0, 25.0, true), &marks, 1.0)
+            .expect("armed");
+        t.add(
+            &rec(
+                2.0,
+                FLY_AWAY_DISTANCE_M - 0.5,
+                FLY_AWAY_HEIGHT_M - 0.5,
+                25.0,
+                true,
+            ),
+            &marks,
+            1.0,
+        )
+        .expect("inside the limits of the gate's class");
+        assert_eq!(t.stats.class, Some(FlightClass::Safe));
+        assert_eq!(t.stats.class_exit_s, None);
+        // 150 m out: not safe, a sentence that names the class and the time.
+        let e = t
+            .add(&rec(3.0, 150.0, 10.0, 25.0, true), &marks, 1.0)
+            .expect_err("150 m out is a fly-away");
+        assert!(e.contains("class fly-away at flight time 3.000 s"), "{e}");
+        assert!(e.contains("150.00 m from where it armed"), "{e}");
+        assert_eq!(t.stats.class_exit_s, Some(3.0));
+        // The limit applies to the height, too.
+        let mut t = Tracker::default();
+        t.add(&rec(0.0, 0.0, 0.0, 25.0, false), &marks, 1.0)
+            .expect("ground");
+        t.add(&rec(1.0, 0.0, 0.0, 25.0, true), &marks, 1.0)
+            .expect("armed");
+        let e = t
+            .add(
+                &rec(2.0, 0.0, FLY_AWAY_HEIGHT_M + 1.0, 25.0, true),
+                &marks,
+                1.0,
+            )
+            .expect_err("61 m up");
+        assert!(e.contains("class fly-away"), "{e}");
+        // Only the first crossing is reported.
+        assert!(t.add(&rec(3.0, 0.0, 70.0, 25.0, true), &marks, 1.0).is_ok());
+    }
+
+    #[test]
+    fn the_pack_is_the_mean_voltage_of_the_second_before_the_throttle_went_low() {
+        let mut t = Tracker::default();
+        let mut m = Marks::default();
+        // 2 s at 22.0 V, then 1 s (until the throttle goes low) at 21.0 V
+        // with a dip in the first half of that second, then 19 V (after the
+        // landing began, and at the disarm).
+        for i in 0..4000u64 {
+            let ts = i as f64 * 0.001;
+            let v = if ts < 2.0 {
+                22.0
+            } else if ts < 3.0 {
+                21.0
+            } else {
+                19.0
+            };
+            if i == 3000 {
+                m.throttle_low = Some(3_000_000);
+            }
+            if i == 3900 {
+                m.disarmed = Some(3_900_000);
+            }
+            t.add(&rec(ts, 0.0, 5.0, v, true), &m, 0.5).expect("safe");
+        }
+        let v = t.stats.pack_before_landing_v.expect("measured");
+        assert!(
+            (v - 21.0).abs() < 1e-9,
+            "{v}: the second before the throttle went low"
+        );
+        // The pack at the marks: the voltage at the disarm is another one.
+        let disarmed = t
+            .pack
+            .iter()
+            .find(|(n, _)| *n == "disarmed")
+            .expect("mark")
+            .1;
+        assert_eq!(disarmed.volts, 19.0);
+        assert!((disarmed.t_s - 3.9).abs() < 1e-9);
+        let low = t
+            .pack
+            .iter()
+            .find(|(n, _)| *n == "throttle low")
+            .expect("mark")
+            .1;
+        assert_eq!(low.state_of_charge, 0.5);
+        assert_eq!(low.amps, 8.0);
+        // Not measured while the throttle has not gone low.
+        let mut t = Tracker::default();
+        t.add(&rec(0.0, 0.0, 5.0, 22.0, true), &Marks::default(), 1.0)
+            .expect("safe");
+        assert_eq!(t.stats.pack_before_landing_v, None);
+    }
+
+    #[test]
+    fn a_pack_that_is_not_above_the_low_battery_threshold_before_the_landing_fails_the_check() {
+        let low = low_battery_volt();
+        assert!(
+            (low - 20.767).abs() < 0.001,
+            "the runner's BATT_LOW_VOLT: {low}"
+        );
+        assert_eq!(
+            check(&texts_ok(), &all_gains(), Some(low + 0.01), low),
+            Ok(())
+        );
+        for v in [low, low - 0.5, 17.7, f64::NAN] {
+            let e = check(&texts_ok(), &all_gains(), Some(v), low).expect_err("too empty");
+            assert!(
+                e.contains("pack voltage under load") && e.contains("low-battery threshold"),
+                "{e}"
+            );
+        }
+        let e = check(&texts_ok(), &all_gains(), None, low).expect_err("not measured");
+        assert!(e.contains("not measured"), "{e}");
     }
 
     /// The decision path never reads what came from MAVLink, and takes the

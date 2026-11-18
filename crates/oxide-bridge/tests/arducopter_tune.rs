@@ -66,7 +66,7 @@ fn plan(root: &Path, instance: u8, seed: u64, stop_after_hover: bool) -> FlightP
         stop_after_hover,
         autotune_s: AUTOTUNE_S,
         // The tuner is let run to its end where a test says so.
-        enforce_box: stop_after_hover,
+        enforce_class: stop_after_hover,
     }
 }
 
@@ -87,7 +87,7 @@ fn the_hover_learns_the_thrust_and_the_spectrum_has_no_peak() {
     let lease = Instance::lease();
     let root = TempDir::new("hover");
     let mut p = plan(root.path(), lease.0, 0, true);
-    p.enforce_box = false;
+    p.enforce_class = false;
     let f = tune::fly_flight(&p).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(f.failure, None);
     let m = f.marks;
@@ -250,7 +250,14 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
     assert_eq!(saved, at("Disarming motors"));
     let low = ra.marks.throttle_low.expect("throttle low") as f64 * 1e-6;
     assert!((saved - low - 7.2).abs() < 0.3, "{saved} {low}");
-    assert_eq!(tune::check(&tune::texts(&ra.audit), &after), Ok(()));
+    println!(
+        "MEASURED pack {:?}, pack before landing {:?}, stats {:?}",
+        ra.pack, ra.stats.pack_before_landing_v, ra.stats
+    );
+    assert_eq!(
+        tune::check(&tune::texts(&ra.audit), &after, None, 0.0).expect_err("no pack"),
+        "the pack voltage before the landing was not measured"
+    );
     // The gains after the save, as the program reported them.
     println!("MEASURED gains after: {after:?}");
     let g = |n: &str| f64::from(after[n]);
@@ -264,27 +271,76 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
     assert!((g("ATC_ACC_P_MAX") - 5008.833).abs() < 0.01);
     assert!((g("ATC_ACC_Y_MAX") - 206.292_11).abs() < 0.01);
     assert_eq!(g("ATC_RAT_YAW_FLTE"), 5.0);
-    assert!((g("MOT_THST_HOVER") - 0.182_423_79).abs() < 1e-6);
+    // The thrust the program learned in the hover and kept: with the wait
+    // of 480 s the vehicle lands on a pack with charge left (it was 0.1824,
+    // an artefact of landing on an empty pack, after 900 s).
+    assert!((g("MOT_THST_HOVER") - 0.149_965_4).abs() < 1e-6);
     // The gains the tuner started from are the starting gains.
     assert_eq!(before["ATC_RAT_RLL_P"], 0.05);
-    // The vehicle left the box: how far and when.
-    let exit = ra.stats.box_exit_s.expect("the vehicle left the box");
-    assert!((exit - 135.3095).abs() < 1e-3, "{exit}");
+    assert_eq!(GAIN_NAMES.len(), after.len());
+    // The tuner needed 438.8 s of its 480 s (started 85.762, success 524.564)
+    // and the throttle went low at 565.760 s.
+    assert!(yaw - started < AUTOTUNE_S as f64, "{}", yaw - started);
+    assert_eq!(ra.marks.throttle_low, Some(565_759_500));
+    // The pack, with the class not enforced: the voltage under load over the
+    // last second before the throttle went low is above the gate's
+    // low-battery threshold, and the state of charge at each mark.
+    let pack = ra.stats.pack_before_landing_v.expect("pack measured");
+    assert!((pack - 21.6549).abs() < 0.001, "{pack}");
+    assert!(pack > tune::low_battery_volt());
+    assert_eq!(
+        tune::check(
+            &tune::texts(&ra.audit),
+            &after,
+            Some(pack),
+            tune::low_battery_volt()
+        ),
+        Ok(())
+    );
+    let soc = |name: &str| {
+        ra.pack
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect(name)
+            .1
+            .state_of_charge
+    };
+    assert!((soc("hover reached") - 0.9876).abs() < 0.001);
+    assert!((soc("AUTOTUNE start") - 0.8991).abs() < 0.001);
+    assert!((soc("throttle low") - 0.1454).abs() < 0.001);
+    assert!((soc("disarmed") - 0.1377).abs() < 0.001);
+    // The class: the vehicle stays inside the limits of the gate's class
+    // (furthest 26.78 m out, highest 10.65 m, tilt up to 15.6 deg) and lands
+    // at 2.481 m/s, which the gate's own rule calls a crash (more than
+    // 2.0 m/s): the throttle stick low in AUTOTUNE descends at the program's
+    // PILOT_SPEED_DN, 2.5 m/s.
     assert!(
-        (ra.stats.max_horizontal_m - 35.02).abs() < 0.05,
+        (ra.stats.furthest_from_home_m - 26.78).abs() < 0.05,
         "{:?}",
         ra.stats
     );
-    assert!(ra.stats.max_up_m < 11.2, "{:?}", ra.stats);
-    assert_eq!(GAIN_NAMES.len(), after.len());
+    assert!((ra.stats.highest_m - 10.65).abs() < 0.05, "{:?}", ra.stats);
+    assert!(
+        (ra.stats.largest_tilt_deg - 15.58).abs() < 0.05,
+        "{:?}",
+        ra.stats
+    );
+    let touchdown = ra.stats.touchdown_speed_mps.expect("it came down");
+    assert!((touchdown - 2.4809).abs() < 0.001, "{touchdown}");
+    assert_eq!(ra.stats.class, Some(oxide_sim::outcome::FlightClass::Crash));
+    let exit = ra.stats.class_exit_s.expect("not safe at the touchdown");
+    assert!((exit - 570.8135).abs() < 1e-3, "{exit}");
 }
 
-/// The procedure as the command runs it: the vehicle leaves the 20 m box in
-/// ALT_HOLD at 135.309 s, the flight stops, the report says what happened and
-/// what the gains were at that moment, and no `tuned-gains.parm` is written.
+/// The procedure as the command runs it, on the specification as it stands
+/// (ADR-0007 section 2): the tuner succeeds in 438.8 s of its 480 s and the
+/// pack is at 21.65 V before the landing, but the landing itself is a crash by
+/// the gate's class (touchdown at 2.481 m/s, more than 2.0 m/s). The flight is
+/// stopped at the touchdown, the report says what happened, and no
+/// `tuned-gains.parm` is written.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
-fn the_procedure_stops_when_the_vehicle_leaves_the_box_and_writes_no_tuned_file() {
+fn the_procedure_fails_its_class_check_at_the_touchdown_and_writes_no_tuned_file() {
     let lease = Instance::lease();
     let out = TempDir::new("proc");
     let err = tune::tune(&TuneConfig {
@@ -293,19 +349,25 @@ fn the_procedure_stops_when_the_vehicle_leaves_the_box_and_writes_no_tuned_file(
         instance: lease.0,
         seed: 0,
     })
-    .expect_err("the vehicle leaves the box");
+    .expect_err("the touchdown is a crash by the gate's class");
     let TuneError::Failed(why) = &err else {
         panic!("{err}");
     };
     assert!(
-        why.contains("the vehicle left the box (20 m out, 30 m up) at flight time 135.30"),
+        why.contains("class crash at flight time 570.813 s, 26.78 m from where it armed"),
         "{why}"
     );
+    assert!(why.contains("touchdown speed Some(2.48"), "{why}");
     assert!(!out.path().join("tuned-gains.parm").exists());
     let report = std::fs::read_to_string(out.path().join("report.txt")).expect("report");
     assert!(report.contains("RESULT: FAILED"), "{report}");
     assert!(report.contains("AutoTune: Started"));
+    assert!(report.contains("AutoTune: Success"));
     assert!(report.contains("as read at the moment the flight was stopped"));
+    assert!(report.contains(
+        "pack voltage under load, mean of the last second before the throttle went low: 21.655 V"
+    ));
+    assert!(report.contains("AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 7, AUTOTUNE_MIN_D 0.0005"));
     let spectrum = std::fs::read_to_string(out.path().join("spectrum.csv")).expect("spectrum");
     assert_eq!(spectrum.lines().count(), 1 + 513);
     assert!(spectrum.starts_with("freq_hz,gyro_x_rad_s"));
