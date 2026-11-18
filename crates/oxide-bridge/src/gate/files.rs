@@ -431,8 +431,8 @@ mod tests {
     /// reconstruction here is the runner's.
     #[test]
     fn the_expected_parameter_hash_is_the_one_real_flights_recorded() {
-        let plain = "ae053345c56fec2f82cd84e28af2d5341fb55be0cf21469b03078b8f01b77cbd";
-        let fenced = "f53ea72f74f2ceabae9cea13f4b68af6756aa82ce0f30570356e95581596fd27";
+        let plain = "8db5323869d2895814634b63e9890f40738e0241c0801a65079ed8f70c479017";
+        let fenced = "2fae2241d0c105580e781cbea337071e2f87cd1ce9e36795a090a4eceb464b62";
         for s in ["gps-loss", "gust-hold", "battery-low"] {
             assert_eq!(expected_params_sha256(s).as_deref(), Ok(plain), "{s}");
         }

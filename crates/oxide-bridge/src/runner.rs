@@ -231,12 +231,14 @@ impl Recorder {
 }
 
 /// What every bridged flight is given, whatever the scenario: the committed
-/// files (`base.parm`, `starting-gains.parm`, `failsafes.parm`) and our core's
+/// files (`base.parm`, `setup.parm`, `tuned-gains.parm`, `failsafes.parm`, in
+/// this order; the starting gains are the tuning flights' own) and our core's
 /// battery thresholds as ArduCopter's own ([`battery_failsafe_params`]).
 pub fn committed_params(airframe: &Airframe) -> (Vec<PathBuf>, Vec<(String, f64)>) {
     let files = vec![
         parm::base_path(),
-        parm::starting_gains_path(),
+        parm::setup_path(),
+        parm::tuned_gains_path(),
         parm::failsafes_path(),
     ];
     let cells = u8::try_from(airframe.battery.cells).unwrap_or(u8::MAX);
@@ -569,7 +571,8 @@ mod tests {
             names,
             [
                 "base.parm",
-                "starting-gains.parm",
+                "setup.parm",
+                "tuned-gains.parm",
                 "failsafes.parm",
                 "mine.parm"
             ]

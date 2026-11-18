@@ -14,11 +14,16 @@ pub const BASE: &str = include_str!("../arducopter/base.parm");
 /// `arducopter/setup.parm`: the settings of ArduPilot's tuning guide that are
 /// not in `base.parm`.
 pub const SETUP: &str = include_str!("../arducopter/setup.parm");
-/// `arducopter/starting-gains.parm`: the hand step before the tuner.
+/// `arducopter/starting-gains.parm`: the hand step before the tuner. Flown by
+/// the tuning flights only.
 pub const STARTING_GAINS: &str = include_str!("../arducopter/starting-gains.parm");
+/// `arducopter/tuned-gains.parm`: what `oxide-bridge tune` wrote after the
+/// automatic tuner saved its gains (ADR-0007 section 2). Never edited by hand.
+pub const TUNED_GAINS: &str = include_str!("../arducopter/tuned-gains.parm");
 /// `arducopter/failsafes.parm`: ADR-0007 section 3, each failsafe switched on
 /// with its usual action. Not in the default file list of
-/// [`crate::arducopter::ArduCopterConfig::new`]: a flight takes it on request.
+/// [`crate::arducopter::ArduCopterConfig::new`]: a flight takes it on request
+/// (every bridged flight of the runner does).
 pub const FAILSAFES: &str = include_str!("../arducopter/failsafes.parm");
 
 /// The text of the committed file called `name` as this program was built
@@ -28,6 +33,7 @@ pub fn embedded(name: &str) -> Option<&'static str> {
         "base.parm" => Some(BASE),
         "setup.parm" => Some(SETUP),
         "starting-gains.parm" => Some(STARTING_GAINS),
+        "tuned-gains.parm" => Some(TUNED_GAINS),
         "failsafes.parm" => Some(FAILSAFES),
         _ => None,
     }
@@ -47,6 +53,11 @@ pub fn setup_path() -> PathBuf {
 /// from.
 pub fn starting_gains_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/starting-gains.parm")
+}
+
+/// The path of `tuned-gains.parm` in the source tree this crate was built from.
+pub fn tuned_gains_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/tuned-gains.parm")
 }
 
 /// The path of `failsafes.parm` in the source tree this crate was built from.
@@ -127,9 +138,54 @@ mod tests {
             STARTING_GAINS
         );
         assert_eq!(
+            std::fs::read_to_string(tuned_gains_path()).expect("tuned"),
+            TUNED_GAINS
+        );
+        assert_eq!(
             std::fs::read_to_string(failsafes_path()).expect("failsafes"),
             FAILSAFES
         );
+    }
+
+    #[test]
+    fn every_name_of_the_starting_gains_is_in_the_tuned_file_so_that_replacing_loses_nothing() {
+        let tuned: BTreeMap<String, f64> = parse(TUNED_GAINS)
+            .expect("tuned parses")
+            .into_iter()
+            .collect();
+        for (name, _) in parse(STARTING_GAINS).expect("gains") {
+            assert!(
+                tuned.contains_key(&name),
+                "{name} is not in tuned-gains.parm"
+            );
+        }
+        assert_eq!(tuned.len(), crate::tune::GAIN_NAMES.len());
+        for n in crate::tune::GAIN_NAMES {
+            assert!(tuned.contains_key(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn no_name_is_in_both_setup_and_base_with_another_value_and_the_tuned_file_comes_after_setup() {
+        let base: BTreeMap<String, f64> = parse(BASE).expect("base").into_iter().collect();
+        for (name, value) in parse(SETUP).expect("setup") {
+            if let Some(b) = base.get(&name) {
+                assert_eq!(*b, value, "{name} is in base.parm and setup.parm");
+            }
+        }
+        // The tuner changes ATC_RAT_YAW_FLTE, which the set-up file sets: the
+        // later file wins, so the order of the flown list matters.
+        let setup: BTreeMap<String, f64> = parse(SETUP).expect("setup").into_iter().collect();
+        let tuned: BTreeMap<String, f64> = parse(TUNED_GAINS).expect("tuned").into_iter().collect();
+        assert_ne!(setup.get("ATC_RAT_YAW_FLTE"), tuned.get("ATC_RAT_YAW_FLTE"));
+        let airframe = oxide_sim::Airframe::reference_quad().expect("airframe");
+        let names: Vec<String> = crate::runner::committed_params(&airframe)
+            .0
+            .iter()
+            .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+            .collect();
+        let at = |n: &str| names.iter().position(|m| m == n).expect(n);
+        assert!(at("setup.parm") < at("tuned-gains.parm"));
     }
 
     #[test]

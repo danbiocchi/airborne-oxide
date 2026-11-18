@@ -311,7 +311,9 @@ pub struct ArduCopterConfig {
 }
 
 impl ArduCopterConfig {
-    /// The default setup: both committed parameter files, the brain on
+    /// The default setup: the committed parameter files of the gains
+    /// (`base.parm`, `setup.parm`, `tuned-gains.parm`; the failsafes and the
+    /// battery thresholds are given by the runner), the brain on
     /// serial 1, the GPS error ours, `SYSTEM_TIME` at 10 Hz and
     /// `LOCAL_POSITION_NED` at 10 Hz requested 2 s into the pre-roll.
     pub fn new(binary: impl Into<PathBuf>, root: impl Into<PathBuf>, instance: u8) -> Self {
@@ -321,7 +323,11 @@ impl ArduCopterConfig {
             flight_name: None,
             instance,
             speedup: 100,
-            param_files: vec![parm::base_path(), parm::starting_gains_path()],
+            param_files: vec![
+                parm::base_path(),
+                parm::setup_path(),
+                parm::tuned_gains_path(),
+            ],
             extra_params: Vec::new(),
             seed: 0,
             gps_error: GpsError::ours(),

@@ -1,0 +1,36 @@
+# ArduCopter parameters after the tuning of ADR-0007 section 2.
+# Written by `oxide-bridge tune --seed 0` (crates/oxide-bridge/src/tune.rs): the
+# values read back from the program after the automatic tuner saved its gains.
+# binary sha256 caed35e4cb796ec06cac40b09566a18251771486b1cbac5e2bf16b7a5ed5045d
+# seed 0
+# simulated flight time of the procedure 597.429 s
+# Never edited by hand: a test flies the procedure again and compares.
+ATC_ACC_P_MAX 5008.833
+ATC_ACC_R_MAX 4874.6885
+ATC_ACC_Y_MAX 206.29211
+ATC_ANG_PIT_P 27.75
+ATC_ANG_RLL_P 25.442236
+ATC_ANG_YAW_P 1.9577342
+ATC_RATE_FF_ENAB 1
+ATC_RAT_PIT_D 0.0012337201
+ATC_RAT_PIT_FF 0
+ATC_RAT_PIT_FLTD 40
+ATC_RAT_PIT_FLTE 0
+ATC_RAT_PIT_FLTT 40
+ATC_RAT_PIT_I 0.054852616
+ATC_RAT_PIT_P 0.054852616
+ATC_RAT_RLL_D 0.0011720341
+ATC_RAT_RLL_FF 0
+ATC_RAT_RLL_FLTD 40
+ATC_RAT_RLL_FLTE 0
+ATC_RAT_RLL_FLTT 40
+ATC_RAT_RLL_I 0.054715484
+ATC_RAT_RLL_P 0.054715484
+ATC_RAT_YAW_D 0
+ATC_RAT_YAW_FF 0
+ATC_RAT_YAW_FLTD 20
+ATC_RAT_YAW_FLTE 5
+ATC_RAT_YAW_FLTT 40
+ATC_RAT_YAW_I 0.004832374
+ATC_RAT_YAW_P 0.04832374
+MOT_THST_HOVER 0.1499654
