@@ -734,6 +734,13 @@ impl fmt::Display for FlightAudit {
     }
 }
 
+/// A heartbeat is forwarded on the second, and only while the one of ours that
+/// it stands for arrives (`arriving`): a lost ground station or a crashed
+/// brain stops its heartbeat on the link as well.
+fn heartbeat_due<T>(arriving: &Option<T>, t: Micros) -> bool {
+    arriving.is_some() && t.0.is_multiple_of(1_000_000)
+}
+
 /// The GPS error's state: the held offset, redrawn every period.
 ///
 /// Per axis, at each fix instant: `sent(k) = (n(k) - lo sent(k-1)) / hi` for
@@ -1287,10 +1294,8 @@ impl ArduCopter {
         input: &AutopilotInput<'_, 4>,
     ) -> Result<(), ArduCopterError> {
         let n = self.ex.frames();
-        let on_second = t.0.is_multiple_of(1_000_000);
         // The brain's heartbeat, while ours come.
-        if input.brain_heartbeat.is_some()
-            && on_second
+        if heartbeat_due(&input.brain_heartbeat, t)
             && self.config.brain == BrainLink::Serial1
             && let Some(c) = self.brain_client.as_ref()
         {
@@ -1299,8 +1304,7 @@ impl ArduCopter {
             self.record(LinkName::Brain, BRAIN_SYSTEM_ID, SentKind::Heartbeat);
         }
         // The ground station's, while ours come.
-        if input.gcs_heartbeat.is_some()
-            && on_second
+        if heartbeat_due(&input.gcs_heartbeat, t)
             && let Some(c) = self.gcs_client.as_ref()
         {
             c.heartbeat()
@@ -2021,8 +2025,22 @@ mod tests {
     }
 
     #[test]
+    fn a_heartbeat_is_forwarded_on_the_second_and_only_while_ours_arrives() {
+        let (some, none): (Option<u8>, Option<u8>) = (Some(1), None);
+        assert!(heartbeat_due(&some, Micros(7_000_000)));
+        assert!(heartbeat_due(&some, Micros(0)));
+        assert!(!heartbeat_due(&some, Micros(7_000_500)));
+        assert!(
+            !heartbeat_due(&none, Micros(7_000_000)),
+            "a lost link sends none"
+        );
+        assert!(!heartbeat_due(&none, Micros(7_000_500)));
+    }
+
+    #[test]
     fn a_lag_that_is_zero_or_a_period_or_more_is_not_blended() {
-        for lag_us in [0, 200_000, 350_000] {
+        // A whole number of periods reads one stored sample.
+        for lag_us in [0, 200_000, 400_000, 600_000] {
             let c = GpsError {
                 lag_us,
                 ..GpsError::ours()
