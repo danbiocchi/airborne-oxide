@@ -12,6 +12,7 @@
 //! repository without being listed here (or to the record's lists in
 //! [`crate::gate::plan`]) fails it.
 
+use crate::gate::plan::{Plan, Scoring, failure_start, pair_kinds};
 use crate::parm;
 use crate::runner::committed_params;
 use crate::scenario::{LoadedScenario, translate};
@@ -299,6 +300,47 @@ pub fn differences_from_build<'a>(
                 got.unwrap_or("none"),
                 want.as_deref().unwrap_or("not in the repository")
             ));
+        }
+    }
+    out
+}
+
+/// How the facts `gate.txt` states about its plan (what is in each pair, the
+/// start of the failure that a time to motors off counts from) are not the
+/// facts of the commit's own scenario files, as sentences. They decide
+/// criteria B1 to B3, so they are read from the built-in files and not taken
+/// on trust.
+pub fn plan_fact_differences(plan: &Plan) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in &plan.entries {
+        // A scenario that is not built in is reported by its hash.
+        let Some(text) = scenario_text(&e.scenario) else {
+            continue;
+        };
+        let Ok(src) = LoadedScenario::from_text(text) else {
+            continue;
+        };
+        if e.scenario.starts_with("pair-") {
+            let want = pair_kinds(&src.file);
+            if plan.pair_kinds.get(&e.scenario) != Some(&want) {
+                out.push(format!(
+                    "gate.txt says {} holds {:?} and the commit's file holds {}",
+                    e.scenario,
+                    plan.pair_kinds.get(&e.scenario).map(|k| k.join(" and ")),
+                    want.join(" and ")
+                ));
+            }
+        }
+        if e.scoring == Scoring::MotorsOff {
+            let want = failure_start(&src.file, &e.scenario);
+            if plan.failure_starts.get(&e.scenario).copied() != want {
+                out.push(format!(
+                    "gate.txt says the failure of {} starts at {:?} s and the commit's file says \
+                     {want:?} s",
+                    e.scenario,
+                    plan.failure_starts.get(&e.scenario)
+                ));
+            }
         }
     }
     out

@@ -779,6 +779,7 @@ pub fn read_at(out: &Path, own: Option<&str>) -> Result<Gate, Incomplete> {
         &info.scenario_files,
         info.plan.entries.iter().map(|e| e.scenario.as_str()),
     ));
+    trial_reasons.extend(files::plan_fact_differences(&info.plan));
     let mut reader = Reader {
         info: &info,
         problems: &mut problems,

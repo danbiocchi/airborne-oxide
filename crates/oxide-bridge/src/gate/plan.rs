@@ -239,6 +239,16 @@ pub fn pair_kinds(file: &ScenarioFile) -> Vec<String> {
     kinds
 }
 
+/// The start of the earliest failure of the kind `name` in the file, s: the
+/// time the time to motors off is counted from.
+pub fn failure_start(file: &ScenarioFile, name: &str) -> Option<f64> {
+    file.faults
+        .iter()
+        .filter(|f| kind_name(&f.kind) == name)
+        .map(|f| f.start_s)
+        .fold(None, |a: Option<f64>, s| Some(a.map_or(s, |a| a.min(s))))
+}
+
 /// How a `pair-*` file with these kinds is scored: on the outcome when it has
 /// at least one and every one is in [`OUTCOME_KINDS`] (or is `geofence`);
 /// `None` when the record has no list for it.
@@ -344,13 +354,7 @@ impl Plan {
             match found.get(&name) {
                 Some((scoring, count, file)) => {
                     if *scoring == Scoring::MotorsOff {
-                        let start = file
-                            .faults
-                            .iter()
-                            .filter(|f| kind_name(&f.kind) == name)
-                            .map(|f| f.start_s)
-                            .fold(None, |a: Option<f64>, s| Some(a.map_or(s, |a| a.min(s))));
-                        let Some(start) = start else {
+                        let Some(start) = failure_start(file, &name) else {
                             return err(format!(
                                 "the scenario {name:?} has no {name} failure: the time to motors \
                                  off is counted from its start"

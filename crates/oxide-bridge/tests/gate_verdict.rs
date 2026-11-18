@@ -1467,3 +1467,32 @@ fn tables_of_another_commit_than_the_programs_own_give_no_verdict() {
     let p = read_differ.expect_err("refused").0;
     assert!(mentions(&p, &["flown at commit", &other]), "{p:?}");
 }
+
+#[test]
+fn what_gate_txt_says_of_a_pair_or_a_failure_start_is_the_commits_files_or_exit_2() {
+    // The failure start decides B3 (the times are counted from it) and what a
+    // pair holds decides how it is scored: neither is taken on trust.
+    let mut f = Fixture::full("failure-start");
+    f.info.plan.failure_starts.insert("motor-loss".into(), 10.0);
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["motor-loss", "starts at", "the commit's file"]),
+        "{p:?}"
+    );
+    let mut f = Fixture::full("pair-kinds");
+    f.info.plan.pair_kinds.insert(
+        "pair-gps-loss+baro-loss".into(),
+        vec!["geofence".into(), "gps-loss".into()],
+    );
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["pair-gps-loss+baro-loss", "the commit's file holds"]),
+        "{p:?}"
+    );
+    // The same gate.txt as a trial is a trial, not a pass.
+    let mut f = Fixture::full("failure-start-trial");
+    f.info.plan.failure_starts.insert("motor-loss".into(), 10.0);
+    f.info.reduced = true;
+    let e = eval(&f);
+    assert!(!e.passed, "a trial is never a pass");
+}
