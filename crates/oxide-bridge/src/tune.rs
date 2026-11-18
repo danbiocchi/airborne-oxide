@@ -1353,12 +1353,12 @@ pub fn check(
 /// shortest decimal that gives the same 32-bit float), sorted by name, one
 /// per line.
 ///
-/// The header holds nothing that differs between runs of the same procedure
+/// The header holds no version of the program (the checksum names it) and
+/// nothing that differs between runs of the same procedure
 /// (no commit, no wall time), so a fresh run writes the committed file byte
 /// for byte, header included.
 pub fn tuned_file(
     after: &BTreeMap<String, f32>,
-    binary_version: &str,
     binary_sha256: &str,
     seed: u64,
     flight_s: f64,
@@ -1366,7 +1366,7 @@ pub fn tuned_file(
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "# ArduCopter {binary_version} parameters after the tuning of ADR-0007 section 2."
+        "# ArduCopter parameters after the tuning of ADR-0007 section 2."
     );
     let _ = writeln!(
         s,
@@ -1561,13 +1561,7 @@ pub fn tune(cfg: &TuneConfig) -> Result<Outcome, TuneError> {
         .err();
     }
     let flight_s: f64 = flights.iter().map(|f| f.sim_s).sum();
-    let tuned = tuned_file(
-        &after,
-        crate::sitl::PINNED.version,
-        &last.audit.binary_sha256,
-        cfg.seed,
-        flight_s,
-    );
+    let tuned = tuned_file(&after, &last.audit.binary_sha256, cfg.seed, flight_s);
     let report = report_text(
         cfg,
         &flights,
@@ -2327,7 +2321,7 @@ mod tests {
         ] {
             g.insert(n.to_string(), v);
         }
-        let text = tuned_file(&g, "V4.7.2", "ff00", 7, 1022.5);
+        let text = tuned_file(&g, "ff00", 7, 1022.5);
         let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
         let mut sorted = lines.clone();
         sorted.sort_unstable();
@@ -2335,11 +2329,17 @@ mod tests {
         assert!(
             text.contains("# binary sha256 ff00")
                 && text.contains("# seed 7")
-                && text.contains("ArduCopter V4.7.2")
+                && text.contains("# ArduCopter parameters")
                 && text.contains("simulated flight time of the procedure 1022.500 s")
                 && text.contains("Never edited by hand")
         );
         assert!(text.contains("`oxide-bridge tune --seed 7`"));
+        // The version is not written: nothing reads it from the program, and
+        // the checksum names the binary.
+        assert!(
+            !text.contains("V4."),
+            "no version a constant could mislabel"
+        );
         assert!(
             !text.contains("commit"),
             "nothing that differs between runs"
@@ -2475,6 +2475,68 @@ mod tests {
         t.add(&rec(0.0, 0.0, 5.0, 22.0, true), &Marks::default(), 1.0)
             .expect("safe");
         assert_eq!(t.stats.pack_before_landing_v, None);
+    }
+
+    #[test]
+    fn the_sample_of_the_tick_the_throttle_went_low_at_is_not_in_the_pack_mean() {
+        // The mark is read one tick after the tick it names, so the sample of
+        // that tick (19 V, the landing) is already in the window's reach: it
+        // is left out ("the last second before the throttle goes low").
+        let mut t = Tracker::default();
+        let mut m = Marks::default();
+        for i in 0..3100u64 {
+            let ts = i as f64 * 0.001;
+            let v = if ts < 3.0 { 21.0 } else { 19.0 };
+            if i == 3001 {
+                m.throttle_low = Some(3_000_000);
+            }
+            t.add(&rec(ts, 0.0, 5.0, v, true), &m, 0.5).expect("safe");
+        }
+        let v = t.stats.pack_before_landing_v.expect("measured");
+        assert!((v - 21.0).abs() < 1e-9, "{v}");
+    }
+
+    #[test]
+    fn the_pack_is_reported_at_every_mark_at_the_time_the_mark_names() {
+        let mut t = Tracker::default();
+        let m = Marks {
+            hover: Some(10 * S),
+            spectrum: Some(70 * S),
+            autotune: Some(71 * S),
+            throttle_low: Some(90 * S),
+            disarmed: Some(95 * S),
+            ..Marks::default()
+        };
+        for i in 0..=100u64 {
+            let ts = i as f64;
+            t.add(
+                &rec(ts, 0.0, 5.0, 25.0 - ts * 0.01, true),
+                &m,
+                1.0 - ts / 200.0,
+            )
+            .expect("safe");
+        }
+        let at = |name: &str| {
+            t.pack
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("no mark {name}"))
+                .1
+        };
+        // The spectrum window starts SPECTRUM_S before the end of the hover.
+        let start = at("spectrum window start");
+        assert_eq!(start.t_s, 10.0 + (HOVER_S - SPECTRUM_S) as f64);
+        assert_eq!(start.t_s, 40.0);
+        assert!((start.volts - 24.6).abs() < 1e-9, "{}", start.volts);
+        assert!((start.state_of_charge - 0.8).abs() < 1e-9);
+        let taken = at("spectrum taken");
+        assert_eq!(taken.t_s, 70.0);
+        assert!((taken.state_of_charge - 0.65).abs() < 1e-9);
+        assert_eq!(at("hover reached").t_s, 10.0);
+        assert_eq!(at("AUTOTUNE start").t_s, 71.0);
+        assert_eq!(at("throttle low").t_s, 90.0);
+        assert_eq!(at("disarmed").t_s, 95.0);
+        assert_eq!(t.pack.len(), 6);
     }
 
     #[test]
