@@ -28,10 +28,12 @@ In this order, in calm air on a full pack, by a script that is committed with th
 1. `FRAME_CLASS 1`, `FRAME_TYPE 1`; `MOT_THST_EXPO` set to the airframe's thrust exponent; `MOT_SPIN_ARM`, `MOT_SPIN_MIN`, `MOT_SPIN_MAX` at their defaults; the battery monitor on; the filter settings of ArduPilot's tuning guide for a 5-inch propeller.
 2. Starting gains low enough for a steady hover. The defaults oscillate on this airframe, and the tuner refuses a vehicle that is not steady. The values and how they were found are in the report. This is the manual step the guide puts before the tuner.
 3. Hover-thrust learning in a hover.
-4. A harmonic notch by the guide's throttle-based method, if a spectrum of the gyro samples of a hover shows a peak above the noise floor. If none does, no notch is set and the report shows the spectrum.
+4. A harmonic notch by the guide's throttle-based method, if a spectrum of the gyro samples of a hover shows a peak above the noise floor. If none does, no notch is set and the report shows the spectrum. The rule for "a peak", fixed before the spectrum was taken: a line between 40 Hz and 400 Hz, on any axis, whose power is at least ten times the median power of that band.
 5. AUTOTUNE on roll, pitch and yaw, to its "Success" message, with the gains saved.
 
-Everything the procedure does not touch stays at ArduCopter's default, the position controller included. The resulting parameter file is committed with the report. The report states the simulated flight time the procedure took.
+The guide's values for this vehicle (a 5-inch propeller, six cells): `INS_GYRO_FILTER` 80, the rate controllers' target and derivative filters at half of it, the yaw error filter 2, `INS_ACCEL_FILTER` 10, `MOT_BAT_VOLT_MAX` 25.2 and `MOT_BAT_VOLT_MIN` 19.8. The tuner runs from ALT_HOLD in calm air with its default aggressiveness.
+
+Everything the procedure does not touch stays at ArduCopter's default, the position controller and the tuner's own settings included. The resulting parameter file is committed with the report. The report states the simulated flight time the procedure took.
 
 Our core is not tuned for the gate. Its gains were set by hand during development on this airframe in this simulator, and the report says so.
 
@@ -85,7 +87,7 @@ ArduCopter starts later than our core in this scenario. It holds its motors stil
 - Scored on the time to motors off, not on the outcome: `motor-loss` and `imu-loss`. A quadrotor cannot fly on with either, and our core's designed response is to stop the motors.
 - Scored, because the companion link of ADR-0006 §6 works (proven on the binary when the bridge was built): `brain-crash`, `brain-hang`, `setpoint-gap` and the pairs with a brain failure.
 - Not scored: `kill-in-rtl` (the pilot's kill switch has no agreed ArduCopter counterpart). `hover-step` has no failure and is flown as a check of the bridge.
-- Four scored scenarios have a pilot who moves the sticks: `gps-loss-pilot`, `rc-loss-position`, `rc-loss-override` and `rc-loss-on-ground`. They are scored once the bridge can fly sticks; how their stick scripts are timed for ArduCopter, which starts its motors 2.2 s after the arm switch, is written into this record before they are flown.
+- Four scored scenarios have a pilot who moves the sticks: `gps-loss-pilot`, `rc-loss-position`, `rc-loss-override` and `rc-loss-on-ground`. Their stick scripts were written for our core, whose motors run at once when it arms: they raise the throttle 0.5 s after the arm switch. ArduCopter keeps its motors still for 2.0 s after it arms, and a throttle raised and centred again in that time lifts nothing. The rule, fixed before these were flown: **for ArduCopter, every event of the pilot later than the arm switch (stick frames and mode-switch changes) is delayed by 2.24 s**, the measured time from the switch to live motors rounded up to a radio period. The arm switch itself, the brain's setpoints and every failure keep their times. The pilot then does for ArduCopter what the script means: raise the throttle once the motors run.
 
 A scenario may leave the scored list only for a technical reason found while the bridge is built, written into this record before the run.
 
