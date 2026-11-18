@@ -1808,7 +1808,12 @@ fn a_command_line_that_only_ends_like_the_flights_own_directory_is_not_its_direc
     let f = Fixture::small("suffix-only");
     f.write();
     let run = run_dir(&twice_dir(&f.dir, "gps-loss"), 0);
-    let audit = std::fs::read_to_string(run.join("audit.txt")).expect("audit");
+    // The record names its directory as the platform prints it, with `\` on
+    // Windows. The program reads either separator, so the line is edited with
+    // `/` throughout.
+    let audit = std::fs::read_to_string(run.join("audit.txt"))
+        .expect("audit")
+        .replace('\\', "/");
     let own = format!("/twice/gps-loss/{}/sitl/defaults.parm", "run-0000");
     assert!(audit.contains(&own), "{audit}");
     std::fs::write(
