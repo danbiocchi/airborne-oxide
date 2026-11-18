@@ -183,10 +183,10 @@ pub fn markdown(e: &Evaluation, stem: &str) -> String {
         "One row for each scenario but gust-hold and each autopilot, over every flight of that \
          table: crashes and fly-aways are in these rows. \"flights\" is the rows of the table; \
          \"touched down\" the rows that have a touchdown speed (m/s), and the median and worst \
-         (the largest) are over those. The landing distance (m) is the distance of the end \
-         position from the arming point, sqrt(end north squared + end east squared), of every \
-         row that has both. The greatest tilt (deg) is `max_tilt_deg` of every row that has \
-         one. \"disarmed\" counts the \
+         (the largest) are over those. The end distance (m) is the horizontal distance of the \
+         end position from the arming point, sqrt(end north squared + end east squared), of \
+         every row that has both: where the flight ended, whether or not it landed. The \
+         greatest tilt (deg) is `max_tilt_deg` of every row that has one. \"disarmed\" counts the \
          rows that have a disarm time, and the median and latest are over those; the times are \
          flight time, and each scenario file names when its failure begins. The modes each \
          flight went through are in its `audit.txt`. A `-` is a value that no row has. These \
@@ -195,7 +195,7 @@ pub fn markdown(e: &Evaluation, stem: &str) -> String {
     let _ = writeln!(
         s,
         "| scenario | autopilot | flights | touched down | touchdown speed median (m/s) | \
-         touchdown speed worst (m/s) | landing distance median (m) | landing distance worst (m) | \
+         touchdown speed worst (m/s) | end distance median (m) | end distance worst (m) | \
          greatest tilt median (deg) | greatest tilt worst (deg) | disarmed | \
          disarmed at median (s) | disarmed at latest (s) |"
     );

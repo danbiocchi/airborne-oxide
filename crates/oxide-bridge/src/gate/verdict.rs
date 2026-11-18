@@ -150,7 +150,7 @@ impl Flight {
 
     /// Distance of the end position from the arming point, m: the horizontal
     /// distance, `sqrt(end_n_m^2 + end_e_m^2)`. None when either is empty.
-    pub fn landing_distance_m(&self) -> Option<f64> {
+    pub fn end_distance_m(&self) -> Option<f64> {
         let (n, e) = (self.end_n_m?, self.end_e_m?);
         Some(Real::sqrt(n * n + e * e))
     }
@@ -1243,10 +1243,7 @@ fn largest(values: &[f64]) -> Option<f64> {
 /// [`Reported`] of the flights of one table.
 pub fn reported_of(scenario: &str, autopilot: &str, flights: &[Flight]) -> Reported {
     let touch: Vec<f64> = flights.iter().filter_map(|f| f.touchdown_mps).collect();
-    let dist: Vec<f64> = flights
-        .iter()
-        .filter_map(Flight::landing_distance_m)
-        .collect();
+    let dist: Vec<f64> = flights.iter().filter_map(Flight::end_distance_m).collect();
     let tilt: Vec<f64> = flights.iter().filter_map(|f| f.max_tilt_deg).collect();
     let disarmed: Vec<f64> = flights.iter().filter_map(|f| f.disarmed_at_s).collect();
     Reported {
