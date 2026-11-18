@@ -75,7 +75,7 @@ The scenario files' own expectations are a second, stricter judgement that was w
 The scenario is `gust-hold`, seeds 0 to 499. The measure of a flight is the simulator's own: the RMS of the horizontal distance between the true position and the hold point, from 15 s to the end.
 
 - **A1.** Every one of our core's 500 flights is safe, and passes the limits the scenario file already sets for the hold (among them a maximum horizontal error of 1.5 m, an RMS of 0.5 m and a tilt of 35°).
-- **A2.** Over the 500 seeds, the **median** of our core's RMS error is at most 1.0 times the median of ArduCopter's, **and** the **95th percentile** of ours is at most 1.0 times ArduCopter's 95th percentile. Only ArduCopter's safe flights enter its statistics; its crashes and fly-aways are reported.
+- **A2.** Over the 500 seeds, the **median** of our core's RMS error is at most 1.0 times the median of ArduCopter's, **and** the **95th percentile** of ours is at most 1.0 times ArduCopter's 95th percentile. Only ArduCopter's safe flights enter its statistics; its crashes and fly-aways are reported. The 95th percentile is taken by linear interpolation between the two nearest ordered values (position 0.95 × (n − 1), counted from 0), and the comparison is made on the values as computed, without rounding.
 
 Reported beside it and deciding nothing: our core on the true state; the vertical error and the tilt of both; the same statistics for the H743 profile; the number of seeds in which each was the better.
 
@@ -95,7 +95,7 @@ A scenario may leave the scored list only for a technical reason found while the
 
 - **B1. No worse, scenario by scenario.** In every scored scenario, the number of our core's flights that end in a crash or a fly-away is at most ArduCopter's number.
 - **B2. Zero crashes.** Our core has no crash and no fly-away in any scored scenario, and every one of its flights passes the scenario file's own expectations, which are stricter (a touchdown under 1.5 m/s, a tilt under 40°).
-- **B3. Motors off.** In `motor-loss` and `imu-loss`, the median time from the failure to all motor commands at zero is at most ArduCopter's. A flight in which the motors never stop counts as the length of the flight.
+- **B3. Motors off.** In `motor-loss` and `imu-loss`, the median time from the failure to all motor commands at zero is at most ArduCopter's. A flight in which the motors never stop counts as the length of the flight. Exactly: the time of the last motor command above zero, less the failure's start; when the motors never stop that is the rest of the flight.
 
 Reported and deciding nothing: for each scenario and autopilot, the time from the failure to touchdown, the touchdown speed, the distance of the landing from the arming point, the greatest tilt, and the modes each went through.
 
@@ -103,7 +103,9 @@ Reported and deciding nothing: for each scenario and autopilot, the time from th
 
 Gate 1 is passed when A1, A2, B1, B2 and B3 all hold.
 
-Before the result is accepted, ten bridged flights chosen before the run (gust-hold seeds 0 to 4 and one seed of five failure scenarios) are flown twice. All ten must repeat bit for bit. If one does not, the result waits until the cause is known.
+Before the result is accepted, ten bridged flights chosen before the run are flown twice: gust-hold runs 0 to 4, and run 0 of `gps-loss`, `battery-low`, `rc-loss-offboard-gcs`, `imu-loss` and `pair-gps-loss+baro-loss`. All ten must repeat bit for bit. If one does not, the result waits until the cause is known.
+
+The verdict is computed from the runner's tables by a committed program, not by hand.
 
 If the gate fails, the criteria stay. The core is improved and the whole gate is flown again. Changing a criterion takes a new record that gives the reason, before the next run.
 
