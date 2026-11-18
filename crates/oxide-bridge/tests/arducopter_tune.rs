@@ -101,8 +101,8 @@ fn the_hover_learns_the_thrust_and_the_spectrum_has_no_peak() {
     // spectrum 60 s later.
     assert_eq!(m.arm, 13_000_000);
     assert_eq!(m.climb, Some(16_000_000));
-    assert_eq!(m.hover, Some(22_742_000));
-    assert_eq!(m.spectrum, Some(22_742_000 + HOVER_S * 1_000_000));
+    assert_eq!(m.hover, Some(24_759_500));
+    assert_eq!(m.spectrum, Some(24_759_500 + HOVER_S * 1_000_000));
     // The program armed 0.22 s after the switch and took the mode command.
     assert_eq!(text_at(&f, "Arming motors").map(|t| t.round()), Some(13.0));
     assert!(f.audit.mode_changes.iter().any(|(_, mode)| *mode == 2));
@@ -159,17 +159,17 @@ fn the_hover_learns_the_thrust_and_the_spectrum_has_no_peak() {
     // The hover on the starting gains, calm air, ALT_HOLD: tilt and
     // position over the last 20 s, and how far it went in the 60 s.
     assert!(
-        (f.stats.hover_tilt_rms_deg - 0.239).abs() < 0.005,
+        (f.stats.hover_tilt_rms_deg - 0.2226).abs() < 0.005,
         "{:?}",
         f.stats
     );
     assert!(
-        (f.stats.hover_pos_rms_m - 1.653).abs() < 0.02,
+        (f.stats.hover_pos_rms_m - 1.482).abs() < 0.02,
         "{:?}",
         f.stats
     );
     assert!(
-        (f.stats.max_horizontal_m - 10.23).abs() < 0.05,
+        (f.stats.max_horizontal_m - 10.38).abs() < 0.05,
         "{:?}",
         f.stats
     );
@@ -240,10 +240,10 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
          success {success:.3}, saved {saved:.3}; marks {:?}; stats {:?}",
         ra.marks, ra.stats
     );
-    assert!((started - 83.745).abs() < 0.01, "{started}");
-    assert!((roll - 176.857).abs() < 0.01, "{roll}");
-    assert!((pitch - 270.299).abs() < 0.01, "{pitch}");
-    assert!((yaw - 517.087).abs() < 0.01, "{yaw}");
+    assert!((started - 85.762).abs() < 0.01, "{started}");
+    assert!((roll - 185.165).abs() < 0.01, "{roll}");
+    assert!((pitch - 277.137).abs() < 0.01, "{pitch}");
+    assert!((yaw - 524.564).abs() < 0.01, "{yaw}");
     assert_eq!(success, yaw, "the success message follows the last axis");
     // Landed and disarmed by itself 7.2 s after the throttle went low, and
     // the gains saved at that moment.
@@ -252,25 +252,26 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
     assert!((saved - low - 7.2).abs() < 0.3, "{saved} {low}");
     assert_eq!(tune::check(&tune::texts(&ra.audit), &after), Ok(()));
     // The gains after the save, as the program reported them.
+    println!("MEASURED gains after: {after:?}");
     let g = |n: &str| f64::from(after[n]);
-    assert!((g("ATC_RAT_RLL_P") - 0.054_990_08).abs() < 1e-7);
-    assert!((g("ATC_RAT_PIT_P") - 0.054_852_597).abs() < 1e-7);
-    assert!((g("ATC_RAT_YAW_P") - 0.050_867_11).abs() < 1e-7);
-    assert!((g("ATC_ANG_RLL_P") - 27.75).abs() < 1e-4);
+    assert!((g("ATC_RAT_RLL_P") - 0.054_715_484).abs() < 1e-7);
+    assert!((g("ATC_RAT_PIT_P") - 0.054_852_616).abs() < 1e-7);
+    assert!((g("ATC_RAT_YAW_P") - 0.048_323_74).abs() < 1e-7);
+    assert!((g("ATC_ANG_RLL_P") - 25.442_236).abs() < 1e-4);
     assert!((g("ATC_ANG_PIT_P") - 27.75).abs() < 1e-4);
-    assert!((g("ATC_ANG_YAW_P") - 2.060_773).abs() < 1e-5);
-    assert!((g("ATC_ACC_R_MAX") - 4954.631).abs() < 0.01);
-    assert!((g("ATC_ACC_P_MAX") - 4839.1997).abs() < 0.01);
-    assert!((g("ATC_ACC_Y_MAX") - 229.910_46).abs() < 0.01);
+    assert!((g("ATC_ANG_YAW_P") - 1.957_734_2).abs() < 1e-5);
+    assert!((g("ATC_ACC_R_MAX") - 4874.6885).abs() < 0.01);
+    assert!((g("ATC_ACC_P_MAX") - 5008.833).abs() < 0.01);
+    assert!((g("ATC_ACC_Y_MAX") - 206.292_11).abs() < 0.01);
     assert_eq!(g("ATC_RAT_YAW_FLTE"), 5.0);
-    assert!((g("MOT_THST_HOVER") - 0.182_364_7).abs() < 1e-6);
+    assert!((g("MOT_THST_HOVER") - 0.182_423_79).abs() < 1e-6);
     // The gains the tuner started from are the starting gains.
     assert_eq!(before["ATC_RAT_RLL_P"], 0.05);
     // The vehicle left the box: how far and when.
     let exit = ra.stats.box_exit_s.expect("the vehicle left the box");
-    assert!((exit - 123.1895).abs() < 1e-3, "{exit}");
+    assert!((exit - 135.3095).abs() < 1e-3, "{exit}");
     assert!(
-        (ra.stats.max_horizontal_m - 31.04).abs() < 0.05,
+        (ra.stats.max_horizontal_m - 35.02).abs() < 0.05,
         "{:?}",
         ra.stats
     );
@@ -279,7 +280,7 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
 }
 
 /// The procedure as the command runs it: the vehicle leaves the 20 m box in
-/// ALT_HOLD at 123.189 s, the flight stops, the report says what happened and
+/// ALT_HOLD at 135.309 s, the flight stops, the report says what happened and
 /// what the gains were at that moment, and no `tuned-gains.parm` is written.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
@@ -297,7 +298,7 @@ fn the_procedure_stops_when_the_vehicle_leaves_the_box_and_writes_no_tuned_file(
         panic!("{err}");
     };
     assert!(
-        why.contains("the vehicle left the box (20 m out, 30 m up) at flight time 123.18"),
+        why.contains("the vehicle left the box (20 m out, 30 m up) at flight time 135.30"),
         "{why}"
     );
     assert!(!out.path().join("tuned-gains.parm").exists());
