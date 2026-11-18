@@ -400,9 +400,8 @@ fn a_fresh_run_of_the_procedure_writes_the_committed_tuned_file_byte_for_byte_on
             .find(|l| l.contains("trace hash"))
             .and_then(|l| l.split(',').next().map(str::to_string))
     };
-    assert!(hash(&ra).is_some());
-    assert_eq!(
-        hash(&ra).map(|l| l[..28].to_string()),
-        hash(&rb).map(|l| l[..28].to_string())
-    );
+    // The whole line, the hash's last digit included.
+    let line = hash(&ra).expect("the report has a trace hash line");
+    assert!(line.trim().len() > "trace hash ".len() + 15, "{line:?}");
+    assert_eq!(Some(line), hash(&rb));
 }

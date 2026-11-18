@@ -1421,6 +1421,32 @@ pub fn check(
     }
 }
 
+/// The check that the program took `setup.parm`: every name of it, read back
+/// before the flight (`before`), has the file's value. A program that ignored a
+/// line of the guide's set-up (the 80 Hz gyro filter, say) would otherwise
+/// tune and be flown on another set-up than the files say.
+pub fn check_setup(before: &BTreeMap<String, f32>) -> Result<(), String> {
+    let setup = parm::parse(parm::SETUP).map_err(|e| format!("setup.parm: {e}"))?;
+    let mut wrong = Vec::new();
+    for (name, want) in setup {
+        #[allow(clippy::cast_possible_truncation)] // the program holds 32-bit floats
+        let want = want as f32;
+        match before.get(&name) {
+            Some(got) if *got == want => {}
+            Some(got) => wrong.push(format!("{name} read back {got}, setup.parm says {want}")),
+            None => wrong.push(format!("{name} was not read back")),
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the program did not take setup.parm: {}",
+            wrong.join("; ")
+        ))
+    }
+}
+
 /// The text of `tuned-gains.parm`: a header that says what made it, and every
 /// name of the read-back with its value as the program reported it (the
 /// shortest decimal that gives the same 32-bit float), sorted by name, one
@@ -1631,6 +1657,7 @@ pub fn tune(cfg: &TuneConfig) -> Result<Outcome, TuneError> {
             last.stats.pack_before_landing_v,
             low_battery_volt(),
         )
+        .and_then(|()| check_setup(&before))
         .err();
     }
     let flight_s: f64 = flights.iter().map(|f| f.sim_s).sum();
@@ -2701,6 +2728,27 @@ mod tests {
     }
 
     #[test]
+    fn a_disarm_in_the_air_during_the_descent_ends_it_with_the_stick_low() {
+        // The vehicle disarms itself high up (a failsafe, say): the descent
+        // does not go on to wait for a ground it will fall to.
+        let mut sc = Script::new(false, false, 5);
+        let mut t = 0u64;
+        while sc.marks().descent.is_none() {
+            sc.tick(t, 9.6, true).expect("flying");
+            t += 500;
+        }
+        sc.tick(t, 9.6, true).expect("descending");
+        assert!(
+            sc.marks().throttle_low.is_none(),
+            "armed, high: still descending"
+        );
+        t += 500;
+        let a = sc.tick(t, 9.6, false).expect("disarmed in the air");
+        assert_eq!(a.throttle, 0.0);
+        assert_eq!(sc.marks().throttle_low, Some(t));
+    }
+
+    #[test]
     fn a_pack_that_is_not_above_the_low_battery_threshold_before_the_landing_fails_the_check() {
         let low = low_battery_volt();
         assert!(
@@ -2718,8 +2766,39 @@ mod tests {
                 "{e}"
             );
         }
+        // A threshold that is not a number (BATT_LOW_VOLT missing from the
+        // runner's list) is no threshold: no pack is above it.
+        let e = check(&texts_ok(), &all_gains(), Some(24.0), f64::NAN).expect_err("no threshold");
+        assert!(e.contains("low-battery threshold"), "{e}");
         let e = check(&texts_ok(), &all_gains(), None, low).expect_err("not measured");
         assert!(e.contains("not measured"), "{e}");
+    }
+
+    #[test]
+    fn the_program_must_have_taken_every_line_of_setup_parm() {
+        let setup = parm::parse(parm::SETUP).expect("setup.parm");
+        let all: BTreeMap<String, f32> =
+            setup.iter().map(|(n, v)| (n.clone(), *v as f32)).collect();
+        assert_eq!(all.len(), SETUP_NAMES.len());
+        assert_eq!(check_setup(&all), Ok(()));
+        for (name, _) in &setup {
+            let mut missing = all.clone();
+            missing.remove(name);
+            let e = check_setup(&missing).expect_err(name);
+            assert!(
+                e.contains(name.as_str()) && e.contains("not read back"),
+                "{e}"
+            );
+            let mut other = all.clone();
+            other.insert(name.clone(), all[name] + 1.0);
+            let e = check_setup(&other).expect_err(name);
+            assert!(
+                e.contains(name.as_str()) && e.contains("setup.parm says"),
+                "{e}"
+            );
+        }
+        // The guide's 80 Hz gyro filter, by name.
+        assert_eq!(all.get("INS_GYRO_FILTER"), Some(&80.0));
     }
 
     /// The decision path never reads what came from MAVLink, and takes the
