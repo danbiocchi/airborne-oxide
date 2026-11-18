@@ -46,6 +46,7 @@ This is not the gate's plan, so it is not passed whatever the numbers say:
 - motor-loss is flown on 5 indices and the record says 10
 - the scenario imu-loss is not in the plan
 - the scenario kill-in-rtl is not in the plan
+- hover-step is flown on 2 indices and the commit's scenario file names 1
 - the flights flown twice are [("gust-hold", 2), ("gps-loss", 1)] and the record says [("gust-hold", 5), ("gps-loss", 1), ("battery-low", 1), ("rc-loss-offboard-gcs", 1), ("imu-loss", 1), ("pair-gps-loss+baro-loss", 1)]
 
 Commit `0123456789abcdef0123456789abcdef01234567`, clean tree.

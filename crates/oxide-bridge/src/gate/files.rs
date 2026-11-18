@@ -371,6 +371,13 @@ mod tests {
     }
 
     #[test]
+    fn the_hover_step_count_of_the_plan_is_the_count_of_its_built_in_file() {
+        let text = scenario_text("hover-step").expect("built in");
+        let src = LoadedScenario::from_text(text).expect("parses");
+        assert_eq!(src.file.run.seeds, crate::gate::plan::HOVER_STEP_SEEDS);
+    }
+
+    #[test]
     fn the_built_in_scenario_files_are_the_repositorys_files_and_the_records_names() {
         let mut on_disk: Vec<String> = std::fs::read_dir(dir())
             .expect("dir")

@@ -24,6 +24,9 @@ pub const GUST_SEEDS: u64 = 500;
 /// Indices of every other scenario of the record ("the seeds its file names
 /// (10)", ADR-0007 section 6).
 pub const B_SEEDS: u64 = 10;
+/// Indices of `hover-step`: the seeds its file names (one). A test holds this
+/// to the built-in file, so that the two cannot part.
+pub const HOVER_STEP_SEEDS: u64 = 1;
 
 /// Criterion B, scored on the outcome: the named files (every `pair-*` file
 /// whose failures are all of the kinds in [`OUTCOME_KINDS`] is added).
@@ -447,6 +450,10 @@ impl Plan {
             Some(e) if e.scoring != Scoring::NotScored => out.push(format!(
                 "hover-step is scored {} and the record says not-scored",
                 e.scoring.name()
+            )),
+            Some(e) if e.count != HOVER_STEP_SEEDS => out.push(format!(
+                "hover-step is flown on {} indices and the commit's scenario file names {}",
+                e.count, HOVER_STEP_SEEDS
             )),
             Some(_) => {}
         }

@@ -1801,6 +1801,48 @@ fn hover_step_left_out_of_a_gate_that_says_it_is_the_whole_plan_is_exit_2() {
     assert!(mentions(&p, &["hover-step", "not in the plan"]), "{p:?}");
 }
 
+/// The plan of the repository's files with `hover-step` flown on `count`
+/// indices, and tables that agree with it.
+fn full_with_hover_step_on(count: u64, reduced: bool, tag: &str) -> Fixture {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+    let mut plan = oxide_bridge::gate::plan::Plan::build(&dir, false).expect("the plan");
+    let e = plan
+        .entries
+        .iter_mut()
+        .find(|e| e.scenario == "hover-step")
+        .expect("hover-step");
+    e.count = count;
+    Fixture::of(plan, reduced, tag)
+}
+
+#[test]
+fn hover_step_flown_on_another_count_than_its_file_names_is_exit_2_and_a_trial_when_reduced() {
+    // The commit's file names one seed; two flown is not the gate.
+    let f = full_with_hover_step_on(2, false, "hover-two");
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["hover-step", "2 indices", "names 1"]),
+        "{p:?}"
+    );
+    assert_eq!(
+        Verdict::Incomplete(oxide_bridge::gate::verdict::Incomplete(p)).exit_code(),
+        EXIT_INCOMPLETE
+    );
+    // The same plan in a gate that says it is reduced is a trial.
+    let f = full_with_hover_step_on(2, true, "hover-two-reduced");
+    let e = eval(&f);
+    assert!(!e.passed);
+    assert_eq!(e.exit_code(), EXIT_NOT_PASSED);
+    assert!(
+        mentions(&e.trial_reasons, &["hover-step", "2 indices", "names 1"]),
+        "{:?}",
+        e.trial_reasons
+    );
+    // On the count of its file it is the gate.
+    let f = full_with_hover_step_on(1, false, "hover-one");
+    assert!(eval(&f).trial_reasons.is_empty());
+}
+
 #[test]
 fn a_command_line_that_only_ends_like_the_flights_own_directory_is_not_its_directory() {
     // `.../mytwice/gps-loss/...` ends with the characters of `twice/gps-loss/...`
