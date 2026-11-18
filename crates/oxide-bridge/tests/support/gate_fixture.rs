@@ -42,6 +42,10 @@ pub struct Flown {
     /// row (`row.csv` and the audit are written from it): a table edited
     /// after the flight.
     pub own: Option<Row>,
+    /// The row the flight's audit says it was, when it is not the row of the
+    /// table (and `row.csv`): a table and a `row.csv` edited together, the
+    /// audit left as the flight wrote it.
+    pub audited: Option<Row>,
     /// The `repeats` word of the audit of a flight flown twice, when it is
     /// not the row's.
     pub audit_repeats: Option<String>,
@@ -88,7 +92,14 @@ fn good(entry: &Entry, autopilot: &str, index: u64, twice: bool) -> Flown {
         },
     );
     r.set("violations", "0");
-    r.set("not_judged", "0");
+    r.set(
+        "not_judged",
+        if autopilot == AC && entry.scoring != Scoring::Gust {
+            "1"
+        } else {
+            "0"
+        },
+    );
     if entry.scoring == Scoring::Gust {
         // ArduCopter a little worse than our core.
         let base = if autopilot == AC { 0.2 } else { 0.15 };
@@ -113,6 +124,7 @@ fn good(entry: &Entry, autopilot: &str, index: u64, twice: bool) -> Flown {
     Flown {
         row: r,
         own: None,
+        audited: None,
         audit_repeats: None,
         second: None,
         commit: commit(),
@@ -122,7 +134,85 @@ fn good(entry: &Entry, autopilot: &str, index: u64, twice: bool) -> Flown {
     }
 }
 
+/// Sets the verdict word of a row and the counts that make it that word,
+/// as the runner writes them (`fail`: a violation; `not-judged`: a check
+/// not judged; `pass`: neither).
+pub fn set_verdict(row: &mut Row, word: &str) {
+    row.set("verdict", word);
+    row.set("violations", if word == "fail" { "1" } else { "0" });
+    row.set("not_judged", if word == "not-judged" { "1" } else { "0" });
+}
+
+/// What `{:?}` prints of the number of a cell that may be empty.
+fn debug_option(cell: &str) -> String {
+    if cell.is_empty() {
+        "None".to_string()
+    } else {
+        format!("Some({cell})")
+    }
+}
+
+/// The lines of an audit that hold the flight's numbers, as the runner
+/// writes them, from the cells of `own` (a number the cell does not hold is
+/// left out of its line).
+fn numbers_text(own: &Row) -> String {
+    let mut s = String::new();
+    let mut outcome = String::from("armed at end true, ended 1.000 s at Vec3 { x: 0.0 }");
+    for (key, column, unit) in [
+        ("max height", "max_height_m", "m"),
+        ("max distance", "max_distance_m", "m"),
+        ("max tilt", "max_tilt_deg", "deg"),
+    ] {
+        if !own.get(column).is_empty() {
+            outcome.push_str(&format!(", {key} {} {unit}", own.get(column)));
+        }
+    }
+    outcome.push_str(&format!(
+        ", touchdown {} m/s, disarmed at {} s, last motor on {} s, physics faults 0",
+        debug_option(own.get("touchdown_mps")),
+        debug_option(own.get("disarmed_at_s")),
+        debug_option(own.get("last_motor_on_s"))
+    ));
+    s.push_str(&format!("  outcome         {outcome}\n"));
+    let hold: Vec<String> = [
+        ("max_h_error_m", "max_h_m"),
+        ("rms_h_error_m", "rms_h_m"),
+        ("max_v_error_m", "max_v_m"),
+    ]
+    .iter()
+    .filter(|(_, c)| !own.get(c).is_empty())
+    .map(|(k, c)| format!("{k}: {}", own.get(c)))
+    .collect();
+    if !hold.is_empty() {
+        s.push_str(&format!(
+            "  hold            HoldMetrics {{ {}, unarmed_ticks: 0 }}\n",
+            hold.join(", ")
+        ));
+    }
+    if !own.get("rms_v_m").is_empty() {
+        s.push_str(&format!(
+            "  hold vertical   rms {} m\n",
+            debug_option(own.get("rms_v_m"))
+        ));
+    }
+    s.push_str(&format!(
+        "  verdict         {} violations, {} not judged\n",
+        own.get("violations"),
+        own.get("not_judged")
+    ));
+    s
+}
+
 impl Flown {
+    /// Edits a cell of the table and of `row.csv`: the flight's audit keeps
+    /// what the flight wrote.
+    pub fn edit_table_and_row_only(&mut self, column: &str, value: &str) {
+        if self.audited.is_none() {
+            self.audited = Some(self.row.clone());
+        }
+        self.row.set(column, value);
+    }
+
     /// Edits a cell of the table only: the flight's own run directory keeps
     /// the row it had.
     pub fn edit_table_only(&mut self, column: &str, value: &str) {
@@ -282,17 +372,18 @@ fn write_table(dir: &Path, flights: &[Flown], bridged: bool) {
         std::fs::create_dir_all(&run).expect("run dir");
         // The flight's own record of itself.
         let own = f.own.as_ref().unwrap_or(&f.row);
+        let audited = f.audited.as_ref().unwrap_or(own);
         let mut audit = format!(
             "oxide-bridge flight record\n  scenario        {}\n  \
              scenario file   /somewhere/{}.toml\n  file sha256     {}\n  \
              run index       {}\n  seed            {}\n  autopilot       {}\n  \
              our commit      {}\n",
-            own.get("scenario"),
-            own.get("scenario"),
+            audited.get("scenario"),
+            audited.get("scenario"),
             f.file_sha,
-            own.get("index"),
-            own.get("seed"),
-            own.get("autopilot"),
+            audited.get("index"),
+            audited.get("seed"),
+            audited.get("autopilot"),
             f.commit
         );
         if !f.row.get("repeats").is_empty() || f.audit_repeats.is_some() {
@@ -303,17 +394,21 @@ fn write_table(dir: &Path, flights: &[Flown], bridged: bool) {
                     .unwrap_or_else(|| f.row.get("repeats").to_string())
             ));
         }
-        audit.push_str(&format!("  class           {}\n", own.get("class")));
+        audit.push_str(&format!("  class           {}\n", audited.get("class")));
+        audit.push_str(&numbers_text(audited));
         if bridged && f.row.get("autopilot") == AC {
             audit.push_str(&format!(
                 "\nflight audit\n  binary sha256   {}\n  params sha256   {}\n  \
+                 command line    /x/arducopter --model JSON:127.0.0.1 --defaults {}/sitl/defaults.parm \
+                 --home 1,2,3,0 -I 0 -w\n  \
                  seed {}, step 1000 us, 3 pre-roll steps, 9 exchanges\n  \
                  packet hash {}, reply hash {}\n",
                 f.binary,
                 f.params,
-                own.get("seed"),
-                own.get("packet_hash"),
-                own.get("reply_hash")
+                run.display(),
+                audited.get("seed"),
+                audited.get("packet_hash"),
+                audited.get("reply_hash")
             ));
         }
         // A doubled row has the same run directory: it is written once.
@@ -338,8 +433,10 @@ fn write_table(dir: &Path, flights: &[Flown], bridged: bool) {
                 second.join("audit.txt"),
                 format!(
                     "oxide-bridge flight record\n  scenario        {}\n\nflight audit\n  \
+                     command line    /x/arducopter --defaults {}/sitl/defaults.parm --home 1,2,3,0\n  \
                      packet hash {packet}, reply hash {reply}\n",
-                    own.get("scenario")
+                    own.get("scenario"),
+                    second.display()
                 ),
             )
             .expect("second audit");

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use fx::{AC, F405, Fixture};
 use oxide_bridge::gate::report::{cumulative_svg, markdown, scatter_svg, write};
-use oxide_bridge::gate::verdict::{Evaluation, Verdict, verdict};
+use oxide_bridge::gate::verdict::{Evaluation, Verdict, verdict_at};
 
 fn golden(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,7 +36,7 @@ fn small() -> Evaluation {
     f.row("gps-loss", AC, 0).set("class", "fly-away");
     f.row("motor-loss", AC, 1).set("last_motor_on_s", "59.995");
     f.write();
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     let Verdict::Evaluated(mut e) = v else {
         panic!("the tables should be complete");

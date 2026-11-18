@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Puts the git hash of the build into `OXIDE_GIT_HASH` (the `ver_sw` of every
 //! log the binary writes): `git rev-parse HEAD`, with `-dirty` appended when
-//! `git status --porcelain` lists anything, and `unknown` when git is not
+//! `git status --porcelain --untracked-files=no` lists anything (a change to a
+//! tracked file; a stray untracked file does not make a build no commit's, as
+//! it does not for `gate fly`), and `unknown` when git is not
 //! installed or this is not a repository. It never fails the build.
 //!
 //! The script reruns when what it read can have moved: `HEAD` (a checkout),
@@ -53,7 +55,8 @@ pub fn watched(dir: &Path) -> Vec<PathBuf> {
 pub fn hash_of(dir: &Path) -> String {
     match git(dir, &["rev-parse", "HEAD"]) {
         Some(h) if !h.is_empty() => {
-            let dirty = git(dir, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+            let dirty = git(dir, &["status", "--porcelain", "--untracked-files=no"])
+                .is_some_and(|s| !s.is_empty());
             if dirty { format!("{h}-dirty") } else { h }
         }
         _ => "unknown".to_string(),

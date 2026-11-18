@@ -23,8 +23,33 @@ fn verdict(f: &Fixture, report: Option<&std::path::Path>) -> (i32, String, Strin
     )
 }
 
+/// Whether the program under test was built at a commit. Built on a tree
+/// with uncommitted changes (a work in progress) it gives no verdict at all,
+/// which `the_command_gives_no_verdict_when_it_is_not_a_commits_program`
+/// shows; the tests of what it does with tables then have nothing to see.
+fn at_a_commit() -> bool {
+    oxide_bridge::gate::verdict::own_commit().is_some()
+}
+
+#[test]
+fn the_command_gives_no_verdict_when_it_is_not_a_commits_program() {
+    if at_a_commit() {
+        return; // shown at the commit by the unit-level test of read_at(None)
+    }
+    let f = Fixture::full("cli-uncommitted");
+    f.write();
+    let (code, out, err) = verdict(&f, None);
+    assert_eq!(code, 2, "{out}{err}");
+    assert!(out.contains("not built at a commit"), "{out}");
+    assert!(!out.contains("PASSED"), "{out}");
+    f.remove();
+}
+
 #[test]
 fn the_command_exits_0_when_the_gate_is_passed_and_writes_the_report() {
+    if !at_a_commit() {
+        return;
+    }
     let f = Fixture::full("cli-pass");
     f.write();
     let report = f.dir.join("out").join("gate-report.md");
@@ -40,6 +65,9 @@ fn the_command_exits_0_when_the_gate_is_passed_and_writes_the_report() {
 
 #[test]
 fn the_command_exits_4_when_the_gate_is_not_passed() {
+    if !at_a_commit() {
+        return;
+    }
     let mut f = Fixture::full("cli-fail");
     f.row("gust-hold", F405, 3).set("class", "crash");
     f.write();
@@ -52,6 +80,9 @@ fn the_command_exits_4_when_the_gate_is_not_passed() {
 
 #[test]
 fn the_command_exits_2_with_no_verdict_and_no_report_when_a_row_is_missing() {
+    if !at_a_commit() {
+        return;
+    }
     let mut f = Fixture::small("cli-missing");
     f.tables
         .get_mut(&("gust-hold".to_string(), F405.to_string()))

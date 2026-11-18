@@ -172,7 +172,54 @@ struct Audit {
     /// The first word of the `repeats` line (`yes` or `no`) of a flight flown
     /// twice.
     repeats: Option<String>,
+    /// The line of the bridge's audit that starts the simulator program
+    /// (ArduCopter): it names the flight's own directory.
+    command_line: Option<String>,
+    /// The numbers the audit holds of the flight, by the column of the
+    /// table that carries the same number; `None` for a number it does not
+    /// hold (a flight without hold metrics, a touchdown that did not happen).
+    numbers: Vec<(&'static str, Option<f64>)>,
+    /// The violations and the not-judged count of the `verdict` line.
+    counts: Option<(String, String)>,
+    /// Numbers of the audit that could not be read.
+    unreadable: Vec<String>,
 }
+
+/// The first word after `key` in `line`.
+fn word_after<'t>(line: &'t str, key: &str) -> Option<&'t str> {
+    let (_, rest) = line.split_once(key)?;
+    rest.split([' ', ',', '}']).next().filter(|w| !w.is_empty())
+}
+
+/// A number as the audit prints it: `1.5`, `Some(1.5)` or `None`.
+fn audit_number(word: &str) -> Result<Option<f64>, String> {
+    if word == "None" {
+        return Ok(None);
+    }
+    let inner = word
+        .strip_prefix("Some(")
+        .and_then(|w| w.strip_suffix(')'))
+        .unwrap_or(word);
+    inner
+        .parse::<f64>()
+        .map(Some)
+        .map_err(|_| format!("its audit holds {word:?} where a number should be"))
+}
+
+/// The columns of the table whose numbers the audit holds too: the column,
+/// the label of the audit's line and the text before the number.
+const AUDIT_NUMBERS: [(&str, &str, &str); 10] = [
+    ("rms_h_m", "hold", "rms_h_error_m: "),
+    ("max_h_m", "hold", "max_h_error_m: "),
+    ("max_v_m", "hold", "max_v_error_m: "),
+    ("rms_v_m", "hold vertical", "rms "),
+    ("max_tilt_deg", "outcome", "max tilt "),
+    ("max_height_m", "outcome", "max height "),
+    ("max_distance_m", "outcome", "max distance "),
+    ("touchdown_mps", "outcome", "touchdown "),
+    ("disarmed_at_s", "outcome", "disarmed at "),
+    ("last_motor_on_s", "outcome", "last motor on "),
+];
 
 /// The value of the line `label  value` of an audit: the label, then at least
 /// two spaces (the audit pads its labels), so that `scenario` is not the line
@@ -204,6 +251,22 @@ fn read_audit(dir: &Path) -> Result<Audit, String> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let (packet, reply) = audit_hashes(&text);
+    let mut unreadable = Vec::new();
+    let mut numbers = Vec::new();
+    for (column, label, key) in AUDIT_NUMBERS {
+        let value = audit_field(&text, label)
+            .and_then(|line| word_after(&line, key).map(String::from))
+            .map_or(Ok(None), |w| audit_number(&w));
+        match value {
+            Ok(v) => numbers.push((column, v)),
+            Err(e) => unreadable.push(format!("{column}: {e}")),
+        }
+    }
+    let counts = audit_field(&text, "verdict").and_then(|v| {
+        let (violations, rest) = v.split_once(" violations, ")?;
+        let (not_judged, _) = rest.split_once(" not judged")?;
+        Some((violations.to_string(), not_judged.to_string()))
+    });
     Ok(Audit {
         scenario: audit_field(&text, "scenario"),
         index: audit_field(&text, "run index"),
@@ -218,6 +281,10 @@ fn read_audit(dir: &Path) -> Result<Audit, String> {
         reply,
         repeats: audit_field(&text, "repeats")
             .and_then(|r| r.split_whitespace().next().map(String::from)),
+        command_line: audit_field(&text, "command line"),
+        numbers,
+        counts,
+        unreadable,
     })
 }
 
@@ -450,6 +517,26 @@ impl Reader<'_> {
         let rms_v_m = num("rms_v_m", false);
         let max_tilt_deg = num("max_tilt_deg", false);
         let last_motor_on_s = num("last_motor_on_s", entry.scoring == Scoring::MotorsOff);
+        // Every other number of the row is read too: a value that cannot be
+        // (a word, a negative error or time) is no verdict (ADR-0007
+        // section 7), whether or not a criterion reads it.
+        for column in [
+            "max_h_m",
+            "max_v_m",
+            "max_height_m",
+            "max_distance_m",
+            "touchdown_mps",
+            "disarmed_at_s",
+            "wall_s",
+        ] {
+            num(column, false);
+        }
+        // The end position is a position: it may be negative.
+        for column in ["end_n_m", "end_e_m", "end_d_m"] {
+            if let Err(e) = number(row, column) {
+                whys.push(e);
+            }
+        }
         let audit_dir = run_dir(dir, index);
         match read_row_file(&audit_dir) {
             Err(e) => whys.push(e),
@@ -478,6 +565,13 @@ impl Reader<'_> {
                 audit_row_problems(row, &a, &mut whys);
                 if autopilot == "arducopter" {
                     self.expected_params(scenario, &a);
+                    let run = file_name(&audit_dir);
+                    let suffix = if twice {
+                        format!("{TWICE_DIR}/{scenario}/{run}/sitl/defaults.parm")
+                    } else {
+                        format!("{scenario}/{autopilot}/{run}/sitl/defaults.parm")
+                    };
+                    whys.extend(command_line_problem(&a, &suffix));
                 }
             }
         }
@@ -559,8 +653,82 @@ fn audit_problems(
     }
 }
 
+/// The name of the last component of `path`.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Whether the audit's command line starts the simulator program on the
+/// `--defaults` file at `suffix` (a path below the gate directory, with `/`):
+/// the flight's own directory, so that the record of one flight is not
+/// another's. Compared as a suffix so that a gate directory can be moved.
+fn command_line_problem(a: &Audit, suffix: &str) -> Option<String> {
+    let Some(line) = a.command_line.as_deref() else {
+        return Some("its audit has no command line".to_string());
+    };
+    let line = line.replace('\\', "/");
+    let path = line
+        .split_once("--defaults ")
+        .map(|(_, rest)| rest.split(" --").next().unwrap_or(rest).trim());
+    match path {
+        Some(p) if p == suffix || p.ends_with(&format!("/{suffix}")) => None,
+        Some(p) => Some(format!(
+            "its audit is not the record of this flight: its command line names the defaults file \
+             {p} and this flight's is .../{suffix}"
+        )),
+        None => Some("its audit's command line names no defaults file".to_string()),
+    }
+}
+
 /// What the audit says against what the row says: the same flight.
 fn audit_row_problems(row: &Row, a: &Audit, whys: &mut Vec<String>) {
+    whys.extend(a.unreadable.iter().cloned());
+    for (column, value) in &a.numbers {
+        let cell = row.get(column);
+        let from_cell = if cell.is_empty() {
+            None
+        } else {
+            match cell.parse::<f64>() {
+                Ok(v) => Some(v),
+                // Reported where the row's numbers are read.
+                Err(_) => continue,
+            }
+        };
+        if from_cell != *value {
+            whys.push(format!(
+                "its audit says {column} {} and its row says {}",
+                value.map_or("none".to_string(), |v| format!("{v}")),
+                if cell.is_empty() { "none" } else { cell }
+            ));
+        }
+    }
+    let count = |column: &str| row.get(column).parse::<u64>().ok();
+    match (&a.counts, count("violations"), count("not_judged")) {
+        (Some((av, an)), Some(v), Some(n)) => {
+            if av.parse::<u64>().ok() != Some(v) || an.parse::<u64>().ok() != Some(n) {
+                whys.push(format!(
+                    "its audit says {av} violations and {an} not judged and its row says {v} and {n}"
+                ));
+            }
+            let word = if v > 0 {
+                "fail"
+            } else if n > 0 {
+                "not-judged"
+            } else {
+                "pass"
+            };
+            if row.get("verdict") != word {
+                whys.push(format!(
+                    "its row says verdict {:?} with {v} violations and {n} not judged, which is {word:?}",
+                    row.get("verdict")
+                ));
+            }
+        }
+        (None, _, _) => whys.push("its audit has no verdict line".to_string()),
+        _ => whys.push("its violations or not_judged cell is not a whole number".to_string()),
+    }
     let mut same = |what: &str, audit: &Option<String>, cell: &str| match audit {
         Some(v) if v == cell => {}
         Some(v) => whys.push(format!(
@@ -607,11 +775,29 @@ impl Reader<'_> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incomplete(pub Vec<String>);
 
-/// The directories of `out` that the plan does not name: a scenario that is
-/// not in it, an autopilot that does not fly a scenario, a flown-twice
+/// The directories of `out` that hold tables or flights and that the plan
+/// does not name (a directory with no table in it, a report's for one, is
+/// not one): a scenario that is not in it, an autopilot that does not fly a scenario, a flown-twice
 /// scenario that is not in the plan. (A directory a continued gate moved
 /// aside, `NAME.interrupted`, is its own leftover and is let be.)
 fn stray_directories(out: &Path, info: &GateInfo) -> Vec<String> {
+    /// Whether `path` holds a table or a flight's record, in itself or
+    /// below it (a directory of reports does not).
+    fn holds_flights(path: &Path, depth: u32) -> bool {
+        if path.join(TABLE).is_file() {
+            return true;
+        }
+        depth > 0
+            && std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_dir())
+                .any(|e| {
+                    e.file_name().to_string_lossy().starts_with("run-")
+                        || holds_flights(&e.path(), depth - 1)
+                })
+    }
     fn dirs(path: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(path)
             .into_iter()
@@ -620,6 +806,7 @@ fn stray_directories(out: &Path, info: &GateInfo) -> Vec<String> {
             .filter(|e| e.path().is_dir())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| !n.ends_with(".interrupted"))
+            .filter(|n| holds_flights(&path.join(n), 3))
             .collect();
         v.sort();
         v
@@ -688,6 +875,11 @@ fn twice_problems(
                 read_row_file(&run.join("second")),
             ) {
                 (Ok(a), Ok(own)) => {
+                    let suffix = format!(
+                        "{TWICE_DIR}/{scenario}/{}/second/sitl/defaults.parm",
+                        file_name(&run)
+                    );
+                    broken.extend(command_line_problem(&a, &suffix));
                     if a.packet.as_deref() != Some(f.packet_hash.as_str())
                         || a.reply.as_deref() != Some(f.reply_hash.as_str())
                         || own.get("trace_hash") != f.trace_hash
@@ -751,9 +943,9 @@ pub fn read(out: &Path) -> Result<Gate, Incomplete> {
     read_at(out, own_commit())
 }
 
-/// [`read`] for a program built at `own` (`None`: not at a commit, which
-/// cannot be compared). Tables flown at another commit than the program's own
-/// give no verdict (ADR-0007 section 7).
+/// [`read`] for a program built at `own` (`None`: not at a commit, which gives
+/// no verdict). Tables flown at another commit than the program's own give no
+/// verdict either (ADR-0007 section 7).
 pub fn read_at(out: &Path, own: Option<&str>) -> Result<Gate, Incomplete> {
     let path = out.join("gate.txt");
     let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -765,14 +957,20 @@ pub fn read_at(out: &Path, own: Option<&str>) -> Result<Gate, Incomplete> {
     })?;
     let info = GateInfo::parse(&text).map_err(|e| Incomplete(vec![e]))?;
     let mut problems = Vec::new();
-    if let Some(own) = own
-        && info.commit != own
-    {
-        problems.push(format!(
+    match own {
+        Some(own) if info.commit != own => problems.push(format!(
             "gate.txt says the gate was flown at commit {} and this program was built at {own}: \
              a verdict is given on tables of the program's own commit only (ADR-0007 section 7)",
             info.commit
-        ));
+        )),
+        Some(_) => {}
+        None => problems.push(
+            "this program was not built at a commit (the tree it was built from had uncommitted \
+             changes to tracked files, or there was no repository), so it is no commit's program \
+             and gives no verdict: the verdict is computed by a committed program (ADR-0007 \
+             section 7)"
+                .to_string(),
+        ),
     }
     if info.tree_dirty {
         problems.push(format!(

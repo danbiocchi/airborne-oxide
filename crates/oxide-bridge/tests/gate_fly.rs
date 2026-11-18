@@ -370,3 +370,64 @@ fn the_dirty_note_is_added_to_every_row_once() {
     assert_eq!(rows[1].get("note"), "dirty tree");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---- the files the gate flies ----------------------------------------------
+
+/// A scenario directory that is the repository's with one file edited.
+fn edited_scenarios(tag: &str) -> PathBuf {
+    let d = temp(tag);
+    for e in std::fs::read_dir(scenarios_dir()).expect("read").flatten() {
+        std::fs::copy(e.path(), d.join(e.file_name())).expect("copy");
+    }
+    let hover = d.join("hover-step.toml");
+    let mut text = std::fs::read_to_string(&hover).expect("hover-step");
+    text.push_str("\n# an edit\n");
+    std::fs::write(&hover, text).expect("write");
+    d
+}
+
+#[test]
+fn the_gate_is_not_flown_from_scenario_files_that_are_not_the_commits() {
+    // The refusal comes before the simulator program is started, so a file
+    // that is not one is enough. It needs a program built at a commit: on a
+    // tree with changes the working-tree check refuses first, as it should.
+    if oxide_bridge::gate::verdict::own_commit().is_none() {
+        return;
+    }
+    let scen = edited_scenarios("edited-scen");
+    let out = temp("edited-out").join("gate-out");
+    let dummy = temp("edited-bin").join("arducopter");
+    std::fs::write(&dummy, "not a simulator\n").expect("dummy");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let o = Command::new(env!("CARGO_BIN_EXE_oxide-bridge"))
+        .current_dir(root)
+        .args(["gate", "fly", "--scenarios"])
+        .arg(&scen)
+        .arg("--out")
+        .arg(&out)
+        .arg("--binary")
+        .arg(&dummy)
+        .env_remove("OXIDE_ARDUCOPTER")
+        .output()
+        .expect("runs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("the commit's own files only"), "{err}");
+    assert!(err.contains("the scenario file hover-step"), "{err}");
+    assert!(!out.exists(), "nothing was written before the refusal");
+    // The same files as a trial are let through the refusal (and stop later).
+    let o = Command::new(env!("CARGO_BIN_EXE_oxide-bridge"))
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["gate", "fly", "--reduced", "--scenarios"])
+        .arg(&scen)
+        .arg("--out")
+        .arg(&out)
+        .arg("--binary")
+        .arg("/no/such/arducopter")
+        .env_remove("OXIDE_ARDUCOPTER")
+        .output()
+        .expect("runs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("the commit's own files only"), "{err}");
+    let _ = std::fs::remove_dir_all(&scen);
+}

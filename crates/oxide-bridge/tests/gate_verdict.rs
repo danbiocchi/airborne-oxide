@@ -7,10 +7,11 @@
 mod fx;
 
 use fx::{AC, F405, Fixture, H743, TRUTH};
+use oxide_bridge::batch::run_dir;
 use oxide_bridge::gate::stats::median;
 use oxide_bridge::gate::verdict::{
     EXIT_INCOMPLETE, EXIT_NOT_PASSED, EXIT_PASSED, Evaluation, Gate, Status, Verdict, evaluate,
-    read, read_at, table_dir, twice_dir, verdict, verdict_at,
+    read_at, table_dir, twice_dir, verdict, verdict_at,
 };
 
 /// An edit of a good fixture.
@@ -18,7 +19,7 @@ type Edit = fn(&mut Fixture);
 
 fn run(f: &Fixture) -> Verdict {
     f.write();
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     v
 }
@@ -34,7 +35,7 @@ fn eval(f: &Fixture) -> Evaluation {
 /// The tables read and checked, for a test that edits what was read.
 fn read_gate(f: &Fixture) -> Gate {
     f.write();
-    let g = read(&f.dir);
+    let g = read_at(&f.dir, Some(&f.info.commit));
     f.remove();
     match g {
         Ok(g) => g,
@@ -117,7 +118,7 @@ fn the_gate_is_not_passed_when_any_one_criterion_fails_on_the_whole_plan() {
         }),
         ("B1", |f| set_class(f, "geofence", F405, 0, "crash")),
         ("B2", |f| {
-            f.row("battery-low", F405, 2).set("verdict", "fail")
+            fx::set_verdict(f.row("battery-low", F405, 2), "fail")
         }),
         ("B3", |f| {
             f.row("motor-loss", F405, 4).set("last_motor_on_s", "40");
@@ -194,7 +195,7 @@ fn a1_fails_for_one_f405_flight_that_is_a_fly_away() {
 #[test]
 fn a1_fails_for_one_f405_flight_whose_verdict_is_fail() {
     let mut f = Fixture::small("a1-verdict");
-    f.row("gust-hold", F405, 5).set("verdict", "fail");
+    fx::set_verdict(f.row("gust-hold", F405, 5), "fail");
     let e = eval(&f);
     assert_eq!(e.a1.status, Status::Fails);
     assert!(mentions(
@@ -206,14 +207,14 @@ fn a1_fails_for_one_f405_flight_whose_verdict_is_fail() {
 #[test]
 fn a1_fails_for_a_flight_that_was_not_judged() {
     let mut f = Fixture::small("a1-notjudged");
-    f.row("gust-hold", F405, 6).set("verdict", "not-judged");
+    fx::set_verdict(f.row("gust-hold", F405, 6), "not-judged");
     assert_eq!(eval(&f).a1.status, Status::Fails);
 }
 
 #[test]
 fn a1_fails_for_one_h743_flight_whose_verdict_is_fail() {
     let mut f = Fixture::small("a1-h743");
-    f.row("gust-hold", H743, 7).set("verdict", "fail");
+    fx::set_verdict(f.row("gust-hold", H743, 7), "fail");
     let e = eval(&f);
     assert_eq!(e.a1.status, Status::Fails);
     assert!(mentions(&e.a1.failing, &["core-h743 index 7"]));
@@ -230,9 +231,9 @@ fn a1_fails_for_one_h743_flight_that_is_a_crash() {
 fn a1_does_not_read_arducopter_or_the_true_state_core() {
     let mut f = Fixture::small("a1-others");
     set_class(&mut f, "gust-hold", AC, 0, "crash");
-    f.row("gust-hold", AC, 1).set("verdict", "fail");
+    fx::set_verdict(f.row("gust-hold", AC, 1), "fail");
     set_class(&mut f, "gust-hold", TRUTH, 2, "crash");
-    f.row("gust-hold", TRUTH, 3).set("verdict", "fail");
+    fx::set_verdict(f.row("gust-hold", TRUTH, 3), "fail");
     assert_eq!(eval(&f).a1.status, Status::Holds);
 }
 
@@ -425,7 +426,7 @@ fn b2_fails_for_one_crash_one_fly_away_one_verdict_fail_each_alone() {
             set_class(f, "gps-loss", F405, 1, "fly-away")
         }),
         ("verdict", |f| {
-            f.row("gps-loss", F405, 2).set("verdict", "fail")
+            fx::set_verdict(f.row("gps-loss", F405, 2), "fail")
         }),
     ];
     for (name, apply) in each {
@@ -453,7 +454,7 @@ fn b2_fails_for_one_crash_one_fly_away_one_verdict_fail_each_alone() {
 #[test]
 fn b2_fails_for_a_flight_that_was_not_judged() {
     let mut f = Fixture::small("b2-notjudged");
-    f.row("gps-loss", F405, 0).set("verdict", "not-judged");
+    fx::set_verdict(f.row("gps-loss", F405, 0), "not-judged");
     assert_eq!(eval(&f).b2.status, Status::Fails);
 }
 
@@ -461,7 +462,7 @@ fn b2_fails_for_a_flight_that_was_not_judged() {
 fn b_reads_the_f405_core_and_leaves_the_h743_to_the_report() {
     let mut f = Fixture::small("b-h743");
     set_class(&mut f, "gps-loss", H743, 0, "crash");
-    f.row("gps-loss", H743, 1).set("verdict", "fail");
+    fx::set_verdict(f.row("gps-loss", H743, 1), "fail");
     let e = eval(&f);
     assert_eq!(e.b1.status, Status::Holds);
     assert_eq!(e.b2.status, Status::Holds);
@@ -478,7 +479,7 @@ fn b_reads_the_f405_core_and_leaves_the_h743_to_the_report() {
 fn a_scenario_that_is_not_scored_decides_nothing() {
     let mut f = Fixture::small("b-notscored");
     set_class(&mut f, "hover-step", F405, 0, "crash");
-    f.row("hover-step", F405, 1).set("verdict", "fail");
+    fx::set_verdict(f.row("hover-step", F405, 1), "fail");
     let e = eval(&f);
     assert_eq!(e.b1.status, Status::Holds);
     assert_eq!(e.b2.status, Status::Holds);
@@ -490,7 +491,7 @@ fn a_scenario_that_is_not_scored_decides_nothing() {
 fn a_scenario_scored_on_the_time_to_motors_off_is_not_scored_on_its_outcome() {
     let mut f = Fixture::small("b-motors-outcome");
     set_class(&mut f, "motor-loss", F405, 0, "crash");
-    f.row("motor-loss", F405, 1).set("verdict", "fail");
+    fx::set_verdict(f.row("motor-loss", F405, 1), "fail");
     let e = eval(&f);
     assert_eq!(e.b1.status, Status::Holds);
     assert_eq!(e.b2.status, Status::Holds);
@@ -773,7 +774,7 @@ fn a_flight_flown_twice_without_the_record_of_its_second_flight_is_not_a_repeat(
     f.write();
     let second = oxide_bridge::batch::run_dir(&twice_dir(&f.dir, "gps-loss"), 0).join("second");
     std::fs::remove_dir_all(second).expect("remove");
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     assert_eq!(v.exit_code(), EXIT_INCOMPLETE);
     assert!(
@@ -821,7 +822,7 @@ fn a_missing_row_is_exit_2_and_names_the_row() {
         .expect("table")
         .retain(|r| r.row.get("index") != "3");
     f.write();
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     assert_eq!(v.exit_code(), EXIT_INCOMPLETE);
     let text = v.text();
@@ -842,7 +843,7 @@ fn a_missing_row_does_not_pass_a_criterion_it_would_have_failed() {
         .expect("table")
         .pop();
     f.write();
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     assert_eq!(v.exit_code(), EXIT_INCOMPLETE);
 }
@@ -987,7 +988,7 @@ fn a_missing_table_is_exit_2() {
     let f = Fixture::small("no-table");
     f.write();
     std::fs::remove_dir_all(table_dir(&f.dir, "gps-loss", F405)).expect("remove");
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     assert_eq!(v.exit_code(), EXIT_INCOMPLETE);
     assert!(
@@ -1364,7 +1365,8 @@ fn a_directory_the_plan_does_not_name_is_exit_2() {
         let f = Fixture::small(name);
         f.write();
         std::fs::create_dir_all(f.dir.join(dir)).expect("dir");
-        let v = verdict(&f.dir);
+        std::fs::write(f.dir.join(dir).join("flights.csv"), "x\n").expect("table");
+        let v = verdict_at(&f.dir, Some(&f.info.commit));
         f.remove();
         assert_eq!(v.exit_code(), EXIT_INCOMPLETE, "{dir}: {}", v.text());
         assert!(
@@ -1373,11 +1375,20 @@ fn a_directory_the_plan_does_not_name_is_exit_2() {
             v.text()
         );
     }
+    // A directory with no table in it (the reports of `gate verdict --report`
+    // go into one when the person says so) is not a table of another plan.
+    let f = Fixture::small("report-dir");
+    f.write();
+    std::fs::create_dir_all(f.dir.join("report/figures")).expect("dir");
+    std::fs::write(f.dir.join("report/gate1.md"), "report\n").expect("report");
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
+    f.remove();
+    assert!(matches!(v, Verdict::Evaluated(_)), "{}", v.text());
     // A table a continued gate moved aside is its own leftover.
     let f = Fixture::small("interrupted");
     f.write();
     std::fs::create_dir_all(f.dir.join("gps-loss/arducopter.interrupted")).expect("dir");
-    let v = verdict(&f.dir);
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
     f.remove();
     assert!(matches!(v, Verdict::Evaluated(_)), "{}", v.text());
 }
@@ -1462,7 +1473,14 @@ fn tables_of_another_commit_than_the_programs_own_give_no_verdict() {
     let read_differ = read_at(&f.dir, Some(&other));
     f.remove();
     assert!(matches!(same, Verdict::Evaluated(_)), "{}", same.text());
-    assert!(matches!(none, Verdict::Evaluated(_)), "{}", none.text());
+    // A program that is no commit's gives no verdict, a pass or not.
+    assert_eq!(none.exit_code(), EXIT_INCOMPLETE, "{}", none.text());
+    assert!(
+        mentions(&incomplete(&none), &["not built at a commit"]),
+        "{}",
+        none.text()
+    );
+    assert!(!none.text().contains("PASSED"));
     assert_eq!(differ.exit_code(), EXIT_INCOMPLETE, "{}", differ.text());
     let p = read_differ.expect_err("refused").0;
     assert!(mentions(&p, &["flown at commit", &other]), "{p:?}");
@@ -1515,7 +1533,7 @@ fn a_table_with_other_line_ends_or_an_unended_last_line_is_exit_2() {
         let path = table_dir(&f.dir, "gps-loss", F405).join("flights.csv");
         let text = std::fs::read_to_string(&path).expect("table");
         std::fs::write(&path, edit(&text)).expect("write");
-        let v = verdict(&f.dir);
+        let v = verdict_at(&f.dir, Some(&f.info.commit));
         f.remove();
         let Verdict::Incomplete(i) = v else {
             panic!("{tag}: the table should be refused");
@@ -1525,4 +1543,260 @@ fn a_table_with_other_line_ends_or_an_unended_last_line_is_exit_2() {
             "{tag}: {i:?}"
         );
     }
+}
+
+// ---- the row against the flight's own audit --------------------------------
+
+/// The problems of tables in which one cell of one flight was edited in the
+/// table and in its `row.csv` together and its audit was left as the flight
+/// wrote it.
+fn forged(tag: &str, scenario: &str, who: &str, index: u64, cells: &[(&str, &str)]) -> Vec<String> {
+    let mut f = Fixture::small(tag);
+    for (column, value) in cells {
+        f.flown(scenario, who, index)
+            .edit_table_and_row_only(column, value);
+    }
+    refused(&f)
+}
+
+#[test]
+fn a_number_that_decides_a_criterion_edited_in_the_table_and_row_csv_but_not_in_the_audit_is_exit_2()
+ {
+    // The value is in three records of the flight; two of them agreeing is not
+    // enough (ADR-0007 section 7: every row equals the flight's own record).
+    let cases: [(&str, &str, u64, &str, &str); 8] = [
+        ("gust-hold", F405, 3, "rms_h_m", "0.01"),
+        ("gust-hold", F405, 3, "rms_v_m", "0.001"),
+        ("gust-hold", F405, 3, "max_tilt_deg", "1.5"),
+        ("gust-hold", F405, 3, "max_h_m", "0.1"),
+        ("motor-loss", AC, 1, "last_motor_on_s", "15.05"),
+        ("motor-loss", F405, 1, "last_motor_on_s", "40"),
+        ("gps-loss", F405, 1, "touchdown_mps", "0.1"),
+        ("gps-loss", F405, 1, "disarmed_at_s", "3"),
+    ];
+    for (scenario, who, index, column, value) in cases {
+        let p = forged("audit-number", scenario, who, index, &[(column, value)]);
+        assert!(
+            mentions(
+                &p,
+                &[
+                    &format!("{scenario} {who} index {index}"),
+                    "its audit says",
+                    column
+                ]
+            ),
+            "{scenario} {who} {column}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn a_verdict_edited_in_the_table_and_row_csv_but_not_in_the_audit_is_exit_2() {
+    // The word with the audit's counts, and the counts with the word.
+    let p = forged(
+        "audit-verdict",
+        "gps-loss",
+        F405,
+        1,
+        &[("verdict", "fail"), ("violations", "1")],
+    );
+    assert!(
+        mentions(&p, &["its audit says 0 violations", "its row says 1"]),
+        "{p:?}"
+    );
+    // The word alone says something its own counts do not.
+    let p = forged("audit-word", "gps-loss", F405, 1, &[("verdict", "fail")]);
+    assert!(mentions(&p, &["verdict \"fail\"", "\"pass\""]), "{p:?}");
+    let p = forged(
+        "audit-notjudged",
+        "gps-loss",
+        F405,
+        1,
+        &[("verdict", "not-judged"), ("not_judged", "2")],
+    );
+    assert!(mentions(&p, &["its audit says", "not judged"]), "{p:?}");
+}
+
+#[test]
+fn a_class_or_a_hash_edited_in_the_table_and_row_csv_but_not_in_the_audit_is_exit_2() {
+    let p = forged("audit-class", "gps-loss", F405, 0, &[("class", "crash")]);
+    assert!(
+        mentions(&p, &["its audit says class \"safe\"", "\"crash\""]),
+        "{p:?}"
+    );
+    let p = forged(
+        "audit-packet",
+        "gps-loss",
+        AC,
+        0,
+        &[("packet_hash", "0123456789abcdef")],
+    );
+    assert!(mentions(&p, &["its audit says packet hash"]), "{p:?}");
+    let p = forged(
+        "audit-reply",
+        "gps-loss",
+        AC,
+        0,
+        &[("reply_hash", "0123456789abcdef")],
+    );
+    assert!(mentions(&p, &["its audit says reply hash"]), "{p:?}");
+}
+
+#[test]
+fn a_note_edited_in_the_table_only_is_exit_2_unless_the_flight_was_retried() {
+    let mut f = Fixture::small("note-differs");
+    f.flown("gps-loss", F405, 0)
+        .edit_table_only("note", "another note");
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gps-loss core-f405 index 0", "note differ"]),
+        "{p:?}"
+    );
+    // A flight flown again has the batch's own retried and note.
+    let mut f = Fixture::small("note-retried");
+    let flown = f.flown("gps-loss", F405, 0);
+    flown.edit_table_only("retried", "yes");
+    flown.edit_table_only("note", "retried after: first attempt failed");
+    assert_eq!(eval(&f).a1.status, Status::Holds);
+    // But not another cell on the way.
+    let mut f = Fixture::small("note-retried-other");
+    let flown = f.flown("gps-loss", F405, 0);
+    flown.edit_table_only("retried", "yes");
+    flown.edit_table_only("class", "crash");
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gps-loss core-f405 index 0", "class differ"]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_negative_error_or_time_or_a_word_in_any_number_column_is_exit_2() {
+    let cases: [(&str, &str, u64, &str, &str); 8] = [
+        ("gust-hold", F405, 7, "max_h_m", "-0.3"),
+        ("gps-loss", F405, 1, "disarmed_at_s", "-4.0"),
+        ("gps-loss", F405, 1, "max_h_m", "abc"),
+        ("gps-loss", F405, 1, "touchdown_mps", "-0.5"),
+        ("gps-loss", F405, 1, "max_height_m", "NaN"),
+        ("gps-loss", F405, 1, "max_distance_m", "-1"),
+        ("gps-loss", F405, 1, "wall_s", "-2"),
+        ("gps-loss", F405, 1, "end_n_m", "inf"),
+    ];
+    for (scenario, who, index, column, value) in cases {
+        let mut f = Fixture::small("bad-number");
+        f.row(scenario, who, index).set(column, value);
+        let p = refused(&f);
+        assert!(
+            mentions(&p, &[&format!("{scenario} {who} index {index}"), column]),
+            "{column} {value}: {p:?}"
+        );
+    }
+    // A position may be negative.
+    let mut f = Fixture::small("negative-position");
+    f.row("gps-loss", F405, 1).set("end_n_m", "-3.5");
+    assert_eq!(eval(&f).a1.status, Status::Holds);
+}
+
+/// Copies a directory with everything in it.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("dir");
+    for e in std::fs::read_dir(from).expect("read").flatten() {
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if src.is_dir() {
+            copy_dir(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).expect("copy");
+        }
+    }
+}
+
+#[test]
+fn flights_flown_twice_that_are_copies_of_the_main_flights_records_are_not_repeats() {
+    // The hashes of a copy agree with the main flight's by construction; the
+    // copy's audit still names the main flight's directory.
+    let f = Fixture::small("twice-copies");
+    f.write();
+    for (scenario, count) in &f.info.plan.twice {
+        for i in 0..*count {
+            let main = run_dir(&table_dir(&f.dir, scenario, AC), i);
+            let twice = run_dir(&twice_dir(&f.dir, scenario), i);
+            std::fs::remove_dir_all(&twice).expect("remove");
+            copy_dir(&main, &twice);
+            let audit = std::fs::read_to_string(twice.join("audit.txt")).expect("audit");
+            let audit = audit.replacen(
+                "  class ",
+                "  repeats         yes (trace, packet and reply hashes of two flights)\n  class ",
+                1,
+            );
+            std::fs::write(twice.join("audit.txt"), audit).expect("audit");
+            copy_dir(&main, &twice.join("second"));
+        }
+    }
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
+    f.remove();
+    assert_eq!(v.exit_code(), EXIT_INCOMPLETE, "{}", v.text());
+    let p = incomplete(&v);
+    assert!(
+        mentions(
+            &p,
+            &[
+                "gust-hold arducopter index 0 (flown twice)",
+                "not the record of this flight"
+            ]
+        ),
+        "{p:?}"
+    );
+    assert!(!v.text().contains("PASSED"));
+}
+
+#[test]
+fn a_second_flight_whose_record_is_a_copy_of_another_is_not_a_repeat() {
+    let f = Fixture::small("second-copy");
+    f.write();
+    let main = run_dir(&table_dir(&f.dir, "gps-loss", AC), 0);
+    let twice = run_dir(&twice_dir(&f.dir, "gps-loss"), 0);
+    std::fs::remove_dir_all(twice.join("second")).expect("remove");
+    copy_dir(&main, &twice.join("second"));
+    let v = verdict_at(&f.dir, Some(&f.info.commit));
+    f.remove();
+    assert_eq!(v.exit_code(), EXIT_INCOMPLETE, "{}", v.text());
+    assert!(
+        mentions(
+            &incomplete(&v),
+            &[
+                "gps-loss arducopter index 0",
+                "does not repeat",
+                "command line"
+            ]
+        ),
+        "{}",
+        v.text()
+    );
+}
+
+#[test]
+fn a_gate_directory_that_was_moved_is_still_read() {
+    // The audits name the directory they were flown in; only the end of the
+    // path, below the gate directory, is compared.
+    let f = Fixture::small("moved");
+    f.write();
+    let moved = f.dir.with_file_name(format!(
+        "{}-moved",
+        f.dir.file_name().expect("name").to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&moved);
+    std::fs::rename(&f.dir, &moved).expect("move");
+    let v = verdict_at(&moved, Some(&f.info.commit));
+    let _ = std::fs::remove_dir_all(&moved);
+    assert!(matches!(v, Verdict::Evaluated(_)), "{}", v.text());
+}
+
+#[test]
+fn hover_step_left_out_of_a_gate_that_says_it_is_the_whole_plan_is_exit_2() {
+    let mut f = Fixture::full("no-hover-step");
+    f.info.plan.entries.retain(|e| e.scenario != "hover-step");
+    f.info.scenario_files.retain(|(n, _)| n != "hover-step");
+    f.tables.retain(|(s, _), _| s != "hover-step");
+    let p = refused(&f);
+    assert!(mentions(&p, &["hover-step", "not in the plan"]), "{p:?}");
 }
