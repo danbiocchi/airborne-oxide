@@ -50,7 +50,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use oxide_core::io::TrajectorySetpoint;
+use oxide_core::io::{RcSample, TrajectorySetpoint};
 use oxide_core::math::Real;
 use oxide_core::time::Micros;
 use oxide_sim::autopilot::{Autopilot, AutopilotInput, AutopilotOutput, PrerollInput};
@@ -69,6 +69,7 @@ use crate::mav::{self, MavClient, MavError, MavEvent};
 use crate::motors::{DEFAULT_SPIN_MAX, DEFAULT_SPIN_MIN, MotorMap};
 use crate::parm::{self, ParmError};
 use crate::reply::Reply;
+use crate::scenario::MODE_OFFBOARD;
 use crate::sitl::{Sitl, SitlConfig, SitlError, json_port_of};
 
 /// The step of a bridged flight, µs.
@@ -850,11 +851,20 @@ pub enum BrainCommand {
     },
 }
 
-/// Turns our setpoint stream into GUIDED commands. Every decision is from the
-/// exchange number, the setpoint, the true height and whether the pulses of
-/// the previous exchange say the vehicle is armed.
+/// Turns our setpoint stream into GUIDED commands, while the pilot's mode
+/// switch says offboard. Every decision is from the exchange number, the
+/// setpoint, the true height, whether the pulses of the previous exchange say
+/// the vehicle is armed, and the mode switch of the pilot's last valid radio
+/// frame (lockstep data, not the vehicle's own mode).
+///
+/// Outside offboard nothing is sent, and the state starts afresh when the
+/// switch comes back: a take-off from the ground, or, when offboard begins
+/// in the air, no take-off and targets at once.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Brain {
+    /// The mode switch of the last valid radio frame says offboard. Before
+    /// any frame, and in the absence of a valid one, it keeps its value.
+    offboard: bool,
     takeoff_height_m: Option<f64>,
     last_takeoff: Option<u64>,
     targets_on: bool,
@@ -863,6 +873,28 @@ pub struct Brain {
 }
 
 impl Brain {
+    /// Notes the pilot's mode switch from the radio frame that arrived at
+    /// this tick, if any. A frame with failsafe or a lost frame carries no
+    /// switch: the last one stands.
+    pub fn on_radio(&mut self, frame: Option<&RcSample>) {
+        if let Some(rc) = frame.filter(|rc| rc.is_valid()) {
+            self.offboard = rc.mode_switch >= MODE_OFFBOARD;
+        }
+    }
+
+    /// Whether the pilot's mode switch says offboard.
+    pub fn offboard(&self) -> bool {
+        self.offboard
+    }
+
+    /// Starts afresh, keeping what the switch says.
+    fn restart(&mut self) {
+        *self = Self {
+            offboard: self.offboard,
+            ..Self::default()
+        };
+    }
+
     /// The commands to send before exchange `n`, when a setpoint arrived at
     /// this tick. `armed` is the pulses' verdict of the previous exchange,
     /// `height_m` the true height above the start point.
@@ -874,8 +906,8 @@ impl Brain {
         sp: &TrajectorySetpoint,
         out: &mut Vec<BrainCommand>,
     ) {
-        if !armed {
-            *self = Self::default();
+        if !armed || !self.offboard {
+            self.restart();
             return;
         }
         let sp_height = -sp.position.z;
@@ -895,6 +927,11 @@ impl Brain {
             if let Some(h) = self.takeoff_height_m
                 && (height_m - h).abs() <= TAKEOFF_REACHED_M
             {
+                self.targets_on = true;
+            }
+            // Offboard begins in the air (nothing asked for a take-off, and
+            // the vehicle is off the ground): no take-off, targets at once.
+            if self.takeoff_height_m.is_none() && height_m >= GROUND_M {
                 self.targets_on = true;
             }
         }
@@ -1338,6 +1375,8 @@ impl ArduCopter {
         if self.config.brain == BrainLink::None {
             return Ok(());
         }
+        self.brain
+            .on_radio(input.rc.as_ref().map(|frame| &frame.value));
         if let Some(sp) = input.setpoint {
             self.commands.clear();
             let height = -input.body.position.z;
@@ -1760,9 +1799,23 @@ mod tests {
         out
     }
 
+    /// A brain whose pilot's switch says offboard.
+    fn offboard_brain() -> Brain {
+        let mut b = Brain::default();
+        switch(&mut b, MODE_OFFBOARD);
+        b
+    }
+
+    fn switch(b: &mut Brain, position: u8) {
+        b.on_radio(Some(&RcSample {
+            mode_switch: position,
+            ..RcSample::default()
+        }));
+    }
+
     #[test]
     fn nothing_is_sent_while_the_vehicle_is_not_armed_by_its_pulses() {
-        let mut b = Brain::default();
+        let mut b = offboard_brain();
         for n in 0..100 {
             assert!(brain(&mut b, n, false, 0.0, &sp(0.0, 0.0, -2.0, 0.0)).is_empty());
         }
@@ -1770,7 +1823,7 @@ mod tests {
 
     #[test]
     fn the_take_off_goes_out_at_the_first_armed_tick_with_an_airborne_setpoint() {
-        let mut b = Brain::default();
+        let mut b = offboard_brain();
         // Armed but the setpoint is on the ground (0.2 m is not above 0.2 m).
         assert!(brain(&mut b, 10, true, 0.0, &sp(0.0, 0.0, -0.2, 0.0)).is_empty());
         assert!(brain(&mut b, 11, true, 0.0, &sp(0.0, 0.0, 0.0, 0.0)).is_empty());
@@ -1790,7 +1843,7 @@ mod tests {
 
     #[test]
     fn position_targets_start_within_0_3_m_of_the_take_off_height_and_follow_the_rules() {
-        let mut b = Brain::default();
+        let mut b = offboard_brain();
         let s = sp(1.0, 0.0, -2.0, 0.0);
         assert_eq!(brain(&mut b, 0, true, 0.0, &s).len(), 1, "the take-off");
         // Climbing: no target yet at 1.69 m, the first one at 1.7 m.
@@ -1830,6 +1883,127 @@ mod tests {
             1,
             "a new take-off"
         );
+    }
+
+    #[test]
+    fn a_brain_whose_switch_was_never_seen_or_is_not_offboard_sends_nothing() {
+        let s = sp(1.0, 0.0, -2.0, 0.0);
+        let mut b = Brain::default();
+        assert!(!b.offboard());
+        for n in 0..50 {
+            assert!(brain(&mut b, n, true, 0.0, &s).is_empty(), "no frame yet");
+        }
+        // Stabilized (0) and Position (1): armed, on the ground, an airborne
+        // setpoint, and still nothing, and in the air nothing either.
+        for position in [0, 1] {
+            switch(&mut b, position);
+            assert!(!b.offboard());
+            for (n, h) in [(100, 0.0), (101, 1.0), (102, 2.0)] {
+                assert!(
+                    brain(&mut b, n, true, h, &s).is_empty(),
+                    "switch {position}"
+                );
+            }
+        }
+        switch(&mut b, MODE_OFFBOARD);
+        assert!(b.offboard());
+        assert_eq!(brain(&mut b, 200, true, 0.0, &s).len(), 1, "the take-off");
+    }
+
+    #[test]
+    fn the_state_starts_afresh_when_the_switch_comes_back_to_offboard() {
+        let mut b = offboard_brain();
+        let s = sp(1.0, 0.0, -2.0, 0.0);
+        assert_eq!(
+            brain(&mut b, 0, true, 0.0, &s),
+            vec![BrainCommand::TakeOff { height_m: 2.0 }]
+        );
+        assert_eq!(brain(&mut b, 100, true, 1.9, &s).len(), 1, "a target");
+        // The pilot leaves offboard; the vehicle is in the air: nothing goes.
+        switch(&mut b, 1);
+        assert!(brain(&mut b, 200, true, 1.9, &s).is_empty());
+        assert!(brain(&mut b, 200 + SECOND_STEPS, true, 1.9, &s).is_empty());
+        // The pilot lands (still armed, on the ground) and comes back: a new
+        // take-off, not the old target.
+        assert!(brain(&mut b, 300, true, 0.0, &s).is_empty());
+        switch(&mut b, MODE_OFFBOARD);
+        assert_eq!(
+            brain(&mut b, 301, true, 0.0, &s),
+            vec![BrainCommand::TakeOff { height_m: 2.0 }]
+        );
+        assert!(
+            brain(&mut b, 302, true, 0.5, &s).is_empty(),
+            "no target yet"
+        );
+    }
+
+    #[test]
+    fn offboard_that_begins_in_the_air_sends_no_take_off_and_targets_at_once() {
+        let mut b = Brain::default();
+        let s = sp(7.0, 0.0, -10.0, 0.0);
+        switch(&mut b, 1);
+        assert!(brain(&mut b, 0, true, 10.0, &s).is_empty(), "Position");
+        switch(&mut b, MODE_OFFBOARD);
+        let c = brain(&mut b, 1, true, 10.0, &s);
+        assert_eq!(
+            c,
+            vec![BrainCommand::Target {
+                position: [7.0, 0.0, -10.0],
+                yaw: 0.0
+            }],
+            "the first command in the air is a target"
+        );
+        // No take-off ever, and the rules of the targets are the usual ones.
+        assert!(brain(&mut b, 2, true, 10.0, &s).is_empty());
+        assert_eq!(brain(&mut b, 1 + SECOND_STEPS, true, 10.0, &s).len(), 1);
+        let c = brain(
+            &mut b,
+            2 + SECOND_STEPS,
+            true,
+            10.0,
+            &sp(8.0, 0.0, -10.0, 0.0),
+        );
+        assert!(
+            matches!(c.as_slice(), [BrainCommand::Target { .. }]),
+            "{c:?}"
+        );
+        // Just above the ground (0.3 m) counts as the air; under it is the ground.
+        let mut b = offboard_brain();
+        assert!(brain(&mut b, 0, true, 0.29, &sp(0.0, 0.0, 0.0, 0.0)).is_empty());
+        let mut b = offboard_brain();
+        assert_eq!(
+            brain(&mut b, 0, true, 0.3, &sp(0.0, 0.0, -1.0, 0.0)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_frame_with_failsafe_or_a_lost_frame_does_not_move_the_switch() {
+        let mut b = offboard_brain();
+        for rc in [
+            RcSample {
+                failsafe: true,
+                mode_switch: 0,
+                ..RcSample::default()
+            },
+            RcSample {
+                frame_lost: true,
+                mode_switch: 1,
+                ..RcSample::default()
+            },
+        ] {
+            b.on_radio(Some(&rc));
+            assert!(b.offboard(), "{rc:?}");
+        }
+        b.on_radio(None);
+        assert!(b.offboard(), "no frame at this tick");
+        let mut b = Brain::default();
+        b.on_radio(Some(&RcSample {
+            failsafe: true,
+            mode_switch: 2,
+            ..RcSample::default()
+        }));
+        assert!(!b.offboard(), "a failsafe frame never says offboard");
     }
 
     #[test]

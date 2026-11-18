@@ -517,7 +517,8 @@ fn alive(pid: u32) -> bool {
 
 /// A program that dies is noticed within a fraction of a second, not when the
 /// reply time-out (10 s by default) runs out: killed 1.5 s (wall) into the
-/// pre-roll, and again at flight time 10 s.
+/// pre-roll (a pre-roll four times as long as the flights', so that the
+/// kill cannot come after its end), and again at flight time 10 s.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
@@ -555,7 +556,10 @@ fn a_program_that_dies_ends_the_flight_at_once_not_at_the_reply_time_out() {
             })
         });
         let message = if in_preroll {
-            sim.preroll(PREROLL_STEPS)
+            // Four times the usual pre-roll (about 16 s of wall time alone):
+            // the kill 1.5 s in comes long before it could end, whatever the
+            // load of the machine does to the thread that sleeps.
+            sim.preroll(4 * PREROLL_STEPS)
                 .expect_err("the program was killed")
                 .to_string()
         } else {

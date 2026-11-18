@@ -1,0 +1,31 @@
+# ArduCopter V4.7.2: the settings of ArduPilot's tuning guide ("Setting the
+# aircraft up for tuning") for a 5-inch propeller and a 6-cell pack that are
+# not in base.parm (ADR-0007 section 2 step 1). It is loaded for the tuning
+# flights (`oxide-bridge tune`) and, after them, for every bridged flight.
+# Not set here, on purpose: MOT_THST_EXPO and MOT_THST_HOVER (base.parm: the
+# airframe's own thrust curve, and a hover thrust below the expected one for
+# the program to learn), MOT_SPIN_ARM, MOT_SPIN_MIN and MOT_SPIN_MAX (the
+# defaults, the last one the guide's 0.95), ATC_ACC_R_MAX, ATC_ACC_P_MAX and
+# ATC_ACC_Y_MAX (the guide gives no 5-inch value: the tuner sets them) and
+# AUTOTUNE_AGGR and AUTOTUNE_MIN_D (the defaults).
+
+# Battery: the guide's "Battery setting" rule, 4.2 V per cell full and 3.3 V
+# per cell empty; our pack has 6 cells.
+MOT_BAT_VOLT_MAX 25.2
+MOT_BAT_VOLT_MIN 19.8
+
+# Filters: the guide gives the accelerometer filter 10 Hz and, for a 5-inch
+# propeller, the gyro filter 80 Hz.
+INS_ACCEL_FILTER 10
+INS_GYRO_FILTER 80
+
+# The rate controllers' target and derivative filters are half the gyro
+# filter (the guide's rule), 40 Hz.
+ATC_RAT_RLL_FLTT 40
+ATC_RAT_RLL_FLTD 40
+ATC_RAT_PIT_FLTT 40
+ATC_RAT_PIT_FLTD 40
+ATC_RAT_YAW_FLTT 40
+
+# The yaw error filter: the guide's 2 Hz.
+ATC_RAT_YAW_FLTE 2

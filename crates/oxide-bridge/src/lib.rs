@@ -33,7 +33,11 @@
 //! - [`record`]: the flight's record as files (`audit.txt`, `row.csv`) and the
 //!   table's row format.
 //! - [`batch`]: many flights, each in a child process of its own.
-//! - [`cli`]: the command line of the binary `oxide-bridge` (`fly`, `batch`).
+//! - [`tune`]: ArduCopter's tuning procedure as a script (ADR-0007 section 2):
+//!   hover and learn, the gyro spectrum and its notch rule, the automatic
+//!   tuner, the read-back of the gains, and the check.
+//! - [`cli`]: the command line of the binary `oxide-bridge` (`fly`, `batch`,
+//!   `tune`).
 //!
 //! # The binary
 //!
@@ -46,8 +50,17 @@
 //! ([`faults::FaultTranslator`]). `--autopilot core-f405` and `core-h743`
 //! fly our own core on the same file. Both write the same row
 //! ([`record::COLUMNS`]) and the same record (`audit.txt`, `row.csv`), judged
-//! by the same checker and classed by the same code. A scenario that needs
-//! the pilot's sticks is refused with a sentence ([`scenario::translate`]).
+//! by the same checker and classed by the same code. `oxide-bridge tune --out
+//! DIR` flies the tuning procedure ([`tune`]) and writes `report.txt`,
+//! `spectrum.csv` and, when the check passes, `tuned-gains.parm`; the set-up
+//! of ArduPilot's tuning guide is `arducopter/setup.parm`. A scenario that
+//! needs an airframe other than the reference quad or a parameter without a
+//! counterpart is refused with a sentence ([`scenario::translate`]). A pilot
+//! who flies the sticks is translated: the radio goes to the program as it
+//! is, its set-up in `base.parm` (range 1000 to 2000 us, the pitch channel
+//! reversed), the pilot's frames and mode switches after the arm switch are
+//! delayed by [`scenario::ARM_DELAY_S`] for the program's arming delay, and
+//! the brain acts only while the pilot's switch says offboard.
 //!
 //! # A bridged flight repeats bit for bit
 //!
@@ -80,3 +93,4 @@ pub mod runner;
 pub mod scenario;
 pub mod sha256;
 pub mod sitl;
+pub mod tune;
