@@ -80,3 +80,4 @@ pub mod runner;
 pub mod scenario;
 pub mod sha256;
 pub mod sitl;
+pub mod tune;

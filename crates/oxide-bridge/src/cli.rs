@@ -9,6 +9,8 @@
 //! oxide-bridge batch --scenario FILE --indices A..B --out DIR [--jobs J] [--instances A-B]
 //!                    [--autopilot ...] [--binary PATH] [--speedup X] [--param-file FILE]...
 //!                    [--twice] [--limit-s S] [--no-pin] [--first-core N]
+//! oxide-bridge tune  --out DIR [--binary PATH] [--instance N] [--seed N]
+//!                    [--hover-only [--gains FILE]]
 //! ```
 //!
 //! Exit codes: 0 the work was done (`fly`: the flight was flown and judged,
@@ -82,11 +84,26 @@ pub struct BatchArgs {
     pub first_core: usize,
 }
 
+/// What `tune` is given (ADR-0007 section 2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TuneArgs {
+    pub out: PathBuf,
+    pub binary: Option<PathBuf>,
+    pub instance: u8,
+    pub seed: u64,
+    /// Fly only the hover of the script, as a check of a gains file, and
+    /// report its quality.
+    pub hover_only: bool,
+    /// The gains file of a hover check (default `starting-gains.parm`).
+    pub gains: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
     Help,
     Fly(FlyArgs),
     Batch(BatchArgs),
+    Tune(TuneArgs),
 }
 
 /// The usage text.
@@ -97,9 +114,13 @@ oxide-bridge fly   --scenario FILE [--index N] [--autopilot arducopter|core-f405
 oxide-bridge batch --scenario FILE --indices A..B --out DIR [--jobs J] [--instances A-B]
                    [--autopilot ...] [--binary PATH] [--speedup X] [--param-file FILE]...
                    [--twice] [--limit-s S] [--no-pin] [--first-core N]
+oxide-bridge tune  --out DIR [--binary PATH] [--instance N] [--seed N]
+                   [--hover-only [--gains FILE]]
 The simulator program is --binary, or the path in OXIDE_ARDUCOPTER. A batch runs
 each flight as `oxide-bridge fly` in a child process of its own and writes
-DIR/flights.csv. Exit codes: 0 done, 1 wrong use, 2 the flight did not start or
+DIR/flights.csv. `tune` flies ArduCopter's tuning procedure (ADR-0007 section 2) and
+writes DIR/report.txt, DIR/spectrum.csv and DIR/tuned-gains.parm; with --hover-only it
+flies only the hover of the script and prints its quality. Exit codes: 0 done, 1 wrong use, 2 the flight did not start or
 the bridge failed, 3 a run failed twice and the batch stopped.";
 
 struct Args<'a> {
@@ -178,8 +199,9 @@ pub fn parse(args: &[String]) -> Result<Cmd, Usage> {
         "help" | "--help" | "-h" => Ok(Cmd::Help),
         "fly" => parse_fly(args.get(1..).unwrap_or(&[])),
         "batch" => parse_batch(args.get(1..).unwrap_or(&[])),
+        "tune" => parse_tune(args.get(1..).unwrap_or(&[])),
         other => usage(format!(
-            "{other:?} is not a command: say `fly` or `batch` (oxide-bridge help lists the options)"
+            "{other:?} is not a command: say `fly`, `batch` or `tune` (oxide-bridge help lists the options)"
         )),
     }
 }
@@ -312,6 +334,119 @@ fn parse_fly(rest: &[String]) -> Result<Cmd, Usage> {
         instance: c.instance.unwrap_or(0),
         out: c.out,
     }))
+}
+
+fn parse_tune(rest: &[String]) -> Result<Cmd, Usage> {
+    let mut a = Args { rest, pos: 0 };
+    let (mut out, mut binary, mut gains) = (None, None, None);
+    let (mut instance, mut seed, mut hover_only) = (0u8, 0u64, false);
+    while let Some(flag) = a.next() {
+        match flag {
+            "--out" => out = Some(PathBuf::from(a.value(flag)?)),
+            "--binary" => binary = Some(PathBuf::from(a.value(flag)?)),
+            "--gains" => gains = Some(PathBuf::from(a.value(flag)?)),
+            "--hover-only" => hover_only = true,
+            "--instance" => {
+                let v = a.value(flag)?;
+                instance = number(flag, v, "a whole number from 0 to 9")?;
+                if instance > 9 {
+                    return usage(format!("--instance is {instance}: it must be from 0 to 9"));
+                }
+            }
+            "--seed" => seed = number(flag, a.value(flag)?, "a whole number")?,
+            other => {
+                return usage(format!(
+                    "{other:?} is not an option of tune: oxide-bridge help lists them"
+                ));
+            }
+        }
+    }
+    let Some(out) = out else {
+        return usage("--out DIR is required: say where the tuning writes its files");
+    };
+    if gains.is_some() && !hover_only {
+        return usage(
+            "--gains is for --hover-only: the tuning itself starts from starting-gains.parm",
+        );
+    }
+    Ok(Cmd::Tune(TuneArgs {
+        out,
+        binary,
+        instance,
+        seed,
+        hover_only,
+        gains,
+    }))
+}
+
+/// `oxide-bridge tune`.
+pub fn run_tune(args: &TuneArgs) -> ExitCode {
+    let binary = match &args.binary {
+        Some(b) => b.clone(),
+        None => match std::env::var_os(BINARY_VARIABLE) {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => {
+                return wrong_use(&Usage(format!(
+                    "no simulator program: give --binary PATH or set {BINARY_VARIABLE}"
+                )));
+            }
+        },
+    };
+    if args.hover_only {
+        let gains = args
+            .gains
+            .clone()
+            .unwrap_or_else(crate::parm::starting_gains_path);
+        let files = vec![crate::parm::base_path(), crate::parm::setup_path(), gains];
+        return match crate::tune::hover_check(&binary, &args.out, args.instance, args.seed, files) {
+            Ok(f) => {
+                let s = &f.stats;
+                println!(
+                    "hover check: tilt rms {:.4} deg, position rms {:.4} m, height rms {:.4} m \
+                     (the last {} s of the hover); simulated {:.1} s, wall {:.1} s{}",
+                    s.hover_tilt_rms_deg,
+                    s.hover_pos_rms_m,
+                    s.hover_height_rms_m,
+                    crate::tune::QUALITY_S,
+                    f.sim_s,
+                    f.wall_s,
+                    f.failure
+                        .as_ref()
+                        .map_or(String::new(), |e| format!("; FAILED: {e}"))
+                );
+                if f.failure.is_some() {
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    let cfg = crate::tune::TuneConfig {
+        binary,
+        out: args.out.clone(),
+        instance: args.instance,
+        seed: args.seed,
+    };
+    match crate::tune::tune(&cfg) {
+        Ok(o) => {
+            println!(
+                "tuned      {} gains written to {}",
+                o.after.len(),
+                args.out.join("tuned-gains.parm").display()
+            );
+            println!("report     {}", args.out.join("report.txt").display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn parse_batch(rest: &[String]) -> Result<Cmd, Usage> {
@@ -703,6 +838,7 @@ pub fn main_with(args: &[String]) -> ExitCode {
         }
         Ok(Cmd::Fly(a)) => run_fly(&a),
         Ok(Cmd::Batch(a)) => run_batch(&a),
+        Ok(Cmd::Tune(a)) => run_tune(&a),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
