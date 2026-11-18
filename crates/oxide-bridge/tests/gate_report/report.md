@@ -22,6 +22,27 @@ This is not the gate's plan, so it is not passed whatever the numbers say:
 - the scenario brain-crash is not in the plan
 - the scenario brain-hang is not in the plan
 - the scenario setpoint-gap is not in the plan
+- the scenario pair-battery-critical+baro-loss is not in the plan
+- the scenario pair-battery-critical+brain-crash is not in the plan
+- the scenario pair-battery-critical+geofence is not in the plan
+- the scenario pair-battery-low+baro-loss is not in the plan
+- the scenario pair-battery-low+battery-critical is not in the plan
+- the scenario pair-battery-low+brain-crash is not in the plan
+- the scenario pair-battery-low+geofence is not in the plan
+- the scenario pair-brain-crash+baro-loss is not in the plan
+- the scenario pair-brain-crash+geofence is not in the plan
+- the scenario pair-geofence+baro-loss is not in the plan
+- the scenario pair-gps-loss+baro-loss is not in the plan
+- the scenario pair-gps-loss+battery-critical is not in the plan
+- the scenario pair-gps-loss+battery-low is not in the plan
+- the scenario pair-gps-loss+brain-crash is not in the plan
+- the scenario pair-gps-loss+geofence is not in the plan
+- the scenario pair-rc-loss+baro-loss is not in the plan
+- the scenario pair-rc-loss+battery-critical is not in the plan
+- the scenario pair-rc-loss+battery-low is not in the plan
+- the scenario pair-rc-loss+brain-crash is not in the plan
+- the scenario pair-rc-loss+geofence is not in the plan
+- the scenario pair-rc-loss+gps-loss is not in the plan
 - motor-loss is flown on 5 indices and the record says 10
 - the scenario imu-loss is not in the plan
 - the scenario kill-in-rtl is not in the plan
@@ -75,6 +96,8 @@ Lower `rms_h_m`: core-f405 in 16 indices, ArduCopter in 4, equal in 0.
 ![cumulative curves of rms_h_m](report-cumulative.svg)
 
 ![rms_h_m of each index, ArduCopter across, core-f405 up](report-scatter.svg)
+
+The curves and the points are over ArduCopter's safe flights: an index where its flight is not safe is not drawn.
 
 ## Criterion B: failures
 

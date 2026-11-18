@@ -3,6 +3,7 @@
 //! from the tables alone.
 
 pub mod cmd;
+pub mod files;
 pub mod fly;
 pub mod info;
 pub mod plan;

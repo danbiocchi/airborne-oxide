@@ -346,3 +346,94 @@ fn every_scenario_planned_for_arducopter_translates_and_the_stick_files_are_flow
         assert!(sticks.iter().any(|x| x == s), "{s} not in {sticks:?}");
     }
 }
+
+#[test]
+fn the_records_pair_list_is_the_repositorys_pair_files() {
+    let mut files: Vec<String> = std::fs::read_dir(scenarios_dir())
+        .expect("dir")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            let stem = p.file_stem()?.to_string_lossy().into_owned();
+            (p.extension().is_some_and(|x| x == "toml") && stem.starts_with("pair-"))
+                .then_some(stem)
+        })
+        .collect();
+    files.sort();
+    let mut listed: Vec<String> = oxide_bridge::gate::plan::PAIR_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    listed.sort();
+    assert_eq!(files, listed);
+    assert_eq!(listed.len(), 21);
+}
+
+#[test]
+fn a_pair_scenario_left_out_is_refused_and_a_reduced_plan_without_it_is_a_trial() {
+    let dir = copy_of_scenarios("pair-left-out");
+    std::fs::remove_file(dir.join("pair-rc-loss+geofence.toml")).expect("remove");
+    let e = Plan::build(&dir, false).expect_err("refused");
+    assert!(e.to_string().contains("pair-rc-loss+geofence"), "{e}");
+    let plan = Plan::build(&dir, true).expect("reduced");
+    assert_eq!(plan.entries.len(), 42);
+    let d = plan.deviations_from_the_record();
+    assert!(
+        d.iter()
+            .any(|d| d.contains("pair-rc-loss+geofence") && d.contains("not in the plan")),
+        "{d:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plan_with_a_pair_the_record_does_not_name_is_a_trial() {
+    let dir = copy_of_scenarios("pair-extra");
+    write_pair(
+        &dir,
+        "pair-gps-loss+mag-loss",
+        "[[fault]]\nkind = \"gps-loss\"\nstart_s = 10.0\n\
+         [[fault]]\nkind = \"mag-loss\"\nstart_s = 12.0\n",
+    );
+    let plan = Plan::build(&dir, false).expect("a valid pair is built");
+    let d = plan.deviations_from_the_record();
+    assert!(
+        d.iter()
+            .any(|d| d.contains("pair-gps-loss+mag-loss") && d.contains("not in the record")),
+        "{d:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_entry_of_the_plan_is_compared_with_the_record_by_scoring_and_count() {
+    let mut plan = Plan::build(&scenarios_dir(), false).expect("the plan");
+    assert!(plan.deviations_from_the_record().is_empty());
+    // A pair flown on 9 indices, one scored as not scored, one dropped.
+    let i = plan
+        .entries
+        .iter()
+        .position(|e| e.scenario == "pair-gps-loss+geofence")
+        .expect("pair");
+    plan.entries[i].count = 9;
+    let j = plan
+        .entries
+        .iter()
+        .position(|e| e.scenario == "pair-rc-loss+gps-loss")
+        .expect("pair");
+    plan.entries[j].scoring = Scoring::NotScored;
+    let k = plan
+        .entries
+        .iter()
+        .position(|e| e.scenario == "pair-battery-low+brain-crash")
+        .expect("pair");
+    plan.entries.remove(k);
+    let d = plan.deviations_from_the_record();
+    for word in [
+        "pair-gps-loss+geofence is flown on 9",
+        "pair-rc-loss+gps-loss is scored not-scored",
+        "pair-battery-low+brain-crash is not in the plan",
+    ] {
+        assert!(d.iter().any(|d| d.contains(word)), "{word}: {d:?}");
+    }
+}

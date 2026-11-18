@@ -47,6 +47,36 @@ pub const OUTCOME_NAMES: [&str; 17] = [
     "setpoint-gap",
 ];
 
+/// Criterion B, scored on the outcome: the `pair-*` files of ADR-0007
+/// section 6, "every `pair-*` scenario whose two failures are both in this
+/// list". The record's plan holds exactly these; a test holds the list to the
+/// repository's directory, and [`Plan::build`] and
+/// [`Plan::deviations_from_the_record`] refuse a plan with one more or one
+/// fewer, so that a pair left out cannot go unnoticed.
+pub const PAIR_NAMES: [&str; 21] = [
+    "pair-battery-critical+baro-loss",
+    "pair-battery-critical+brain-crash",
+    "pair-battery-critical+geofence",
+    "pair-battery-low+baro-loss",
+    "pair-battery-low+battery-critical",
+    "pair-battery-low+brain-crash",
+    "pair-battery-low+geofence",
+    "pair-brain-crash+baro-loss",
+    "pair-brain-crash+geofence",
+    "pair-geofence+baro-loss",
+    "pair-gps-loss+baro-loss",
+    "pair-gps-loss+battery-critical",
+    "pair-gps-loss+battery-low",
+    "pair-gps-loss+brain-crash",
+    "pair-gps-loss+geofence",
+    "pair-rc-loss+baro-loss",
+    "pair-rc-loss+battery-critical",
+    "pair-rc-loss+battery-low",
+    "pair-rc-loss+brain-crash",
+    "pair-rc-loss+geofence",
+    "pair-rc-loss+gps-loss",
+];
+
 /// Criterion B, scored on the time to motors off.
 pub const MOTORS_OFF_NAMES: [&str; 2] = ["motor-loss", "imu-loss"];
 
@@ -301,7 +331,13 @@ impl Plan {
         let mut missing = Vec::new();
         let mut order: Vec<String> = vec![GUST.to_string()];
         order.extend(OUTCOME_NAMES.iter().map(|s| (*s).to_string()));
-        order.extend(found.keys().filter(|n| n.starts_with("pair-")).cloned());
+        order.extend(PAIR_NAMES.iter().map(|s| (*s).to_string()));
+        order.extend(
+            found
+                .keys()
+                .filter(|n| n.starts_with("pair-") && !PAIR_NAMES.contains(&n.as_str()))
+                .cloned(),
+        );
         order.extend(MOTORS_OFF_NAMES.iter().map(|s| (*s).to_string()));
         order.extend(NOT_SCORED_NAMES.iter().map(|s| (*s).to_string()));
         for name in order {
@@ -358,27 +394,67 @@ impl Plan {
 
     /// How the plan departs from the record's, as sentences: empty for the
     /// gate itself. A plan with any is a trial and its verdict is never a
-    /// pass.
+    /// pass. The comparison is with the record's whole plan: every scenario
+    /// the record names (the 21 pairs included) with its scoring and its
+    /// number of indices, and no scenario the record does not name.
     pub fn deviations_from_the_record(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut fixed: Vec<(&str, u64)> = vec![(GUST, GUST_SEEDS)];
-        fixed.extend(OUTCOME_NAMES.iter().map(|n| (*n, B_SEEDS)));
-        fixed.extend(MOTORS_OFF_NAMES.iter().map(|n| (*n, B_SEEDS)));
-        fixed.push(("kill-in-rtl", B_SEEDS));
-        for (name, count) in fixed {
-            match self.entries.iter().find(|e| e.scenario == name) {
+        let mut fixed: Vec<(String, Scoring, u64)> =
+            vec![(GUST.to_string(), Scoring::Gust, GUST_SEEDS)];
+        fixed.extend(
+            OUTCOME_NAMES
+                .iter()
+                .map(|n| ((*n).to_string(), Scoring::Outcome, B_SEEDS)),
+        );
+        fixed.extend(
+            PAIR_NAMES
+                .iter()
+                .map(|n| ((*n).to_string(), Scoring::Outcome, B_SEEDS)),
+        );
+        fixed.extend(
+            MOTORS_OFF_NAMES
+                .iter()
+                .map(|n| ((*n).to_string(), Scoring::MotorsOff, B_SEEDS)),
+        );
+        fixed.push(("kill-in-rtl".to_string(), Scoring::NotScored, B_SEEDS));
+        for (name, scoring, count) in &fixed {
+            match self.entries.iter().find(|e| &e.scenario == name) {
                 None => out.push(format!("the scenario {name} is not in the plan")),
-                Some(e) if e.count != count => out.push(format!(
-                    "{name} is flown on {} indices and the record says {count}",
-                    e.count
-                )),
-                Some(_) => {}
+                Some(e) => {
+                    if e.scoring != *scoring {
+                        out.push(format!(
+                            "{name} is scored {} and the record says {}",
+                            e.scoring.name(),
+                            scoring.name()
+                        ));
+                    }
+                    if e.count != *count {
+                        out.push(format!(
+                            "{name} is flown on {} indices and the record says {count}",
+                            e.count
+                        ));
+                    }
+                }
             }
         }
         match self.entries.iter().find(|e| e.scenario == "hover-step") {
             None => out.push("the scenario hover-step is not in the plan".to_string()),
             Some(e) if e.count == 0 => out.push("hover-step is flown on no index".to_string()),
+            Some(e) if e.scoring != Scoring::NotScored => out.push(format!(
+                "hover-step is scored {} and the record says not-scored",
+                e.scoring.name()
+            )),
             Some(_) => {}
+        }
+        for e in &self.entries {
+            let known =
+                e.scenario == "hover-step" || fixed.iter().any(|(n, _, _)| n == &e.scenario);
+            if !known {
+                out.push(format!(
+                    "the scenario {} is in the plan and not in the record's",
+                    e.scenario
+                ));
+            }
         }
         let record: Vec<(String, u64)> =
             TWICE.iter().map(|(n, c)| ((*n).to_string(), *c)).collect();

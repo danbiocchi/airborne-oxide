@@ -21,6 +21,18 @@ pub const STARTING_GAINS: &str = include_str!("../arducopter/starting-gains.parm
 /// [`crate::arducopter::ArduCopterConfig::new`]: a flight takes it on request.
 pub const FAILSAFES: &str = include_str!("../arducopter/failsafes.parm");
 
+/// The text of the committed file called `name` as this program was built
+/// with it, for the files a bridged flight can be given.
+pub fn embedded(name: &str) -> Option<&'static str> {
+    match name {
+        "base.parm" => Some(BASE),
+        "setup.parm" => Some(SETUP),
+        "starting-gains.parm" => Some(STARTING_GAINS),
+        "failsafes.parm" => Some(FAILSAFES),
+        _ => None,
+    }
+}
+
 /// The path of `base.parm` in the source tree this crate was built from.
 pub fn base_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("arducopter/base.parm")

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use oxide_sim::rng::run_seed;
 
 use crate::batch::run_dir;
+use crate::gate::files;
 use crate::gate::info::{DIRTY_NOTE, GateInfo};
 use crate::gate::plan::{Entry, GUST, Scoring};
 use crate::gate::stats::{mean, median, percentile_95};
@@ -156,31 +157,98 @@ impl Gate {
 /// What a row's audit says, from its `audit.txt`.
 #[derive(Debug, Default)]
 struct Audit {
+    scenario: Option<String>,
+    index: Option<String>,
+    seed: Option<String>,
+    autopilot: Option<String>,
+    class: Option<String>,
     commit: Option<String>,
     file_sha: Option<String>,
     binary_sha: Option<String>,
     params_sha: Option<String>,
+    /// The packet and the reply hash of the bridge's audit (ArduCopter).
+    packet: Option<String>,
+    reply: Option<String>,
+    /// The first word of the `repeats` line (`yes` or `no`) of a flight flown
+    /// twice.
+    repeats: Option<String>,
 }
 
+/// The value of the line `label  value` of an audit: the label, then at least
+/// two spaces (the audit pads its labels), so that `scenario` is not the line
+/// of `scenario file` and `seed` not that of `seed 7, step 1000 us`.
 fn audit_field(text: &str, label: &str) -> Option<String> {
     text.lines().find_map(|l| {
         l.trim_start()
             .strip_prefix(label)
-            .filter(|rest| rest.starts_with(' '))
+            .filter(|rest| rest.starts_with("  "))
             .map(|rest| rest.trim().to_string())
     })
+}
+
+/// The two hashes of the line `packet hash X, reply hash Y`.
+fn audit_hashes(text: &str) -> (Option<String>, Option<String>) {
+    for l in text.lines() {
+        let l = l.trim();
+        if let Some(rest) = l.strip_prefix("packet hash ")
+            && let Some((p, r)) = rest.split_once(", reply hash ")
+        {
+            return (Some(p.trim().to_string()), Some(r.trim().to_string()));
+        }
+    }
+    (None, None)
 }
 
 fn read_audit(dir: &Path) -> Result<Audit, String> {
     let path = dir.join("audit.txt");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let (packet, reply) = audit_hashes(&text);
     Ok(Audit {
+        scenario: audit_field(&text, "scenario"),
+        index: audit_field(&text, "run index"),
+        seed: audit_field(&text, "seed"),
+        autopilot: audit_field(&text, "autopilot"),
+        class: audit_field(&text, "class"),
         commit: audit_field(&text, "our commit"),
         file_sha: audit_field(&text, "file sha256"),
         binary_sha: audit_field(&text, "binary sha256"),
         params_sha: audit_field(&text, "params sha256"),
+        packet,
+        reply,
+        repeats: audit_field(&text, "repeats")
+            .and_then(|r| r.split_whitespace().next().map(String::from)),
     })
+}
+
+/// The row of `dir/row.csv`, the flight's own record of itself.
+fn read_row_file(dir: &Path) -> Result<Row, String> {
+    let path = dir.join("row.csv");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut lines = text.lines();
+    if lines.next() != Some(header().as_str()) {
+        return Err(format!(
+            "{} does not start with the table's header",
+            path.display()
+        ));
+    }
+    let line = lines
+        .next()
+        .ok_or_else(|| format!("{} holds no row", path.display()))?;
+    Row::parse(line).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The columns of the table's row that differ from the flight's own
+/// `row.csv`: all of them, except that a flight flown again after a failed
+/// attempt has its `retried` and `note` set by the batch.
+fn differing_columns(table: &Row, own: &Row) -> Vec<&'static str> {
+    COLUMNS
+        .iter()
+        .copied()
+        .filter(|c| !(table.get("retried") == "yes" && (*c == "retried" || *c == "note")))
+        .filter(|c| table.get(c) != own.get(c))
+        .collect()
 }
 
 /// A number of a cell: empty is `None`; a word or a non-finite number is an
@@ -202,6 +270,9 @@ struct Reader<'a> {
     problems: &'a mut Vec<String>,
     /// The parameter hashes seen by ArduCopter's tables.
     params: BTreeMap<(String, bool), BTreeSet<String>>,
+    /// Why the flights are not the record's gate although the tables are
+    /// consistent (flown with files that are not the commit's).
+    trial: BTreeSet<String>,
 }
 
 impl Reader<'_> {
@@ -340,6 +411,10 @@ impl Reader<'_> {
         }
         let mut num = |column: &str, required: bool| -> Option<f64> {
             match number(row, column) {
+                Ok(Some(v)) if v < 0.0 => {
+                    whys.push(format!("{column} is {v}, which is negative"));
+                    None
+                }
                 Ok(Some(v)) => Some(v),
                 Ok(None) => {
                     if required {
@@ -353,22 +428,47 @@ impl Reader<'_> {
                 }
             }
         };
-        let rms_h_m = num("rms_h_m", entry.scoring == Scoring::Gust);
+        // The statistics read the rms_h_m of every core flight and of
+        // ArduCopter's safe flights; an unsafe flight of ArduCopter's is only
+        // counted (ADR-0007 section 5), so it need not have one.
+        let enters_statistics = autopilot != "arducopter" || class == Some(Class::Safe);
+        let rms_h_m = num(
+            "rms_h_m",
+            entry.scoring == Scoring::Gust && enters_statistics,
+        );
         let rms_v_m = num("rms_v_m", false);
         let max_tilt_deg = num("max_tilt_deg", false);
         let last_motor_on_s = num("last_motor_on_s", entry.scoring == Scoring::MotorsOff);
         let audit_dir = run_dir(dir, index);
+        match read_row_file(&audit_dir) {
+            Err(e) => whys.push(e),
+            Ok(own) => {
+                let differ = differing_columns(row, &own);
+                if !differ.is_empty() {
+                    whys.push(format!(
+                        "its row of the table is not the row of its own run directory: {} differ",
+                        differ.join(", ")
+                    ));
+                }
+            }
+        }
         match read_audit(&audit_dir) {
             Err(e) => whys.push(e),
-            Ok(a) => audit_problems(
-                self.info,
-                &mut self.params,
-                autopilot,
-                scenario,
-                twice,
-                &a,
-                &mut whys,
-            ),
+            Ok(a) => {
+                audit_problems(
+                    self.info,
+                    &mut self.params,
+                    autopilot,
+                    scenario,
+                    twice,
+                    &a,
+                    &mut whys,
+                );
+                audit_row_problems(row, &a, &mut whys);
+                if autopilot == "arducopter" {
+                    self.expected_params(scenario, &a);
+                }
+            }
         }
         if !whys.is_empty() {
             for why in whys {
@@ -448,12 +548,202 @@ fn audit_problems(
     }
 }
 
+/// What the audit says against what the row says: the same flight.
+fn audit_row_problems(row: &Row, a: &Audit, whys: &mut Vec<String>) {
+    let mut same = |what: &str, audit: &Option<String>, cell: &str| match audit {
+        Some(v) if v == cell => {}
+        Some(v) => whys.push(format!(
+            "its audit says {what} {v:?} and its row says {cell:?}"
+        )),
+        None => whys.push(format!("its audit has no {what}")),
+    };
+    same("scenario", &a.scenario, row.get("scenario"));
+    same("run index", &a.index, row.get("index"));
+    same("seed", &a.seed, row.get("seed"));
+    same("autopilot", &a.autopilot, row.get("autopilot"));
+    same("class", &a.class, row.get("class"));
+    if row.get("autopilot") == "arducopter" {
+        same("packet hash", &a.packet, row.get("packet_hash"));
+        same("reply hash", &a.reply, row.get("reply_hash"));
+    }
+}
+
+impl Reader<'_> {
+    /// Notes a flight of ArduCopter whose parameters are not the effective
+    /// file of the commit's parameter files for its scenario.
+    fn expected_params(&mut self, scenario: &str, a: &Audit) {
+        let Some(got) = a.params_sha.as_deref() else {
+            return;
+        };
+        match files::expected_params_sha256(scenario) {
+            Ok(want) if want == got => {}
+            Ok(want) => {
+                self.trial.insert(format!(
+                    "{scenario} was flown with the parameter hash {got} and the commit's \
+                     parameter files give {want}"
+                ));
+            }
+            Err(e) => {
+                self.trial.insert(format!(
+                    "the parameters of {scenario} cannot be computed from the commit's files: {e}"
+                ));
+            }
+        }
+    }
+}
+
 /// Why the tables cannot give a verdict: one sentence for each problem.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incomplete(pub Vec<String>);
 
-/// Reads `out/gate.txt` and every table of its plan and checks them.
+/// The directories of `out` that the plan does not name: a scenario that is
+/// not in it, an autopilot that does not fly a scenario, a flown-twice
+/// scenario that is not in the plan. (A directory a continued gate moved
+/// aside, `NAME.interrupted`, is its own leftover and is let be.)
+fn stray_directories(out: &Path, info: &GateInfo) -> Vec<String> {
+    fn dirs(path: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".interrupted"))
+            .collect();
+        v.sort();
+        v
+    }
+    let mut stray = Vec::new();
+    for name in dirs(out) {
+        let dir = out.join(&name);
+        if name == TWICE_DIR {
+            for s in dirs(&dir) {
+                if !info.plan.twice.iter().any(|(n, _)| *n == s) {
+                    stray.push(format!(
+                        "the directory {TWICE_DIR}/{s} holds flights flown twice that the plan does not name"
+                    ));
+                }
+            }
+        } else if let Some(entry) = info.plan.entries.iter().find(|e| e.scenario == name) {
+            let known: Vec<String> = entry
+                .scoring
+                .autopilots()
+                .iter()
+                .map(|a| a.name())
+                .collect();
+            for a in dirs(&dir) {
+                if !known.contains(&a) {
+                    stray.push(format!(
+                        "the directory {name}/{a} holds a table of an autopilot that does not fly {name} in the plan"
+                    ));
+                }
+            }
+        } else {
+            stray.push(format!(
+                "the directory {name} holds tables of a scenario that is not in the plan"
+            ));
+        }
+    }
+    stray
+}
+
+/// The flights flown twice against their evidence and against the main
+/// table (ADR-0007 section 7: "both of each pair must agree with each other
+/// and with the same flight in the tables"). A flight that does not repeat
+/// gives no verdict: "the result waits until the cause is known".
+fn twice_problems(
+    out: &Path,
+    info: &GateInfo,
+    tables: &BTreeMap<(String, String), Vec<Flight>>,
+    twice: &BTreeMap<String, Vec<Flight>>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (scenario, _) in &info.plan.twice {
+        let main = tables.get(&(scenario.clone(), "arducopter".to_string()));
+        for f in twice.get(scenario).map_or(&[][..], Vec::as_slice) {
+            let name = format!("the flight {} flown twice", f.name());
+            let run = run_dir(&twice_dir(out, scenario), f.index);
+            let mut broken = Vec::new();
+            match read_audit(&run) {
+                Ok(a) if a.repeats.as_deref() == Some("yes") => {}
+                Ok(a) => broken.push(format!(
+                    "its audit says repeats {:?}",
+                    a.repeats.unwrap_or_default()
+                )),
+                Err(e) => broken.push(e),
+            }
+            match (
+                read_audit(&run.join("second")),
+                read_row_file(&run.join("second")),
+            ) {
+                (Ok(a), Ok(own)) => {
+                    if a.packet.as_deref() != Some(f.packet_hash.as_str())
+                        || a.reply.as_deref() != Some(f.reply_hash.as_str())
+                        || own.get("trace_hash") != f.trace_hash
+                    {
+                        broken.push(
+                            "its second flight's trace, packet and reply hashes are not those of \
+                             its first flight"
+                                .to_string(),
+                        );
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    broken.push(format!("the record of its second flight is missing: {e}"));
+                }
+            }
+            let same_as_main = main
+                .and_then(|m| m.iter().find(|m| m.index == f.index))
+                .is_some_and(|m| m.hashes() == f.hashes())
+                && !f.trace_hash.is_empty()
+                && !f.packet_hash.is_empty()
+                && !f.reply_hash.is_empty();
+            if !same_as_main {
+                broken.push(
+                    "its trace, packet and reply hashes are not those of the same flight in the \
+                     main table"
+                        .to_string(),
+                );
+            }
+            if f.repeats != Some(true) {
+                broken.push(format!(
+                    "its repeats cell is {}",
+                    match f.repeats {
+                        Some(false) => "no",
+                        _ => "empty",
+                    }
+                ));
+            }
+            if !broken.is_empty() {
+                problems.push(format!(
+                    "{name} does not repeat bit for bit or cannot be shown to ({}): the result \
+                     waits until the cause is known (ADR-0007 section 7)",
+                    broken.join("; ")
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// The commit this program was built at, when that is a commit: not
+/// `unknown` (no repository) and not `-dirty` (a build on a tree with
+/// uncommitted changes, which is no commit's program).
+pub fn own_commit() -> Option<&'static str> {
+    let h = env!("OXIDE_GIT_HASH");
+    (h != "unknown" && !h.ends_with("-dirty")).then_some(h)
+}
+
+/// Reads `out/gate.txt` and every table of its plan and checks them, for the
+/// program's own commit ([`own_commit`]).
 pub fn read(out: &Path) -> Result<Gate, Incomplete> {
+    read_at(out, own_commit())
+}
+
+/// [`read`] for a program built at `own` (`None`: not at a commit, which
+/// cannot be compared). Tables flown at another commit than the program's own
+/// give no verdict (ADR-0007 section 7).
+pub fn read_at(out: &Path, own: Option<&str>) -> Result<Gate, Incomplete> {
     let path = out.join("gate.txt");
     let text = std::fs::read_to_string(&path).map_err(|e| {
         Incomplete(vec![format!(
@@ -464,6 +754,15 @@ pub fn read(out: &Path) -> Result<Gate, Incomplete> {
     })?;
     let info = GateInfo::parse(&text).map_err(|e| Incomplete(vec![e]))?;
     let mut problems = Vec::new();
+    if let Some(own) = own
+        && info.commit != own
+    {
+        problems.push(format!(
+            "gate.txt says the gate was flown at commit {} and this program was built at {own}: \
+             a verdict is given on tables of the program's own commit only (ADR-0007 section 7)",
+            info.commit
+        ));
+    }
     if info.tree_dirty {
         problems.push(format!(
             "gate.txt says {DIRTY_NOTE}: the gate is flown on a commit (ADR-0007 section 1)"
@@ -474,18 +773,17 @@ pub fn read(out: &Path) -> Result<Gate, Incomplete> {
     }
     problems.extend(info.plan.inconsistencies());
     let mut trial_reasons = info.plan.deviations_from_the_record();
-    if info.reduced && trial_reasons.is_empty() {
-        trial_reasons.push("gate.txt says the plan is a reduced one".into());
-    } else if !info.reduced && !trial_reasons.is_empty() {
-        problems.push(format!(
-            "gate.txt says the plan is the gate's and it is not: {}",
-            trial_reasons.join("; ")
-        ));
-    }
+    trial_reasons.extend(files::differences_from_build(
+        info.binary_sha256.as_deref(),
+        &info.params,
+        &info.scenario_files,
+        info.plan.entries.iter().map(|e| e.scenario.as_str()),
+    ));
     let mut reader = Reader {
         info: &info,
         problems: &mut problems,
         params: BTreeMap::new(),
+        trial: BTreeSet::new(),
     };
     let mut tables = BTreeMap::new();
     for entry in &info.plan.entries {
@@ -528,8 +826,19 @@ pub fn read(out: &Path) -> Result<Gate, Incomplete> {
             })
         })
         .collect();
+    trial_reasons.extend(std::mem::take(&mut reader.trial));
     problems.extend(mixed);
     problems.extend(across);
+    problems.extend(twice_problems(out, &info, &tables, &twice));
+    problems.extend(stray_directories(out, &info));
+    if info.reduced && trial_reasons.is_empty() {
+        trial_reasons.push("gate.txt says the plan is a reduced one".into());
+    } else if !info.reduced && !trial_reasons.is_empty() {
+        problems.push(format!(
+            "gate.txt says the plan is the gate's and it is not: {}",
+            trial_reasons.join("; ")
+        ));
+    }
     if !problems.is_empty() {
         return Err(Incomplete(problems));
     }
@@ -697,10 +1006,11 @@ pub struct Evaluation {
     pub scenarios: Vec<ScenarioSummary>,
     pub motors: Vec<MotorsSummary>,
     pub twice: Vec<TwiceSummary>,
-    /// ArduCopter's and our F405 core's `rms_h_m` of each gust index, for the
-    /// plots.
+    /// ArduCopter's and our F405 core's `rms_h_m` of each gust index where
+    /// ArduCopter's flight is safe, for the plots.
     pub paired: Vec<(f64, f64)>,
-    /// `rms_h_m` of every gust flight, by autopilot, in index order.
+    /// `rms_h_m` of every gust flight that is in the statistics (all but
+    /// ArduCopter's unsafe flights), by autopilot, in index order.
     pub curves: Vec<(String, Vec<f64>)>,
 }
 
@@ -802,7 +1112,14 @@ pub fn evaluate(gate: &Gate) -> Evaluation {
         for who in [ac, f405, h743, truth] {
             let flights = gate.flights(GUST, who);
             gust.push(gust_stats(who, flights));
-            curves.push((who.to_string(), rms(flights)));
+            // ArduCopter's unsafe flights are left out of its statistics
+            // (ADR-0007 section 5) and so out of its curve.
+            let drawn: Vec<Flight> = flights
+                .iter()
+                .filter(|f| who != ac || f.class == Class::Safe)
+                .cloned()
+                .collect();
+            curves.push((who.to_string(), rms(&drawn)));
         }
         let ours = rms(gate.flights(GUST, f405));
         let theirs: Vec<f64> = gate
@@ -858,7 +1175,9 @@ pub fn evaluate(gate: &Gate) -> Evaluation {
         }
         for (a, b) in gate.flights(GUST, f405).iter().zip(gate.flights(GUST, ac)) {
             if let (Some(x), Some(y)) = (a.rms_h_m, b.rms_h_m) {
-                paired.push((y, x));
+                if b.class == Class::Safe {
+                    paired.push((y, x));
+                }
                 if x < y {
                     wins.ours += 1;
                 } else if y < x {
@@ -1053,7 +1372,12 @@ pub enum Verdict {
 
 /// Reads the tables of `out` and computes the verdict.
 pub fn verdict(out: &Path) -> Verdict {
-    match read(out) {
+    verdict_at(out, own_commit())
+}
+
+/// [`verdict`] for a program built at `own` (see [`read_at`]).
+pub fn verdict_at(out: &Path, own: Option<&str>) -> Verdict {
+    match read_at(out, own) {
         Err(e) => Verdict::Incomplete(e),
         Ok(g) => Verdict::Evaluated(Box::new(evaluate(&g))),
     }

@@ -119,6 +119,11 @@ pub fn markdown(e: &Evaluation, stem: &str) -> String {
         s,
         "![rms_h_m of each index, ArduCopter across, core-f405 up]({stem}{SCATTER_SUFFIX})\n"
     );
+    let _ = writeln!(
+        s,
+        "The curves and the points are over ArduCopter's safe flights: an index where its flight \
+         is not safe is not drawn.\n"
+    );
 
     let _ = writeln!(s, "## Criterion B: failures\n");
     let _ = writeln!(
@@ -336,12 +341,17 @@ pub fn cumulative_svg(e: &Evaluation) -> String {
             W - RIGHT - 126.0,
             colour(who)
         );
+        let how = match e.gust.iter().find(|g| &g.autopilot == who) {
+            Some(g) if g.unsafe_flights > 0 && who == "arducopter" => {
+                format!("{} safe of {}", g.counted, g.flights)
+            }
+            _ => format!("{} flights", values.len()),
+        };
         let _ = writeln!(
             s,
-            "<text x=\"{:.2}\" y=\"{:.2}\" fill=\"#222222\">{who} ({} flights)</text>",
+            "<text x=\"{:.2}\" y=\"{:.2}\" fill=\"#222222\">{who} ({how})</text>",
             W - RIGHT - 120.0,
-            ly + 4.0,
-            values.len()
+            ly + 4.0
         );
     }
     s.push_str("</svg>\n");

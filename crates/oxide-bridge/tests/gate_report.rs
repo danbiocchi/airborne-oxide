@@ -38,10 +38,19 @@ fn small() -> Evaluation {
     f.write();
     let v = verdict(&f.dir);
     f.remove();
-    match v {
-        Verdict::Evaluated(e) => *e,
-        Verdict::Incomplete(i) => panic!("{i:?}"),
+    let Verdict::Evaluated(mut e) = v else {
+        panic!("the tables should be complete");
+    };
+    // The golden files do not hold the hashes of the repository's own files
+    // (which change when a scenario or a parameter file does): the report
+    // prints gate.txt as it is, so the hashes are fixed here.
+    e.info.commit = "0123456789abcdef0123456789abcdef01234567".into();
+    e.info.params = vec![("base.parm".into(), "aa".into())];
+    e.info.binary_sha256 = Some("b1".repeat(32));
+    for (name, sha) in &mut e.info.scenario_files {
+        *sha = format!("{:064x}", oxide_sim::rng::run_seed(name, 99));
     }
+    *e
 }
 
 fn check(name: &str, got: &str) {
@@ -120,7 +129,10 @@ fn the_figures_are_plain_svg_text_with_the_four_curves_and_the_diagonal() {
     assert!(c.starts_with("<svg ") && c.ends_with("</svg>\n"));
     assert_eq!(c.matches("<polyline").count(), 4);
     let s = scatter_svg(&e);
-    assert_eq!(s.matches("<circle").count(), 20);
+    // 20 indices; ArduCopter's flight of index 4 is a crash and is not drawn.
+    assert_eq!(s.matches("<circle").count(), 19);
+    assert!(c.contains("arducopter (19 safe of 20)"));
+    assert!(c.contains("core-f405 (20 flights)"));
     assert!(s.contains("stroke-dasharray"));
     assert!(c.is_ascii() && s.is_ascii());
 }

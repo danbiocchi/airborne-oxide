@@ -9,14 +9,24 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use oxide_bridge::batch::run_dir;
+use oxide_bridge::gate::files;
 use oxide_bridge::gate::info::GateInfo;
 use oxide_bridge::gate::plan::{Entry, Plan, Scoring};
 use oxide_bridge::gate::verdict::{table_dir, twice_dir};
 use oxide_bridge::record::{Row, header};
 use oxide_sim::rng::run_seed;
 
-pub const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
-pub const BINARY: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+const MADE_UP_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The commit the fixtures say they were flown at: this build's own when it
+/// is a clean commit (the verdict gives none on tables of another commit), a
+/// made-up one for a build on a dirty tree.
+pub fn commit() -> String {
+    oxide_bridge::gate::verdict::own_commit()
+        .map_or_else(|| MADE_UP_COMMIT.to_string(), String::from)
+}
+/// The pinned simulator program's checksum: the only one the verdict accepts.
+pub const BINARY: &str = oxide_bridge::sitl::PINNED.sha256;
 
 pub const AC: &str = "arducopter";
 pub const F405: &str = "core-f405";
@@ -26,7 +36,18 @@ pub const TRUTH: &str = "core-f405-truth";
 /// One flight's row and the audit that goes with it.
 #[derive(Clone)]
 pub struct Flown {
+    /// The row of the table.
     pub row: Row,
+    /// What the flight's own run directory holds when it is not the table's
+    /// row (`row.csv` and the audit are written from it): a table edited
+    /// after the flight.
+    pub own: Option<Row>,
+    /// The `repeats` word of the audit of a flight flown twice, when it is
+    /// not the row's.
+    pub audit_repeats: Option<String>,
+    /// The trace, packet and reply hash of a second flight, when they are
+    /// not the first's.
+    pub second: Option<(String, String, String)>,
     pub commit: String,
     pub file_sha: String,
     pub binary: String,
@@ -91,15 +112,36 @@ fn good(entry: &Entry, autopilot: &str, index: u64, twice: bool) -> Flown {
     r.set("retried", "no");
     Flown {
         row: r,
-        commit: COMMIT.to_string(),
+        own: None,
+        audit_repeats: None,
+        second: None,
+        commit: commit(),
         file_sha: file_sha(scenario),
         binary: BINARY.to_string(),
-        params: format!("params-of-{scenario}"),
+        params: params_sha(scenario),
     }
 }
 
+impl Flown {
+    /// Edits a cell of the table only: the flight's own run directory keeps
+    /// the row it had.
+    pub fn edit_table_only(&mut self, column: &str, value: &str) {
+        if self.own.is_none() {
+            self.own = Some(self.row.clone());
+        }
+        self.row.set(column, value);
+    }
+}
+
+/// The SHA-256 of the scenario file of the commit (a made-up one for a name
+/// that is not a scenario of the repository).
 pub fn file_sha(scenario: &str) -> String {
-    format!("{:064x}", run_seed(scenario, 99))
+    files::scenario_sha256(scenario).unwrap_or_else(|| format!("{:064x}", run_seed(scenario, 99)))
+}
+
+/// The effective parameter hash of a bridged flight of the scenario.
+pub fn params_sha(scenario: &str) -> String {
+    files::expected_params_sha256(scenario).unwrap_or_else(|_| format!("params-of-{scenario}"))
 }
 
 impl Fixture {
@@ -130,7 +172,7 @@ impl Fixture {
             // The second flight's hashes are the first's.
         }
         let info = GateInfo {
-            commit: COMMIT.into(),
+            commit: commit(),
             tree_dirty: false,
             reduced,
             binary_sha256: Some(BINARY.into()),
@@ -140,7 +182,7 @@ impl Fixture {
             started: "2026-01-01T00:00:00Z".into(),
             ended: "2026-01-01T09:00:00Z".into(),
             cores: 4,
-            params: vec![("base.parm".into(), "aa".into())],
+            params: files::param_hashes().expect("the commit's parameter hashes"),
             scenario_files: plan
                 .entries
                 .iter()
@@ -238,21 +280,78 @@ fn write_table(dir: &Path, flights: &[Flown], bridged: bool) {
         let index: u64 = f.row.get("index").parse().unwrap_or(0);
         let run = run_dir(dir, index);
         std::fs::create_dir_all(&run).expect("run dir");
+        // The flight's own record of itself.
+        let own = f.own.as_ref().unwrap_or(&f.row);
         let mut audit = format!(
-            "oxide-bridge flight record\n  scenario        {}\n  file sha256     {}\n  \
-             run index       {index}\n  our commit      {}\n",
-            f.row.get("scenario"),
+            "oxide-bridge flight record\n  scenario        {}\n  \
+             scenario file   /somewhere/{}.toml\n  file sha256     {}\n  \
+             run index       {}\n  seed            {}\n  autopilot       {}\n  \
+             our commit      {}\n",
+            own.get("scenario"),
+            own.get("scenario"),
             f.file_sha,
+            own.get("index"),
+            own.get("seed"),
+            own.get("autopilot"),
             f.commit
         );
+        if !f.row.get("repeats").is_empty() || f.audit_repeats.is_some() {
+            audit.push_str(&format!(
+                "  repeats         {} (trace, packet and reply hashes of two flights)\n",
+                f.audit_repeats
+                    .clone()
+                    .unwrap_or_else(|| f.row.get("repeats").to_string())
+            ));
+        }
+        audit.push_str(&format!("  class           {}\n", own.get("class")));
         if bridged && f.row.get("autopilot") == AC {
             audit.push_str(&format!(
-                "\nflight audit\n  binary sha256   {}\n  params sha256   {}\n",
-                f.binary, f.params
+                "\nflight audit\n  binary sha256   {}\n  params sha256   {}\n  \
+                 seed {}, step 1000 us, 3 pre-roll steps, 9 exchanges\n  \
+                 packet hash {}, reply hash {}\n",
+                f.binary,
+                f.params,
+                own.get("seed"),
+                own.get("packet_hash"),
+                own.get("reply_hash")
             ));
         }
         // A doubled row has the same run directory: it is written once.
         std::fs::write(run.join("audit.txt"), audit).expect("audit");
+        std::fs::write(
+            run.join("row.csv"),
+            format!("{}\n{}\n", header(), own.line()),
+        )
+        .expect("row.csv");
+        if !f.row.get("repeats").is_empty() || f.audit_repeats.is_some() {
+            // The second flight of a flight flown twice.
+            let second = run.join("second");
+            std::fs::create_dir_all(&second).expect("second dir");
+            let (trace, packet, reply) = f.second.clone().unwrap_or_else(|| {
+                (
+                    own.get("trace_hash").to_string(),
+                    own.get("packet_hash").to_string(),
+                    own.get("reply_hash").to_string(),
+                )
+            });
+            std::fs::write(
+                second.join("audit.txt"),
+                format!(
+                    "oxide-bridge flight record\n  scenario        {}\n\nflight audit\n  \
+                     packet hash {packet}, reply hash {reply}\n",
+                    own.get("scenario")
+                ),
+            )
+            .expect("second audit");
+            let mut again = own.clone();
+            again.set("trace_hash", &trace);
+            again.set("repeats", "");
+            std::fs::write(
+                second.join("row.csv"),
+                format!("{}\n{}\n", header(), again.line()),
+            )
+            .expect("second row");
+        }
     }
     std::fs::write(dir.join("flights.csv"), text).expect("flights.csv");
 }

@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{self, BatchConfig, Event, Job, Pin};
 use crate::cli::{self, BINARY_VARIABLE, BatchArgs, Common, DEFAULT_LIMIT_S};
+use crate::gate::files;
 use crate::gate::info::{DIRTY_NOTE, GateInfo, utc_text};
 use crate::gate::plan::Plan;
 use crate::gate::verdict::{TABLE, table_dir, twice_dir};
@@ -278,22 +279,48 @@ pub fn fly(s: &Settings) -> Result<u8, String> {
         ));
     }
     let plan = Plan::build(&s.scenarios, s.reduced).map_err(|e| e.to_string())?;
-    let deviations = plan.deviations_from_the_record();
+    let binary = binary_path(s)?;
+    let binary_sha = sha_of(&binary).map_err(|e| format!("the simulator program: {e}"))?;
+    let airframe = oxide_sim::Airframe::reference_quad().map_err(|e| e.to_string())?;
+    let params = param_hashes(&airframe)?;
+    // The children read the parameter files from the source tree: they must
+    // be the ones this program was built with, which are the commit's (the
+    // build refuses a dirty tree's hash above).
+    let built_params = files::param_hashes()?;
+    if params != built_params {
+        return Err(format!(
+            "the parameter files on disk ({}) are not the ones this program was built with ({}): \
+             build it again at the commit that is to be flown",
+            params
+                .iter()
+                .map(|(n, h)| format!("{n} {}", h.get(..12).unwrap_or(h)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            built_params
+                .iter()
+                .map(|(n, h)| format!("{n} {}", h.get(..12).unwrap_or(h)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut scenario_files = Vec::new();
+    for e in &plan.entries {
+        let path = s.scenarios.join(format!("{}.toml", e.scenario));
+        scenario_files.push((e.scenario.clone(), sha_of(&path)?));
+    }
+    let mut deviations = plan.deviations_from_the_record();
+    deviations.extend(files::differences_from_build(
+        Some(&binary_sha),
+        &params,
+        &scenario_files,
+        plan.entries.iter().map(|e| e.scenario.as_str()),
+    ));
     let reduced = s.reduced || !deviations.is_empty();
     if reduced {
         eprintln!(
             "note: this plan is not the gate's plan ({}): its verdict is never a pass",
             deviations.join("; ")
         );
-    }
-    let binary = binary_path(s)?;
-    let binary_sha = sha_of(&binary).map_err(|e| format!("the simulator program: {e}"))?;
-    let airframe = oxide_sim::Airframe::reference_quad().map_err(|e| e.to_string())?;
-    let params = param_hashes(&airframe)?;
-    let mut scenario_files = Vec::new();
-    for e in &plan.entries {
-        let path = s.scenarios.join(format!("{}.toml", e.scenario));
-        scenario_files.push((e.scenario.clone(), sha_of(&path)?));
     }
     let mut info = GateInfo {
         commit,

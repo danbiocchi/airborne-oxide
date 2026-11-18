@@ -9,7 +9,8 @@ mod fx;
 use fx::{AC, F405, Fixture, H743, TRUTH};
 use oxide_bridge::gate::stats::median;
 use oxide_bridge::gate::verdict::{
-    EXIT_INCOMPLETE, EXIT_NOT_PASSED, EXIT_PASSED, Evaluation, Status, Verdict, table_dir, verdict,
+    EXIT_INCOMPLETE, EXIT_NOT_PASSED, EXIT_PASSED, Evaluation, Gate, Status, Verdict, evaluate,
+    read, read_at, table_dir, twice_dir, verdict, verdict_at,
 };
 
 /// An edit of a good fixture.
@@ -27,6 +28,17 @@ fn eval(f: &Fixture) -> Evaluation {
     match run(f) {
         Verdict::Evaluated(e) => *e,
         Verdict::Incomplete(i) => panic!("the tables should be complete: {i:?}"),
+    }
+}
+
+/// The tables read and checked, for a test that edits what was read.
+fn read_gate(f: &Fixture) -> Gate {
+    f.write();
+    let g = read(&f.dir);
+    f.remove();
+    match g {
+        Ok(g) => g,
+        Err(i) => panic!("the tables should be complete: {i:?}"),
     }
 }
 
@@ -96,7 +108,7 @@ fn the_gate_is_passed_on_good_tables_of_the_whole_plan() {
 
 #[test]
 fn the_gate_is_not_passed_when_any_one_criterion_fails_on_the_whole_plan() {
-    let breaks: [(&str, Edit); 6] = [
+    let breaks: [(&str, Edit); 5] = [
         ("A1", |f| set_class(f, "gust-hold", F405, 17, "crash")),
         ("A2", |f| {
             for i in 0..500 {
@@ -113,9 +125,6 @@ fn the_gate_is_not_passed_when_any_one_criterion_fails_on_the_whole_plan() {
             f.row("motor-loss", F405, 2).set("last_motor_on_s", "40");
             f.row("motor-loss", F405, 1).set("last_motor_on_s", "40");
             f.row("motor-loss", F405, 0).set("last_motor_on_s", "40");
-        }),
-        ("repeats", |f| {
-            f.twice_flown("imu-loss", 0).row.set("repeats", "no");
         }),
     ];
     for (name, apply) in breaks {
@@ -139,6 +148,19 @@ fn the_gate_is_not_passed_when_any_one_criterion_fails_on_the_whole_plan() {
         .collect();
         assert!(failing.contains(&name), "{name}: failing {failing:?}");
     }
+}
+
+#[test]
+fn the_gate_is_not_passed_when_the_repeats_cannot_hold_on_the_whole_plan() {
+    // A flight that does not repeat gives no verdict at all (see below); a
+    // Gate whose flight flown twice is edited after it was read is not
+    // passed either.
+    let mut g = read_gate(&Fixture::full("repeats-whole"));
+    g.twice.get_mut("imu-loss").expect("twice")[0].repeats = Some(false);
+    let e = evaluate(&g);
+    assert!(!e.passed, "{}", e.text());
+    assert_eq!(e.repeats.status, Status::Fails);
+    assert_eq!(e.exit_code(), EXIT_NOT_PASSED);
 }
 
 // ---- A1 --------------------------------------------------------------------
@@ -586,43 +608,207 @@ fn the_repeats_hold_when_every_twice_flown_flight_repeats_and_matches() {
 
 #[test]
 fn one_repeats_no_fails() {
-    let mut f = Fixture::small("rep-no");
-    f.twice_flown("gps-loss", 0).row.set("repeats", "no");
-    let e = eval(&f);
+    // On a gate that was read: the criterion itself.
+    let mut g = read_gate(&Fixture::small("rep-no"));
+    g.twice.get_mut("gps-loss").expect("twice")[0].repeats = Some(false);
+    let e = evaluate(&g);
     assert_eq!(e.repeats.status, Status::Fails);
     assert!(mentions(
         &e.repeats.failing,
         &["gps-loss arducopter index 0", "repeats is no"]
     ));
+    // From the tables: no verdict, "the result waits until the cause is known"
+    // (ADR-0007 section 7), not a failed gate.
+    let mut f = Fixture::small("rep-no-tables");
+    f.twice_flown("gps-loss", 0).row.set("repeats", "no");
+    let p = refused(&f);
+    assert!(
+        mentions(
+            &p,
+            &[
+                "gps-loss arducopter index 0",
+                "waits until the cause is known"
+            ]
+        ),
+        "{p:?}"
+    );
 }
 
 #[test]
 fn a_repeats_that_is_empty_does_not_count_as_yes() {
-    let mut f = Fixture::small("rep-empty");
+    let mut g = read_gate(&Fixture::small("rep-empty"));
+    g.twice.get_mut("gust-hold").expect("twice")[1].repeats = None;
+    assert_eq!(evaluate(&g).repeats.status, Status::Fails);
+    let mut f = Fixture::small("rep-empty-tables");
     f.twice_flown("gust-hold", 1).row.set("repeats", "");
-    assert_eq!(eval(&f).repeats.status, Status::Fails);
+    assert!(mentions(
+        &refused(&f),
+        &["gust-hold arducopter index 1", "repeats"]
+    ));
 }
 
 #[test]
 fn a_twice_flown_flight_whose_hash_differs_from_the_main_table_fails_each_hash() {
     for column in ["trace_hash", "packet_hash", "reply_hash"] {
-        let mut f = Fixture::small(&format!("rep-{column}"));
-        // It says it repeated; the hash is not the main table's.
-        f.twice_flown("gust-hold", 1)
-            .row
-            .set(column, "00000000deadbeef");
-        let e = eval(&f);
+        // The criterion, on a gate that was read.
+        let mut g = read_gate(&Fixture::small(&format!("rep-{column}")));
+        {
+            let f = &mut g.twice.get_mut("gust-hold").expect("twice")[1];
+            match column {
+                "trace_hash" => f.trace_hash = "00000000deadbeef".into(),
+                "packet_hash" => f.packet_hash = "00000000deadbeef".into(),
+                _ => f.reply_hash = "00000000deadbeef".into(),
+            }
+        }
+        let e = evaluate(&g);
         assert_eq!(e.repeats.status, Status::Fails, "{column}");
         assert!(mentions(
             &e.repeats.failing,
             &["gust-hold arducopter index 1", "main table"]
         ));
+        // From the tables: no verdict, the result waits.
+        let mut f = Fixture::small(&format!("rep-{column}-tables"));
+        // It says it repeated; the hash is not the main table's.
+        f.twice_flown("gust-hold", 1)
+            .row
+            .set(column, "00000000deadbeef");
+        let p = refused(&f);
+        assert!(
+            mentions(
+                &p,
+                &[
+                    "gust-hold arducopter index 1",
+                    "waits until the cause is known"
+                ]
+            ),
+            "{column}: {p:?}"
+        );
     }
     // The other way: the main table's hash is the one that differs.
     let mut f = Fixture::small("rep-main");
     f.row("gust-hold", AC, 0)
         .set("trace_hash", "00000000deadbeef");
-    assert_eq!(eval(&f).repeats.status, Status::Fails);
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gust-hold arducopter index 0", "main table"]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_twice_table_that_holds_copies_of_the_main_rows_is_not_a_repeat() {
+    // The flight did not repeat (its second flight's hashes differ and its
+    // audit says no); the table was then edited to say yes and to hold the
+    // main table's hashes. Its own run directory still says what happened.
+    let mut f = Fixture::small("rep-forged");
+    let main = f.row("gps-loss", AC, 0).clone();
+    {
+        let t = f.twice_flown("gps-loss", 0);
+        t.row.set("trace_hash", "0000000000000001");
+        t.row.set("packet_hash", "0000000000000002");
+        t.row.set("reply_hash", "0000000000000003");
+        t.row.set("repeats", "no");
+        t.audit_repeats = Some("no".into());
+        t.second = Some((
+            "0000000000000011".into(),
+            "0000000000000012".into(),
+            "0000000000000013".into(),
+        ));
+        t.own = Some(t.row.clone());
+        for c in ["trace_hash", "packet_hash", "reply_hash"] {
+            t.row.set(c, main.get(c));
+        }
+        t.row.set("repeats", "yes");
+    }
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gps-loss arducopter index 0", "own run directory"]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_flight_whose_second_flight_has_other_hashes_is_not_a_repeat_whatever_the_table_says() {
+    // Table and run directory agree and say yes; the second flight's record
+    // holds other hashes.
+    for which in 0..3 {
+        let mut f = Fixture::small(&format!("rep-second-{which}"));
+        let t = f.twice_flown("gps-loss", 0);
+        let (tr, pk, rp) = (
+            t.row.get("trace_hash").to_string(),
+            t.row.get("packet_hash").to_string(),
+            t.row.get("reply_hash").to_string(),
+        );
+        let other = "00000000cafe0000".to_string();
+        t.second = Some(match which {
+            0 => (other, pk, rp),
+            1 => (tr, other, rp),
+            _ => (tr, pk, other),
+        });
+        let p = refused(&f);
+        assert!(
+            mentions(&p, &["gps-loss arducopter index 0", "second flight"]),
+            "{which}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn a_flight_flown_twice_whose_audit_does_not_say_it_repeated_is_not_a_repeat() {
+    let mut f = Fixture::small("rep-audit");
+    f.twice_flown("gps-loss", 0).audit_repeats = Some("no".into());
+    let p = refused(&f);
+    assert!(
+        mentions(
+            &p,
+            &["gps-loss arducopter index 0", "its audit says repeats"]
+        ),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_flight_flown_twice_without_the_record_of_its_second_flight_is_not_a_repeat() {
+    let f = Fixture::small("rep-no-second");
+    f.write();
+    let second = oxide_bridge::batch::run_dir(&twice_dir(&f.dir, "gps-loss"), 0).join("second");
+    std::fs::remove_dir_all(second).expect("remove");
+    let v = verdict(&f.dir);
+    f.remove();
+    assert_eq!(v.exit_code(), EXIT_INCOMPLETE);
+    assert!(
+        mentions(
+            &incomplete(&v),
+            &["gps-loss arducopter index 0", "second flight", "missing"]
+        ),
+        "{}",
+        v.text()
+    );
+}
+
+#[test]
+fn empty_hashes_on_both_sides_are_not_the_same_flight() {
+    let mut f = Fixture::small("rep-empty-hashes");
+    f.row("gust-hold", AC, 1).set("trace_hash", "");
+    f.twice_flown("gust-hold", 1).row.set("trace_hash", "");
+    let p = refused(&f);
+    assert!(
+        mentions(
+            &p,
+            &[
+                "gust-hold arducopter index 1",
+                "same flight in the main table"
+            ]
+        ),
+        "{p:?}"
+    );
+}
+
+fn incomplete(v: &Verdict) -> Vec<String> {
+    match v {
+        Verdict::Incomplete(i) => i.0.clone(),
+        Verdict::Evaluated(e) => panic!("should be refused:\n{}", e.text()),
+    }
 }
 
 // ---- completeness ----------------------------------------------------------
@@ -727,7 +913,7 @@ fn a_row_flown_on_a_dirty_tree_is_exit_2_by_its_note_or_by_its_audit() {
         "{p:?}"
     );
     let mut f = Fixture::small("dirty-audit");
-    f.flown("gust-hold", F405, 4).commit = format!("{}-dirty", fx::COMMIT);
+    f.flown("gust-hold", F405, 4).commit = format!("{}-dirty", fx::commit());
     let p = refused(&f);
     assert!(
         mentions(&p, &["gust-hold core-f405 index 4", "dirty tree"]),
@@ -884,4 +1070,400 @@ fn a_plan_that_scores_a_scenario_otherwise_than_the_record_is_exit_2() {
     }
     let p = refused(&f);
     assert!(mentions(&p, &["gps-loss", "scored"]), "{p:?}");
+}
+
+// ---- the record's whole plan -----------------------------------------------
+
+/// Takes the scenario out of a fixture of the whole plan: gate.txt's plan and
+/// scenario files, the tables, and the flights flown twice.
+fn drop_scenario(f: &mut Fixture, name: &str) {
+    f.info.plan.entries.retain(|e| e.scenario != name);
+    f.info.plan.twice.retain(|(n, _)| n != name);
+    f.info.plan.pair_kinds.remove(name);
+    f.info.scenario_files.retain(|(n, _)| n != name);
+    f.tables.retain(|(s, _), _| s != name);
+    f.twice.remove(name);
+}
+
+#[test]
+fn a_pair_scenario_left_out_of_the_whole_plan_is_exit_2() {
+    let mut f = Fixture::full("pair-left-out");
+    drop_scenario(&mut f, "pair-rc-loss+geofence");
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["pair-rc-loss+geofence", "not in the plan"]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn every_pair_that_is_not_flown_twice_left_out_is_exit_2() {
+    let mut f = Fixture::full("pairs-left-out");
+    let pairs: Vec<String> = oxide_bridge::gate::plan::PAIR_NAMES
+        .iter()
+        .filter(|n| **n != "pair-gps-loss+baro-loss")
+        .map(|n| (*n).to_string())
+        .collect();
+    assert_eq!(pairs.len(), 20);
+    for n in &pairs {
+        drop_scenario(&mut f, n);
+    }
+    let p = refused(&f);
+    for n in &pairs {
+        assert!(mentions(&p, &[n.as_str(), "not in the plan"]), "{n}: {p:?}");
+    }
+}
+
+#[test]
+fn a_scenario_the_record_does_not_name_is_exit_2_on_the_whole_plan() {
+    let mut f = Fixture::full("extra-scenario");
+    let mut e = f
+        .info
+        .plan
+        .entries
+        .iter()
+        .find(|e| e.scenario == "gps-loss")
+        .expect("entry")
+        .clone();
+    e.scenario = "pair-gps-loss+mag-loss".into();
+    f.info.plan.entries.push(e);
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["pair-gps-loss+mag-loss", "not in the record"]),
+        "{p:?}"
+    );
+}
+
+// ---- the files are the commit's --------------------------------------------
+
+/// Gives every flight of the scenario's tables (and twice-flown flights) the
+/// scenario file hash `sha`, in the audits and in gate.txt.
+fn set_file_sha(f: &mut Fixture, scenario: &str, sha: &str) {
+    for ((s, _), flights) in &mut f.tables {
+        if s == scenario {
+            for fl in flights {
+                fl.file_sha = sha.to_string();
+            }
+        }
+    }
+    for fl in f.twice.get_mut(scenario).into_iter().flatten() {
+        fl.file_sha = sha.to_string();
+    }
+    for (n, h) in &mut f.info.scenario_files {
+        if n == scenario {
+            *h = sha.to_string();
+        }
+    }
+}
+
+#[test]
+fn a_gate_flown_from_an_edited_scenario_file_is_exit_2_on_the_whole_plan_and_a_trial_otherwise() {
+    // gust-hold in calm air: every audit and gate.txt agree with each other
+    // and none with the commit's file.
+    let mut f = Fixture::full("edited-scenario");
+    set_file_sha(&mut f, "gust-hold", &"7".repeat(64));
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gust-hold", "SHA-256", "the commit's"]),
+        "{p:?}"
+    );
+    // A reduced gate keeps its verdict and says why it is not a pass.
+    let mut f = Fixture::full("edited-scenario-reduced");
+    set_file_sha(&mut f, "gust-hold", &"7".repeat(64));
+    f.info.reduced = true;
+    let e = eval(&f);
+    assert!(!e.passed);
+    assert_eq!(e.exit_code(), EXIT_NOT_PASSED);
+    assert!(
+        mentions(&e.trial_reasons, &["gust-hold", "the commit's"]),
+        "{:?}",
+        e.trial_reasons
+    );
+}
+
+#[test]
+fn a_gate_flown_with_other_parameter_files_is_exit_2() {
+    // gate.txt's hash of a file differs from the program's.
+    let mut f = Fixture::full("param-file");
+    f.info.params[0].1 = "9".repeat(64);
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["parameter files", "not the commit's"]),
+        "{p:?}"
+    );
+    // A file missing from the list.
+    let mut f = Fixture::full("param-file-missing");
+    f.info.params.pop();
+    assert!(mentions(&refused(&f), &["parameter files"]));
+}
+
+#[test]
+fn a_table_whose_every_flight_has_another_parameter_hash_is_exit_2() {
+    // Not one table that mixes them: every audit of the scenario, and of its
+    // flights flown twice, agree on a set that is not the commit's.
+    for scenario in ["gps-loss", "gust-hold"] {
+        let mut f = Fixture::full(&format!("params-{scenario}"));
+        for ((s, a), flights) in &mut f.tables {
+            if s == scenario && a == AC {
+                for fl in flights {
+                    fl.params = "9".repeat(64);
+                }
+            }
+        }
+        for fl in f.twice.get_mut(scenario).into_iter().flatten() {
+            fl.params = "9".repeat(64);
+        }
+        let p = refused(&f);
+        assert!(
+            mentions(
+                &p,
+                &[scenario, "parameter hash", "commit's parameter files"]
+            ),
+            "{scenario}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn a_binary_that_is_not_the_pinned_one_is_exit_2_even_when_gate_txt_and_every_audit_agree() {
+    let mut f = Fixture::full("binary-pinned");
+    let other = "d".repeat(64);
+    f.info.binary_sha256 = Some(other.clone());
+    for flights in f.tables.values_mut().chain(f.twice.values_mut()) {
+        for fl in flights {
+            fl.binary = other.clone();
+        }
+    }
+    let p = refused(&f);
+    assert!(mentions(&p, &["simulator program", "pinned"]), "{p:?}");
+}
+
+// ---- the table is the flight's own record ----------------------------------
+
+#[test]
+fn a_class_edited_in_the_table_against_the_flights_own_record_is_exit_2() {
+    let mut f = Fixture::full("class-edit");
+    {
+        let fl = f.flown("gps-loss", F405, 5);
+        fl.row.set("class", "crash");
+        fl.own = Some(fl.row.clone());
+        fl.row.set("class", "safe");
+    }
+    let p = refused(&f);
+    assert!(
+        mentions(
+            &p,
+            &["gps-loss core-f405 index 5", "own run directory", "class"]
+        ),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_halved_rms_in_the_table_alone_is_exit_2() {
+    let mut f = Fixture::full("rms-halved");
+    for i in 0..500 {
+        let fl = f.flown("gust-hold", F405, i);
+        let v: f64 = fl.row.get("rms_h_m").parse().expect("number");
+        fl.edit_table_only("rms_h_m", &format!("{}", v / 2.0));
+    }
+    let p = refused(&f);
+    assert!(
+        mentions(
+            &p,
+            &[
+                "gust-hold core-f405 index 0",
+                "own run directory",
+                "rms_h_m"
+            ]
+        ),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_table_row_and_audit_that_disagree_on_class_seed_or_hash_is_exit_2() {
+    // The audit is the flight's: a table row that says another class, or a
+    // reply hash the audit does not have, is not that flight's row.
+    let mut f = Fixture::small("audit-class");
+    f.flown("gps-loss", F405, 1).own = None;
+    {
+        let fl = f.flown("gps-loss", AC, 1);
+        fl.own = Some(fl.row.clone());
+        fl.row.set("packet_hash", "00000000000000aa");
+    }
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gps-loss arducopter index 1", "packet_hash"]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_negative_error_time_or_tilt_is_malformed_and_exit_2() {
+    for (scenario, who, column) in [
+        ("gust-hold", F405, "rms_h_m"),
+        ("gust-hold", AC, "rms_h_m"),
+        ("gust-hold", F405, "rms_v_m"),
+        ("gust-hold", F405, "max_tilt_deg"),
+        ("motor-loss", F405, "last_motor_on_s"),
+    ] {
+        let mut f = Fixture::small(&format!("negative-{column}"));
+        let fl = f.flown(scenario, who, 2);
+        fl.row.set(column, "-0.5");
+        fl.own = None;
+        let p = refused(&f);
+        assert!(
+            mentions(&p, &[scenario, column, "negative"]),
+            "{scenario} {who} {column}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unsafe_arducopter_gust_flight_needs_no_rms_but_a_safe_one_and_ours_do() {
+    let mut f = Fixture::small("rms-unsafe");
+    set_class(&mut f, "gust-hold", AC, 4, "crash");
+    f.row("gust-hold", AC, 4).set("rms_h_m", "");
+    let e = eval(&f);
+    assert_eq!(e.gust[0].unsafe_flights, 1);
+    assert_eq!(e.gust[0].counted, 19);
+    let mut f = Fixture::small("rms-safe");
+    f.row("gust-hold", AC, 4).set("rms_h_m", "");
+    assert!(mentions(
+        &refused(&f),
+        &["gust-hold arducopter index 4", "rms_h_m"]
+    ));
+    let mut f = Fixture::small("rms-ours");
+    set_class(&mut f, "gust-hold", F405, 4, "crash");
+    f.row("gust-hold", F405, 4).set("rms_h_m", "");
+    assert!(mentions(
+        &refused(&f),
+        &["gust-hold core-f405 index 4", "rms_h_m"]
+    ));
+}
+
+// ---- directories the plan does not name ------------------------------------
+
+#[test]
+fn a_directory_the_plan_does_not_name_is_exit_2() {
+    for (name, dir, word) in [
+        (
+            "extra-scenario",
+            "extra-scenario/arducopter",
+            "extra-scenario",
+        ),
+        (
+            "extra-autopilot",
+            "gust-hold/core-f405-more",
+            "core-f405-more",
+        ),
+        ("extra-twice", "twice/mag-loss", "mag-loss"),
+        ("extra-truth", "gps-loss/core-f405-truth", "core-f405-truth"),
+    ] {
+        let f = Fixture::small(name);
+        f.write();
+        std::fs::create_dir_all(f.dir.join(dir)).expect("dir");
+        let v = verdict(&f.dir);
+        f.remove();
+        assert_eq!(v.exit_code(), EXIT_INCOMPLETE, "{dir}: {}", v.text());
+        assert!(
+            mentions(&incomplete(&v), &[word, "plan"]),
+            "{dir}: {}",
+            v.text()
+        );
+    }
+    // A table a continued gate moved aside is its own leftover.
+    let f = Fixture::small("interrupted");
+    f.write();
+    std::fs::create_dir_all(f.dir.join("gps-loss/arducopter.interrupted")).expect("dir");
+    let v = verdict(&f.dir);
+    f.remove();
+    assert!(matches!(v, Verdict::Evaluated(_)), "{}", v.text());
+}
+
+// ---- the rules that no other test held -------------------------------------
+
+#[test]
+fn the_seed_of_a_twice_flown_row_is_checked_like_any_other() {
+    let mut f = Fixture::small("seed-twice");
+    f.twice_flown("gps-loss", 0).row.set("seed", "12345");
+    let p = refused(&f);
+    assert!(
+        mentions(
+            &p,
+            &["gps-loss arducopter index 0 (flown twice)", "its seed"]
+        ),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn the_binary_of_a_twice_flown_flight_is_checked_like_any_other() {
+    let mut f = Fixture::small("binary-twice");
+    f.twice_flown("gps-loss", 0).binary = "c".repeat(64);
+    let p = refused(&f);
+    assert!(
+        mentions(&p, &["gps-loss arducopter index 0 (flown twice)", "binary"]),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_started_cell_that_is_not_yes_is_exit_2_whatever_it_says() {
+    for word in ["", "maybe", "YES", "true"] {
+        let mut f = Fixture::small("started-word");
+        f.row("gps-loss", AC, 1).set("started", word);
+        f.flown("gps-loss", AC, 1).own = None;
+        let p = refused(&f);
+        assert!(
+            mentions(&p, &["gps-loss arducopter index 1", "did not start"]),
+            "{word:?}: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn arducopters_fly_aways_are_left_out_of_its_statistics_like_its_crashes() {
+    // Ten of twenty fly away with a tiny error: counted, ArduCopter's median
+    // would be 0.105 and ours (0.15) would fail; left out it is 0.2.
+    let mut f = Fixture::small("a2-flyaways");
+    set_rms(&mut f, F405, |_| 0.15);
+    set_rms(&mut f, AC, |_| 0.2);
+    for i in 0..10 {
+        set_class(&mut f, "gust-hold", AC, i, "fly-away");
+        f.row("gust-hold", AC, i).set("rms_h_m", "0.01");
+    }
+    let e = eval(&f);
+    assert_eq!(e.a2.status, Status::Holds, "{}", e.text());
+    assert_eq!(e.gust[0].median, Some(0.2));
+    assert!(mentions(&e.a2.lines, &["10 of 20", "not safe"]));
+}
+
+#[test]
+fn a_gate_that_says_it_stopped_gives_no_verdict_whatever_the_tables_hold() {
+    let mut f = Fixture::small("stopped-line");
+    f.info.stopped = Some("gps-loss/arducopter run 2 failed twice".into());
+    let p = refused(&f);
+    assert!(mentions(&p, &["the gate stopped", "failed twice"]), "{p:?}");
+}
+
+#[test]
+fn tables_of_another_commit_than_the_programs_own_give_no_verdict() {
+    // ADR-0007 section 7: "no verdict on tables flown ... at another commit
+    // than its own". A program not built at a commit has none to compare.
+    let f = Fixture::small("own-commit");
+    f.write();
+    let own = fx::commit();
+    let other = "f".repeat(40);
+    let same = verdict_at(&f.dir, Some(&own));
+    let none = verdict_at(&f.dir, None);
+    let differ = verdict_at(&f.dir, Some(&other));
+    let read_differ = read_at(&f.dir, Some(&other));
+    f.remove();
+    assert!(matches!(same, Verdict::Evaluated(_)), "{}", same.text());
+    assert!(matches!(none, Verdict::Evaluated(_)), "{}", none.text());
+    assert_eq!(differ.exit_code(), EXIT_INCOMPLETE, "{}", differ.text());
+    let p = read_differ.expect_err("refused").0;
+    assert!(mentions(&p, &["flown at commit", &other]), "{p:?}");
 }
