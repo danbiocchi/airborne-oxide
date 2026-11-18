@@ -207,6 +207,20 @@ fn sha_of(path: &Path) -> Result<String, String> {
     Ok(sha256::hex(&sha256::digest(&bytes)))
 }
 
+/// The SHA-256 of every parameter file a bridged flight is given, in the order
+/// it is given: exactly the files of [`committed_params`], so that a file
+/// added to the runner's list cannot be missing from `gate.txt`.
+pub fn param_hashes(airframe: &oxide_sim::Airframe) -> Result<Vec<(String, String)>, String> {
+    let mut params = Vec::new();
+    for p in committed_params(airframe).0 {
+        let name = p
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        params.push((name, sha_of(&p)?));
+    }
+    Ok(params)
+}
+
 /// Adds the dirty-tree note to every row of a table.
 pub fn mark_dirty(table: &Path) -> Result<(), String> {
     let path = table.join(TABLE);
@@ -275,13 +289,7 @@ pub fn fly(s: &Settings) -> Result<u8, String> {
     let binary = binary_path(s)?;
     let binary_sha = sha_of(&binary).map_err(|e| format!("the simulator program: {e}"))?;
     let airframe = oxide_sim::Airframe::reference_quad().map_err(|e| e.to_string())?;
-    let mut params = Vec::new();
-    for p in committed_params(&airframe).0 {
-        let name = p
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        params.push((name, sha_of(&p)?));
-    }
+    let params = param_hashes(&airframe)?;
     let mut scenario_files = Vec::new();
     for e in &plan.entries {
         let path = s.scenarios.join(format!("{}.toml", e.scenario));
@@ -464,6 +472,31 @@ pub fn run(s: &Settings) -> ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_txt_lists_the_sha256_of_exactly_the_runners_files_in_the_runners_order() {
+        let airframe = oxide_sim::Airframe::reference_quad().expect("airframe");
+        let listed = param_hashes(&airframe).expect("hashes");
+        let files = committed_params(&airframe).0;
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            listed.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            names
+        );
+        assert!(!names.is_empty());
+        for ((_, h), p) in listed.iter().zip(&files) {
+            assert_eq!(h, &sha_of(p).expect("sha"));
+            assert_eq!(h.len(), 64);
         }
     }
 }

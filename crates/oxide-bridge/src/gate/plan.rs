@@ -133,6 +133,13 @@ pub struct Entry {
     pub count: u64,
 }
 
+impl Entry {
+    /// Whether ArduCopter flies this scenario (every scenario of the plan).
+    pub fn autopilots_include_arducopter(&self) -> bool {
+        self.scoring.autopilots().contains(&Autopilot::ArduCopter)
+    }
+}
+
 /// Why a plan could not be made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanError(pub String);

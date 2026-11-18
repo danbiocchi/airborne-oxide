@@ -314,3 +314,35 @@ fn only_the_kinds_of_the_outcome_list_are_scored_on_the_outcome() {
     assert_eq!(s(&["rc-silent", "baro-loss"]), None);
     assert_eq!(s(&[]), None, "a pair with no failure in it is in no list");
 }
+
+#[test]
+fn every_scenario_planned_for_arducopter_translates_and_the_stick_files_are_flown() {
+    let plan = Plan::build(&scenarios_dir(), false).expect("the plan");
+    let mut planned = 0;
+    let mut sticks = Vec::new();
+    for e in &plan.entries {
+        if !e.autopilots_include_arducopter() {
+            continue;
+        }
+        let loaded = LoadedScenario::load(scenarios_dir().join(format!("{}.toml", e.scenario)))
+            .expect("the file loads");
+        if let Err(why) = oxide_bridge::scenario::translate(&loaded.file) {
+            panic!(
+                "{} is planned for ArduCopter and does not translate: {why}",
+                e.scenario
+            );
+        }
+        planned += 1;
+        let text = std::fs::read_to_string(&loaded.path).expect("read");
+        if text.contains("[[pilot.sticks]]") {
+            sticks.push(e.scenario.clone());
+        }
+    }
+    // Every entry of the plan is flown with ArduCopter.
+    assert_eq!(planned, plan.entries.len());
+    // The files with a stick script are in the plan for it.
+    assert!(!sticks.is_empty(), "no stick file was found");
+    for s in ["gps-loss-pilot", "rc-loss-override", "rc-loss-position"] {
+        assert!(sticks.iter().any(|x| x == s), "{s} not in {sticks:?}");
+    }
+}

@@ -3,7 +3,7 @@
 //! file, `batch` flies many, each in a child process of its own.
 //!
 //! ```text
-//! oxide-bridge fly   --scenario FILE [--index N] [--autopilot arducopter|core-f405|core-h743]
+//! oxide-bridge fly   --scenario FILE [--index N] [--autopilot arducopter|core-f405|core-h743|core-f405-truth]
 //!                    [--binary PATH] [--instance N] [--out DIR] [--speedup X]
 //!                    [--param-file FILE]... [--twice]
 //! oxide-bridge batch --scenario FILE --indices A..B --out DIR [--jobs J] [--instances A-B]
@@ -110,7 +110,7 @@ pub enum Cmd {
 
 /// The usage text.
 pub const USAGE: &str = "\
-oxide-bridge fly   --scenario FILE [--index N] [--autopilot arducopter|core-f405|core-h743]
+oxide-bridge fly   --scenario FILE [--index N] [--autopilot arducopter|core-f405|core-h743|core-f405-truth]
                    [--binary PATH] [--instance N] [--out DIR] [--speedup X]
                    [--param-file FILE]... [--twice]
 oxide-bridge batch --scenario FILE --indices A..B --out DIR [--jobs J] [--instances A-B]
@@ -255,7 +255,7 @@ fn collect(rest: &[String], batch: bool) -> Result<Collected, Usage> {
                 c.autopilot = Autopilot::parse(v).map_or_else(
                     || {
                         usage(format!(
-                            "--autopilot is {v:?}: it must be arducopter, core-f405 or core-h743"
+                            "--autopilot is {v:?}: it must be arducopter, core-f405, core-h743 or core-f405-truth"
                         ))
                     },
                     Ok,
@@ -983,7 +983,7 @@ mod tests {
             ("fly --scenario s.toml --instance q", "--instance"),
             (
                 "fly --scenario s.toml --autopilot px4",
-                "arducopter, core-f405 or core-h743",
+                "arducopter, core-f405, core-h743 or core-f405-truth",
             ),
             ("fly --scenario s.toml --speedup 0", "from 1"),
             ("fly --scenario s.toml --speedup fast", "--speedup"),
