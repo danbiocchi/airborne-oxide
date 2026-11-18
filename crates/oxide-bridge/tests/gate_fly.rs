@@ -9,7 +9,7 @@ use std::process::Command;
 use oxide_bridge::cli::{Cmd, parse};
 use oxide_bridge::gate::cmd::GateCmd;
 use oxide_bridge::gate::fly::{
-    Batch, mark_dirty, schedule, status_is_dirty, table_complete, tree_state,
+    Batch, mark_dirty, refuse_other_files, schedule, status_is_dirty, table_complete, tree_state,
 };
 use oxide_bridge::gate::plan::Plan;
 use oxide_bridge::record::{Row, header};
@@ -372,6 +372,41 @@ fn the_dirty_note_is_added_to_every_row_once() {
 }
 
 // ---- the files the gate flies ----------------------------------------------
+
+fn settings(line: &str) -> oxide_bridge::gate::fly::Settings {
+    match parse(&words(line)).expect("parses") {
+        Cmd::Gate(GateCmd::Fly(s)) => s,
+        other => panic!("not gate fly: {other:?}"),
+    }
+}
+
+#[test]
+fn only_a_trial_may_fly_files_that_are_not_the_commits() {
+    let others =
+        vec!["the scenario file gust-hold has SHA-256 aa and the commit's is bb".to_string()];
+    // The gate itself: refused, with the differences in the sentence.
+    let e = refuse_other_files(&settings("gate fly --scenarios s --out o"), &others)
+        .expect_err("refused");
+    assert!(
+        e.contains("the commit's own files only") && e.contains("gust-hold"),
+        "{e}"
+    );
+    // A trial is let through; so is a gate with nothing different.
+    for line in [
+        "gate fly --scenarios s --out o --reduced",
+        "gate fly --scenarios s --out o --allow-dirty",
+    ] {
+        assert_eq!(
+            refuse_other_files(&settings(line), &others),
+            Ok(()),
+            "{line}"
+        );
+    }
+    assert_eq!(
+        refuse_other_files(&settings("gate fly --scenarios s --out o"), &[]),
+        Ok(())
+    );
+}
 
 /// A scenario directory that is the repository's with one file edited.
 fn edited_scenarios(tag: &str) -> PathBuf {

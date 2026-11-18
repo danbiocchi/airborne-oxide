@@ -250,6 +250,14 @@ fn write_info(out: &Path, info: &GateInfo) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
+/// The refusal to fly the gate with scenario files, parameter files or a
+/// simulator program that are not the commit's (`others`, from
+/// `files::differences_from_build`). Only a trial (`--reduced`,
+/// `--allow-dirty`) may.
+pub fn refuse_other_files(s: &Settings, others: &[String]) -> Result<(), String> {
+    files::refuse_others_for_the_gate(others, s.reduced || s.allow_dirty)
+}
+
 /// Flies the gate. `Ok(code)` is the exit code of a gate that ran (0 done, 3
 /// stopped); `Err` is a wrong use or an environment that cannot fly it, as a
 /// sentence (exit code 1).
@@ -299,7 +307,7 @@ pub fn fly(s: &Settings) -> Result<u8, String> {
         &scenario_files,
         plan.entries.iter().map(|e| e.scenario.as_str()),
     );
-    files::refuse_others_for_the_gate(&others, s.reduced || s.allow_dirty)?;
+    refuse_other_files(s, &others)?;
     let mut deviations = plan.deviations_from_the_record();
     deviations.extend(others);
     let reduced = s.reduced || !deviations.is_empty();
