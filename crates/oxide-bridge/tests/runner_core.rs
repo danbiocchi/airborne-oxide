@@ -72,3 +72,16 @@ fn a_core_flight_is_judged_with_its_status_so_nothing_is_left_unjudged() {
     assert!(f.last_motor_on_s.is_some());
     assert!(f.rms_v_m.is_none(), "hover-step has no hold criteria");
 }
+
+#[test]
+fn the_core_row_of_gust_hold_0_pins_the_vertical_error_and_the_last_motor_command() {
+    // Values of the preview table of the same flight (rms_v_m over the hold
+    // window from 15 s; the last tick of a flight that never stops its
+    // motors). A window that starts later, or a last-motor test that counts
+    // zero, moves them.
+    let f = fly_core(&scenario("gust-hold"), 0, RunProfile::F405).expect("flies");
+    let row = Row::of_flight(&f);
+    assert_eq!(row.get("rms_v_m"), "0.08154483892160544", "{}", row.line());
+    assert_eq!(row.get("max_v_m"), "0.18137856722087164");
+    assert_eq!(row.get("last_motor_on_s"), "39.998999999999995");
+}

@@ -176,7 +176,10 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn new(file: &ScenarioFile) -> Self {
+    /// `bridged`: the flight is another autopilot's, and the hold's
+    /// armed-from limit, which is our core's own start-up, is left out
+    /// (listed as not judged: ADR-0007 section 5).
+    fn new(file: &ScenarioFile, bridged: bool) -> Self {
         let target_z = file
             .pilot
             .setpoints
@@ -187,8 +190,13 @@ impl Recorder {
             (Some(c), Some(z)) => Some((z, c.window_start_s, 0.0, 0)),
             _ => None,
         };
+        let checker = Checker::new(file);
         Self {
-            checker: Checker::new(file),
+            checker: if bridged {
+                checker.without_armed_limit()
+            } else {
+                checker
+            },
             vertical,
             last_motor_on_s: None,
         }
@@ -249,6 +257,19 @@ pub fn arducopter_params(
     (files, extras)
 }
 
+/// The simulation options of run `index` for a bridged flight: the file's
+/// own, without its `[params]`, which are our core's and never reach the other
+/// autopilot as they are ([`translate`] decides what becomes of each).
+fn bridged_scenario_options(
+    file: &ScenarioFile,
+    airframe: &Airframe,
+    index: u64,
+) -> oxide_sim::SimOptions {
+    let mut options = file.options(airframe, index);
+    options.params.clear();
+    options
+}
+
 /// Flies run `index` of `src` through the bridge, judges it, and returns
 /// what happened. Nothing is written: see [`crate::record`].
 pub fn fly_scenario(
@@ -259,9 +280,7 @@ pub fn fly_scenario(
     let file = &src.file;
     let translation = translate(file).map_err(RunError::NotTranslatable)?;
     let airframe = Airframe::reference_quad().map_err(RunError::Sim)?;
-    // Our core's parameters never reach the other autopilot as they are.
-    let mut options = file.options(&airframe, index);
-    options.params.clear();
+    let options = bridged_scenario_options(file, &airframe, index);
     let (param_files, extra_params) = arducopter_params(&translation, setup, &airframe);
     let mut config = ArduCopterConfig::new(&setup.binary, &setup.out, setup.instance);
     config.flight_name = Some("sitl".into());
@@ -269,7 +288,7 @@ pub fn fly_scenario(
     config.param_files.clone_from(&param_files);
     config.extra_params.clone_from(&extra_params);
     config.brain = translation.brain;
-    let mut rec = Recorder::new(file);
+    let mut rec = Recorder::new(file, true);
     let wall = Instant::now();
     let flown = fly(
         &airframe,
@@ -318,7 +337,7 @@ pub fn fly_core(
     let mut sim = file
         .build_with_params(profile.profile(), index, &[])
         .map_err(RunError::Sim)?;
-    let mut rec = Recorder::new(file);
+    let mut rec = Recorder::new(file, false);
     let wall = Instant::now();
     sim.run_until(file.end(), |r| rec.add(r));
     let wall_s = wall.elapsed().as_secs_f64();
@@ -350,6 +369,140 @@ pub fn fly_core(
 mod tests {
     use super::*;
     use crate::scenario::LoadedScenario;
+    use oxide_core::math::{Quat, Vec3};
+    use oxide_core::time::Micros;
+
+    fn scenario(name: &str) -> LoadedScenario {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scenarios")
+            .join(format!("{name}.toml"));
+        LoadedScenario::load(path).expect("the scenario file")
+    }
+
+    /// A record of another autopilot's tick (truth and the armed flag only).
+    fn record(t_s: f64, z: f64, motor: f32, armed: bool) -> StepRecord<4> {
+        StepRecord {
+            t: Micros((t_s * 1e6).round() as u64),
+            position: Vec3::new(0.0, 0.0, z),
+            velocity: Vec3::zero(),
+            attitude: Quat::identity(),
+            rate: Vec3::zero(),
+            motors: [motor, 0.0, 0.0, 0.0],
+            rotor_speed: [0.0; 4],
+            battery_v: 22.0,
+            battery_a: 0.0,
+            armed,
+            setpoint: None,
+            wind: Vec3::zero(),
+            physics_faults: 0,
+            core: None,
+        }
+    }
+
+    #[test]
+    fn our_cores_parameters_are_not_in_the_options_of_a_bridged_flight() {
+        let af = Airframe::reference_quad().expect("airframe");
+        let src = scenario("geofence");
+        let ours = src.file.options(&af, 0);
+        assert!(
+            ours.params.iter().any(|(n, _)| n == "FS_FENCE_RAD"),
+            "the file sets our core's fence radius: {:?}",
+            ours.params
+        );
+        let bridged = bridged_scenario_options(&src.file, &af, 0);
+        assert!(bridged.params.is_empty(), "{:?}", bridged.params);
+        // Nothing else of the options is touched.
+        assert_eq!(bridged.seed, ours.seed);
+    }
+
+    #[test]
+    fn the_last_motor_on_is_the_time_of_the_last_record_with_a_command_above_zero() {
+        let src = scenario("hover-step");
+        let mut rec = Recorder::new(&src.file, true);
+        assert_eq!(rec.last_motor_on_s, None);
+        // Zero commands are not "on": a command of exactly zero is off.
+        for k in 0..10 {
+            rec.add(&record(f64::from(k) * 0.5, 0.0, 0.0, false));
+        }
+        assert_eq!(rec.last_motor_on_s, None, "motors at exactly zero");
+        rec.add(&record(5.0, -1.0, 0.25, true));
+        assert_eq!(rec.last_motor_on_s, Some(5.0));
+        rec.add(&record(5.5, -1.0, 0.0, true));
+        rec.add(&record(6.0, -1.0, 0.0, true));
+        assert_eq!(rec.last_motor_on_s, Some(5.0), "later zeros do not move it");
+        rec.add(&record(7.0, -1.0, 1e-9, true));
+        assert_eq!(rec.last_motor_on_s, Some(7.0));
+        // Only the first of the four motors was above zero in these; any one
+        // counts.
+        let mut r = record(8.0, -1.0, 0.0, true);
+        r.motors = [0.0, 0.0, 0.0, 0.1];
+        rec.add(&r);
+        assert_eq!(rec.last_motor_on_s, Some(8.0));
+    }
+
+    #[test]
+    fn the_armed_from_limit_is_ours_only_a_bridged_flight_is_not_judged_on_it() {
+        let src = scenario("gust-hold");
+        let verdict = |bridged: bool| {
+            let mut rec = Recorder::new(&src.file, bridged);
+            // Armed only from 5.2 s, as ArduCopter does.
+            for k in 0..400 {
+                let t = f64::from(k) * 0.05;
+                rec.add(&record(t, -2.0, 0.5, t >= 5.2));
+            }
+            rec.checker.finish()
+        };
+        let ours = verdict(false);
+        assert!(
+            ours.violations
+                .iter()
+                .any(|v| v.contains("not armed after")),
+            "{:?}",
+            ours.violations
+        );
+        let bridged = verdict(true);
+        assert!(
+            !bridged.violations.iter().any(|v| v.contains("not armed")),
+            "{:?}",
+            bridged.violations
+        );
+        assert!(
+            bridged
+                .not_judged
+                .iter()
+                .any(|n| n.key == "hold: armed from armed_from_s"),
+            "{:?}",
+            bridged.not_judged
+        );
+    }
+
+    #[test]
+    fn the_vertical_error_is_the_rms_from_the_window_start_inclusive() {
+        let src = scenario("gust-hold");
+        let from = src.file.hold.expect("a hold").window_start_s;
+        assert_eq!(from, 15.0);
+        // The hold point's z is the file's last setpoint.
+        let target = src
+            .file
+            .pilot
+            .setpoints
+            .iter()
+            .rev()
+            .find_map(|(_, sp)| sp.map(|sp| f64::from(sp.position.z)))
+            .expect("a setpoint");
+        let mut rec = Recorder::new(&src.file, false);
+        assert_eq!(rec.rms_v_m(), None, "no tick in the window yet");
+        // Before the window: far off, must not count.
+        rec.add(&record(from - 0.001, target + 10.0, 0.5, true));
+        assert_eq!(rec.rms_v_m(), None);
+        // At the start (inclusive), then later: errors 1, 1 and 3.
+        rec.add(&record(from, target + 1.0, 0.5, true));
+        rec.add(&record(from + 1.0, target - 1.0, 0.5, true));
+        rec.add(&record(from + 6.0, target + 3.0, 0.5, true));
+        let want = Real::sqrt((1.0 + 1.0 + 9.0) / 3.0);
+        let got = rec.rms_v_m().expect("a value");
+        assert!((got - want).abs() < 1e-9, "{got} against {want}");
+    }
 
     #[test]
     fn the_parameters_of_a_bridged_flight_are_the_committed_files_the_battery_then_the_fence() {

@@ -177,6 +177,46 @@ fn hover_step_is_flown_and_safe_and_the_verdict_lists_what_it_could_not_judge() 
     assert!(f.verdict.outcome.physics_faults == 0 && !f.verdict.outcome.non_finite);
 }
 
+/// The armed-from limit is our core's own: ArduCopter arms at 5.2 s, and the
+/// verdict must not call that a violation (ADR-0007 section 5); it lists the
+/// limit as not judged. The last motor command above zero of a bridged
+/// imu-loss flight is the tick at which the pulses drop to 1000 (17.0015 s,
+/// measured by a step walk of the flight and by the faults test file).
+#[test]
+#[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
+fn a_bridged_flight_is_not_judged_on_the_armed_limit_and_the_last_motor_time_is_pinned() {
+    let lease = Instance::lease();
+    let root = TempDir::new("armed-limit");
+    let mut setup = Setup::new(binary(), root.path().join("gust"), lease.0);
+    setup.speedup = 100;
+    let f = fly_scenario(&scenario("gust-hold"), 0, &setup).unwrap_or_else(|e| panic!("{e}"));
+    println!(
+        "MEASURED gust-hold 0 violations {:?}, not judged {}",
+        f.verdict.violations,
+        f.verdict.not_judged.len()
+    );
+    assert!(
+        !f.verdict.violations.iter().any(|v| v.contains("not armed")),
+        "{:?}",
+        f.verdict.violations
+    );
+    assert!(
+        f.verdict
+            .not_judged
+            .iter()
+            .any(|n| n.key == "hold: armed from armed_from_s"),
+        "{:?}",
+        f.verdict.not_judged
+    );
+    let mut setup = Setup::new(binary(), root.path().join("imu"), lease.0);
+    setup.speedup = 100;
+    let f = fly_scenario(&scenario("imu-loss"), 0, &setup).unwrap_or_else(|e| panic!("{e}"));
+    let off = f.last_motor_on_s.expect("motors were on");
+    println!("MEASURED imu-loss 0 last motor on {off:.4} s, class {}", f.class);
+    assert!((off - 17.0015).abs() <= 0.002, "{off}");
+    assert_eq!(f.class, FlightClass::Crash);
+}
+
 /// Test 3. Geofence: the fence is in the program and acts.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]

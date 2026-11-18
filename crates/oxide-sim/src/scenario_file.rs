@@ -394,6 +394,14 @@ impl Checker {
         }
     }
 
+    /// Leaves the hold's `armed_from_s` limit out (listed as not judged): for
+    /// an autopilot whose start-up is not ours ([`HoldMetrics::without_armed_limit`]).
+    #[must_use]
+    pub fn without_armed_limit(mut self) -> Self {
+        self.hold = self.hold.map(|(m, c, t)| (m.without_armed_limit(), c, t));
+        self
+    }
+
     pub fn add(&mut self, r: &StepRecord<ROTORS>) {
         self.outcome.add(r);
         if let Some((m, c, target)) = &mut self.hold {

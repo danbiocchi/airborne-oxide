@@ -12,6 +12,10 @@ use crate::scenario::gust_hold;
 use crate::sim::StepRecord;
 use crate::{Airframe, SimError, Simulation};
 
+/// Why the armed-from limit is left out for another autopilot.
+pub const ARMED_LIMIT_OURS_ONLY: &str =
+    "the limit is our core's own start-up time and is not judged for another autopilot";
+
 /// Pass/fail limits for a hold scenario. These are the M1b acceptance
 /// criteria (DESIGN §13); they are fixed in advance and are not tuned to
 /// make a run pass.
@@ -76,6 +80,8 @@ pub struct HoldMetrics {
     pub core: Option<CoreHold>,
     sum_sq_h: f64,
     window_ticks: u64,
+    /// The `armed_from_s` limit is not judged ([`Self::without_armed_limit`]).
+    armed_limit_skipped: bool,
 }
 
 /// The part of [`HoldMetrics`] that needs our flight core's status and
@@ -116,7 +122,18 @@ impl HoldMetrics {
             core: None,
             sum_sq_h: 0.0,
             window_ticks: 0,
+            armed_limit_skipped: false,
         }
+    }
+
+    /// Leaves the `armed_from_s` limit out of the judgement: ticks that are
+    /// not armed after it are not counted, and the limit is listed as not
+    /// judged. The limit is our core's own (it arms at 3.1 s); another
+    /// autopilot's start-up is its own (ADR-0007 section 5).
+    #[must_use]
+    pub fn without_armed_limit(mut self) -> Self {
+        self.armed_limit_skipped = true;
+        self
     }
 
     /// Adds one tick. `target` is the hold point (NED, m).
@@ -138,7 +155,7 @@ impl HoldMetrics {
         self.physics_faults = r.physics_faults;
 
         if t >= c.armed_from_s {
-            if !r.armed {
+            if !r.armed && !self.armed_limit_skipped {
                 self.unarmed_ticks += 1;
             }
             if let (Some(k), Some(rc)) = (self.core.as_mut(), r.core.as_ref())
@@ -292,7 +309,7 @@ impl HoldMetrics {
                 k.resets
             ));
         }
-        let not_judged = if self.core.is_some() {
+        let mut not_judged = if self.core.is_some() {
             Vec::new()
         } else {
             [
@@ -307,6 +324,12 @@ impl HoldMetrics {
             .map(NotJudged::core)
             .to_vec()
         };
+        if self.armed_limit_skipped {
+            not_judged.push(NotJudged {
+                key: "hold: armed from armed_from_s",
+                reason: ARMED_LIMIT_OURS_ONLY,
+            });
+        }
         Judgement {
             violations: out,
             not_judged,
@@ -514,6 +537,59 @@ mod tests {
         nan.position.x = f64::NAN;
         m.add(&nan, target(), &c);
         assert!(m.non_finite);
+    }
+
+    #[test]
+    fn the_armed_limit_can_be_left_out_and_is_then_listed_as_not_judged() {
+        let c = HoldCriteria::default();
+        let run = |m: &mut HoldMetrics| {
+            // Not armed from 3.5 s to 5 s, armed after.
+            for k in 0..30 {
+                let mut r = rec(3.5 + f64::from(k) * 0.05, target());
+                r.armed = k >= 30;
+                m.add(&r, target(), &c);
+            }
+            m.add(&rec(16.0, target()), target(), &c);
+        };
+        let mut judged = HoldMetrics::new();
+        run(&mut judged);
+        assert_eq!(judged.unarmed_ticks, 30);
+        assert!(
+            judged
+                .judge(&c)
+                .violations
+                .iter()
+                .any(|v| v.contains("not armed after 3.5"))
+        );
+        let mut skipped = HoldMetrics::new().without_armed_limit();
+        run(&mut skipped);
+        assert_eq!(skipped.unarmed_ticks, 0);
+        let j = skipped.judge(&c);
+        assert!(
+            !j.violations.iter().any(|v| v.contains("not armed")),
+            "{:?}",
+            j.violations
+        );
+        assert_eq!(
+            j.not_judged
+                .iter()
+                .filter(|n| n.reason == ARMED_LIMIT_OURS_ONLY)
+                .count(),
+            1,
+            "{:?}",
+            j.not_judged
+        );
+        // Everything else is still judged: a tilt is a violation.
+        let mut r = rec(20.0, target());
+        r.attitude = Quat::from_rotation_vector(Vec3::new(50.0_f64.to_radians(), 0.0, 0.0));
+        skipped.add(&r, target(), &c);
+        assert!(
+            skipped
+                .judge(&c)
+                .violations
+                .iter()
+                .any(|v| v.contains("max tilt"))
+        );
     }
 
     /// A record as another autopilot's tick gives it: truth and the armed
