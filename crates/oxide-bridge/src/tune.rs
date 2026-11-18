@@ -1145,7 +1145,7 @@ pub fn echoes(audit: &FlightAudit, from_us: u64, to_us: u64) -> BTreeMap<String,
 }
 
 /// Program time of a flight time in microseconds.
-fn program_us(us: u64) -> u64 {
+pub fn program_us(us: u64) -> u64 {
     PREROLL_STEPS * STEP_US + us
 }
 
@@ -1271,8 +1271,9 @@ pub struct Outcome {
     pub report: String,
 }
 
-fn files_for(extra_setup: bool) -> Vec<PathBuf> {
-    let _ = extra_setup;
+/// The parameter files of the tuning flights, in order: the set-up of the
+/// airframe and its sensors, the guide's set-up, and the starting gains.
+pub fn tuning_files() -> Vec<PathBuf> {
     vec![
         parm::base_path(),
         parm::setup_path(),
@@ -1342,7 +1343,7 @@ pub fn tune(cfg: &TuneConfig) -> Result<Outcome, TuneError> {
         flight_name: "flight-1".into(),
         instance: cfg.instance,
         seed: cfg.seed,
-        files: files_for(false),
+        files: tuning_files(),
         extra: Vec::new(),
         stop_on_peak: true,
         stop_after_hover: false,
@@ -1732,6 +1733,18 @@ mod tests {
             "MOT_THST_HOVER",
         ] {
             assert!(GAIN_NAMES.contains(&n), "{n}");
+        }
+    }
+
+    #[test]
+    fn the_tuning_flights_load_base_setup_and_the_starting_gains_in_this_order() {
+        let names: Vec<String> = tuning_files()
+            .iter()
+            .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["base.parm", "setup.parm", "starting-gains.parm"]);
+        for p in tuning_files() {
+            assert!(p.exists(), "{}", p.display());
         }
     }
 
