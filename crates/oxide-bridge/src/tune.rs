@@ -95,13 +95,20 @@ pub const SPECTRUM_S: u64 = 30;
 pub const QUALITY_S: u64 = 20;
 /// From the end of the hover (the spectrum) to the mode change.
 const AFTER_SPECTRUM_US: u64 = S;
-/// How long AUTOTUNE is given before the throttle goes low, s. The tuner
+/// How long AUTOTUNE is given before the descent begins, s. The tuner
 /// needed 439 s on seed 0; the pack is empty about 650 s into the flight
 /// (ADR-0007 section 2). A fixed number: nothing read from MAVLink decides
 /// when the pilot lands.
 pub const AUTOTUNE_S: u64 = 480;
-/// The vehicle must be disarmed (by its pulses) within this time of the
-/// throttle going low.
+/// The throttle stick of the landing (ADR-0007 section 2): ArduCopter reads it
+/// as a slow descent. The stick goes fully low when the vehicle is on the
+/// ground.
+pub const DESCENT_STICK: f32 = 0.30;
+/// The vehicle is on the ground when its true height is at or below this, m.
+pub const GROUND_M: f64 = 0.05;
+/// The vehicle must be on the ground (and then disarmed, by its pulses)
+/// within this time of the descent beginning or of the throttle going low,
+/// each.
 const LAND_LIMIT_US: u64 = 180 * S;
 /// From the pulses saying disarmed to the read-back.
 const DISARM_SETTLE_US: u64 = 5 * S;
@@ -432,8 +439,14 @@ enum Stage {
     Autotune {
         since: u64,
     },
-    /// The throttle low since this time; the pulses say disarmed since the
-    /// other time.
+    /// Descending with the throttle stick at [`DESCENT_STICK`] since this time,
+    /// until the true height is at or below [`GROUND_M`].
+    Descend {
+        since: u64,
+        then_read: bool,
+    },
+    /// The throttle fully low since this time (the vehicle is on the ground);
+    /// the pulses say disarmed since the other time.
     Land {
         since: u64,
         disarmed: Option<u64>,
@@ -456,6 +469,9 @@ pub struct Marks {
     pub hover: Option<u64>,
     pub spectrum: Option<u64>,
     pub autotune: Option<u64>,
+    /// The descent began: the throttle stick went to [`DESCENT_STICK`].
+    pub descent: Option<u64>,
+    /// The vehicle was on the ground and the throttle stick went fully low.
     pub throttle_low: Option<u64>,
     pub disarmed: Option<u64>,
     pub read_back: Option<u64>,
@@ -606,8 +622,8 @@ impl Script {
                         if self.stop_after_hover {
                             self.finish(t_us);
                         } else if peak && self.stop_on_peak {
-                            self.begin_land(t_us, false);
-                            a.throttle = 0.0;
+                            self.begin_descent(t_us, false);
+                            a.throttle = DESCENT_STICK;
                         } else {
                             self.marks.autotune = Some(t_us);
                             self.stage = Stage::Autotune { since: t_us };
@@ -620,8 +636,22 @@ impl Script {
             Stage::Autotune { since } => {
                 a.throttle = 0.5;
                 if t_us >= since + self.autotune_us {
-                    self.begin_land(t_us, true);
+                    self.begin_descent(t_us, true);
+                    a.throttle = DESCENT_STICK;
+                }
+            }
+            Stage::Descend { since, then_read } => {
+                a.throttle = DESCENT_STICK;
+                if height_m <= GROUND_M || !armed {
+                    self.begin_land(t_us, then_read);
                     a.throttle = 0.0;
+                } else if t_us - since > LAND_LIMIT_US {
+                    return Err(format!(
+                        "the vehicle was not on the ground {} s after the descent began (flight \
+                         time {:.3} s, height {height_m:.2} m)",
+                        LAND_LIMIT_US / S,
+                        t_us as f64 * 1e-6
+                    ));
                 }
             }
             Stage::Land {
@@ -686,12 +716,25 @@ impl Script {
         if matches!(self.stage, Stage::Done | Stage::ReadBack { .. }) {
             return;
         }
-        let in_air = !matches!(self.stage, Stage::Ground | Stage::Land { .. });
+        // A descent that is stopped holds the stick low like a landing does:
+        // it is the ground the vehicle is about to be on.
+        let in_air = !matches!(
+            self.stage,
+            Stage::Ground | Stage::Descend { .. } | Stage::Land { .. }
+        );
         self.marks.aborted = Some(t_us);
         self.marks.read_back = Some(t_us);
         self.stage = Stage::ReadBack {
             since: t_us,
             centre: in_air,
+        };
+    }
+
+    fn begin_descent(&mut self, t_us: u64, then_read: bool) {
+        self.marks.descent = Some(t_us);
+        self.stage = Stage::Descend {
+            since: t_us,
+            then_read,
         };
     }
 
@@ -880,8 +923,16 @@ pub struct Stats {
     pub touchdown_speed_mps: Option<f64>,
     pub worst_impact_mps: Option<f64>,
     /// The pack voltage under load, V, averaged over the last
-    /// [`PACK_WINDOW_US`] before the throttle went low.
+    /// [`PACK_WINDOW_US`] before the descent began.
     pub pack_before_landing_v: Option<f64>,
+    /// The descent: the true height when it began, m, and the greatest
+    /// downward speed from then until the vehicle was on the ground, m/s.
+    pub descent_from_m: Option<f64>,
+    pub descent_max_down_mps: Option<f64>,
+    /// The true height and the downward speed at the tick the vehicle was
+    /// first at or below [`GROUND_M`] after the descent began.
+    pub ground_height_m: Option<f64>,
+    pub ground_down_mps: Option<f64>,
 }
 
 /// The pack at one mark of the flight.
@@ -918,7 +969,7 @@ struct Tracker {
 }
 
 /// The marks the pack is reported at: a name and the flight time of the mark.
-fn pack_marks(m: &Marks) -> [(&'static str, Option<u64>); 6] {
+fn pack_marks(m: &Marks) -> [(&'static str, Option<u64>); 7] {
     [
         ("hover reached", m.hover),
         (
@@ -927,7 +978,8 @@ fn pack_marks(m: &Marks) -> [(&'static str, Option<u64>); 6] {
         ),
         ("spectrum taken", m.spectrum),
         ("AUTOTUNE start", m.autotune),
-        ("throttle low", m.throttle_low),
+        ("descent start", m.descent),
+        ("on the ground", m.throttle_low),
         ("disarmed", m.disarmed),
     ]
 }
@@ -955,9 +1007,9 @@ impl Tracker {
         self.stats.largest_tilt_deg = self.outcome.max_tilt_deg;
         self.stats.touchdown_speed_mps = self.outcome.touchdown_speed_mps;
         self.stats.worst_impact_mps = self.outcome.worst_impact_mps;
-        // The pack under load: the window before the throttle goes low, the
+        // The pack under load: the window before the descent begins, the
         // sample of the tick itself not included.
-        if let Some(low) = m.throttle_low
+        if let Some(low) = m.descent
             && self.stats.pack_before_landing_v.is_none()
         {
             let from = low.saturating_sub(PACK_WINDOW_US);
@@ -1026,7 +1078,24 @@ impl Tracker {
         {
             self.hover_samples.push((d.x, d.y, -d.z, Self::tilt_deg(r)));
         }
-        if m.autotune.is_some() && m.throttle_low.is_none() {
+        if let Some(d) = m.descent {
+            // The descent: from the tick it began to the first tick at or
+            // below the ground height.
+            if r.t.0 >= d && self.stats.ground_height_m.is_none() {
+                let down = r.velocity.z;
+                self.stats.descent_from_m.get_or_insert(-r.position.z);
+                self.stats.descent_max_down_mps = Some(
+                    self.stats
+                        .descent_max_down_mps
+                        .map_or(down, |x| x.max(down)),
+                );
+                if -r.position.z <= GROUND_M {
+                    self.stats.ground_height_m = Some(-r.position.z);
+                    self.stats.ground_down_mps = Some(down);
+                }
+            }
+        }
+        if m.autotune.is_some() && m.descent.is_none() {
             let o = *self.tune_origin.get_or_insert(r.position);
             let e = r.position - o;
             self.stats.tune_max_horizontal_m = self
@@ -1297,7 +1366,7 @@ pub fn low_battery_volt() -> f64 {
 /// The check on a finished procedure's texts and read-back: the tuner's
 /// success message for each axis and its saved-gains message, a value for
 /// every name of [`GAIN_NAMES`], and the pack: its voltage under load,
-/// averaged over the last second before the throttle went low
+/// averaged over the last second before the descent began
 /// (`pack_before_landing_v`), above `low_battery_v`. An error is a sentence.
 pub fn check(
     texts: &[(f64, String)],
@@ -1340,8 +1409,8 @@ pub fn check(
     match pack_before_landing_v {
         None => Err("the pack voltage before the landing was not measured".into()),
         Some(v) if v.is_nan() || low_battery_v.is_nan() || v <= low_battery_v => Err(format!(
-            "the pack voltage under load, averaged over the last second before the throttle went \
-             low, was {v:.3} V: not above the low-battery threshold {low_battery_v:.3} V (the \
+            "the pack voltage under load, averaged over the last second before the descent began, \
+             was {v:.3} V: not above the low-battery threshold {low_battery_v:.3} V (the \
              vehicle landed on a pack that was too empty)"
         )),
         Some(_) => Ok(()),
@@ -1695,13 +1764,14 @@ fn report_text(
         );
         let _ = writeln!(
             s,
-            "  stages (flight time): ALT_HOLD command {}, arm switch {}, throttle up {}, hover {}, spectrum {}, AUTOTUNE {}, throttle low {}, disarmed (pulses) {}, read-back {}, end {}",
+            "  stages (flight time): ALT_HOLD command {}, arm switch {}, throttle up {}, hover {}, spectrum {}, AUTOTUNE {}, descent {}, on the ground (throttle low) {}, disarmed (pulses) {}, read-back {}, end {}",
             secs(Some(ALT_HOLD_AT_US)),
             secs(Some(m.arm)),
             secs(m.climb),
             secs(m.hover),
             secs(m.spectrum),
             secs(m.autotune),
+            secs(m.descent),
             secs(m.throttle_low),
             secs(m.disarmed),
             secs(m.read_back),
@@ -1746,11 +1816,33 @@ fn report_text(
             }
             _ => {}
         }
+        match (m.descent, m.throttle_low) {
+            (Some(d), Some(g)) => {
+                let secs_down = (g - d) as f64 * 1e-6;
+                let from = st.descent_from_m.unwrap_or(f64::NAN);
+                let _ = writeln!(
+                    s,
+                    "  the descent (throttle stick {DESCENT_STICK}): began at {:.3} s from {from:.2} m, \
+                     on the ground (height at most {GROUND_M} m) {secs_down:.3} s later, mean rate {:.3} m/s, \
+                     greatest downward speed {:.3} m/s, downward speed at the first tick on the ground \
+                     {:?} m/s (height {:?} m), touchdown speed {:?} m/s",
+                    d as f64 * 1e-6,
+                    from / secs_down,
+                    st.descent_max_down_mps.unwrap_or(f64::NAN),
+                    st.ground_down_mps,
+                    st.ground_height_m,
+                    st.touchdown_speed_mps
+                );
+            }
+            _ => {
+                let _ = writeln!(s, "  the descent: not completed");
+            }
+        }
         match st.pack_before_landing_v {
             Some(v) => {
                 let _ = writeln!(
                     s,
-                    "  pack voltage under load, mean of the last second before the throttle went low: {v:.3} V (the low-battery threshold is {:.3} V)",
+                    "  pack voltage under load, mean of the last second before the descent began: {v:.3} V (the low-battery threshold is {:.3} V)",
                     low_battery_volt()
                 );
             }
@@ -2063,7 +2155,8 @@ mod tests {
     }
 
     /// Drives a script on a model vehicle: the height rises at 1.4 m/s while
-    /// the throttle is above 0.55 and the vehicle is armed; the pulses say
+    /// the throttle is above 0.55 and falls at 1 m/s while it is at the
+    /// descent stick; the pulses say
     /// armed until `disarm_at`.
     fn drive(mut sc: Script, peak: bool, disarm_at: Option<u64>) -> Run {
         let mut run = Run::default();
@@ -2092,8 +2185,9 @@ mod tests {
                     if a.throttle > 0.55 {
                         h += 1.4 * 0.0005;
                     }
-                    if a.throttle == 0.0 && h > 0.0 && sc.marks().throttle_low.is_some() {
-                        h = (h - 2.0 * 0.0005).max(0.0);
+                    // The descent stick sinks the model at 1 m/s.
+                    if a.throttle == DESCENT_STICK {
+                        h = (h - 1.0 * 0.0005).max(0.0);
                     }
                 }
                 Err(e) => {
@@ -2133,11 +2227,21 @@ mod tests {
             "{hover_at}"
         );
         // The spectrum is taken 60 s into the hover, the tuner started 1 s
-        // after, and the throttle goes low 480 s after.
+        // after, the descent begins 480 s after (the stick at 0.30) and the
+        // stick goes fully low when the height is at most 0.05 m: 9.45 to
+        // 9.6 s later at the model's 1 m/s from 9.5 m.
         assert_eq!(run.analysed, vec![hover_at + HOVER_S * S]);
         assert_eq!(m[1], (hover_at + (HOVER_S + 1) * S, 15));
         let low = hover_at + (HOVER_S + 1 + AUTOTUNE_S) * S;
-        assert_eq!(th[3], (low, 0.0));
+        assert_eq!(DESCENT_STICK, 0.30, "ADR-0007 section 2: the stick is 0.30");
+        assert_eq!(th[3], (low, DESCENT_STICK));
+        assert_eq!(th[4].1, 0.0);
+        let down = (th[4].0 - low) as f64 * 1e-6;
+        assert!(
+            (9.4..9.7).contains(&down),
+            "{down} s from the descent to the ground"
+        );
+        assert_eq!(th.len(), 5, "{th:?}");
         // Reads: groups of at most 6, a second apart, the first group at 3 s.
         let before: Vec<_> = run.reads.iter().filter(|(t, _)| *t < arm).collect();
         assert_eq!(before[0].0, READ_BEFORE_AT_US);
@@ -2425,10 +2529,10 @@ mod tests {
     }
 
     #[test]
-    fn the_pack_is_the_mean_voltage_of_the_second_before_the_throttle_went_low() {
+    fn the_pack_is_the_mean_voltage_of_the_second_before_the_descent_began() {
         let mut t = Tracker::default();
         let mut m = Marks::default();
-        // 2 s at 22.0 V, then 1 s (until the throttle goes low) at 21.0 V
+        // 2 s at 22.0 V, then 1 s (until the descent begins) at 21.0 V
         // with a dip in the first half of that second, then 19 V (after the
         // landing began, and at the disarm).
         for i in 0..4000u64 {
@@ -2441,7 +2545,7 @@ mod tests {
                 19.0
             };
             if i == 3000 {
-                m.throttle_low = Some(3_000_000);
+                m.descent = Some(3_000_000);
             }
             if i == 3900 {
                 m.disarmed = Some(3_900_000);
@@ -2451,7 +2555,7 @@ mod tests {
         let v = t.stats.pack_before_landing_v.expect("measured");
         assert!(
             (v - 21.0).abs() < 1e-9,
-            "{v}: the second before the throttle went low"
+            "{v}: the second before the descent began"
         );
         // The pack at the marks: the voltage at the disarm is another one.
         let disarmed = t
@@ -2465,12 +2569,12 @@ mod tests {
         let low = t
             .pack
             .iter()
-            .find(|(n, _)| *n == "throttle low")
+            .find(|(n, _)| *n == "descent start")
             .expect("mark")
             .1;
         assert_eq!(low.state_of_charge, 0.5);
         assert_eq!(low.amps, 8.0);
-        // Not measured while the throttle has not gone low.
+        // Not measured while the descent has not begun.
         let mut t = Tracker::default();
         t.add(&rec(0.0, 0.0, 5.0, 22.0, true), &Marks::default(), 1.0)
             .expect("safe");
@@ -2478,17 +2582,17 @@ mod tests {
     }
 
     #[test]
-    fn the_sample_of_the_tick_the_throttle_went_low_at_is_not_in_the_pack_mean() {
+    fn the_sample_of_the_tick_the_descent_began_at_is_not_in_the_pack_mean() {
         // The mark is read one tick after the tick it names, so the sample of
-        // that tick (19 V, the landing) is already in the window's reach: it
-        // is left out ("the last second before the throttle goes low").
+        // that tick (19 V, the descent) is already in the window's reach: it
+        // is left out ("the last second before the descent begins").
         let mut t = Tracker::default();
         let mut m = Marks::default();
         for i in 0..3100u64 {
             let ts = i as f64 * 0.001;
             let v = if ts < 3.0 { 21.0 } else { 19.0 };
             if i == 3001 {
-                m.throttle_low = Some(3_000_000);
+                m.descent = Some(3_000_000);
             }
             t.add(&rec(ts, 0.0, 5.0, v, true), &m, 0.5).expect("safe");
         }
@@ -2503,7 +2607,8 @@ mod tests {
             hover: Some(10 * S),
             spectrum: Some(70 * S),
             autotune: Some(71 * S),
-            throttle_low: Some(90 * S),
+            descent: Some(90 * S),
+            throttle_low: Some(92 * S),
             disarmed: Some(95 * S),
             ..Marks::default()
         };
@@ -2534,9 +2639,61 @@ mod tests {
         assert!((taken.state_of_charge - 0.65).abs() < 1e-9);
         assert_eq!(at("hover reached").t_s, 10.0);
         assert_eq!(at("AUTOTUNE start").t_s, 71.0);
-        assert_eq!(at("throttle low").t_s, 90.0);
+        assert_eq!(at("descent start").t_s, 90.0);
+        assert_eq!(at("on the ground").t_s, 92.0);
         assert_eq!(at("disarmed").t_s, 95.0);
-        assert_eq!(t.pack.len(), 6);
+        assert_eq!(t.pack.len(), 7);
+    }
+
+    #[test]
+    fn the_descent_is_measured_from_its_start_to_the_first_tick_on_the_ground() {
+        let mut t = Tracker::default();
+        let m = Marks {
+            descent: Some(10 * S),
+            ..Marks::default()
+        };
+        // 10 m at the start of the descent, down at 1.25 m/s, on the ground
+        // (0.04 m) at 17.97 s, a spike of 1.5 m/s at 17.9 s.
+        for i in 0..=2000u64 {
+            let ts = i as f64 * 0.01;
+            let up = (10.0 - 1.25 * (ts - 10.0)).max(0.04);
+            let mut r = rec(ts, 0.0, if ts < 10.0 { 10.0 } else { up }, 25.0, true);
+            r.velocity = Vec3::new(0.0, 0.0, if ts < 10.0 || up <= 0.04 { 0.0 } else { 1.25 });
+            if i == 1790 {
+                r.velocity = Vec3::new(0.0, 0.0, 1.5);
+            }
+            t.add(&r, &m, 0.5).expect("safe");
+        }
+        let st = t.stats;
+        assert_eq!(st.descent_from_m, Some(10.0));
+        assert_eq!(st.descent_max_down_mps, Some(1.5));
+        assert!(st.ground_height_m.expect("on the ground") <= GROUND_M);
+        assert_eq!(st.ground_down_mps, Some(1.25));
+        // Nothing before the descent began.
+        let mut t = Tracker::default();
+        t.add(&rec(0.0, 0.0, 5.0, 22.0, true), &Marks::default(), 1.0)
+            .expect("safe");
+        assert_eq!(t.stats.descent_from_m, None);
+    }
+
+    #[test]
+    fn a_descent_that_does_not_reach_the_ground_is_an_error_and_a_disarm_in_the_air_ends_it() {
+        // The model never sinks (no drive of the height): 180 s after the
+        // descent began the script gives up with a sentence.
+        let mut sc = Script::new(false, false, 5);
+        let mut t = 0u64;
+        let err = loop {
+            let h = if t > 20 * S { 9.6 } else { 0.0 };
+            match sc.tick(t, h, true) {
+                Ok(_) => t += 500,
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            err.contains("not on the ground 180 s after the descent began"),
+            "{err}"
+        );
+        assert!(sc.marks().descent.is_some() && sc.marks().throttle_low.is_none());
     }
 
     #[test]
