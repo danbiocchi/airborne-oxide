@@ -64,9 +64,11 @@ Every flight of either autopilot is classed from the true state, by the same cod
 - **Fly-away:** the vehicle is more than 100 m from where it armed, or more than 60 m high, at any time. No scenario's own geometry comes near either.
 - **Safe:** neither.
 
+Made exact when the code was written (`FlightOutcome::class` in the simulator, the same for both autopilots): every time the vehicle comes down onto the ground counts, not only the first, and whatever height it had reached before; a flight whose simulated state stops being a number, or in which the physics reports a fault, is a crash; a flight that is both a crash and a fly-away is a crash. The tilt counts only while armed, which for ArduCopter means while any motor output is above 1000 µs. A vehicle that tumbles after its motors have stopped is caught by how it meets the ground.
+
 A flight that did not start (ArduCopter not ready to arm after the pre-roll, a dead process) is not an outcome. It is flown again once; if it fails to start again, the gate stops until the cause is known.
 
-The scenario files' own expectations are a second, stricter judgement that was written for our core. For ArduCopter, the ones that need our core's states are not judged, and the ones that can be judged from the physics describe our core's designed response (land at home, be disarmed by a given time). ArduCopter is not scored on them: it is scored on the class.
+The scenario files' own expectations are a second, stricter judgement that was written for our core. For ArduCopter, the ones that need our core's states are not judged, and the ones that can be judged from the physics describe our core's designed response (land at home, be disarmed by a given time). ArduCopter is not scored on them: it is scored on the class. In the runner's table its verdict therefore reads "not judged" or "fail" where our core's reads "pass", and nothing of the gate selects ArduCopter's flights by that column.
 
 ### 5. Criterion A: holding position in gusts
 
