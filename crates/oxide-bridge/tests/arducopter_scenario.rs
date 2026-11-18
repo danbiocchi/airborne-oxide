@@ -212,7 +212,10 @@ fn a_bridged_flight_is_not_judged_on_the_armed_limit_and_the_last_motor_time_is_
     setup.speedup = 100;
     let f = fly_scenario(&scenario("imu-loss"), 0, &setup).unwrap_or_else(|e| panic!("{e}"));
     let off = f.last_motor_on_s.expect("motors were on");
-    println!("MEASURED imu-loss 0 last motor on {off:.4} s, class {}", f.class);
+    println!(
+        "MEASURED imu-loss 0 last motor on {off:.4} s, class {}",
+        f.class
+    );
     assert!((off - 17.0015).abs() <= 0.002, "{off}");
     assert_eq!(f.class, FlightClass::Crash);
 }

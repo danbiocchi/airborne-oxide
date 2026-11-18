@@ -5,7 +5,7 @@
 //! their own.
 //!
 //! The range is `OXIDE_ARDUCOPTER_INSTANCES`, `a-b` (inclusive, `0 <= a <= b
-//! <= 19`), read once; the default is `0-9`. Anything else panics with a
+//! <= 9`, the program's own instance numbers), read once; the default is `0-9`. Anything else panics with a
 //! sentence that names the variable and what it holds.
 
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -17,7 +17,7 @@ pub const VARIABLE: &str = "OXIDE_ARDUCOPTER_INSTANCES";
 pub const DEFAULT: (u8, u8) = (0, 9);
 
 /// The largest instance number a range may name.
-pub const LARGEST: u8 = 19;
+pub const LARGEST: u8 = 9;
 
 /// Parses `a-b` (or the default for `None`). The error is a sentence.
 pub fn parse_range(text: Option<&str>) -> Result<(u8, u8), String> {
@@ -94,6 +94,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_number_of_a_range_is_one_the_program_refuses() {
+        use oxide_bridge::sitl::json_port_of;
+        assert!(json_port_of(LARGEST).is_some());
+        assert!(json_port_of(LARGEST + 1).is_none());
+    }
+
+    #[test]
     fn the_default_is_0_to_9() {
         assert_eq!(parse_range(None), Ok((0, 9)));
     }
@@ -102,16 +109,16 @@ mod tests {
     fn a_range_is_two_inclusive_ends() {
         assert_eq!(parse_range(Some("0-9")), Ok((0, 9)));
         assert_eq!(parse_range(Some("3-3")), Ok((3, 3)));
-        assert_eq!(parse_range(Some("10-19")), Ok((10, 19)));
-        assert_eq!(parse_range(Some("0-19")), Ok((0, 19)));
+        assert_eq!(parse_range(Some("0-0")), Ok((0, 0)));
+        assert_eq!(parse_range(Some("9-9")), Ok((9, 9)));
         assert_eq!(parse_range(Some("05-07")), Ok((5, 7)));
     }
 
     #[test]
     fn anything_else_is_a_sentence_that_names_the_variable() {
         for bad in [
-            "", "5", "-", "a-b", "3-", "-3", "5-4", "0-20", "20-20", "256-300", "1-2-3", " 1-2",
-            "1 -2", "+1-2", "1,2", "1..2", "-1-5",
+            "", "5", "-", "a-b", "3-", "-3", "5-4", "0-10", "10-10", "10-19", "0-19", "0-20",
+            "20-20", "256-300", "1-2-3", " 1-2", "1 -2", "+1-2", "1,2", "1..2", "-1-5",
         ] {
             let e = parse_range(Some(bad)).unwrap_err();
             assert!(
