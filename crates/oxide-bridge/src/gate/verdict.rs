@@ -8,6 +8,13 @@
 //! from the flights. A pass is reported only when the plan is the record's
 //! plan and every criterion holds on rows that are all there.
 //!
+//! What a row must equal: its own `row.csv`, and the numbers, counts, class and
+//! hashes of its flight's `audit.txt` (so that a table and a `row.csv` edited
+//! together are not a verdict); an ArduCopter audit, a flight flown twice and
+//! its second flight must each name their own directory in their command line.
+//! A program that was not built at a commit (a build on a tree with uncommitted
+//! changes to tracked files) gives no verdict at all.
+//!
 //! Readings where the record's words leave a choice, and the one built:
 //! the median of an even count is the mean of the two middle values; an
 //! ArduCopter with no safe gust flight fails A2; "the time to motors off"

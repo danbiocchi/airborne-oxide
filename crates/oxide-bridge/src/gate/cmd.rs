@@ -37,8 +37,9 @@ oxide-bridge gate fly --scenarios DIR --out OUT [--binary PATH] [--jobs J] [--in
 oxide-bridge gate verdict --in OUT [--report FILE]
 `gate fly` flies the plan of ADR-0007 from the scenario files of DIR into OUT (exit 3: a
 run failed twice and the gate stopped), from a commit with no uncommitted changes unless
---allow-dirty; a directory with a gate in it is continued. `gate verdict` reads only OUT's
-tables and gate.txt: exit 0 passed, 4 not passed, 2 the tables are incomplete or inconsistent.";
+--allow-dirty; a directory with a gate in it is continued. `gate verdict` reads only OUT
+(the tables, gate.txt and each flight's run directory): exit 0 passed, 4 not passed, 2 the
+tables are incomplete or inconsistent or this program is no commit's.";
 
 fn usage<T>(text: impl Into<String>) -> Result<T, Usage> {
     Err(Usage(text.into()))
