@@ -2,5 +2,7 @@
 //! Gate 1 (ADR-0007): the plan, the flying of it, and the verdict computed
 //! from the tables alone.
 
+pub mod info;
 pub mod plan;
 pub mod stats;
+pub mod verdict;
