@@ -5,7 +5,8 @@
 //! The script flies ArduCopter on the reference quad in calm air on a full
 //! pack, with the gate's sensing (our IMU model on the 1000 us grid, the white
 //! GPS error, the 45 s pre-roll) and with `base.parm`, `setup.parm` and
-//! `starting-gains.parm`, in these stages:
+//! `starting-gains.parm` (the only flights that fly the starting gains), in
+//! these stages:
 //!
 //! 1. *Hover and learn.* Mode ALT_HOLD by a MAVLink mode command at a fixed
 //!    time (the radio's mode switch has no ALT_HOLD position), the arm switch,
@@ -19,12 +20,15 @@
 //!    lands, ends, and the hover and the next stage are flown again as a new
 //!    flight with the notch parameters and the learned hover thrust added.
 //! 3. *AutoTune.* Mode AUTOTUNE, the sticks centred, for [`AUTOTUNE_S`]
-//!    seconds; then the throttle stick low: the vehicle descends inside
-//!    AUTOTUNE, lands, disarms itself, and the tuner saves the gains.
+//!    seconds; then the descent with the throttle stick at [`DESCENT_STICK`]
+//!    until the true height is at most [`GROUND_M`], and the stick fully low:
+//!    the vehicle disarms itself inside AUTOTUNE, and the tuner saves the
+//!    gains.
 //! 4. *Read back.* After the disarm every parameter the tuner may have
 //!    changed ([`GAIN_NAMES`]) is asked for in groups of 6 a second apart, and
 //!    `tuned-gains.parm` is written.
-//! 5. *Check.* The tuner's messages, the read-back, the box.
+//! 5. *Check.* The tuner's messages, the read-back, the gate's outcome class
+//!    of the flight, and the pack's voltage before the descent.
 //!
 //! # Where the rule of the bridge holds
 //!

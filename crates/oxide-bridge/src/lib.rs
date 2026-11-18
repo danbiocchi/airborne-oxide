@@ -47,16 +47,19 @@
 //! `oxide-bridge fly --scenario FILE` flies one run of a scenario file and
 //! `oxide-bridge batch --scenario FILE --indices A..B --out DIR` flies many,
 //! each in a child process of its own. `--autopilot arducopter` goes through
-//! the bridge: the committed parameter files (`base.parm`,
-//! `starting-gains.parm`, `failsafes.parm`), our battery thresholds as the
-//! program's, the scenario's fence, and our faults as parameter writes
+//! the bridge: the committed parameter files (`base.parm`, `setup.parm`,
+//! `tuned-gains.parm`, `failsafes.parm`, in this order), our battery
+//! thresholds as the program's, the scenario's fence, and our faults as parameter writes
 //! ([`faults::FaultTranslator`]). `--autopilot core-f405` and `core-h743`
 //! fly our own core on the same file. Both write the same row
 //! ([`record::COLUMNS`]) and the same record (`audit.txt`, `row.csv`), judged
 //! by the same checker and classed by the same code. `oxide-bridge tune --out
 //! DIR` flies the tuning procedure ([`tune`]) and writes `report.txt`,
-//! `spectrum.csv` and, when the check passes, `tuned-gains.parm`; the set-up
-//! of ArduPilot's tuning guide is `arducopter/setup.parm`. A scenario that
+//! `spectrum.csv` and, when the check passes, `tuned-gains.parm`, which is
+//! committed as it was written and never edited by hand (a real-binary test
+//! flies the procedure again and compares); the set-up of ArduPilot's tuning
+//! guide is `arducopter/setup.parm`, and `starting-gains.parm` is the tuning
+//! flights' own start. A scenario that
 //! needs an airframe other than the reference quad or a parameter without a
 //! counterpart is refused with a sentence ([`scenario::translate`]). A pilot
 //! who flies the sticks is translated: the radio goes to the program as it
