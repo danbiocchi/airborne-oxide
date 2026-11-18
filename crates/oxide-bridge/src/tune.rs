@@ -1771,6 +1771,23 @@ mod tests {
     }
 
     #[test]
+    fn the_mean_of_each_segment_is_removed_before_the_transform() {
+        // A constant of 100 rad/s and a line of 0.002 rad/s at 150 Hz. With
+        // the mean removed the zero bin holds (almost) nothing; without it the
+        // zero bin would hold the constant.
+        let n = 30_000;
+        let s = samples(n, |i| [100.0 + sine(i, 150.0, 0.002), 100.0, -100.0]);
+        let sp = spectrum(&s, 1000.0).expect("spectrum");
+        for axis in 0..3 {
+            assert!(
+                sp.amplitude[axis][0] < 1e-3,
+                "axis {axis}: the zero bin is {}",
+                sp.amplitude[axis][0]
+            );
+        }
+    }
+
+    #[test]
     fn the_amplitude_of_a_line_is_its_amplitude_and_the_band_is_40_to_400() {
         let n = 30_000;
         // A line at a bin's centre: 100 bins of 0.9765625 Hz.
