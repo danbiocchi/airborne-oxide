@@ -82,6 +82,7 @@ pub mod batch;
 pub mod bridge;
 pub mod cli;
 pub mod faults;
+pub mod gate;
 pub mod link;
 pub mod mav;
 pub mod motors;
