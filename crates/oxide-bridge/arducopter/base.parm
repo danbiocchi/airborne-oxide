@@ -53,3 +53,26 @@ FLTMODE6 4
 RC6_OPTION 153
 GUID_OPTIONS 1
 RC7_OPTION 31
+
+# The sticks (ADR-0006 section 6). Our radio sends roll, pitch, yaw -1 to 1
+# and throttle 0 to 1 as 1000 to 2000 us with 1500 at the centre. The program
+# reads sticks between RCn_MIN and RCn_MAX (1100 and 1900 by default), so
+# our 0.6 would read 0.75 and every stick beyond 0.8 would read as full:
+# the range is ours, 1000 to 2000 on the four sticks. Trim 1500 and the dead
+# zones stay at their defaults (20 us on roll, pitch and yaw, 30 us on the
+# throttle: a centred stick is 1500 and is read as centred).
+RC1_MIN 1000
+RC1_MAX 2000
+RC2_MIN 1000
+RC2_MAX 2000
+RC3_MIN 1000
+RC3_MAX 2000
+RC4_MIN 1000
+RC4_MAX 2000
+# Pitch: measured on the program, +0.5 on our pitch stick (forward) flew the
+# vehicle south with this left at its default: ArduCopter reads a forward
+# stick as a low pulse and we send a high one. Reversed here, in the radio's
+# own set-up and not in the bridge. Roll, yaw and throttle need nothing: a
+# right stick flies east and turns the nose right, and a high throttle
+# climbs, as ours do. tests/arducopter_sticks.rs holds the four signs.
+RC2_REVERSED 1

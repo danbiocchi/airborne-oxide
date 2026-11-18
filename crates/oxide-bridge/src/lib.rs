@@ -47,7 +47,13 @@
 //! fly our own core on the same file. Both write the same row
 //! ([`record::COLUMNS`]) and the same record (`audit.txt`, `row.csv`), judged
 //! by the same checker and classed by the same code. A scenario that needs
-//! the pilot's sticks is refused with a sentence ([`scenario::translate`]).
+//! an airframe other than the reference quad or a parameter without a
+//! counterpart is refused with a sentence ([`scenario::translate`]). A pilot
+//! who flies the sticks is translated: the radio goes to the program as it
+//! is, its set-up in `base.parm` (range 1000 to 2000 us, the pitch channel
+//! reversed), the pilot's frames and mode switches after the arm switch are
+//! delayed by [`scenario::ARM_DELAY_S`] for the program's arming delay, and
+//! the brain acts only while the pilot's switch says offboard.
 //!
 //! # A bridged flight repeats bit for bit
 //!

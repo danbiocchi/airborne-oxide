@@ -292,7 +292,7 @@ pub fn fly_scenario(
     let wall = Instant::now();
     let flown = fly(
         &airframe,
-        file.pilot.clone(),
+        translation.pilot.clone(),
         options,
         config,
         file.end(),
@@ -413,6 +413,19 @@ mod tests {
         assert!(bridged.params.is_empty(), "{:?}", bridged.params);
         // Nothing else of the options is touched.
         assert_eq!(bridged.seed, ours.seed);
+    }
+
+    #[test]
+    fn the_faults_of_a_bridged_flight_keep_the_files_times_only_the_pilot_is_delayed() {
+        let af = Airframe::reference_quad().expect("airframe");
+        let src = scenario("rc-loss-override");
+        let ours = src.file.options(&af, 0);
+        assert!(!ours.faults.is_empty(), "the file has a radio fault");
+        let bridged = bridged_scenario_options(&src.file, &af, 0);
+        assert_eq!(bridged.faults, ours.faults);
+        let t = translate(&src.file).expect("translatable");
+        assert_ne!(t.pilot, src.file.pilot, "the pilot's script is delayed");
+        assert_eq!(t.pilot.arm_at_s, src.file.pilot.arm_at_s);
     }
 
     #[test]
