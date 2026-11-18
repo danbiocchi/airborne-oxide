@@ -4,5 +4,6 @@
 
 pub mod info;
 pub mod plan;
+pub mod report;
 pub mod stats;
 pub mod verdict;

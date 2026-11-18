@@ -106,7 +106,10 @@ impl Fixture {
     /// A directory of good tables for `plan`, under a temporary directory
     /// named by `tag`.
     pub fn of(plan: Plan, reduced: bool, tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("oxide-gate-fx-{tag}-{}", std::process::id()));
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("oxide-gate-fx-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut tables = BTreeMap::new();
         for e in &plan.entries {

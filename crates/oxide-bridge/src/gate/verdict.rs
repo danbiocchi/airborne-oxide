@@ -1129,11 +1129,14 @@ impl Evaluation {
             if self.passed { "PASSED" } else { "NOT PASSED" }
         );
         let _ = writeln!(s, "  commit {}", self.info.commit);
-        for r in &self.trial_reasons {
+        if !self.trial_reasons.is_empty() {
             let _ = writeln!(
                 s,
-                "  this is not the gate's plan, so it is not passed whatever the numbers say: {r}"
+                "  this is not the gate's plan, so it is not passed whatever the numbers say:"
             );
+            for r in &self.trial_reasons {
+                let _ = writeln!(s, "    - {r}");
+            }
         }
         self.check_text(&mut s, "A1", &self.a1);
         self.check_text(&mut s, "A2", &self.a2);
