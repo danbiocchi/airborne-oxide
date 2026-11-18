@@ -104,6 +104,8 @@ pub enum Cmd {
     Fly(FlyArgs),
     Batch(BatchArgs),
     Tune(TuneArgs),
+    /// `gate fly` and `gate verdict` ([`crate::gate::cmd`]).
+    Gate(crate::gate::cmd::GateCmd),
 }
 
 /// The usage text.
@@ -121,7 +123,8 @@ each flight as `oxide-bridge fly` in a child process of its own and writes
 DIR/flights.csv. `tune` flies ArduCopter's tuning procedure (ADR-0007 section 2) and
 writes DIR/report.txt, DIR/spectrum.csv and DIR/tuned-gains.parm; with --hover-only it
 flies only the hover of the script and prints its quality. Exit codes: 0 done, 1 wrong use, 2 the flight did not start or
-the bridge failed, 3 a run failed twice and the batch stopped.";
+the bridge failed, 3 a run failed twice and the batch stopped.
+oxide-bridge gate fly|verdict: flies gate 1 and computes its verdict (`oxide-bridge gate`).";
 
 struct Args<'a> {
     rest: &'a [String],
@@ -200,6 +203,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, Usage> {
         "fly" => parse_fly(args.get(1..).unwrap_or(&[])),
         "batch" => parse_batch(args.get(1..).unwrap_or(&[])),
         "tune" => parse_tune(args.get(1..).unwrap_or(&[])),
+        "gate" => crate::gate::cmd::parse(args.get(1..).unwrap_or(&[])).map(Cmd::Gate),
         other => usage(format!(
             "{other:?} is not a command: say `fly`, `batch` or `tune` (oxide-bridge help lists the options)"
         )),
@@ -842,6 +846,7 @@ pub fn main_with(args: &[String]) -> ExitCode {
         Ok(Cmd::Fly(a)) => run_fly(&a),
         Ok(Cmd::Batch(a)) => run_batch(&a),
         Ok(Cmd::Tune(a)) => run_tune(&a),
+        Ok(Cmd::Gate(g)) => crate::gate::cmd::run(&g),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)

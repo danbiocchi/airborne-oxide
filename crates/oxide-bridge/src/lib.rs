@@ -36,8 +36,11 @@
 //! - [`tune`]: ArduCopter's tuning procedure as a script (ADR-0007 section 2):
 //!   hover and learn, the gyro spectrum and its notch rule, the automatic
 //!   tuner, the read-back of the gains, and the check.
+//! - [`gate`]: gate 1 (ADR-0007): the plan as data ([`gate::plan`]), `oxide-bridge
+//!   gate fly` ([`gate::fly`]) and `oxide-bridge gate verdict`
+//!   ([`gate::verdict`], [`gate::report`]).
 //! - [`cli`]: the command line of the binary `oxide-bridge` (`fly`, `batch`,
-//!   `tune`).
+//!   `tune`, `gate`).
 //!
 //! # The binary
 //!
@@ -61,6 +64,17 @@
 //! reversed), the pilot's frames and mode switches after the arm switch are
 //! delayed by [`scenario::ARM_DELAY_S`] for the program's arming delay, and
 //! the brain acts only while the pilot's switch says offboard.
+//!
+//! # Gate 1
+//!
+//! `oxide-bridge gate fly --scenarios DIR --out OUT --binary PATH` flies the
+//! plan of ADR-0007 (criterion A on 500 gust seeds with ArduCopter and our
+//! core on three estimator and profile choices, criterion B on the failure
+//! scenarios, ten flights twice) with the batch machinery, from a commit with no
+//! uncommitted changes, and writes `OUT/gate.txt`. `oxide-bridge gate verdict
+//! --in OUT [--report FILE]` reads only the tables and `gate.txt` and computes
+//! the verdict: exit 0 passed, 4 not passed, 2 the tables are incomplete or
+//! inconsistent (it then says what is missing and gives no verdict).
 //!
 //! # A bridged flight repeats bit for bit
 //!
