@@ -39,7 +39,7 @@ Every flight of the 2,000 below was safe and passed the scenario file's own limi
 | Our core, H743 | 0.15618 | 0.16997 | 0.21287 | 0.22985 |
 | ArduCopter (tuned file as committed) | 0.17467 | 0.17512 | 0.21373 | 0.21722 |
 
-Reproduced with `oxide-bridge batch --scenario scenarios/gust-hold.toml --indices 500..1000 --autopilot core-f405` (and `core-h743`, `arducopter`) at `6265126` for before and at this record's first commit for after.
+Reproduced with `oxide-bridge batch --scenario scenarios/gust-hold.toml --indices 500..1000 --autopilot core-f405` (and `core-h743`, `arducopter`) at `6265126` for before and at `d7cd474` (this branch's model change) for after.
 
 Paired by seed (the wind is the same per seed; only the IMU's draws change), with 95 % intervals from 4,000 bootstrap resamples of the seeds:
 
