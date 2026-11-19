@@ -6,7 +6,10 @@
 //! state is `[δp, δv, δθ, δbg, δba]`; the attitude error is a **world-frame**
 //! rotation vector, `q_true = Exp(δθ) ⊗ q` (Solà 2017, "global angular
 //! error"). Prediction integrates IMU deltas; measurements are fused one
-//! scalar at a time with an innovation gate. Generic over the scalar so the
+//! scalar at a time with an innovation gate. The process-noise parameters
+//! are PX4 EKF2's, stated for its 10 ms prediction step; the variance added
+//! per prediction is `σ² · dt · 0.01 s`, the same per second at any filter
+//! rate. Generic over the scalar so the
 //! Jacobians can be checked in f64 while the core runs `Ekf<f32>`.
 
 use crate::config::EkfParams;

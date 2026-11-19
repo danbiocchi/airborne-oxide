@@ -9,6 +9,11 @@
 //! are only buffered. After alignment the EKF runs `delay_horizon_us` behind
 //! real time so that every sensor (GPS above all) can be fused at the time it
 //! was measured, and the output predictor carries the result forward.
+//!
+//! The process-noise parameters (`EKF_GYR_NOISE`, `EKF_ACC_NOISE`,
+//! `EKF_GYR_BNOISE`, `EKF_ACC_BNOISE`) are stated, as PX4 EKF2 states them,
+//! for a 10 ms prediction step; the filter applies the same noise per second
+//! at any filter rate (see [`ekf::Ekf::predict`]).
 
 pub mod ekf;
 pub mod imu;
