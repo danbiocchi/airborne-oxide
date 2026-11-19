@@ -1127,4 +1127,184 @@ mod tests {
             }
         }
     }
+
+    /// Standard normal draws from the test generator (Box-Muller).
+    fn normal(rng: &mut Lcg) -> f64 {
+        let (a, b) = (1.0 - rng.next(), rng.next());
+        Real::sqrt(-2.0 * Real::ln(a)) * Real::cos(2.0 * core::f64::consts::PI * b)
+    }
+
+    fn normal3(rng: &mut Lcg, sigma: f64) -> Vec3<f64> {
+        Vec3::new(
+            sigma * normal(rng),
+            sigma * normal(rng),
+            sigma * normal(rng),
+        )
+    }
+
+    /// A filter whose attitude is exactly `q` and whose covariance is the
+    /// one after `secs` seconds at rest at `q` with the simulator's sensor
+    /// noise (gyro, accelerometer, barometer, GPS and magnetometer 0.5 µT
+    /// per axis): a realistic covariance at a known true state.
+    fn settled_filter(q: Quat<f64>, secs: u32, seed: u64) -> Ekf<f64> {
+        let mut rng = Lcg(seed);
+        let mut ekf = Ekf::<f64>::new(&EkfParams::default(), q);
+        let dt = 0.004;
+        let f_body = q.inverse_rotate(Vec3::new(0.0, 0.0, -9.80665));
+        let mag = q.inverse_rotate(B_NED);
+        for k in 1..=(secs * 250) {
+            let d = ImuDelta::<f64> {
+                t_end: Micros::default(),
+                dt,
+                dang: normal3(&mut rng, 8.7e-5 * Real::sqrt(dt)),
+                dvel: f_body * dt + normal3(&mut rng, 3.9e-3 * Real::sqrt(dt)),
+            };
+            ekf.predict(&d);
+            if k % 5 == 0 {
+                ekf.fuse_height(0.1 * normal(&mut rng), 0.5);
+                ekf.fuse_mag_heading(mag + normal3(&mut rng, 0.5), 0.15);
+            }
+            if k % 50 == 0 {
+                let n = normal3(&mut rng, 0.3);
+                ekf.fuse_gps_position_ne([n.x, n.y], 0.6);
+                ekf.fuse_gps_velocity(normal3(&mut rng, 0.1), 0.3);
+            }
+        }
+        let mut at_truth = Ekf::<f64>::new(&EkfParams::default(), q);
+        at_truth.p = ekf.p;
+        at_truth
+    }
+
+    /// Mean and standard error of the world-frame tilt correction (about
+    /// North and East) of one `fuse_mag_heading` update at a fixed true
+    /// state (estimate equals truth, so ν is pure sensor noise; in f64, the f32 core
+    /// gives the same means to 3 digits), over
+    /// `n` noisy readings (0.5 µT per body axis on the 50 µT field).
+    fn mean_tilt_correction(ekf: &Ekf<f64>, q: Quat<f64>, n: u32, seed: u64) -> [(f64, f64); 2] {
+        let mut rng = Lcg(seed);
+        let b_body = q.inverse_rotate(B_NED);
+        let (mut s1, mut s2) = ([0.0f64; 2], [0.0f64; 2]);
+        for _ in 0..n {
+            let mut e = *ekf;
+            let m = b_body + normal3(&mut rng, 0.5);
+            assert!(matches!(
+                e.fuse_mag_heading(m, 0.15),
+                Fusion::Accepted { .. }
+            ));
+            let dth = (e.x.q * ekf.x.q.conj()).to_rotation_vector();
+            for (i, v) in [dth.x, dth.y].into_iter().enumerate() {
+                s1[i] += v;
+                s2[i] += v * v;
+            }
+        }
+        let nf = f64::from(n);
+        let out = |i: usize| {
+            let mean = s1[i] / nf;
+            let var = (s2[i] / nf - mean * mean).max(0.0);
+            (mean, Real::sqrt(var / nf))
+        };
+        [out(0), out(1)]
+    }
+
+    /// At a fixed true state the heading update has no mean tilt
+    /// correction. With the Jacobian built from the noisy measured field
+    /// (the code before this fix) the mean about East was +3.46e-6 rad per
+    /// update here, about 450 standard errors (446 measured). Bound: each mean is within 4
+    /// standard errors of zero (fixed seeds, so the test is deterministic).
+    #[test]
+    fn heading_update_has_no_mean_tilt_correction() {
+        let q0 = Quat::<f64>::identity();
+        let ekf = settled_filter(q0, 100, 1);
+        let [(mn, sn), (me, se)] = mean_tilt_correction(&ekf, q0, 400_000, 42);
+        assert!(sn > 0.0 && se > 0.0);
+        assert!(
+            mn.abs() < 4.0 * sn && me.abs() < 4.0 * se,
+            "mean tilt correction N {mn:e} ± {sn:e}, E {me:e} ± {se:e}"
+        );
+        // A tilted, rotated attitude: the biased axis would turn with the field.
+        let q1 = Quat::<f64>::from_euler(5f64.to_radians(), (-3f64).to_radians(), 0.7);
+        let ekf = settled_filter(q1, 100, 2);
+        let [(mn, sn), (me, se)] = mean_tilt_correction(&ekf, q1, 400_000, 43);
+        assert!(
+            mn.abs() < 4.0 * sn && me.abs() < 4.0 * se,
+            "tilted: mean tilt correction N {mn:e} ± {sn:e}, E {me:e} ± {se:e}"
+        );
+    }
+
+    /// The tilt entries of H are taken at the predicted field: turning the
+    /// measured world field about Down (as heading noise does) leaves them
+    /// unchanged, for zero and non-zero declination.
+    #[test]
+    fn heading_jacobian_tilt_entries_ignore_field_rotation_about_down() {
+        let mut rng = Lcg(5);
+        for decl in [0.0, 0.3, -2.0] {
+            let prm = EkfParams {
+                mag_declination_rad: decl as f32,
+                ..EkfParams::default()
+            };
+            for _ in 0..20 {
+                let q = Quat::from_euler(
+                    rng.range(-0.8, 0.8),
+                    rng.range(-0.8, 0.8),
+                    rng.range(-3.1, 3.1),
+                );
+                let ekf = Ekf::<f64>::new(&prm, q);
+                let rd = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), decl);
+                // A field with some heading error and a noisy dip.
+                let m_w = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), rng.range(-0.2, 0.2))
+                    .rotate(rd.rotate(B_NED) + rng.vec(0.5));
+                let (_, h0) = ekf.heading_model(q.inverse_rotate(m_w)).unwrap();
+                for _ in 0..5 {
+                    let phi = rng.range(-1.0, 1.0);
+                    let turned = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), phi).rotate(m_w);
+                    let (nu, h) = ekf.heading_model(q.inverse_rotate(turned)).unwrap();
+                    assert!(nu.is_finite());
+                    for k in 0..2 {
+                        assert!(
+                            (h[k].1 - h0[k].1).abs() < 1e-9,
+                            "decl {decl}: H[{k}] {} after a turn of {phi}, was {}",
+                            h[k].1,
+                            h0[k].1
+                        );
+                    }
+                    assert_eq!(h[2].1, 1.0);
+                }
+            }
+        }
+    }
+
+    /// At a consistent field (ν = 0) H equals the exact first-order
+    /// expression `−m_x·m_z/h²`, `−m_y·m_z/h²` evaluated at the world
+    /// field, also for a non-zero declination (the finite-difference test
+    /// above runs at declination 0).
+    #[test]
+    fn heading_jacobian_at_consistent_field_is_the_measured_field_form() {
+        let mut rng = Lcg(6);
+        for decl in [0.0, 0.3, -1.2, 3.0] {
+            let prm = EkfParams {
+                mag_declination_rad: decl as f32,
+                ..EkfParams::default()
+            };
+            let decl = f64::from(prm.mag_declination_rad);
+            for k in 0..60 {
+                let q = Quat::from_euler(
+                    rng.range(-0.8, 0.8),
+                    rng.range(-0.8, 0.8),
+                    rng.range(-3.1, 3.1),
+                );
+                let ekf = Ekf::<f64>::new(&prm, q);
+                // The dip comes from the measurement: other inclinations
+                // than the simulator's 60 degrees.
+                let incl = [60.0f64, 10.0, 45.0, 80.0, -30.0][k % 5].to_radians();
+                let b0 = Vec3::new(50.0 * Real::cos(incl), 0.0, 50.0 * Real::sin(incl));
+                let b = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), decl).rotate(b0);
+                let mw = q.rotate(q.inverse_rotate(b));
+                let h2 = mw.x * mw.x + mw.y * mw.y;
+                let (nu, h) = ekf.heading_model(q.inverse_rotate(b)).unwrap();
+                assert!(nu.abs() < 1e-9);
+                assert!((h[0].1 + mw.x * mw.z / h2).abs() < 1e-9, "decl {decl}");
+                assert!((h[1].1 + mw.y * mw.z / h2).abs() < 1e-9, "decl {decl}");
+            }
+        }
+    }
 }
