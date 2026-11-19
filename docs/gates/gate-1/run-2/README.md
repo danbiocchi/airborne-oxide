@@ -85,7 +85,7 @@ Two things about this pass need saying:
 
 - **The gate was flown twice, and the second run passed.** The change between them was chosen on seeds the gate does not fly, and it passed there too before the gate was flown again. The second run measured the improved core on the same 500 winds, so its pass is not a fit to them. The first run stays in the record.
 - **The fix does not mean the estimator is now well calibrated.** The independent consistency check found three faults outside this change, deferred in ADR-0002:
-  - a slow pitch and accelerometer-bias drift through the heading fusion in flights of minutes, which must be fixed before flight on hardware;
+  - a slow pitch and accelerometer-bias drift through the heading fusion in flights of minutes, which must be fixed before flight on hardware (fixed after this run, on 19 November: ADR-0002 item 5; it does not change the gust error);
   - the barometer's drift, which the filter does not model;
   - the simulated GPS, which reports twice its true noise.
 
