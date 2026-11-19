@@ -45,7 +45,7 @@ fn realistic_sensors_with_external_estimator_still_fly() {
     let err = (at(&log, 19.9).position - Vec3::new(1.0, 1.0, -3.0)).norm();
     assert!(err < 0.1, "final position error {err}");
     assert!(
-        log.iter().any(|r| r.estimate.is_some()),
+        log.iter().any(|r| r.estimate().is_some()),
         "truth state should be published as the estimate"
     );
 }

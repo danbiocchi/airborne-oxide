@@ -1,0 +1,78 @@
+# ArduCopter V4.7.2 parameters for a bridged flight of the reference quad
+# (airframes/quad-x-5in.toml). One `NAME VALUE` per line. Gains are not here:
+# they are in starting-gains.parm.
+
+# Frame: a quad in the X layout. Without these ArduCopter never arms
+# ("PreArm: Motors: Check frame class and type") and its outputs stay at 0.
+# ADR-0006 section 5 (motors), ADR-0007 section 2 step 1.
+FRAME_CLASS 1
+FRAME_TYPE 1
+
+# Thrust curve: our rotors give thrust as the square of the command
+# (exponent 1.0), and the hover command is near the learned value (0.154 on a
+# full pack). MOT_SPIN_ARM, MOT_SPIN_MIN and MOT_SPIN_MAX stay at their
+# defaults. ADR-0007 section 2 steps 1 and 3.
+MOT_THST_EXPO 1.0
+MOT_THST_HOVER 0.16
+
+# Sensors that match our models (ADR-0006 section 4). SITL adds a slow gyro
+# drift of its own unless it is switched off; its barometer, compass and GPS
+# velocity noise are set to our values (measured in the spike: 0.10 m,
+# about 0.5 uT, 0.1 m/s); the GPS delay is ours, 150 ms. SIM_GPS1_NOISE
+# noises the GPS height only (std 0.21 m at 0.3; it does nothing to the
+# horizontal position): the horizontal error is added by the bridge.
+SIM_DRIFT_SPEED 0
+SIM_BARO_RND 0.173
+SIM_MAG_RND 27
+SIM_GPS1_LAG_MS 150
+SIM_GPS1_VERR_X 0.1
+SIM_GPS1_VERR_Y 0.1
+SIM_GPS1_VERR_Z 0.1
+SIM_GPS1_NOISE 0.3
+
+# The battery: monitor type 4 reads the voltage and current we send in the
+# reply (ADR-0006 section 4).
+BATT_MONITOR 4
+
+# No log file: a flight with the log on does not repeat (ADR-0006 section 8).
+LOG_BACKEND_TYPE 0
+
+# A tumbling vehicle (a motor-loss fault) raises a floating-point exception
+# that aborts SITL unless this is off (ADR-0006 section 6).
+SIM_FLOAT_EXCEPT 0
+
+# The radio as the bridge sends it (ADR-0006 section 6): channel 5 is the
+# mode switch, 1000 us STABILIZE (our Stabilized), 1500 us LOITER (Position),
+# 2000 us GUIDED (Offboard). Channel 6 is the arm switch (function 153,
+# arm/disarm); in GUIDED, arming from the radio needs GUID_OPTIONS bit 0.
+# Channel 7 is the motor emergency stop (function 31), our kill switch.
+FLTMODE_CH 5
+FLTMODE1 0
+FLTMODE4 5
+FLTMODE6 4
+RC6_OPTION 153
+GUID_OPTIONS 1
+RC7_OPTION 31
+
+# The sticks (ADR-0006 section 6). Our radio sends roll, pitch, yaw -1 to 1
+# and throttle 0 to 1 as 1000 to 2000 us with 1500 at the centre. The program
+# reads sticks between RCn_MIN and RCn_MAX (1100 and 1900 by default), so
+# our 0.6 would read 0.75 and every stick beyond 0.8 would read as full:
+# the range is ours, 1000 to 2000 on the four sticks. Trim 1500 and the dead
+# zones stay at their defaults (20 us on roll, pitch and yaw, 30 us on the
+# throttle: a centred stick is 1500 and is read as centred).
+RC1_MIN 1000
+RC1_MAX 2000
+RC2_MIN 1000
+RC2_MAX 2000
+RC3_MIN 1000
+RC3_MAX 2000
+RC4_MIN 1000
+RC4_MAX 2000
+# Pitch: measured on the program, +0.5 on our pitch stick (forward) flew the
+# vehicle south with this left at its default: ArduCopter reads a forward
+# stick as a low pulse and we send a high one. Reversed here, in the radio's
+# own set-up and not in the bridge. Roll, yaw and throttle need nothing: a
+# right stick flies east and turns the nose right, and a high throttle
+# climbs, as ours do. tests/arducopter_sticks.rs holds the four signs.
+RC2_REVERSED 1

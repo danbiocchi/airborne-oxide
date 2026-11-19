@@ -118,6 +118,9 @@ fn fly(b: &mut Booted, changes: &[(f64, ParamSet)], cut: Option<Cut>) -> Flight 
         }
         let rec = b.sim.step();
         f.changed += rec
+            .core
+            .as_ref()
+            .expect("core part")
             .events
             .iter()
             .filter(|e| matches!(e.kind, EventKind::ParamChanged(_)))
@@ -174,7 +177,7 @@ fn arms_after_boot(flash: Flash) -> (VehicleConfig<4>, LoadReport) {
     let mut armed = false;
     while b.sim.time().as_secs_f64() < 6.0 {
         let r = b.sim.step();
-        armed |= r.status.armed;
+        armed |= r.status().expect("core part").armed;
     }
     assert!(armed, "the vehicle arms after this boot");
     (cfg, b.report)

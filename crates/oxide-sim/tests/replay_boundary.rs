@@ -135,7 +135,7 @@ fn fly_with(flash: Flash, ack: bool, torn: u16) -> Flown {
             next += 1;
         }
         let rec = sim.step();
-        for e in rec.events.iter() {
+        for e in rec.core.as_ref().expect("core part").events.iter() {
             match e.kind {
                 EventKind::ParamChanged(_) => out.changed += 1,
                 EventKind::ParamRefused { .. } => out.refused += 1,

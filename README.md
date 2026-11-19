@@ -51,7 +51,7 @@ cargo run --release -p oxide-sim-cli -- params list
 cargo run --release -p oxide-sim-cli -- run --param POS_X_P=1.2
 ```
 
-Write a log in PX4's ULog format, then a replay log, and run that flight through the flight core again. The log uses PX4's topic names and units so that PlotJuggler and Flight Review can show it; `pyulog` reads it in CI, and the other two have not been tried yet. `replay` compares every output of every tick bit for bit and names the first one that differs ([ADR-0005](docs/adr/0005-logging-and-replay.md)):
+Write a log in PX4's ULog format, then a replay log, and run that flight through the flight core again. The log uses PX4's topic names and units so that PlotJuggler and Flight Review can show it; `pyulog` reads it in CI, Flight Review's plotting code has drawn its plots from simulator logs, and PlotJuggler has not been tried yet. `replay` compares every output of every tick bit for bit and names the first one that differs ([ADR-0005](docs/adr/0005-logging-and-replay.md)):
 
 ```bash
 cargo run --release -p oxide-sim-cli -- scenario rc-loss-position --log flight.ulg
@@ -154,6 +154,7 @@ Putting a file in `scenarios/` adds it to the Monte-Carlo run. To embed it in th
 | `crates/oxide-store` | Parameter storage on flash (`no_std`): a two-sector log that survives power loss at any point |
 | `crates/oxide-log` | Flight logs in PX4's ULog format (`no_std`): the writer, the topics, the logger's ring buffer, the replay records, and a reader |
 | `crates/oxide-sim` | Simulator: physics, wind, battery, sensor models, fault injection, scenario-file loader, Monte-Carlo runner, lockstep loop |
+| `crates/oxide-bridge` | The bridge that flies another autopilot's simulator build on our physics (ADR-0006); the exchange, the ArduCopter process, MAVLink, an autopilot that flies offboard or the pilot's sticks (a delayed script for the program's arming delay), our faults as its parameter writes, the tuning script (`tune`: hover, spectrum, the automatic tuner, read-back; its result is committed as `tuned-gains.parm`, which every bridged flight flies), and the binary `oxide-bridge` that flies a scenario file (`fly`) or many (`batch`) on ArduCopter or on our core and writes one table for both, and flies benchmark gate 1 and computes its verdict from the tables (`gate fly`, `gate verdict`; ADR-0007) |
 | `scenarios/` | The scenario files: the 20 failures, the 21 pairings, `hover-step` and `gust-hold` |
 | `crates/oxide-sim-cli` | `oxide-sim` command-line runner |
 | `tools/ulog_check.py` | Checks a log with `pyulog`, PX4's reference reader (used by CI) |

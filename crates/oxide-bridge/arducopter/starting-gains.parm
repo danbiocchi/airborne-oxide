@@ -1,0 +1,13 @@
+# The hand step before the automatic tuner (ADR-0007 section 2 step 2):
+# starting gains low enough for a steady hover. ArduCopter's defaults give
+# roll, pitch and yaw rate each a limit cycle on this airframe, whose
+# thrust-to-weight is about 5; these values were found by trial in the spike
+# (hover tilt RMS 0.03 degrees) and are the values the tuner starts from.
+ATC_RAT_RLL_P 0.05
+ATC_RAT_RLL_I 0.05
+ATC_RAT_RLL_D 0.0012
+ATC_RAT_PIT_P 0.05
+ATC_RAT_PIT_I 0.05
+ATC_RAT_PIT_D 0.0012
+ATC_RAT_YAW_P 0.065
+ATC_RAT_YAW_I 0.0065

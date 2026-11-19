@@ -8,7 +8,9 @@
 use oxide_core::io::{Action, DisarmReason, Event, EventKind, NavState, Reasons};
 use oxide_core::math::{Real, Vec3};
 
-use crate::sim::StepRecord;
+use oxide_core::time::Micros;
+
+use crate::sim::{CoreRecord, StepRecord};
 use crate::vehicle::GroundModel;
 
 /// Height above the ground below which the vehicle counts as touching it, m:
@@ -35,24 +37,13 @@ const HOLD_REASONS: Reasons = Reasons::RC_LOST
     .union(Reasons::SETPOINT_STALE)
     .union(Reasons::GPS_LOST);
 
-/// What happened in one run, gathered from the step records.
+/// What happened in one run, gathered from the step records. The first
+/// part is judged from the physics truth and the autopilot's `armed` flag,
+/// whatever autopilot flew; the second ([`CoreOutcome`]) exists only when the
+/// records carried our flight core's status.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlightOutcome {
-    /// Every event, in order.
-    pub events: Vec<Event>,
-    /// Navigation states in the order they were entered (consecutive
-    /// duplicates removed). The first is the state of the first record.
-    pub nav_sequence: Vec<NavState>,
-    /// Every reason that was raised at some point.
-    pub reasons_seen: Reasons,
-    /// The highest failsafe action reached.
-    pub max_action: Action,
-    /// True if, while armed, the action ever dropped to a lower-ranked one
-    /// other than Hold to None once no Hold reason is left, unless it dropped to None within
-    /// `OVERRIDE_WINDOW_S` after a pilot override.
-    pub action_decreased: bool,
     pub armed_at_end: bool,
-    pub nav_at_end: NavState,
     pub position_at_end: Vec3<f64>,
     /// Time of the last record, s.
     pub end_s: f64,
@@ -67,22 +58,63 @@ pub struct FlightOutcome {
     /// Downward speed (truth) at the first ground contact after having been
     /// above 0.3 m; None if it never came down.
     pub touchdown_speed_mps: Option<f64>,
-    /// The last Disarmed event.
-    pub disarm_reason: Option<DisarmReason>,
+    /// The greatest downward speed (truth) at any entry into ground contact,
+    /// m/s: the first touchdown, a later one after taking off again, and a
+    /// contact after a hop that never rose above 0.3 m. `None` if the vehicle
+    /// never came into contact from the air. The crash class reads this,
+    /// not only the first touchdown.
+    pub worst_impact_mps: Option<f64>,
+    /// When the vehicle was last disarmed, s. With the core part it is the
+    /// time of the core's last Disarmed event (the supervisor decides at that
+    /// tick, and the status shows it one supervisor period later: the flag's
+    /// change would be a later tick). Without it, the time of the last record
+    /// at which the armed flag changed from true to false.
     pub disarmed_at_s: Option<f64>,
     /// Records with the vehicle disarmed and a motor command above zero.
     pub motor_ticks_while_disarmed: u32,
     pub non_finite: bool,
     pub physics_faults: u32,
-    pub timing_faults: u32,
+    /// What only our flight core reports; `None` when the records had no
+    /// core part.
+    pub core: Option<CoreOutcome>,
     // Recorder state.
+    /// Records added so far: with none, whether the autopilot has a core part
+    /// is not known.
+    records: u64,
     was_above: bool,
     touched_down: bool,
     prev_down_speed: f64,
+    prev_armed: bool,
+    /// The previous record was in ground contact (the vehicle starts on the
+    /// ground).
+    prev_in_contact: bool,
+}
+
+/// The part of a [`FlightOutcome`] that comes from our flight core's status
+/// and events.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoreOutcome {
+    /// Every event, in order.
+    pub events: Vec<Event>,
+    /// Navigation states in the order they were entered (consecutive
+    /// duplicates removed). The first is the state of the first record.
+    pub nav_sequence: Vec<NavState>,
+    /// Every reason that was raised at some point.
+    pub reasons_seen: Reasons,
+    /// The highest failsafe action reached.
+    pub max_action: Action,
+    /// True if, while armed, the action ever dropped to a lower-ranked one
+    /// other than Hold to None once no Hold reason is left, unless it dropped to None within
+    /// `OVERRIDE_WINDOW_S` after a pilot override.
+    pub action_decreased: bool,
+    pub nav_at_end: NavState,
+    /// The last Disarmed event.
+    pub disarm_reason: Option<DisarmReason>,
+    pub timing_faults: u32,
+    // Recorder state.
     /// Until this time, s, an action dropping to None is a pilot takeover.
     override_until_s: f64,
     prev_action: Action,
-    prev_armed: bool,
 }
 
 impl Default for FlightOutcome {
@@ -91,48 +123,33 @@ impl Default for FlightOutcome {
     }
 }
 
-impl FlightOutcome {
-    pub fn new() -> Self {
+impl CoreOutcome {
+    fn new() -> Self {
         Self {
             events: Vec::new(),
             nav_sequence: Vec::new(),
             reasons_seen: Reasons::empty(),
             max_action: Action::None,
             action_decreased: false,
-            armed_at_end: false,
             nav_at_end: NavState::Disarmed,
-            position_at_end: Vec3::zero(),
-            end_s: 0.0,
-            home: None,
-            max_height_m: 0.0,
-            max_distance_from_home_m: 0.0,
-            max_tilt_deg: 0.0,
-            touchdown_speed_mps: None,
             disarm_reason: None,
-            disarmed_at_s: None,
-            motor_ticks_while_disarmed: 0,
-            non_finite: false,
-            physics_faults: 0,
             timing_faults: 0,
-            was_above: false,
-            touched_down: false,
-            prev_down_speed: 0.0,
             override_until_s: f64::NEG_INFINITY,
             prev_action: Action::None,
-            prev_armed: false,
         }
     }
 
-    /// Adds one tick.
-    pub fn add<const N: usize>(&mut self, r: &StepRecord<N>) {
-        let s = &r.status;
-
-        for e in r.events.iter() {
+    /// Adds one tick's core part; `prev_armed` is the armed flag of the
+    /// record before. Returns the time of the tick's last Disarmed event.
+    fn add(&mut self, core: &CoreRecord, t: Micros, prev_armed: bool) -> Option<f64> {
+        let s = &core.status;
+        let mut disarmed_at = None;
+        for e in core.events.iter() {
             self.events.push(*e);
             match e.kind {
                 EventKind::Disarmed(reason) => {
                     self.disarm_reason = Some(reason);
-                    self.disarmed_at_s = Some(e.t.as_secs_f64());
+                    disarmed_at = Some(e.t.as_secs_f64());
                 }
                 EventKind::PilotOverride(_) => {
                     self.override_until_s = e.t.as_secs_f64() + OVERRIDE_WINDOW_S;
@@ -147,7 +164,7 @@ impl FlightOutcome {
         self.max_action = self.max_action.max(s.action);
 
         // Escalation only: judged while armed (disarming resets everything).
-        if s.armed && self.prev_armed && s.action < self.prev_action {
+        if s.armed && prev_armed && s.action < self.prev_action {
             // A Hold may end when none of its reasons is left in this record
             // (a pilot override is excused by `taken_over` below).
             let hold_ended = self.prev_action == Action::Hold
@@ -156,24 +173,76 @@ impl FlightOutcome {
             // The pilot's takeover ends the action (to None); the status
             // follows the event by up to a status period, so a short window
             // after the event excuses that one decrease.
-            let taken_over = s.action == Action::None && r.t.as_secs_f64() <= self.override_until_s;
+            let taken_over = s.action == Action::None && t.as_secs_f64() <= self.override_until_s;
             if !hold_ended && !taken_over {
                 self.action_decreased = true;
             }
         }
         self.prev_action = s.action;
-        self.prev_armed = s.armed;
+        self.nav_at_end = s.nav;
+        self.timing_faults = s.timing_faults;
+        disarmed_at
+    }
+}
 
-        if s.armed && self.home.is_none() {
+impl FlightOutcome {
+    pub fn new() -> Self {
+        Self {
+            armed_at_end: false,
+            position_at_end: Vec3::zero(),
+            end_s: 0.0,
+            home: None,
+            max_height_m: 0.0,
+            max_distance_from_home_m: 0.0,
+            max_tilt_deg: 0.0,
+            touchdown_speed_mps: None,
+            worst_impact_mps: None,
+            disarmed_at_s: None,
+            motor_ticks_while_disarmed: 0,
+            non_finite: false,
+            physics_faults: 0,
+            core: None,
+            records: 0,
+            was_above: false,
+            touched_down: false,
+            prev_down_speed: 0.0,
+            prev_armed: false,
+            prev_in_contact: true,
+        }
+    }
+
+    /// The core part, created empty if the outcome has none yet (for tests
+    /// that set a field by hand).
+    #[cfg(test)]
+    pub(crate) fn core_mut(&mut self) -> &mut CoreOutcome {
+        self.core.get_or_insert_with(CoreOutcome::new)
+    }
+
+    /// Adds one tick.
+    pub fn add<const N: usize>(&mut self, r: &StepRecord<N>) {
+        self.records = self.records.saturating_add(1);
+        let disarmed_at = if let Some(core) = r.core.as_ref() {
+            self.core
+                .get_or_insert_with(CoreOutcome::new)
+                .add(core, r.t, self.prev_armed)
+        } else if self.prev_armed && !r.armed {
+            Some(r.t.as_secs_f64())
+        } else {
+            None
+        };
+        if disarmed_at.is_some() {
+            self.disarmed_at_s = disarmed_at;
+        }
+        self.prev_armed = r.armed;
+
+        if r.armed && self.home.is_none() {
             self.home = Some(r.position);
         }
-        self.armed_at_end = s.armed;
-        self.nav_at_end = s.nav;
+        self.armed_at_end = r.armed;
         self.position_at_end = r.position;
         self.end_s = r.t.as_secs_f64();
         self.physics_faults = r.physics_faults;
-        self.timing_faults = s.timing_faults;
-        if !s.armed && r.motors.iter().any(|m| *m > 0.0) {
+        if !r.armed && r.motors.iter().any(|m| *m > 0.0) {
             self.motor_ticks_while_disarmed = self.motor_ticks_while_disarmed.saturating_add(1);
         }
 
@@ -188,7 +257,7 @@ impl FlightOutcome {
             let dh = Real::sqrt(d.x * d.x + d.y * d.y);
             self.max_distance_from_home_m = self.max_distance_from_home_m.max(dh);
         }
-        if s.armed {
+        if r.armed {
             let down = r.attitude.rotate(Vec3::new(0.0, 0.0, 1.0));
             let tilt = Real::atan2(Real::sqrt(down.x * down.x + down.y * down.y), down.z);
             if tilt.is_finite() {
@@ -207,7 +276,86 @@ impl FlightOutcome {
                 self.touchdown_speed_mps = Some(self.prev_down_speed.max(r.velocity.z).max(0.0));
             }
         }
+        // Every entry into ground contact, whatever happened before it: the
+        // downward speed of the record before it or of its own.
+        let in_contact = height < ground_m();
+        if in_contact && !self.prev_in_contact {
+            let v = self.prev_down_speed.max(r.velocity.z).max(0.0);
+            self.worst_impact_mps = Some(self.worst_impact_mps.map_or(v, |w| w.max(v)));
+        }
+        self.prev_in_contact = in_contact;
         self.prev_down_speed = r.velocity.z;
+    }
+}
+
+/// Touchdown faster than this, m/s downward, is a crash (ADR-0007 section 4).
+pub const CRASH_TOUCHDOWN_MPS: f64 = 2.0;
+/// A tilt beyond this while armed, deg, is a crash.
+pub const CRASH_TILT_DEG: f64 = 60.0;
+/// Farther than this from where the vehicle armed, m, is a fly-away.
+pub const FLY_AWAY_DISTANCE_M: f64 = 100.0;
+/// Higher than this, m, is a fly-away.
+pub const FLY_AWAY_HEIGHT_M: f64 = 60.0;
+
+/// How a flight ended, from the physics alone (ADR-0007 section 4). The same
+/// code classes our core's flights and another autopilot's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlightClass {
+    /// Neither of the others.
+    Safe,
+    /// The vehicle met the ground at more than [`CRASH_TOUCHDOWN_MPS`]
+    /// downward, or tilted more than [`CRASH_TILT_DEG`] while armed.
+    Crash,
+    /// More than [`FLY_AWAY_DISTANCE_M`] from where it armed, or more than
+    /// [`FLY_AWAY_HEIGHT_M`] high, and not a crash.
+    FlyAway,
+}
+
+impl FlightClass {
+    /// The name written in tables: `safe`, `crash`, `fly-away`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Crash => "crash",
+            Self::FlyAway => "fly-away",
+        }
+    }
+}
+
+impl core::fmt::Display for FlightClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FlightOutcome {
+    /// The class of the flight. A flight that is both a crash and a fly-away
+    /// is a crash. It uses only fields every autopilot's flight has.
+    ///
+    /// A flight whose truth became non-finite, or that has physics faults, is
+    /// a crash: the vehicle is not in a state the other rules can read.
+    ///
+    /// The tilt rule counts only while armed, as ADR-0007 section 4 says. A
+    /// vehicle that tumbles after its motors stopped (for ArduCopter: its
+    /// pulses at 1000) is caught by the impact rule, not by the tilt.
+    pub fn class(&self) -> FlightClass {
+        if self.non_finite
+            || self.physics_faults > 0
+            || self
+                .touchdown_speed_mps
+                .into_iter()
+                .chain(self.worst_impact_mps)
+                .any(|v| v > CRASH_TOUCHDOWN_MPS)
+            || self.max_tilt_deg > CRASH_TILT_DEG
+        {
+            FlightClass::Crash
+        } else if self.max_distance_from_home_m > FLY_AWAY_DISTANCE_M
+            || self.max_height_m > FLY_AWAY_HEIGHT_M
+        {
+            FlightClass::FlyAway
+        } else {
+            FlightClass::Safe
+        }
     }
 }
 
@@ -357,79 +505,201 @@ pub fn event_line(e: &Event) -> String {
     format!("{:8.3} s  {what}", e.t.as_secs_f64())
 }
 
+/// Why an expectation or invariant cannot be judged without the core part.
+pub const NEEDS_CORE: &str = "needs the flight core's status";
+
+/// A requirement the outcome cannot answer: it is neither passed nor
+/// violated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotJudged {
+    /// The `[expect]` key or invariant, with the part of it that needs the
+    /// core where only a part does.
+    pub key: &'static str,
+    pub reason: &'static str,
+}
+
+impl NotJudged {
+    pub(crate) const fn core(key: &'static str) -> Self {
+        Self {
+            key,
+            reason: NEEDS_CORE,
+        }
+    }
+}
+
+impl core::fmt::Display for NotJudged {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.key, self.reason)
+    }
+}
+
+/// The answer to "does this outcome meet the requirements": what is
+/// violated, and what could not be judged. For an outcome with the core part
+/// `not_judged` is empty.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Judgement {
+    /// One line per violation.
+    pub violations: Vec<String>,
+    pub not_judged: Vec<NotJudged>,
+}
+
+impl Judgement {
+    /// True when nothing is violated and nothing is left unjudged: a
+    /// requirement that could not be judged is not a pass.
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty() && self.not_judged.is_empty()
+    }
+}
+
 impl FlightOutcome {
+    /// An outcome that has seen no record cannot tell whether the autopilot
+    /// has a core part (the part is created by the first record that carries
+    /// one). Judged as it is, every key that reads the core would be listed
+    /// as needing a core our own flight never failed to have. A flight that
+    /// never started is judged as an empty core part would be (nothing
+    /// happened: what is required of the status is violated), as it always
+    /// was. `None` when the outcome has records, or has the part already.
+    fn as_judged_without_records(&self) -> Option<Self> {
+        (self.records == 0 && self.core.is_none()).then(|| {
+            let mut o = self.clone();
+            o.core = Some(CoreOutcome::new());
+            o
+        })
+    }
+
     /// The checks every flight gets, whether or not its file states an
     /// `[expect]`: no non-finite truth, no physics or timing faults, the
     /// action never decreased while armed, no motor command while disarmed.
-    /// One line per violation; empty when the flight kept them all.
-    pub fn invariant_violations(&self) -> Vec<String> {
+    /// The timing-fault and action checks read the core's status: without the
+    /// core part they are listed as not judged.
+    pub fn invariants(&self) -> Judgement {
+        if let Some(empty) = self.as_judged_without_records() {
+            return empty.invariants();
+        }
         let o = self;
-        let mut v: Vec<String> = Vec::new();
+        let mut j = Judgement::default();
+        let v = &mut j.violations;
         if o.non_finite {
             v.push("non-finite value in truth".into());
         }
         if o.physics_faults > 0 {
             v.push(format!("{} non-finite physics steps", o.physics_faults));
         }
-        if o.timing_faults > 0 {
-            v.push(format!("{} timing faults", o.timing_faults));
-        }
-        if o.action_decreased {
-            v.push("failsafe action decreased while armed".into());
+        match &o.core {
+            Some(c) => {
+                if c.timing_faults > 0 {
+                    v.push(format!("{} timing faults", c.timing_faults));
+                }
+                if c.action_decreased {
+                    v.push("failsafe action decreased while armed".into());
+                }
+            }
+            None => {
+                j.not_judged
+                    .push(NotJudged::core("invariant: no timing faults"));
+                j.not_judged.push(NotJudged::core(
+                    "invariant: failsafe action never decreases while armed",
+                ));
+            }
         }
         if o.motor_ticks_while_disarmed > 0 {
-            v.push(format!(
+            j.violations.push(format!(
                 "motors commanded on for {} ticks while disarmed",
                 o.motor_ticks_while_disarmed
             ));
         }
-        v
+        j
     }
 }
 
 impl Expect {
-    /// One line per violation; empty when the outcome is as required.
-    /// Always also the flight's invariants
-    /// ([`FlightOutcome::invariant_violations`]), listed first.
-    pub fn check(&self, o: &FlightOutcome) -> Vec<String> {
-        let mut v: Vec<String> = o.invariant_violations();
+    /// What is violated and what cannot be judged. Always also the flight's
+    /// invariants ([`FlightOutcome::invariants`]), listed first.
+    ///
+    /// Judged from the truth (any autopilot): `min_height_m`, `max_height_m`,
+    /// `max_distance_from_home_m`, `max_tilt_deg`, `by_s`, `max_touchdown_mps`
+    /// and every `ending` as far as it reads position, the armed flag, the
+    /// disarm time and the touchdown. Needing the core's status
+    /// ([`NEEDS_CORE`]): `nav_contains`, `nav_never`, `reasons`,
+    /// `reasons_never`, `events`, `min_action` (each only when it requires
+    /// something), and the parts of the endings that name a disarm reason or
+    /// a navigation state. A key left at its empty default requires nothing
+    /// and is not listed.
+    pub fn check(&self, o: &FlightOutcome) -> Judgement {
+        if let Some(empty) = o.as_judged_without_records() {
+            return self.check(&empty);
+        }
+        let mut j = o.invariants();
+        let v = &mut j.violations;
+
+        let Some(c) = &o.core else {
+            let nj = &mut j.not_judged;
+            if !self.nav_contains.is_empty() {
+                nj.push(NotJudged::core("nav_contains"));
+            }
+            if !self.nav_never.is_empty() {
+                nj.push(NotJudged::core("nav_never"));
+            }
+            if !self.reasons.is_empty() {
+                nj.push(NotJudged::core("reasons"));
+            }
+            if !self.reasons_never.is_empty() {
+                nj.push(NotJudged::core("reasons_never"));
+            }
+            if !self.events.is_empty() {
+                nj.push(NotJudged::core("events"));
+            }
+            if self.min_action > Action::None {
+                nj.push(NotJudged::core("min_action"));
+            }
+            self.check_limits(o, &mut j.violations);
+            self.check_ending(o, &mut j);
+            return j;
+        };
 
         // Navigation states, in order.
-        let mut seq = o.nav_sequence.iter();
+        let mut seq = c.nav_sequence.iter();
         for want in &self.nav_contains {
             if !seq.any(|n| n == want) {
                 v.push(format!(
                     "navigation never reached {want:?} in the required order (saw {:?})",
-                    o.nav_sequence
+                    c.nav_sequence
                 ));
                 break;
             }
         }
         for bad in &self.nav_never {
-            if o.nav_sequence.contains(bad) {
+            if c.nav_sequence.contains(bad) {
                 v.push(format!("navigation entered {bad:?}"));
             }
         }
 
-        let missing = self.reasons.difference(o.reasons_seen);
+        let missing = self.reasons.difference(c.reasons_seen);
         if !missing.is_empty() {
             v.push(format!("reason never raised: {}", reason_names(missing)));
         }
-        let unwanted = o.reasons_seen.intersection(self.reasons_never);
+        let unwanted = c.reasons_seen.intersection(self.reasons_never);
         if !unwanted.is_empty() {
             v.push(format!("reason raised: {}", reason_names(unwanted)));
         }
         for tag in &self.events {
-            if !o.events.iter().any(|e| tag.matches(&e.kind)) {
+            if !c.events.iter().any(|e| tag.matches(&e.kind)) {
                 v.push(format!("no {tag:?} event"));
             }
         }
-        if o.max_action < self.min_action {
+        if c.max_action < self.min_action {
             v.push(format!(
                 "highest action {:?} below the required {:?}",
-                o.max_action, self.min_action
+                c.max_action, self.min_action
             ));
         }
+        self.check_limits(o, &mut j.violations);
+        self.check_ending(o, &mut j);
+        j
+    }
+
+    /// The limits that read the truth only.
+    fn check_limits(&self, o: &FlightOutcome, v: &mut Vec<String>) {
         if let Some(limit) = self.min_height_m
             && o.max_height_m < limit
         {
@@ -460,31 +730,41 @@ impl Expect {
                 o.max_tilt_deg, self.max_tilt_deg
             ));
         }
-
-        self.check_ending(o, &mut v);
-        v
     }
 
-    fn check_ending(&self, o: &FlightOutcome, v: &mut Vec<String>) {
+    fn check_ending(&self, o: &FlightOutcome, j: &mut Judgement) {
+        let v = &mut j.violations;
         let height_end = -o.position_at_end.z;
         let on_ground = height_end < AIRBORNE_M;
         let by_s = self.by_s;
+        let disarm_reason = o.core.as_ref().and_then(|c| c.disarm_reason);
         // The disarm checks shared by the ground endings.
         let disarmed_by = |v: &mut Vec<String>, allowed: &[DisarmReason]| {
             if o.armed_at_end {
                 v.push("still armed at the end".into());
                 return;
             }
-            match (o.disarm_reason, o.disarmed_at_s) {
-                (Some(r), Some(t)) => {
-                    if !allowed.contains(&r) {
-                        v.push(format!("disarmed for {r:?}, expected one of {allowed:?}"));
-                    }
-                    if t > by_s {
-                        v.push(format!("disarmed at {t:.2} s, later than {by_s} s"));
-                    }
+            let check_time = |v: &mut Vec<String>, t: f64| {
+                if t > by_s {
+                    v.push(format!("disarmed at {t:.2} s, later than {by_s} s"));
                 }
-                _ => v.push("never disarmed".into()),
+            };
+            if o.core.is_some() {
+                match (disarm_reason, o.disarmed_at_s) {
+                    (Some(r), Some(t)) => {
+                        if !allowed.contains(&r) {
+                            v.push(format!("disarmed for {r:?}, expected one of {allowed:?}"));
+                        }
+                        check_time(v, t);
+                    }
+                    _ => v.push("never disarmed".into()),
+                }
+            } else {
+                // The reason is the core's to give; the time is the flag's.
+                match o.disarmed_at_s {
+                    Some(t) => check_time(v, t),
+                    None => v.push("never disarmed".into()),
+                }
             }
             if !on_ground {
                 v.push(format!("disarmed but {height_end:.1} m above the ground"));
@@ -501,13 +781,14 @@ impl Expect {
             }
             None => {}
         };
+        let has_core = o.core.is_some();
 
         match self.ending {
             Ending::Flying { point, tolerance_m } => {
                 let d = (o.position_at_end - point).norm();
-                self.check_flying(o, v);
+                self.check_flying(o, j);
                 if exceeds(d, tolerance_m) {
-                    v.push(format!(
+                    j.violations.push(format!(
                         "ended {d:.2} m from the point (limit {tolerance_m} m)"
                     ));
                 }
@@ -516,10 +797,10 @@ impl Expect {
                 height_m,
                 tolerance_m,
             } => {
-                self.check_flying(o, v);
+                self.check_flying(o, j);
                 let e = (height_end - height_m).abs();
                 if exceeds(e, tolerance_m) {
-                    v.push(format!(
+                    j.violations.push(format!(
                         "ended at {height_end:.2} m, {e:.2} m off {height_m} m (limit {tolerance_m} m)"
                     ));
                 }
@@ -534,35 +815,68 @@ impl Expect {
                         v.push(format!("landed {dh:.2} m from home (limit {limit} m)"));
                     }
                 }
+                if !has_core {
+                    j.not_judged
+                        .push(NotJudged::core("ending landed: disarm reason Touchdown"));
+                }
             }
             Ending::Terminated => {
                 disarmed_by(v, &[DisarmReason::Terminated]);
-                if !o.nav_sequence.contains(&NavState::Terminated) {
-                    v.push("navigation never reached Terminated".into());
+                match &o.core {
+                    Some(c) => {
+                        if !c.nav_sequence.contains(&NavState::Terminated) {
+                            v.push("navigation never reached Terminated".into());
+                        }
+                    }
+                    None => {
+                        j.not_judged.push(NotJudged::core(
+                            "ending terminated: disarm reason Terminated and navigation state",
+                        ));
+                    }
                 }
             }
-            Ending::Disarmed(reason) => disarmed_by(v, &[reason]),
+            Ending::Disarmed(reason) => {
+                disarmed_by(v, &[reason]);
+                if !has_core {
+                    j.not_judged
+                        .push(NotJudged::core("ending disarmed: disarm reason"));
+                }
+            }
             Ending::Down => {
                 disarmed_by(v, &[DisarmReason::Touchdown, DisarmReason::Terminated]);
-                if o.disarm_reason == Some(DisarmReason::Touchdown) {
+                if disarm_reason == Some(DisarmReason::Touchdown) {
                     touchdown_speed(v);
+                }
+                if !has_core {
+                    j.not_judged.push(NotJudged::core(
+                        "ending down: disarm reason, and the touchdown speed of a touchdown disarm",
+                    ));
                 }
             }
         }
     }
 
-    fn check_flying(&self, o: &FlightOutcome, v: &mut Vec<String>) {
+    fn check_flying(&self, o: &FlightOutcome, j: &mut Judgement) {
+        let v = &mut j.violations;
         if !o.armed_at_end {
             v.push(format!(
                 "not armed at the end (disarmed {:?} at {:?} s)",
-                o.disarm_reason, o.disarmed_at_s
+                o.core.as_ref().and_then(|c| c.disarm_reason),
+                o.disarmed_at_s
             ));
         }
-        if o.nav_at_end == NavState::Terminated {
-            v.push("terminated".into());
+        match &o.core {
+            Some(c) => {
+                if c.nav_at_end == NavState::Terminated {
+                    v.push("terminated".into());
+                }
+            }
+            None => j
+                .not_judged
+                .push(NotJudged::core("ending flying: navigation not Terminated")),
         }
         if o.end_s < self.by_s - 0.05 {
-            v.push(format!(
+            j.violations.push(format!(
                 "the run ended at {:.2} s, before {} s",
                 o.end_s, self.by_s
             ));
@@ -598,18 +912,22 @@ mod tests {
             rotor_speed: [0.0; 4],
             battery_v: 22.0,
             battery_a: 0.0,
-            status: st,
+            armed: st.armed,
             setpoint: None,
-            estimate: None,
             wind: Vec3::zero(),
             physics_faults: 0,
-            events: EventList::new(),
+            core: Some(crate::CoreRecord {
+                status: st,
+                events: EventList::new(),
+                estimate: None,
+            }),
         }
     }
 
     fn with_event(mut r: StepRecord<4>, kind: EventKind) -> StepRecord<4> {
         let t = r.t;
-        assert!(r.events.push(Event { t, kind }));
+        let core = r.core.as_mut().expect("the record has a core part");
+        assert!(core.events.push(Event { t, kind }));
         r
     }
 
@@ -643,7 +961,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            o.nav_sequence,
+            o.core.as_ref().expect("core part").nav_sequence,
             vec![
                 NavState::Disarmed,
                 NavState::Offboard,
@@ -651,7 +969,10 @@ mod tests {
                 NavState::Offboard
             ]
         );
-        assert_eq!(o.nav_at_end, NavState::Offboard);
+        assert_eq!(
+            o.core.as_ref().expect("core part").nav_at_end,
+            NavState::Offboard
+        );
     }
 
     #[test]
@@ -667,9 +988,12 @@ mod tests {
             up(1.0),
             status(true, NavState::Rtl, Action::Rtl, Reasons::GPS_LOST),
         ));
-        assert_eq!(o.reasons_seen, Reasons::RC_LOST.union(Reasons::GPS_LOST));
-        assert_eq!(o.max_action, Action::Rtl);
-        assert!(!o.action_decreased);
+        assert_eq!(
+            o.core.as_ref().expect("core part").reasons_seen,
+            Reasons::RC_LOST.union(Reasons::GPS_LOST)
+        );
+        assert_eq!(o.core.as_ref().expect("core part").max_action, Action::Rtl);
+        assert!(!o.core.as_ref().expect("core part").action_decreased);
     }
 
     #[test]
@@ -687,7 +1011,7 @@ mod tests {
                 }
                 o.add(&r);
             }
-            o.action_decreased
+            o.core.as_ref().expect("core part").action_decreased
         };
         let t = true;
         // Hold to None is a normal end of a hold.
@@ -751,7 +1075,7 @@ mod tests {
                 r = with_event(r, EventKind::PilotOverride(Reasons::RC_LOST));
             }
             o.add(&r);
-            o.action_decreased
+            o.core.as_ref().expect("core part").action_decreased
         };
         // Every reason that causes a Hold, still set: the Hold ended early.
         for reason in [
@@ -835,6 +1159,77 @@ mod tests {
         assert_eq!(o.touchdown_speed_mps, None);
     }
 
+    /// Adds a record at height `h_m` with downward speed `vz`.
+    fn at(o: &mut FlightOutcome, t: f64, h_m: f64, vz: f64) {
+        let mut r = flying(t, up(h_m), Action::None);
+        r.velocity = Vec3::new(0.0, 0.0, vz);
+        o.add(&r);
+    }
+
+    #[test]
+    fn a_hard_impact_after_a_soft_first_landing_is_a_crash() {
+        let mut o = FlightOutcome::new();
+        at(&mut o, 0.0, 0.0, 0.0);
+        for (k, h) in [1.0, 2.0, 1.0, 0.2].into_iter().enumerate() {
+            at(
+                &mut o,
+                1.0 + k as f64 * 0.1,
+                h,
+                if h < 0.5 { 0.5 } else { 0.0 },
+            );
+        }
+        at(&mut o, 2.0, 0.0, 0.0);
+        assert_eq!(o.touchdown_speed_mps, Some(0.5));
+        assert_eq!(o.worst_impact_mps, Some(0.5));
+        assert_eq!(o.class(), FlightClass::Safe, "a soft landing so far");
+        // Up again to 3 m, then down at 6 m/s.
+        for (k, h) in [1.0, 3.0, 1.0, 0.1].into_iter().enumerate() {
+            at(
+                &mut o,
+                3.0 + k as f64 * 0.1,
+                h,
+                if h < 0.5 { 6.0 } else { 0.0 },
+            );
+        }
+        at(&mut o, 4.0, 0.0, 0.0);
+        assert_eq!(
+            o.touchdown_speed_mps,
+            Some(0.5),
+            "the first touchdown is what it was"
+        );
+        assert_eq!(o.worst_impact_mps, Some(6.0));
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_hop_that_never_rose_above_30_cm_and_then_hits_hard_is_a_crash() {
+        let mut o = FlightOutcome::new();
+        at(&mut o, 0.0, 0.0, 0.0);
+        at(&mut o, 0.1, 0.25, 0.0);
+        at(&mut o, 0.2, 0.0, 8.0);
+        assert_eq!(o.touchdown_speed_mps, None, "never above 0.3 m");
+        assert_eq!(o.worst_impact_mps, Some(8.0));
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_vehicle_that_stays_on_the_ground_has_no_impact_and_the_worst_of_several_counts() {
+        let mut o = FlightOutcome::new();
+        for k in 0..20 {
+            at(&mut o, f64::from(k) * 0.1, 0.0, 0.0);
+        }
+        assert_eq!(o.worst_impact_mps, None);
+        // Three landings, 1.5, 2.5 and 1.0 m/s: the worst is 2.5.
+        for (n, v) in [1.5, 2.5, 1.0].into_iter().enumerate() {
+            let t0 = 10.0 + n as f64 * 10.0;
+            at(&mut o, t0, 2.0, 0.0);
+            at(&mut o, t0 + 1.0, 0.1, v);
+            at(&mut o, t0 + 1.1, 0.0, 0.0);
+        }
+        assert_eq!(o.worst_impact_mps, Some(2.5));
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
     #[test]
     fn disarm_events_and_motors() {
         let mut o = FlightOutcome::new();
@@ -848,10 +1243,13 @@ mod tests {
             EventKind::Disarmed(DisarmReason::Touchdown),
         );
         o.add(&r);
-        assert_eq!(o.disarm_reason, Some(DisarmReason::Touchdown));
+        assert_eq!(
+            o.core.as_ref().expect("core part").disarm_reason,
+            Some(DisarmReason::Touchdown)
+        );
         assert_eq!(o.disarmed_at_s, Some(2.0));
         assert!(!o.armed_at_end);
-        assert_eq!(o.events.len(), 1);
+        assert_eq!(o.core.as_ref().expect("core part").events.len(), 1);
         assert_eq!(o.motor_ticks_while_disarmed, 0);
         let mut m = rec(
             2.1,
@@ -868,9 +1266,19 @@ mod tests {
         let mut o = FlightOutcome::new();
         let mut r = flying(0.0, up(1.0), Action::None);
         r.physics_faults = 2;
-        r.status.timing_faults = 3;
+        r.core
+            .as_mut()
+            .expect("the record has a core part")
+            .status
+            .timing_faults = 3;
         o.add(&r);
-        assert_eq!((o.physics_faults, o.timing_faults), (2, 3));
+        assert_eq!(
+            (
+                o.physics_faults,
+                o.core.as_ref().expect("core part").timing_faults
+            ),
+            (2, 3)
+        );
         assert!(!o.non_finite);
         let mut bad = flying(0.1, up(1.0), Action::None);
         bad.position.x = f64::NAN;
@@ -927,13 +1335,13 @@ mod tests {
     }
 
     fn violations(e: &Expect, o: &FlightOutcome) -> String {
-        e.check(o).join(" | ")
+        e.check(o).violations.join(" | ")
     }
 
     #[test]
     fn a_good_landing_passes() {
         let o = landed_outcome();
-        assert_eq!(landed_expect().check(&o), Vec::<String>::new());
+        assert_eq!(landed_expect().check(&o).violations, Vec::<String>::new());
     }
 
     #[test]
@@ -943,14 +1351,14 @@ mod tests {
         e.nav_contains = vec![NavState::Rtl, NavState::Hold];
         assert!(violations(&e, &o).contains("required order"));
         e.nav_contains = vec![NavState::Offboard, NavState::Rtl];
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         e.nav_contains = vec![NavState::Land];
         assert!(violations(&e, &o).contains("Land"));
         e.nav_contains = vec![];
         e.nav_never = vec![NavState::Hold];
         assert!(violations(&e, &o).contains("entered Hold"));
         e.nav_never = vec![NavState::Land, NavState::LandNow];
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
     }
 
     #[test]
@@ -963,7 +1371,7 @@ mod tests {
         e.reasons_never = Reasons::RC_LOST.union(Reasons::GEOFENCE);
         assert!(violations(&e, &o).contains("reason raised: RC_LOST"));
         e.reasons_never = Reasons::GEOFENCE;
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
     }
 
     #[test]
@@ -972,11 +1380,11 @@ mod tests {
         let mut e = landed_expect();
         e.events = vec![EventTag::PilotOverride];
         assert!(violations(&e, &o).contains("PilotOverride"));
-        o.events.push(Event {
+        o.core.as_mut().expect("core part").events.push(Event {
             t: Micros(1),
             kind: EventKind::PilotOverride(Reasons::RC_LOST),
         });
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         e.min_action = Action::Land;
         assert!(violations(&e, &o).contains("below the required Land"));
         e.min_action = Action::Rtl;
@@ -986,7 +1394,7 @@ mod tests {
         e.max_distance_from_home_m = Some(-1.0);
         assert!(violations(&e, &o).contains("from home, limit"));
         e.max_distance_from_home_m = Some(0.0);
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
     }
 
     #[test]
@@ -996,7 +1404,7 @@ mod tests {
         o.max_tilt_deg = 41.0;
         assert!(violations(&e, &o).contains("tilt 41.0"));
         e.max_tilt_deg = 45.0;
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         e.max_tilt_deg = 10.0;
         e.ending = Ending::Terminated;
         // Not checked for a terminated flight (its other rules still fail).
@@ -1020,7 +1428,7 @@ mod tests {
         assert!(violations(&e, &o).contains("from home"));
         // Wrong reason.
         let mut o = landed_outcome();
-        o.disarm_reason = Some(DisarmReason::Switch);
+        o.core.as_mut().expect("core part").disarm_reason = Some(DisarmReason::Switch);
         assert!(violations(&e, &o).contains("disarmed for Switch"));
         // Still armed.
         let mut o = landed_outcome();
@@ -1028,7 +1436,7 @@ mod tests {
         assert!(violations(&e, &o).contains("still armed"));
         // Never disarmed.
         let mut o = landed_outcome();
-        o.disarm_reason = None;
+        o.core.as_mut().expect("core part").disarm_reason = None;
         o.disarmed_at_s = None;
         assert!(violations(&e, &o).contains("never disarmed"));
         // Never came down although it went up.
@@ -1044,7 +1452,7 @@ mod tests {
         };
         let mut o = landed_outcome();
         o.position_at_end = Vec3::new(30.0, 0.0, 0.0);
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         // Disarmed in the air is not landed.
         o.position_at_end = Vec3::new(0.0, 0.0, -4.0);
         assert!(violations(&e, &o).contains("above the ground"));
@@ -1062,7 +1470,11 @@ mod tests {
             by_s: 20.0,
             ..Expect::default()
         };
-        assert!(e.check(&o).is_empty(), "{:?}", e.check(&o));
+        assert!(
+            e.check(&o).violations.is_empty(),
+            "{:?}",
+            e.check(&o).violations
+        );
         // Off the point.
         let mut far = FlightOutcome::new();
         far.add(&flying(20.0, Vec3::new(2.0, 0.0, -5.0), Action::None));
@@ -1124,7 +1536,7 @@ mod tests {
             by_s: 30.0,
             ..Expect::default()
         };
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         e.ending = Ending::FlyingAtHeight {
             height_m: 5.0,
             tolerance_m: 0.4,
@@ -1166,36 +1578,40 @@ mod tests {
             by_s: 15.3,
             ..Expect::default()
         };
-        assert!(e.check(&o).is_empty(), "{:?}", e.check(&o));
+        assert!(
+            e.check(&o).violations.is_empty(),
+            "{:?}",
+            e.check(&o).violations
+        );
         e.by_s = 15.1;
         assert!(violations(&e, &o).contains("later than 15.1"));
         e.by_s = 15.3;
         e.ending = Ending::Disarmed(DisarmReason::Kill);
         assert!(violations(&e, &o).contains("disarmed for Terminated"));
         e.ending = Ending::Disarmed(DisarmReason::Terminated);
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         // Down accepts either reason.
         e.ending = Ending::Down;
-        assert!(e.check(&o).is_empty());
+        assert!(e.check(&o).violations.is_empty());
         let l = landed_outcome();
         let down = Expect {
             ending: Ending::Down,
             by_s: 5.0,
             ..Expect::default()
         };
-        assert!(down.check(&l).is_empty());
+        assert!(down.check(&l).violations.is_empty());
     }
 
     #[test]
     fn universal_rules_always_apply() {
         let mut o = landed_outcome();
         let e = landed_expect();
-        o.action_decreased = true;
+        o.core.as_mut().expect("core part").action_decreased = true;
         assert!(violations(&e, &o).contains("action decreased"));
-        o.action_decreased = false;
+        o.core.as_mut().expect("core part").action_decreased = false;
         o.non_finite = true;
         o.physics_faults = 1;
-        o.timing_faults = 1;
+        o.core.as_mut().expect("core part").timing_faults = 1;
         o.motor_ticks_while_disarmed = 4;
         let v = violations(&e, &o);
         assert!(v.contains("non-finite value"));
@@ -1211,5 +1627,266 @@ mod tests {
             reason_names(Reasons::RC_LOST.union(Reasons::LOSS_OF_CONTROL)),
             "RC_LOST|LOSS_OF_CONTROL"
         );
+    }
+
+    // ---- Records without the core part (another autopilot) ----
+
+    /// A record as another autopilot's tick gives it: truth and the armed
+    /// flag, no core part.
+    fn plain(t_s: f64, pos: Vec3<f64>, armed: bool) -> StepRecord<4> {
+        let mut r = rec(
+            t_s,
+            pos,
+            status(armed, NavState::Offboard, Action::None, Reasons::empty()),
+        );
+        r.core = None;
+        r
+    }
+
+    /// Up, hold, come down, disarm (the flag falls at 4.2 s).
+    fn plain_landed_outcome() -> FlightOutcome {
+        let mut o = FlightOutcome::new();
+        o.add(&plain(0.0, Vec3::zero(), false));
+        for (t, h) in [(1.0, 5.0), (2.0, 5.0), (3.0, 5.0)] {
+            o.add(&plain(t, up(h), true));
+        }
+        let mut near = plain(4.0, up(0.05), true);
+        near.velocity = Vec3::new(0.0, 0.0, 0.5);
+        o.add(&near);
+        o.add(&plain(4.1, Vec3::zero(), true));
+        o.add(&plain(4.2, Vec3::zero(), false));
+        o
+    }
+
+    #[test]
+    fn records_without_the_core_part_give_the_truth_part_only() {
+        let o = plain_landed_outcome();
+        assert!(o.core.is_none());
+        assert!(!o.armed_at_end);
+        assert_eq!(o.home, Some(up(5.0)));
+        assert!((o.max_height_m - 5.0).abs() < 1e-12);
+        assert_eq!(o.touchdown_speed_mps, Some(0.5));
+        // The time the armed flag went from true to false.
+        assert_eq!(o.disarmed_at_s, Some(4.2));
+        assert!((o.end_s - 4.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn with_the_core_part_the_disarm_time_is_the_events_not_the_flags() {
+        // The supervisor disarms at 4.0 s (the event); the status shows it
+        // one supervisor period later, at 4.02 s. Today's value is the
+        // event's time and stays so for our core.
+        let mut o = FlightOutcome::new();
+        o.add(&flying(3.9, up(5.0), Action::None));
+        o.add(&with_event(
+            flying(4.0, up(5.0), Action::None),
+            EventKind::Disarmed(DisarmReason::Kill),
+        ));
+        o.add(&rec(
+            4.02,
+            up(5.0),
+            status(false, NavState::Disarmed, Action::None, Reasons::empty()),
+        ));
+        assert_eq!(o.disarmed_at_s, Some(4.0));
+    }
+
+    #[test]
+    fn expectations_that_need_the_core_are_not_judged_without_it() {
+        let o = plain_landed_outcome();
+        let e = Expect {
+            nav_contains: vec![NavState::Hold],
+            nav_never: vec![NavState::Terminated],
+            reasons: Reasons::RC_LOST,
+            reasons_never: Reasons::GPS_LOST,
+            events: vec![EventTag::Armed],
+            min_action: Action::Rtl,
+            ending: Ending::Landed {
+                within_m_of_home: Some(2.0),
+            },
+            by_s: 5.0,
+            ..Expect::default()
+        };
+        let j = e.check(&o);
+        // Not violated: the truth part of all of it holds.
+        assert!(j.violations.is_empty(), "{:?}", j.violations);
+        // Not passed either: each is named, with the reason.
+        let keys: Vec<&str> = j.not_judged.iter().map(|n| n.key).collect();
+        for want in [
+            "nav_contains",
+            "nav_never",
+            "reasons",
+            "reasons_never",
+            "events",
+            "min_action",
+        ] {
+            assert!(keys.contains(&want), "{want} missing from {keys:?}");
+        }
+        assert!(keys.iter().any(|k| k.starts_with("ending landed")));
+        assert!(keys.iter().any(|k| k.starts_with("invariant: no timing")));
+        assert!(
+            keys.iter()
+                .any(|k| k.starts_with("invariant: failsafe action"))
+        );
+        assert!(j.not_judged.iter().all(|n| n.reason == NEEDS_CORE));
+    }
+
+    #[test]
+    fn an_outcome_with_no_records_is_judged_as_an_empty_flight_not_as_core_less() {
+        let o = FlightOutcome::new();
+        let j = o.invariants();
+        assert!(j.not_judged.is_empty(), "{:?}", j.not_judged);
+        let e = Expect {
+            nav_contains: vec![NavState::Hold],
+            ..Expect::default()
+        };
+        let j = e.check(&o);
+        assert!(j.not_judged.is_empty(), "{:?}", j.not_judged);
+        assert!(
+            j.violations.iter().any(|v| v.contains("navigation never")),
+            "{:?}",
+            j.violations
+        );
+        // With a record that has no core part the answer is "not judged".
+        let mut o = FlightOutcome::new();
+        o.add(&plain(0.0, Vec3::zero(), false));
+        assert!(!e.check(&o).not_judged.is_empty());
+    }
+
+    #[test]
+    fn keys_a_file_does_not_state_are_not_listed_as_not_judged() {
+        let o = plain_landed_outcome();
+        let j = landed_expect_truth().check(&o);
+        let keys: Vec<&str> = j.not_judged.iter().map(|n| n.key).collect();
+        assert!(!keys.contains(&"nav_contains") && !keys.contains(&"min_action"));
+    }
+
+    fn landed_expect_truth() -> Expect {
+        Expect {
+            ending: Ending::Landed {
+                within_m_of_home: Some(2.0),
+            },
+            by_s: 5.0,
+            ..Expect::default()
+        }
+    }
+
+    #[test]
+    fn truth_expectations_are_judged_without_the_core() {
+        let o = plain_landed_outcome();
+        assert!(landed_expect_truth().check(&o).violations.is_empty());
+        let mut e = landed_expect_truth();
+        e.max_height_m = Some(3.0);
+        e.by_s = 4.0;
+        let v = e.check(&o).violations.join(" | ");
+        assert!(v.contains("reached 5.00 m high, limit 3 m"), "{v}");
+        assert!(v.contains("later than 4 s"), "{v}");
+        // Truth invariants still apply.
+        let mut bad = plain_landed_outcome();
+        bad.motor_ticks_while_disarmed = 2;
+        bad.physics_faults = 1;
+        let v = landed_expect_truth().check(&bad).violations.join(" | ");
+        assert!(v.contains("while disarmed") && v.contains("physics"), "{v}");
+    }
+
+    #[test]
+    fn a_flight_with_the_core_part_has_nothing_unjudged() {
+        let j = landed_expect().check(&landed_outcome());
+        assert!(j.not_judged.is_empty());
+        assert!(landed_outcome().invariants().not_judged.is_empty());
+    }
+    fn outcome_with(f: impl FnOnce(&mut FlightOutcome)) -> FlightOutcome {
+        let mut o = FlightOutcome::new();
+        f(&mut o);
+        o
+    }
+
+    #[test]
+    fn a_flight_that_did_nothing_is_safe() {
+        assert_eq!(FlightOutcome::new().class(), FlightClass::Safe);
+    }
+
+    #[test]
+    fn touchdown_is_a_crash_only_above_two_metres_per_second() {
+        let at = |v| outcome_with(|o| o.touchdown_speed_mps = Some(v)).class();
+        assert_eq!(at(2.0), FlightClass::Safe);
+        assert_eq!(at(2.01), FlightClass::Crash);
+        assert_eq!(at(0.0), FlightClass::Safe);
+        assert_eq!(at(9.0), FlightClass::Crash);
+        assert_eq!(outcome_with(|_| {}).class(), FlightClass::Safe);
+    }
+
+    #[test]
+    fn the_worst_impact_is_a_crash_only_above_two_metres_per_second_too() {
+        let at = |v| outcome_with(|o| o.worst_impact_mps = Some(v)).class();
+        assert_eq!(at(2.0), FlightClass::Safe);
+        assert_eq!(at(2.01), FlightClass::Crash);
+        // The first touchdown soft, a later impact hard.
+        let o = outcome_with(|o| {
+            o.touchdown_speed_mps = Some(0.5);
+            o.worst_impact_mps = Some(6.0);
+        });
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_state_that_is_not_finite_or_a_physics_fault_is_a_crash() {
+        assert_eq!(
+            outcome_with(|o| o.non_finite = true).class(),
+            FlightClass::Crash
+        );
+        assert_eq!(
+            outcome_with(|o| o.physics_faults = 1).class(),
+            FlightClass::Crash
+        );
+        // Through the records: a NaN position after an airborne armed record.
+        let mut o = FlightOutcome::new();
+        at(&mut o, 0.0, 2.0, 0.0);
+        let mut r = flying(1.0, up(2.0), Action::None);
+        r.position = Vec3::new(f64::NAN, 0.0, -2.0);
+        o.add(&r);
+        assert!(o.non_finite);
+        assert_eq!(o.class(), FlightClass::Crash);
+    }
+
+    #[test]
+    fn a_tilt_is_a_crash_only_beyond_sixty_degrees() {
+        let at = |v| outcome_with(|o| o.max_tilt_deg = v).class();
+        assert_eq!(at(60.0), FlightClass::Safe);
+        assert_eq!(at(60.01), FlightClass::Crash);
+        assert_eq!(at(35.0), FlightClass::Safe);
+    }
+
+    #[test]
+    fn a_distance_or_a_height_is_a_fly_away_only_beyond_the_limits() {
+        let far = |v| outcome_with(|o| o.max_distance_from_home_m = v).class();
+        assert_eq!(far(100.0), FlightClass::Safe);
+        assert_eq!(far(100.01), FlightClass::FlyAway);
+        let high = |v| outcome_with(|o| o.max_height_m = v).class();
+        assert_eq!(high(60.0), FlightClass::Safe);
+        assert_eq!(high(60.01), FlightClass::FlyAway);
+    }
+
+    #[test]
+    fn a_flight_that_is_both_is_a_crash() {
+        let o = outcome_with(|o| {
+            o.max_distance_from_home_m = 500.0;
+            o.max_height_m = 80.0;
+            o.touchdown_speed_mps = Some(5.0);
+        });
+        assert_eq!(o.class(), FlightClass::Crash);
+        let o = outcome_with(|o| {
+            o.max_distance_from_home_m = 500.0;
+            o.max_tilt_deg = 90.0;
+        });
+        assert_eq!(o.class(), FlightClass::Crash);
+        let o = outcome_with(|o| o.max_distance_from_home_m = 500.0);
+        assert_eq!(o.class(), FlightClass::FlyAway);
+    }
+
+    #[test]
+    fn the_class_names_are_the_ones_tables_carry() {
+        assert_eq!(FlightClass::Safe.name(), "safe");
+        assert_eq!(FlightClass::Crash.to_string(), "crash");
+        assert_eq!(FlightClass::FlyAway.to_string(), "fly-away");
     }
 }

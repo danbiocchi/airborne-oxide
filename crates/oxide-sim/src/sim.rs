@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The lockstep loop: the simulator owns the clock and drives the flight core
-//! through `Core::tick`, exactly as firmware will (DESIGN §4.2, §5.1).
+//! The lockstep loop: the simulator owns the clock and drives an autopilot (by
+//! default our flight core, through `Core::tick`, exactly as firmware will:
+//! DESIGN §4.2, §5.1) through the [`Autopilot`] seam.
 //!
 //! Per tick `k` at time `t = k·base`:
 //! 1. sample sensors from the true state at `t`;
-//! 2. run `Core::tick(t)`; its outputs are valid from `t + base` (LET);
+//! 2. run the autopilot's tick (for our core `Core::tick(t)`); its outputs are
+//!    valid from `t + base` (LET);
 //! 3. integrate physics over `[t, t + base]` with the command valid at `t`.
 
 use oxide_core::Core;
 use oxide_core::config::{EstimatorSource, FailsafeParams, VehicleConfig};
 use oxide_core::io::ParamSet;
 use oxide_core::io::{
-    BrainHeartbeat, EventList, GcsHeartbeat, Inputs, Outputs, RcSample, Stamped, StateSample,
-    Status, TrajectorySetpoint,
+    BrainHeartbeat, EventList, GcsHeartbeat, Inputs, RcSample, Stamped, StateSample, Status,
+    TrajectorySetpoint,
 };
 use oxide_core::math::{Quat, Vec3};
 use oxide_core::params::{self, LoadReport, ParamError, ParamKind, ParamValue};
@@ -21,15 +23,17 @@ use oxide_core::time::Micros;
 
 use crate::SimError;
 use crate::airframe::{Airframe, BatterySpec};
+use crate::autopilot::{Autopilot, AutopilotInput, CoreAutopilot, PrerollInput};
 use crate::battery::Battery;
 use crate::faults::{
-    BRAIN_HEARTBEAT_PERIOD_US, Fault, FaultKind, GCS_HEARTBEAT_PERIOD_US, LinkConfig, active_at,
+    ActiveFaults, BRAIN_HEARTBEAT_PERIOD_US, Fault, FaultKind, GCS_HEARTBEAT_PERIOD_US, LinkConfig,
+    active_at,
 };
-use crate::flight_log::{FlightLog, Level, LogBuild, LogError, LogWriter, Stats};
+use crate::flight_log::{Level, LogBuild, LogError, LogWriter, Stats};
 use crate::hash::TraceHash;
 use crate::rng::{Rng, Stream};
 use crate::scenario::Pilot;
-use crate::sensors::{self, SensorConfig, SensorSuite, Truth};
+use crate::sensors::{SensorConfig, SensorSuite, Truth};
 use crate::vehicle::{BodyState, GRAVITY, VehicleModel};
 use crate::wind::{Wind, WindConfig};
 
@@ -40,6 +44,12 @@ pub struct SimOptions {
     pub seed: u64,
     pub sensors: SensorConfig,
     pub wind: WindConfig,
+    /// How often the wind is drawn, µs: it is sampled at the multiples of
+    /// this period and held in between. `None` is every step. It must be a
+    /// whole multiple of the step (else [`SimError::WindPeriod`]). A flight
+    /// at a finer step than another's can use the other's period and then
+    /// has the same wind sample for sample (ADR-0006 §7).
+    pub wind_period_us: Option<u64>,
     /// Replaces the airframe's estimator source. With `External` the
     /// simulator also sends ground truth as the `state` input; with `Ekf` it
     /// does not.
@@ -67,6 +77,7 @@ impl Default for SimOptions {
             seed: 0,
             sensors: SensorConfig::ideal(),
             wind: WindConfig::calm(),
+            wind_period_us: None,
             estimator: EstimatorSource::External,
             faults: Vec::new(),
             links: LinkConfig::default(),
@@ -84,6 +95,7 @@ impl SimOptions {
             seed,
             sensors: SensorConfig::realistic(),
             wind: WindConfig::calm(),
+            wind_period_us: None,
             estimator: EstimatorSource::Ekf,
             faults: Vec::new(),
             links: LinkConfig::default(),
@@ -266,21 +278,86 @@ pub struct StepRecord<const N: usize> {
     pub rotor_speed: [f64; N],
     pub battery_v: f64,
     pub battery_a: f64,
-    pub status: Status,
+    /// Whether the autopilot reports itself armed after this tick (from its
+    /// output; for our core, `status.armed`).
+    pub armed: bool,
     pub setpoint: Option<TrajectorySetpoint>,
-    /// The core's published state estimate after this tick.
-    pub estimate: Option<StateSample>,
     /// Wind (air-mass velocity, NED, m/s) acting during this tick.
     pub wind: Vec3<f64>,
     /// Physics steps so far that produced a non-finite state (the vehicle
     /// was frozen in place instead). Must be 0 in a healthy run.
     pub physics_faults: u32,
-    /// Events the core reported with this tick's outputs.
-    pub events: EventList,
+    /// What only our flight core has; `None` for another autopilot.
+    pub core: Option<CoreRecord>,
 }
 
-pub struct Simulation<P: Pilot, const N: usize> {
-    core: Core<N>,
+/// What only our flight core reports about a tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoreRecord {
+    pub status: Status,
+    /// Events the core reported with this tick's outputs.
+    pub events: EventList,
+    /// The core's published state estimate after this tick.
+    pub estimate: Option<StateSample>,
+}
+
+impl<const N: usize> StepRecord<N> {
+    /// The core's status, if the record has the core part.
+    pub fn status(&self) -> Option<&Status> {
+        self.core.as_ref().map(|c| &c.status)
+    }
+    /// The core's published estimate (`None` without the core part, too).
+    pub fn estimate(&self) -> Option<StateSample> {
+        self.core.as_ref().and_then(|c| c.estimate)
+    }
+}
+
+/// Why [`Simulation::preroll`] stopped.
+#[derive(Debug, PartialEq)]
+pub enum PrerollError<E> {
+    /// The simulation has already taken a step (`tick` of them).
+    AfterStep { tick: u64 },
+    /// A pre-roll has already run (or started) on this simulation.
+    AlreadyRun,
+    /// The autopilot's `preroll_tick` failed at step `k`.
+    Autopilot { k: u64, source: E },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for PrerollError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AfterStep { tick } => write!(
+                f,
+                "the pre-roll comes before the flight, and this simulation has already stepped (tick {tick})"
+            ),
+            Self::AlreadyRun => write!(f, "a pre-roll has already run on this simulation"),
+            Self::Autopilot { k, source } => {
+                write!(f, "the autopilot failed at pre-roll step {k}: {source}")
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for PrerollError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Autopilot { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// A command the autopilot produced, waiting for its `t_valid`.
+#[derive(Clone, Copy, Debug)]
+struct PendingCommand<const N: usize> {
+    t_valid: Micros,
+    motors: [f32; N],
+}
+
+/// The simulator: physics, sensors, wind, faults and a pilot around an
+/// [`Autopilot`] (our flight core by default).
+pub struct Simulation<P: Pilot, const N: usize, A: Autopilot<N> = CoreAutopilot<N>> {
+    autopilot: A,
     model: VehicleModel<N>,
     body: BodyState<N>,
     battery: Battery,
@@ -290,9 +367,15 @@ pub struct Simulation<P: Pilot, const N: usize> {
     dt: f64,
     sensors: SensorSuite<N>,
     wind: Wind,
-    truth_state: bool,
-    active: Outputs<N>,
-    pending: Option<Outputs<N>>,
+    /// The wind's sampling period, µs (a whole number of ticks).
+    wind_period_us: u64,
+    /// The wind held since the last sample.
+    held_wind: Vec3<f64>,
+    /// The motor commands acting over the current step.
+    active: [f32; N],
+    /// Commands that have not fallen due yet, oldest issued first (one
+    /// entry for our core, whose commands are valid one tick later).
+    pending: Vec<PendingCommand<N>>,
     specific_force_world: Vec3<f64>,
     hash: TraceHash,
     physics_faults: u32,
@@ -300,18 +383,18 @@ pub struct Simulation<P: Pilot, const N: usize> {
     links: LinkConfig,
     last_rc: Option<RcSample>,
     brain_progress: u32,
-    last_inputs: Inputs,
     /// A parameter change for the next tick's inputs.
     next_param_set: Option<ParamSet>,
     /// An acknowledgement of a parameter fault for the next tick's inputs.
     next_param_ack: bool,
-    /// What the boot step's load of stored parameters reported.
-    load_report: LoadReport,
-    /// The log, once started.
-    log: Option<FlightLog>,
+    /// A pre-roll has run (or started).
+    prerolled: bool,
+    /// A step was attempted (it may have failed before the tick advanced,
+    /// after the wind and the sensors had moved).
+    stepped: bool,
 }
 
-impl<P: Pilot, const N: usize> Simulation<P, N> {
+impl<P: Pilot, const N: usize> Simulation<P, N, CoreAutopilot<N>> {
     /// Ideal sensors, calm wind, truth state (`SimOptions::default()`).
     pub fn new(airframe: &Airframe, profile: Profile, pilot: P) -> Result<Self, SimError> {
         Self::with_options(airframe, profile, pilot, SimOptions::default())
@@ -340,8 +423,19 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         options: SimOptions,
         boot: impl FnOnce(&mut VehicleConfig<N>) -> LoadReport,
     ) -> Result<Self, SimError> {
+        let imu_period = options.sensors.imu.period_us;
+        if imu_period != 0 && imu_period != u64::from(profile.base_period_us) {
+            return Err(SimError::Param {
+                name: "sensors.imu.period_us".into(),
+                reason: format!(
+                    "our flight core needs an IMU sample on every tick ({} us), \
+                     so the IMU period must be 0 or the tick; got {imu_period} us",
+                    profile.base_period_us
+                ),
+            });
+        }
         let mut airframe = airframe.clone();
-        if let Some(b) = options.battery {
+        if let Some(b) = options.battery.clone() {
             airframe.battery = b;
         }
         let airframe = &airframe;
@@ -367,10 +461,131 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         let report = boot(&mut cfg);
         // A parameter (or a stored value) may have changed the source: the
         // state input follows it.
-        let truth_state = cfg.estimator.source == EstimatorSource::External;
+        let source = cfg.estimator.source;
         let mut core = Core::new(cfg, profile).map_err(SimError::Core)?;
         core.report_param_load(report);
-        let base_us = u64::from(profile.base_period_us);
+        let autopilot = CoreAutopilot::new(core, source, report);
+        Self::from_parts(airframe, model, autopilot, pilot, options)
+    }
+
+    pub fn core(&self) -> &Core<N> {
+        self.autopilot.core()
+    }
+    /// The core, between ticks (for the parameter store's `service`, which
+    /// tells it that values are saved).
+    pub fn core_mut(&mut self) -> &mut Core<N> {
+        self.autopilot.core_mut()
+    }
+    /// The report of the stored-parameter load that the boot step returned
+    /// (the value given to `Core::report_param_load` before the first tick).
+    pub fn load_report(&self) -> LoadReport {
+        self.autopilot.load_report()
+    }
+
+    /// Starts a log: writes its header to `writer` and, from then on, hands
+    /// every tick to the recorder and drains the ring to the writer. Only
+    /// before the first tick, and once. At the replay level the boot report
+    /// and the profile are recorded too, and a configuration that could never
+    /// replay is refused ([`LogError::NotReplayable`]). A writer that fails later never changes the flight;
+    /// [`finish_log`](Self::finish_log) returns the first error.
+    pub fn start_log(
+        &mut self,
+        level: Level,
+        build: &LogBuild,
+        writer: LogWriter,
+    ) -> Result<(), LogError> {
+        if self.autopilot.has_log() {
+            return Err(LogError::AlreadyStarted);
+        }
+        if self.tick != 0 {
+            return Err(LogError::AfterFirstTick);
+        }
+        self.autopilot.start_log(level, build, writer)
+    }
+
+    /// The logger's counters, or `None` when there is no log.
+    pub fn log_stats(&self) -> Option<Stats> {
+        self.autopilot.log_stats()
+    }
+
+    /// Flushes the log and returns its writer, or the first I/O error. The
+    /// simulation has no log afterwards.
+    pub fn finish_log(&mut self) -> Result<LogWriter, LogError> {
+        self.autopilot.finish_log()
+    }
+
+    /// What the last `step()` fed the core (after faults).
+    pub fn last_inputs(&self) -> &Inputs {
+        self.autopilot.last_inputs()
+    }
+
+    /// Advances one base tick.
+    pub fn step(&mut self) -> StepRecord<N> {
+        match self.try_step() {
+            Ok(r) => r,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Runs until `t_end`, calling `on_step` for every tick.
+    pub fn run_until(&mut self, t_end: Micros, mut on_step: impl FnMut(&StepRecord<N>)) {
+        while self.time() < t_end {
+            let r = self.step();
+            on_step(&r);
+        }
+    }
+}
+
+impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
+    /// A simulation around another autopilot. `options` is [`SimOptions`]
+    /// as for our core, and what it says about the world applies: `seed`,
+    /// `sensors` (our sensor models run and their frame goes to the
+    /// autopilot, which may ignore it), `wind`, `faults`, `links`, `battery`.
+    /// What configures our flight core does not apply: `params` and
+    /// `failsafe` are refused with [`SimError::Param`] when given (they would
+    /// do nothing, silently), and `estimator`, which `SimOptions::realistic`
+    /// sets, is ignored. The tick period, which is also the physics step, is the
+    /// autopilot's [`period_us`](Autopilot::period_us): it must divide the
+    /// command period, and the sensors' and links' periods must be whole
+    /// multiples of it, else [`SimError::TimeBase`], as for a profile.
+    pub fn with_autopilot(
+        airframe: &Airframe,
+        autopilot: A,
+        pilot: P,
+        options: SimOptions,
+    ) -> Result<Self, SimError> {
+        const NOT_OURS: &str =
+            "configures our flight core, and this simulation hosts another autopilot";
+        if let Some((name, _)) = options.params.first() {
+            return Err(SimError::Param {
+                name: name.clone(),
+                reason: NOT_OURS.into(),
+            });
+        }
+        if options.failsafe.is_some() {
+            return Err(SimError::Param {
+                name: "failsafe".into(),
+                reason: NOT_OURS.into(),
+            });
+        }
+        let mut airframe = airframe.clone();
+        if let Some(b) = options.battery.clone() {
+            airframe.battery = b;
+        }
+        let model = VehicleModel::<N>::from_airframe(&airframe)?;
+        Self::from_parts(&airframe, model, autopilot, pilot, options)
+    }
+
+    /// The part of construction every autopilot shares: the time base, the
+    /// links and faults, the sensors and the wind.
+    fn from_parts(
+        airframe: &Airframe,
+        model: VehicleModel<N>,
+        autopilot: A,
+        pilot: P,
+        options: SimOptions,
+    ) -> Result<Self, SimError> {
+        let base_us = autopilot.period_us();
         // One time base: every period must be a whole number of ticks.
         if base_us == 0 || !crate::scenario::COMMAND_PERIOD_US.is_multiple_of(base_us) {
             return Err(SimError::TimeBase(base_us));
@@ -378,9 +593,16 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         options.links.validate(base_us)?;
         crate::faults::validate_faults(&options.faults, N, &options.links)?;
         let sensors = SensorSuite::new(options.sensors, options.seed, base_us)?;
+        let wind_period_us = options.wind_period_us.unwrap_or(base_us);
+        if wind_period_us == 0 || !wind_period_us.is_multiple_of(base_us) {
+            return Err(SimError::WindPeriod {
+                period_us: wind_period_us,
+                step_us: base_us,
+            });
+        }
         let wind = Wind::new(options.wind, Rng::stream(options.seed, Stream::Wind));
         Ok(Self {
-            core,
+            autopilot,
             model,
             body: BodyState::default(),
             battery: Battery::new(&airframe.battery),
@@ -390,9 +612,10 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             dt: Micros(base_us).as_secs_f64(),
             sensors,
             wind,
-            truth_state,
-            active: Outputs::off(Micros::ZERO),
-            pending: None,
+            wind_period_us,
+            held_wind: Vec3::zero(),
+            active: [0.0; N],
+            pending: Vec::with_capacity(2),
             specific_force_world: Vec3::new(0.0, 0.0, -GRAVITY),
             hash: TraceHash::default(),
             physics_faults: 0,
@@ -400,12 +623,68 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             links: options.links,
             last_rc: None,
             brain_progress: 0,
-            last_inputs: Inputs::default(),
             next_param_set: None,
             next_param_ack: false,
-            load_report: report,
-            log: None,
+            prerolled: false,
+            stepped: false,
         })
+    }
+
+    /// The pre-roll: the vehicle rests on the ground before the flight, and
+    /// the autopilot's [`preroll_tick`](Autopilot::preroll_tick) is called
+    /// for `k = 0..steps`, one per tick, with the body at rest and the IMU
+    /// sample of that step (the IMU model's turn-on bias, walk and noise: its
+    /// state, and only that, advances). Nothing else happens: no physics, no
+    /// wind, no pilot, no faults, no other sensor, and the tick counter and
+    /// the trace hash stay as they are. Stops at the first error of the
+    /// autopilot and returns it with its `k`.
+    ///
+    /// Only before the first step (a step that failed counts), and once.
+    /// The IMU samples are those of a vehicle at rest in no wind: with a
+    /// steady wind the flight's accelerometer reads the drag too, a little
+    /// (about 0.1 m/s2) different from the pre-roll's.
+    pub fn preroll(&mut self, steps: u64) -> Result<(), PrerollError<A::Error>> {
+        if self.tick != 0 || self.stepped {
+            return Err(PrerollError::AfterStep { tick: self.tick });
+        }
+        if self.prerolled {
+            return Err(PrerollError::AlreadyRun);
+        }
+        self.prerolled = true;
+        for k in 0..steps {
+            let truth = Truth {
+                body: &self.body,
+                specific_force_world: self.specific_force_world,
+                battery_v: self.battery.voltage_v,
+                battery_a: self.battery.current_a,
+                max_omega: self.model.max_omega,
+            };
+            let imu = self.sensors.preroll_imu(k, &truth);
+            let input = PrerollInput {
+                body: &self.body,
+                specific_force_world: self.specific_force_world,
+                battery_v: self.battery.voltage_v,
+                battery_a: self.battery.current_a,
+                imu,
+            };
+            self.autopilot
+                .preroll_tick(k, &input)
+                .map_err(|source| PrerollError::Autopilot { k, source })?;
+        }
+        Ok(())
+    }
+
+    /// Puts a parameter change into the next tick's inputs (at most one per
+    /// tick: a later call before the tick replaces it). Only an autopilot with
+    /// parameters of our kind (our core) does anything with it; it stays
+    /// queued if the tick fails.
+    pub fn queue_param_set(&mut self, set: ParamSet) {
+        self.next_param_set = Some(set);
+    }
+    /// Puts an operator's acknowledgement of a parameter fault into the next
+    /// tick's inputs.
+    pub fn queue_param_ack(&mut self) {
+        self.next_param_ack = true;
     }
 
     pub fn time(&self) -> Micros {
@@ -426,97 +705,56 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     pub fn pilot_mut(&mut self) -> &mut P {
         &mut self.pilot
     }
-    pub fn core(&self) -> &Core<N> {
-        &self.core
+    pub fn autopilot(&self) -> &A {
+        &self.autopilot
     }
-    /// The core, between ticks (for the parameter store's `service`, which
-    /// tells it that values are saved).
-    pub fn core_mut(&mut self) -> &mut Core<N> {
-        &mut self.core
+    pub fn autopilot_mut(&mut self) -> &mut A {
+        &mut self.autopilot
     }
-    /// Puts a parameter change into the next tick's inputs (at most one per
-    /// tick: a later call before the tick replaces it).
-    pub fn queue_param_set(&mut self, set: ParamSet) {
-        self.next_param_set = Some(set);
+    /// Ends the simulation and hands the autopilot back, so that a bridge can
+    /// shut its process down and report how it ended instead of doing it in
+    /// `Drop`.
+    pub fn into_autopilot(self) -> A {
+        self.autopilot
     }
-    /// Puts an operator's acknowledgement of a parameter fault into the next
-    /// tick's inputs.
-    pub fn queue_param_ack(&mut self) {
-        self.next_param_ack = true;
-    }
-    /// The report of the stored-parameter load that the boot step returned
-    /// (the value given to `Core::report_param_load` before the first tick).
-    pub fn load_report(&self) -> LoadReport {
-        self.load_report
-    }
-
-    /// Starts a log: writes its header to `writer` and, from then on, hands
-    /// every tick to the recorder and drains the ring to the writer. Only
-    /// before the first tick, and once. At the replay level the boot report
-    /// and the profile are recorded too, and a configuration that could never
-    /// replay is refused ([`LogError::NotReplayable`]). A writer that fails later never changes the flight;
-    /// [`finish_log`](Self::finish_log) returns the first error.
-    pub fn start_log(
-        &mut self,
-        level: Level,
-        build: &LogBuild,
-        writer: LogWriter,
-    ) -> Result<(), LogError> {
-        if self.log.is_some() {
-            return Err(LogError::AlreadyStarted);
-        }
-        if self.tick != 0 {
-            return Err(LogError::AfterFirstTick);
-        }
-        let log = FlightLog::start(
-            level,
-            build,
-            self.core.profile(),
-            &self.load_report,
-            self.core.config(),
-            writer,
-        )?;
-        self.log = Some(log);
-        Ok(())
-    }
-
-    /// The logger's counters, or `None` when there is no log.
-    pub fn log_stats(&self) -> Option<Stats> {
-        self.log.as_ref().map(FlightLog::stats)
-    }
-
-    /// Flushes the log and returns its writer, or the first I/O error. The
-    /// simulation has no log afterwards.
-    pub fn finish_log(&mut self) -> Result<LogWriter, LogError> {
-        self.log.take().ok_or(LogError::NotStarted)?.finish()
-    }
-
     pub fn sensors(&self) -> &SensorSuite<N> {
         &self.sensors
     }
     pub fn wind(&self) -> &Wind {
         &self.wind
     }
+    /// The pack's state of charge, 0 to 1 (read-only).
+    pub fn battery_state_of_charge(&self) -> f64 {
+        self.battery.state_of_charge
+    }
     /// Physics steps so far that produced a non-finite state.
     pub fn physics_faults(&self) -> u32 {
         self.physics_faults
-    }
-    /// What the last `step()` fed the core (after faults).
-    pub fn last_inputs(&self) -> &Inputs {
-        &self.last_inputs
     }
     /// Hash of every state so far (DESIGN §5.2 item 6).
     pub fn trace_hash(&self) -> u64 {
         self.hash.value()
     }
 
-    /// Advances one base tick.
-    pub fn step(&mut self) -> StepRecord<N> {
+    /// Advances one tick. If the autopilot's tick fails, its error is
+    /// returned and the tick did not happen as far as the simulation's
+    /// state goes: the tick counter, the trace hash and the vehicle's truth
+    /// are as they were, and a queued parameter change is still queued. The
+    /// world's random streams, the pilot and the heartbeat counter did
+    /// advance for that tick, so a caller stops (or abandons the run) rather
+    /// than retrying it.
+    pub fn try_step(&mut self) -> Result<StepRecord<N>, A::Error> {
+        self.stepped = true;
         let t = self.time();
 
         // 1. Wind and sensors at t.
-        let wind = self.wind.sample(t);
-        let frame = self.sensors.sample(
+        // The wind is drawn on its own grid (a multiple of the step) and held
+        // between samples, so a finer step sees the same wind (ADR-0006 §7).
+        if t.0.is_multiple_of(self.wind_period_us) {
+            self.held_wind = self.wind.sample(t);
+        }
+        let wind = self.held_wind;
+        let mut frame = self.sensors.sample(
             t,
             &Truth {
                 body: &self.body,
@@ -527,59 +765,74 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             },
         );
         let pilot_setpoint = self.pilot.setpoint(t);
-        let setpoint = if self.fault_active(t, |k| {
-            matches!(k, FaultKind::BrainCrash | FaultKind::BrainHang)
-        }) {
+        let active = ActiveFaults::at(&self.faults, t);
+        let setpoint = if active.brain_crash || active.brain_hang {
             None
         } else {
             pilot_setpoint
         };
         let rc = self.rc_frame(t);
         let (gcs_heartbeat, brain_heartbeat) = self.heartbeats(t);
-        let drop_gps = self.fault_active(t, |k| matches!(k, FaultKind::GpsLoss));
-        let drop_imu = self.fault_active(t, |k| matches!(k, FaultKind::ImuLoss));
-        let drop_baro = self.fault_active(t, |k| matches!(k, FaultKind::BaroLoss));
-        let drop_mag = self.fault_active(t, |k| matches!(k, FaultKind::MagLoss));
         self.apply_motor_faults(t);
-        let inputs = Inputs {
-            imu: frame.imu.filter(|_| !drop_imu),
-            gps: frame.gps.filter(|_| !drop_gps),
-            baro: frame.baro.filter(|_| !drop_baro),
-            mag: frame.mag.filter(|_| !drop_mag),
-            battery: frame.battery,
-            state: self.truth_state.then(|| sensors::state(t, &self.body)),
+        // Sensor faults: a lost sensor delivers nothing.
+        if active.imu_loss {
+            frame.imu = None;
+        }
+        if active.gps_loss {
+            frame.gps = None;
+        }
+        if active.baro_loss {
+            frame.baro = None;
+        }
+        if active.mag_loss {
+            frame.mag = None;
+        }
+        let param_set = self.next_param_set.take();
+        let param_ack = core::mem::take(&mut self.next_param_ack);
+
+        // 2. The autopilot's tick.
+        let input = AutopilotInput {
+            body: &self.body,
+            specific_force_world: self.specific_force_world,
+            battery_v: self.battery.voltage_v,
+            battery_a: self.battery.current_a,
+            wind,
+            sensors: &frame,
             rc,
-            setpoint: setpoint.map(|s| Stamped::ideal(t, s)),
+            setpoint,
             gcs_heartbeat,
             brain_heartbeat,
-            param_set: self.next_param_set.take(),
-            param_ack: core::mem::take(&mut self.next_param_ack),
+            param_set,
+            param_ack,
+            faults: active,
+            rotor_scale: self.model.rotor_scale,
         };
-        self.last_inputs = inputs;
-
-        // 2. Core tick. The log needs to know whether the store has made its
-        // "saved" call since the last tick: the flag is read before the tick.
-        let unsaved_before = self.core.params_unsaved();
-        let out = self.core.tick(t, &inputs);
-        if let Some(log) = self.log.as_mut() {
-            log.record(
-                t,
-                unsaved_before,
-                &inputs,
-                &out,
-                &self.core.telemetry(),
-                self.core.config(),
-            );
-        }
-
-        // 3. Physics over [t, t + base] with the command valid at t.
-        if let Some(p) = self.pending.take() {
-            if p.t_valid <= t {
-                self.active = p;
-            } else {
-                self.pending = Some(p);
+        let out = match self.autopilot.tick(t, &input) {
+            Ok(out) => out,
+            Err(e) => {
+                self.next_param_set = param_set;
+                self.next_param_ack = param_ack;
+                return Err(e);
             }
-        }
+        };
+
+        // 3. Physics over [t, t + base] with the commands valid at t: this
+        // tick's command joins the queue, and every command that is due
+        // (`t_valid <= t`, this tick's own included) takes effect, the one
+        // issued last winning; those not due yet wait.
+        self.pending.push(PendingCommand {
+            t_valid: out.t_valid,
+            motors: out.motors,
+        });
+        let active = &mut self.active;
+        self.pending.retain(|p| {
+            if p.t_valid <= t {
+                *active = p.motors;
+                false
+            } else {
+                true
+            }
+        });
         let record = StepRecord {
             t,
             position: self.body.position,
@@ -590,18 +843,30 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
             rotor_speed: self.body.rotor_speed,
             battery_v: self.battery.voltage_v,
             battery_a: self.battery.current_a,
-            status: out.status,
+            armed: out.armed,
             setpoint,
-            estimate: self.core.estimate(),
             wind,
             physics_faults: self.physics_faults,
-            events: out.events,
+            core: out.core,
         };
         self.integrate(wind);
-        self.pending = Some(out);
         self.hash_state();
         self.tick = self.tick.saturating_add(1);
-        record
+        Ok(record)
+    }
+
+    /// Runs until `t_end`, calling `on_step` for every tick; stops at the
+    /// first error from the autopilot.
+    pub fn try_run_until(
+        &mut self,
+        t_end: Micros,
+        mut on_step: impl FnMut(&StepRecord<N>),
+    ) -> Result<(), A::Error> {
+        while self.time() < t_end {
+            let r = self.try_step()?;
+            on_step(&r);
+        }
+        Ok(())
     }
 
     fn fault_active(&self, t: Micros, pred: fn(&FaultKind) -> bool) -> bool {
@@ -691,7 +956,7 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
     fn integrate(&mut self, wind: Vec3<f64>) {
         let v = self.battery.voltage_v;
         let cmd: [f64; N] = core::array::from_fn(|i| {
-            let u = self.active.motors.get(i).copied().map_or(0.0, f64::from);
+            let u = self.active.get(i).copied().map_or(0.0, f64::from);
             self.model.speed_command(u, v)
         });
         let v_before = self.body.velocity;
@@ -730,17 +995,9 @@ impl<P: Pilot, const N: usize> Simulation<P, N> {
         for s in b.rotor_speed {
             h.write_f64(s);
         }
-        for m in self.active.motors {
+        for m in self.active {
             h.write_f32(m);
         }
         h.write_f64(self.battery.voltage_v);
-    }
-
-    /// Runs until `t_end`, calling `on_step` for every tick.
-    pub fn run_until(&mut self, t_end: Micros, mut on_step: impl FnMut(&StepRecord<N>)) {
-        while self.time() < t_end {
-            let r = self.step();
-            on_step(&r);
-        }
     }
 }

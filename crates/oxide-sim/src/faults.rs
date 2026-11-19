@@ -87,6 +87,56 @@ pub(crate) fn active_at(
     faults.iter().filter(move |f| f.active(t) && pred(&f.kind))
 }
 
+/// Which kinds of fault are active at one instant: what an autopilot behind
+/// a bridge needs to translate a fault into its own terms (a GPS loss into
+/// its own sensor simulation's parameter, say). Built from the fault list by
+/// [`ActiveFaults::at`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveFaults {
+    pub gps_loss: bool,
+    pub imu_loss: bool,
+    pub baro_loss: bool,
+    pub mag_loss: bool,
+    pub rc_loss: bool,
+    pub rc_silent: bool,
+    pub gcs_loss: bool,
+    pub brain_crash: bool,
+    pub brain_hang: bool,
+    /// Bit `i` is set while rotor `i` (below 32) has a motor loss active.
+    pub motor_loss: u32,
+}
+
+impl ActiveFaults {
+    /// The kinds active at `t`.
+    pub fn at(faults: &[Fault], t: Micros) -> Self {
+        let mut a = Self::default();
+        for f in faults.iter().filter(|f| f.active(t)) {
+            match f.kind {
+                FaultKind::MotorLoss { rotor, .. } => {
+                    if let Some(bit) = u32::try_from(rotor).ok().and_then(|r| 1u32.checked_shl(r)) {
+                        a.motor_loss |= bit;
+                    }
+                }
+                FaultKind::GpsLoss => a.gps_loss = true,
+                FaultKind::ImuLoss => a.imu_loss = true,
+                FaultKind::BaroLoss => a.baro_loss = true,
+                FaultKind::MagLoss => a.mag_loss = true,
+                FaultKind::RcLoss => a.rc_loss = true,
+                FaultKind::RcSilent => a.rc_silent = true,
+                FaultKind::GcsLoss => a.gcs_loss = true,
+                FaultKind::BrainCrash => a.brain_crash = true,
+                FaultKind::BrainHang => a.brain_hang = true,
+            }
+        }
+        a
+    }
+
+    /// True when no fault is active.
+    pub fn none(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Which links exist to the vehicle, and the receiver's behaviour.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkConfig {
@@ -190,6 +240,29 @@ mod tests {
         assert!(x.active(Micros(1_999_999)));
         assert!(!x.active(Micros(2_000_000)));
         assert!(f(0.5, None).active(Micros(u64::MAX / 2)));
+    }
+
+    #[test]
+    fn active_faults_follow_the_windows() {
+        let faults = [
+            f(1.0, Some(2.0)),
+            Fault {
+                kind: FaultKind::MotorLoss {
+                    rotor: 2,
+                    scale: 0.0,
+                },
+                start_s: 1.5,
+                end_s: None,
+            },
+        ];
+        assert!(ActiveFaults::at(&faults, Micros(500_000)).none());
+        let a = ActiveFaults::at(&faults, Micros(1_000_000));
+        assert!(a.gps_loss && a.motor_loss == 0);
+        let a = ActiveFaults::at(&faults, Micros(1_600_000));
+        assert!(a.gps_loss && a.motor_loss == 0b100);
+        let a = ActiveFaults::at(&faults, Micros(2_000_000));
+        assert!(!a.gps_loss && a.motor_loss == 0b100);
+        assert!(ActiveFaults::at(&[], Micros(0)).none());
     }
 
     #[test]

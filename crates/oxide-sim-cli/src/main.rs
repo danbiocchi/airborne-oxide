@@ -75,7 +75,7 @@ use oxide_core::schedule::{F405_LEAN, H743_FULL, Profile};
 use oxide_core::time::Micros;
 use oxide_sim::fault_scenarios;
 use oxide_sim::flight_log::{Level, LogBuild, LogError, LogWriter};
-use oxide_sim::metrics::{HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
+use oxide_sim::metrics::{CoreHold, HoldCriteria, HoldMetrics, fly_gust_hold_with_params};
 use oxide_sim::montecarlo::run_indexed;
 use oxide_sim::scenario::{GustHold, HoverStep, Pilot, gust_hold};
 use oxide_sim::scenario_file::{self, Checker, ScenarioFile};
@@ -588,7 +588,7 @@ struct EstimateErrors {
 
 impl EstimateErrors {
     fn update(&mut self, r: &StepRecord<4>) {
-        let Some(est) = r.estimate else { return };
+        let Some(est) = r.estimate() else { return };
         let p = est.position.cast::<f64>();
         let (dn, de) = (p.x - r.position.x, p.y - r.position.y);
         let dh = oxide_core::math::Real::sqrt(dn * dn + de * de);
@@ -610,13 +610,18 @@ fn csv_row(r: &StepRecord<4>) -> String {
     let e = r.attitude.to_euler();
     let sp = r.setpoint.map(|s| s.position);
     let f = |v: Option<f32>| v.map_or(String::new(), |x| format!("{x:.4}"));
-    let est = r.estimate;
+    let est = r.estimate();
+    // The core's columns are empty cells for a record without the core part.
+    let status = r.status();
+    let nav = status.map_or(String::new(), |s| format!("{:?}", s.nav));
+    let action = status.map_or(String::new(), |s| format!("{:?}", s.action));
+    let reasons = status.map_or(String::new(), |s| s.reasons.0.to_string());
     let est_pos = est.map(|s| s.position);
     let est_euler = est.map(|s| s.attitude.cast::<f64>().to_euler());
     let g = |v: Option<f32>| v.map_or(String::new(), |x| format!("{x:.5}"));
     let h = |v: Option<f64>| v.map_or(String::new(), |x| format!("{x:.5}"));
     format!(
-        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:?},{:?},{},{},{},{}\n",
+        "{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{}\n",
         r.t.as_secs_f64(),
         r.position.x,
         r.position.y,
@@ -636,7 +641,7 @@ fn csv_row(r: &StepRecord<4>) -> String {
         r.motors[3],
         r.battery_v,
         r.battery_a,
-        u8::from(r.status.armed),
+        u8::from(r.armed),
         f(sp.map(|p| p.x)),
         f(sp.map(|p| p.y)),
         f(sp.map(|p| p.z)),
@@ -649,12 +654,12 @@ fn csv_row(r: &StepRecord<4>) -> String {
         r.wind.x,
         r.wind.y,
         r.wind.z,
-        r.status.nav,
-        r.status.action,
+        nav,
+        action,
         g(est.map(|s| s.velocity.x)),
         g(est.map(|s| s.velocity.y)),
         g(est.map(|s| s.velocity.z)),
-        r.status.reasons.0,
+        reasons,
     )
 }
 
@@ -922,6 +927,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A number from the core part of a run's hold metrics (0 without it).
+fn core_hold(m: &HoldMetrics, f: fn(&CoreHold) -> f64) -> f64 {
+    m.core.as_ref().map_or(0.0, f)
+}
+
 /// Flies gust-hold indices `0..seeds`; true when every run passed.
 fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     let c = HoldCriteria::default();
@@ -937,10 +947,12 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     }
     let mut passed = 0usize;
     for (i, m) in runs.iter().enumerate() {
-        let f = m.failures(&c);
-        if f.is_empty() {
+        let j = m.judge(&c);
+        if j.passed() {
             passed += 1;
         } else {
+            let mut f = j.violations;
+            f.extend(j.not_judged.iter().map(|n| format!("not judged: {n}")));
             println!("FAIL index {i}: {}", f.join("; "));
         }
     }
@@ -958,11 +970,21 @@ fn montecarlo(args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
         worst("rms horizontal error (m)", |m| m.rms_h_error_m);
         worst("max vertical error (m)", |m| m.max_v_error_m);
         worst("max tilt (deg)", |m| m.max_tilt_deg);
-        worst("estimate max horizontal (m)", |m| m.est_max_h_error_m);
-        worst("estimate max vertical (m)", |m| m.est_max_v_error_m);
-        worst("estimate max velocity (m/s)", |m| m.est_max_vel_error_mps);
-        worst("estimate max attitude (deg)", |m| m.est_max_att_error_deg);
-        worst("rejected measurements", |m| f64::from(m.rejected));
+        worst("estimate max horizontal (m)", |m| {
+            core_hold(m, |k| k.est_max_h_error_m)
+        });
+        worst("estimate max vertical (m)", |m| {
+            core_hold(m, |k| k.est_max_v_error_m)
+        });
+        worst("estimate max velocity (m/s)", |m| {
+            core_hold(m, |k| k.est_max_vel_error_mps)
+        });
+        worst("estimate max attitude (deg)", |m| {
+            core_hold(m, |k| k.est_max_att_error_deg)
+        });
+        worst("rejected measurements", |m| {
+            core_hold(m, |k| f64::from(k.rejected))
+        });
         worst("physics faults", |m| f64::from(m.physics_faults));
     }
     println!("passed {passed}/{}", runs.len());
@@ -1097,19 +1119,33 @@ fn fly_scenario<P: Pilot>(
     ));
     lines.push(format!("about      {}", scenario.about));
     lines.push("timeline".to_string());
-    for e in &outcome.events {
+    let core = outcome.core.as_ref();
+    for e in core.iter().flat_map(|c| &c.events) {
         lines.push(format!("  {}", oxide_sim::outcome::event_line(e)));
     }
     let p = outcome.position_at_end;
-    lines.push(format!("navigation {:?}", outcome.nav_sequence));
+    // Without the core part there is no status to print: the lines say so.
+    let unavailable = || format!("({})", oxide_sim::outcome::NEEDS_CORE);
     lines.push(format!(
-        "reasons    {}   highest action {:?}",
-        oxide_sim::outcome::reason_names(outcome.reasons_seen),
-        outcome.max_action
+        "navigation {}",
+        core.map_or_else(unavailable, |c| format!("{:?}", c.nav_sequence))
     ));
+    lines.push(match core {
+        Some(c) => format!(
+            "reasons    {}   highest action {:?}",
+            oxide_sim::outcome::reason_names(c.reasons_seen),
+            c.max_action
+        ),
+        None => format!("reasons    {}", unavailable()),
+    });
     lines.push(format!(
-        "end        t {:.2} s, N {:.2} E {:.2} D {:.2} m, armed {}, {:?}",
-        outcome.end_s, p.x, p.y, p.z, outcome.armed_at_end, outcome.nav_at_end
+        "end        t {:.2} s, N {:.2} E {:.2} D {:.2} m, armed {}, {}",
+        outcome.end_s,
+        p.x,
+        p.y,
+        p.z,
+        outcome.armed_at_end,
+        core.map_or_else(unavailable, |c| format!("{:?}", c.nav_at_end))
     ));
     lines.push(format!(
         "limits     max height {:.2} m, max distance from home {:.2} m, max tilt {:.1} deg, touchdown {}",
@@ -1122,26 +1158,39 @@ fn fly_scenario<P: Pilot>(
     ));
     lines.push(format!(
         "disarmed   {} at {}",
-        outcome
-            .disarm_reason
+        core.and_then(|c| c.disarm_reason)
             .map_or("never".into(), |r| format!("{r:?}")),
         outcome
             .disarmed_at_s
             .map_or("-".into(), |t| format!("{t:.2} s"))
     ));
     if let Some(h) = &verdict.hold {
-        lines.push(format!(
-            "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {:.3} m",
-            h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m, h.est_max_h_error_m
-        ));
+        lines.push(hold_line(h));
     }
     lines.push(format!("trace hash {:016x}", sim.trace_hash()));
-    lines.extend(result_lines(scenario, &verdict.violations));
+    lines.extend(result_lines(
+        scenario,
+        &verdict.violations,
+        &verdict.not_judged,
+    ));
     Ok(ScenarioRun {
         lines,
-        passed: verdict.violations.is_empty(),
+        passed: verdict.passed(),
         write_error,
     })
+}
+
+/// The `hold` line of a scenario summary. The estimate's error is the core's:
+/// without the core part the line says so instead of printing a number.
+fn hold_line(h: &HoldMetrics) -> String {
+    let estimate = h.core.map_or_else(
+        || format!("({})", oxide_sim::outcome::NEEDS_CORE),
+        |k| format!("{:.3} m", k.est_max_h_error_m),
+    );
+    format!(
+        "hold       max horizontal {:.3} m, rms {:.3} m, max vertical {:.3} m, estimate max horizontal {estimate}",
+        h.max_h_error_m, h.rms_h_error_m, h.max_v_error_m
+    )
 }
 
 /// Replays the log at `path` with the parameter overrides given, and returns
@@ -1204,19 +1253,31 @@ fn replay_command(
 
 /// The `result` line of `scenario` and the violations under it. A file that
 /// states no expectations is judged by the invariants, and says so.
-fn result_lines(scenario: &ScenarioFile, violations: &[String]) -> Vec<String> {
+fn result_lines(
+    scenario: &ScenarioFile,
+    violations: &[String],
+    not_judged: &[oxide_sim::outcome::NotJudged],
+) -> Vec<String> {
     let note = if scenario.states_expectations() {
         ""
     } else {
         " (invariants only: the file states no expectations)"
     };
     let mut out = Vec::new();
-    if violations.is_empty() {
-        out.push(format!("result     PASS{note}"));
-    } else {
+    if !violations.is_empty() {
         out.push(format!("result     FAIL{note}"));
         out.extend(violations.iter().map(|v| format!("  violated: {v}")));
+    } else if !not_judged.is_empty() {
+        // Nothing violated, but not everything was answered: not a pass.
+        out.push(format!(
+            "result     NOT JUDGED ({} requirement{} could not be judged){note}",
+            not_judged.len(),
+            if not_judged.len() == 1 { "" } else { "s" }
+        ));
+    } else {
+        out.push(format!("result     PASS{note}"));
     }
+    out.extend(not_judged.iter().map(|n| format!("  not judged: {n}")));
     out
 }
 
@@ -1274,6 +1335,74 @@ mod tests {
 
     fn p(args: &[&str]) -> Result<Args, String> {
         parse_from(args.iter().map(|s| (*s).to_string()))
+    }
+
+    /// A record of our core after `ticks` ticks of the F405 hover-step flight.
+    fn a_core_record(ticks: usize) -> StepRecord<4> {
+        let mut sim = Simulation::<_, 4>::new(
+            &Airframe::reference_quad().expect("reference airframe"),
+            F405_LEAN,
+            HoverStep::default(),
+        )
+        .expect("builds");
+        let mut r = sim.step();
+        for _ in 0..ticks {
+            r = sim.step();
+        }
+        r
+    }
+
+    fn csv_cells(r: &StepRecord<4>) -> std::collections::HashMap<String, String> {
+        let header = std::str::from_utf8(CSV_HEADER).expect("ascii");
+        let names: Vec<&str> = header.trim_end().split(',').collect();
+        let row = csv_row(r);
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        assert_eq!(names.len(), cells.len(), "a cell per column");
+        names
+            .into_iter()
+            .zip(cells)
+            .map(|(n, c)| (n.to_string(), c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_record_without_the_core_part_has_empty_core_cells_and_the_neutral_armed() {
+        let mut r = a_core_record(100);
+        // With the core part: the cells are filled.
+        r.armed = true;
+        let with = csv_cells(&r);
+        assert!(!with["nav"].is_empty() && !with["action"].is_empty());
+        assert_eq!(with["armed"], "1");
+        // Without it: the core's columns are empty, `armed` is the flag.
+        r.core = None;
+        for armed in [true, false] {
+            r.armed = armed;
+            let c = csv_cells(&r);
+            for col in [
+                "nav",
+                "action",
+                "reasons",
+                "est_x",
+                "est_y",
+                "est_z",
+                "est_roll",
+                "est_pitch",
+                "est_yaw",
+                "est_vx",
+                "est_vy",
+                "est_vz",
+            ] {
+                assert_eq!(c[col], "", "column {col} of a record without the core");
+            }
+            assert_eq!(c["armed"], if armed { "1" } else { "0" });
+            // The truth columns are as they were.
+            assert_eq!(c["x"], with["x"]);
+            assert_eq!(c["battery_v"], with["battery_v"]);
+        }
+        // `armed` follows the neutral flag, not the core's status.
+        let mut r = a_core_record(100);
+        r.armed = !r.core.expect("core part").status.armed;
+        assert_eq!(csv_cells(&r)["armed"], if r.armed { "1" } else { "0" });
     }
 
     #[test]
@@ -1571,14 +1700,54 @@ mod tests {
     fn the_result_line_says_when_only_the_invariants_were_judged() {
         let bare = scenario_file::load_str("name = \"bare\"\nduration_s = 2.0\n").expect("loads");
         assert_eq!(
-            result_lines(&bare, &[]),
+            result_lines(&bare, &[], &[]),
             vec!["result     PASS (invariants only: the file states no expectations)"]
         );
-        let broken = result_lines(&bare, &["2 timing faults".to_string()]);
+        let broken = result_lines(&bare, &["2 timing faults".to_string()], &[]);
         assert!(broken[0].starts_with("result     FAIL"), "{broken:?}");
         assert_eq!(broken[1], "  violated: 2 timing faults");
         let judged = fault_scenarios::by_name("gcs-loss").expect("embedded");
-        assert_eq!(result_lines(&judged, &[]), vec!["result     PASS"]);
+        assert_eq!(result_lines(&judged, &[], &[]), vec!["result     PASS"]);
+    }
+
+    #[test]
+    fn the_hold_line_without_the_core_part_says_what_it_needs() {
+        let line = hold_line(&HoldMetrics::new());
+        assert!(
+            line.ends_with("estimate max horizontal (needs the flight core's status)"),
+            "{line}"
+        );
+        assert!(!line.contains("NaN"), "{line}");
+    }
+
+    #[test]
+    fn unjudged_requirements_are_not_a_pass() {
+        let file = scenario_file::load_str("name = \"bare\"\nduration_s = 2.0\n").expect("loads");
+        let verdict = scenario_file::Verdict {
+            outcome: oxide_sim::outcome::FlightOutcome::new(),
+            hold: None,
+            violations: Vec::new(),
+            not_judged: vec![oxide_sim::outcome::NotJudged {
+                key: "reasons",
+                reason: oxide_sim::outcome::NEEDS_CORE,
+            }],
+        };
+        assert!(!verdict.not_judged.is_empty(), "{:?}", verdict.not_judged);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .first_problem()
+                .is_some_and(|p| p.starts_with("not judged: ")),
+            "{:?}",
+            verdict.first_problem()
+        );
+        let lines = result_lines(&file, &verdict.violations, &verdict.not_judged);
+        assert!(
+            lines[0].starts_with("result     NOT JUDGED (")
+                && !lines.iter().any(|l| l.contains("PASS")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 1 + verdict.not_judged.len(), "{lines:?}");
     }
 
     #[test]

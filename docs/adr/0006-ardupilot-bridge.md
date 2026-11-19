@@ -1,0 +1,148 @@
+# ADR-0006: The ArduPilot bridge
+
+Status: accepted as the design (M1d). Built so far: the seam of §2; the wind grid, the IMU grid and the pre-roll in the simulator; the exchange of §3; the ArduCopter process runner and the MAVLink client; the autopilot that flies offboard (`oxide_bridge::arducopter`), proven on the pinned binary: hover-step and gust-hold fly, and the same flight repeats bit for bit on two instances and at another speed; the failures of §6, each flown on the binary; flights from scenario files; the runner for many flights with its table (§9, §11); stick flying (§6), so that all 43 scenario files fly; the script of ArduCopter's own tuning procedure and the tuned parameter file it wrote, which every bridged flight now flies (gate-criteria record §2); and the program that flies the gate and computes its verdict (`oxide-bridge gate`, gate-criteria record §7). The measurements in the Context come from a prototype that was thrown away; the Decision also gives what the bridge's own tests measured on the pinned binary.
+
+## Context
+
+DESIGN §8 compares our flight core with ArduPilot and PX4 at benchmark gates, in our own simulator, and asks for the semantics of each bridge to be settled before the bridge is written: who owns time, which sensors come from whom, how fast it runs and whether a flight can be repeated.
+
+ArduPilot is GPL-3 and a behaviour reference only (DESIGN §10). It runs as its own program, and nothing of it is copied into this repository. ArduCopter's simulator build (SITL) has an interface for an external physics program, called JSON: SITL sends its motor outputs in a UDP packet, the physics program answers with the vehicle's state as a line of text.
+
+Two spikes produced the facts. The first read ArduPilot's sources at the commit of the pinned release. The second flew our reference quad under the released binary with a prototype that used our physics (`oxide_sim::vehicle`). An independent re-run reproduced the results marked "re-run" below.
+
+**Pinned:** ArduCopter V4.7.2, commit `fb773567896014da007bca58358704d4a0d8516f`, the project's own prebuilt binary `SITL_x86_64_linux_gnu/arducopter` from `firmware.ardupilot.org/Copter/stable-4.7.2/`, 7,235,704 bytes, SHA-256 `caed35e4cb796ec06cac40b09566a18251771486b1cbac5e2bf16b7a5ed5045d`.
+
+What was measured, and shapes the design:
+
+- **It flies.** With only `FRAME_CLASS 1` and `FRAME_TYPE 1` set, ArduCopter arms, takes off, holds, steps and lands our quad. Its motor order and spin directions for a Quad X are ours, rotor for rotor; a swapped order or a reversed spin flips the vehicle at once (re-run).
+- **We own time.** SITL's clock is the sum of the time stamps we send, and it waits for our reply before it moves. Its own time is the same at 1, 10 and 100 times real time.
+- **A flight repeats bit for bit** (re-run): three flights from fresh directories gave the same 160,055 motor packets, also at another speed and on another instance. The conditions are in §8. With SITL's file log on, the arming moment moves by one loop tick between runs and the flights drift 3 to 6 mm apart.
+- **ArduCopter needs 41.2 simulated seconds on the ground** before it will arm in a mode that uses GPS (22.0 s in a mode that does not).
+- **Speed.** One simulated second costs about 0.1 s of wall time for one pair of processes, and 0.044 s when both are pinned to one core: the limit is the hand-over between the two processes, not arithmetic. Three pairs side by side gave about 52 simulated seconds per second together (re-run).
+- **SITL makes its own GPS, barometer and compass** from the true state we send. Our sensor models do not reach it. Its GPS has no setting for horizontal position error. Its settings for IMU noise do nothing on this interface: the IMU values are the ones we send.
+- **ArduCopter's default gains oscillate on this airframe** (thrust-to-weight 5): roll, pitch and yaw rate all show a limit cycle. With reduced gains it flies cleanly, and its automatic tuner then runs to the end in 424 simulated seconds and saves its gains.
+- **Its reactions to failures** were observed one by one (§6).
+
+## Decision
+
+### 1. ArduCopter is a separate program, pinned by checksum
+
+The bridge starts the SITL binary as a child process and talks to it over sockets on the local machine. The binary is never committed, bundled or released with this project. The repository records its URL, version, commit and SHA-256; the runner refuses a binary whose checksum is not the recorded one, unless told to accept it, and writes the checksum it found into the flight's record.
+
+### 2. One seam for every autopilot
+
+The simulator's loop calls an `Autopilot` (`crates/oxide-sim/src/autopilot.rs`): one `tick` that sees what the simulator knows at that instant and returns motor commands, with the time from which they are valid. The simulator flies a command from that time on, so each autopilot states its own delay (§3). Our flight core is one implementation, the bridge is another, and PX4's will be a third. The step record carries what every autopilot has (the motor commands and whether it is armed) and, as an optional part, what only our core reports (its status, events and estimate).
+
+A flight is judged from the physics: where the vehicle went, how far it tilted, how hard it landed. Expectations that need our core's own states cannot be judged for another autopilot. They are reported as **not judged**, never as passed, and a flight with an expectation that was not judged does not count as passed.
+
+### 3. Time
+
+- **Lockstep, and the simulator owns the clock.** One reply per motor packet. The physics never advances on a packet whose frame counter repeats.
+- **The step of a bridged flight is 500 µs.** ArduCopter's loop is 2500 µs, so it gets five steps per loop. Steps of 250, 500, 1000 and 1250 µs all flew with the same tilt and horizontal error; 2500 µs cannot arm, because ArduCopter demands an IMU rate of 1.8 times its loop rate. 500 µs divides the loop evenly at half the cost of 250 µs. Our core's own profiles keep their steps (1000 µs and 250 µs): no existing flight changes.
+- **Time stamps.** The reply's time stamp for exchange *n*, counted from 0 at the program's start with the pre-roll included, is (*n* + 1) × (step + 1 ns). The first reply carries one step, not zero: SITL accepts a first stamp of zero, but such a run does not repeat. The instant its motor outputs come alive then moves by a few steps from run to run; started at one step, every run repeated (measured on the binary, re-run). SITL adds the differences into a whole number of microseconds and truncates, so exact steps make its clock run 0.04 % slow; the extra nanosecond makes it exact (measured).
+- **Framing.** Every reply starts and ends with a newline. SITL drops a first reply that does not start with one.
+- **A flight starts with a pre-roll.** For a fixed 45 simulated seconds the vehicle rests on the ground with no wind and no faults while ArduCopter starts its estimator. The simulator runs it (`Simulation::preroll`), and only our IMU model advances in it: ArduCopter sees the IMU's turn-on bias from its own start, as on a real vehicle, and the flight that follows has the wind and the other sensors of a flight with no pre-roll, bit for bit. Scenario time zero is the end of the pre-roll. A flight in which ArduCopter is not ready to arm by then has failed to start and is reported as that, not as a flight. Measured with the bridge: ArduCopter's estimator starts using GPS at 41.1 s, no motor output moves in the pre-roll, and its clock stays within 1.0 ms of ours to the end of a flight. The record of every flight counts the replies whose time stamp is not exactly one step after the one before, and the tests hold that count at zero.
+- **Commands act at once.** The motor packet that answers the state at *t* drives the physics from *t*. This is how ArduPilot's own simulator and its JSON examples work, and it gives ArduCopter no handicap. Our core keeps its rule that a command acts one tick after the tick that computed it (DESIGN §4.2), so it flies with up to 1 ms more delay than ArduCopter.
+
+### 4. What ArduCopter senses
+
+| Quantity | Where it comes from | Setting |
+|---|---|---|
+| Gyro and accelerometer | **Our IMU model's samples**, sent in the reply: the same noise, bias and vibration model our core flies on, sampled every 1000 µs as for the F405 profile | `SIM_DRIFT_SPEED 0` (SITL otherwise adds its own slow gyro drift) |
+| GPS | SITL's, from the position and velocity we send | 5 Hz as ours; `SIM_GPS1_LAG_MS 150` (our delay); `SIM_GPS1_VERR 0.1` (our velocity noise) |
+| GPS horizontal error | **Ours, added to the horizontal position we send**, held between GPS samples (see below for what SITL's GPS makes of it). It starts after the pre-roll, so ArduCopter's origin is set without it | none exists in SITL |
+| Barometer | SITL's, from the height we send | `SIM_BARO_RND 0.173` (measured: 0.10 m, our noise) |
+| Compass | SITL's, from the attitude we send | `SIM_MAG_RND 27` (about 0.5 µT, our noise) |
+| Battery | Our pack's voltage and current, sent in the reply | `BATT_MONITOR 4` |
+| Radio | Our pilot's sticks, sent in the reply as `rc` channels | |
+
+The GPS error row is the owner's decision: without it, a comparison of position hold measures the GPS models and not the autopilots. In a first look our core held position within 0.035 to 0.044 m RMS in gusts on clean sensors and within 0.15 to 0.22 m on its noisy GPS, while ArduCopter, whose simulated GPS had no horizontal error, held within about 0.10 m. A test on the binary shows that ArduCopter's reported GPS position carries the added error, that the error is zero in the pre-roll, and that its GPS velocity, its pressure and its raw IMU values are identical with and without it.
+
+SITL's GPS does not report the position we send as it is. Its lag of 150 ms reads between two stored samples 200 ms apart, so each fix carries 0.75 of the error we held two samples earlier and 0.25 of the one after it (measured: this blend of the values we sent matches the reported error to 0.007 m RMS). Sent as our model draws it, the reported error would have 0.79 of our standard deviation and successive fixes would be correlated (0.30). Scaling the draws up to mend the standard deviation would keep the correlation and make the slow part of the error 1.26 times ours, which no estimator can average away: unfair to ArduCopter. The bridge therefore sends a filtered sequence, `sent(k) = (n(k) − 0.25 × sent(k−1)) / 0.75` with `n` our model's independent draws. SITL's blend of it is `n` passed through a filter that changes no frequency's size, so the error ArduCopter's GPS reports is what our model's is: independent from fix to fix, 0.3 m per axis. Measured at rest on the binary: 0.290 and 0.291 m (± 0.012) over 295 fixes with fix-to-fix correlations of +0.04 and −0.00 (± 0.06), and in the review's own runs on two other seeds 0.294 to 0.309 m with correlations within ± 0.11. The bridge refuses to start if the lag in the flight's parameters is not the one this filter assumes. (SITL reads between two stored samples whatever the lag; for a lag beyond one period the filter uses the part beyond whole periods, proven on the binary at 250 ms.)
+
+The error costs ArduCopter what it should: on gust-hold runs 0 to 9 its position error was 0.177 m RMS on average with the error and 0.113 m without it.
+
+The IMU is sampled every 1000 µs, not at every 500 µs step, for this reason: our IMU model has a fixed noise density, so the noise of one sample grows as the sampling period shrinks, and SITL reads the latest value we send without averaging. Sampled at every step, ArduCopter would get √2 times the noise per sample that our F405 core gets. The IMU model has a sampling period of its own for this (`ImuModel::period_us`); with the same seed a bridged flight and the F405 flight have the same IMU bias and the same noise draws. On the binary, the raw IMU values ArduCopter reports follow our model's bias for each seed (to 0.05 mrad/s on five of the six gyro axes measured and 0.15 on the sixth, where the message's rounding to whole mrad/s could not be corrected; that was with the program's default 20 Hz gyro filter. With the tuning guide's 80 Hz filter of the flown set its reported values are noisier, and the same comparison gives 0.05 on five axes and 0.28 on the sixth). What it reports is its own filtered value, so the noise level cannot be read back from it.
+
+What cannot be made equal, and is listed in the gate report: our barometer's random offset at start-up and its slow drift (SITL has neither); the height the GPS reports (SITL's error is a slow sine with a standard deviation of 0.21 m, measured; ours is random with 0.5 m); our battery sensor's noise (SITL reads the voltage and current we send as they are; measured to 0.001 V); ArduCopter's GPS, barometer and compass are sampled by SITL's code, not ours. Rangefinder and airspeed are not sent: we do not model them, and SITL's rangefinder input on this interface is faulty at the pinned version.
+
+### 5. Motors
+
+ArduCopter's output *k* drives our rotor *k*. With `A = (pwm − 1000) / 1000`, the command is `u = clamp((A − spin_min) / (spin_max − spin_min), 0, 1)` with ArduCopter's `MOT_SPIN_MIN` and `MOT_SPIN_MAX`, and 0 for a pulse below 1000 µs. The bridge takes both from the flight's parameter files and extra parameters, and a test reads them back from the running program. `MOT_THST_EXPO` is set to the airframe's own thrust exponent, so that ArduCopter's linearisation of thrust is right for this airframe. While disarmed ArduCopter sends 1000 µs, which is command 0. After it arms it holds its outputs at 1000 µs for another 2.0 s before they rise to idle (measured), so the bridge, which takes "armed" from the pulses, reports it armed about 2.2 s after the arm switch. Armed on the ground with the throttle at zero, ArduCopter's outputs sit at `MOT_SPIN_ARM`, which is below `MOT_SPIN_MIN` and so is command 0: a vehicle that arms and never lifts has no motor command above zero in its record.
+
+### 6. Pilot, commands and faults
+
+- **Stick flying** goes through the `rc` channels of the reply, clocked by our time stamps. The channels are numbered by our own choice (`oxide_bridge::bridge::rc_pulses`): 1 roll, 2 pitch, 3 throttle, 4 yaw (1000 to 2000, 1500 at the centre), 5 mode switch (positions 0, 1, 2 as 1000, 1500, 2000), 6 arm switch (1000 off, 2000 on), 7 kill switch (1000 off, 2000 on), 8 unused (1000). The committed parameter file maps them to ArduCopter's own: `FLTMODE_CH 5` with `FLTMODE1 0`, `FLTMODE4 5` and `FLTMODE6 4` (the three switch positions give STABILIZE, LOITER and GUIDED), `RC6_OPTION 153` (arm) and `RC7_OPTION 31` (motor stop). Each is proven on the binary; a switch acts about 0.2 s after it moves. No radio is sent in the pre-roll, and ArduCopter does not mind. The pilot's modes map to ArduCopter's: Stabilized to STABILIZE, Altitude to ALT_HOLD, Position to LOITER.
+- **The radio's set-up** is in the committed parameter file, not in the bridge. `RC1_MIN` to `RC4_MIN` are 1000 and `RC1_MAX` to `RC4_MAX` 2000: the program's default range is 1100 to 1900, which would read our half stick as 0.625 and everything beyond 0.8 as full. `RC2_REVERSED 1`: measured, a forward stick flew ArduCopter backwards without it. Roll, yaw and throttle need nothing. A test flies each stick both ways under both autopilots and holds the four directions equal. How far a stick moves the vehicle is each autopilot's own (gate-criteria record §6).
+- **The pilot's script** is flown as it is, except that for ArduCopter every stick frame and mode-switch change later than the arm switch is delayed by 2.24 s, its arming delay (the rule and its reason are in the gate-criteria record §6). The arm, disarm and kill switches, the brain's setpoints and every fault keep their times. ArduCopter arms by the switch with the throttle at zero in LOITER and in STABILIZE.
+- **The brain acts only while the pilot's mode switch says offboard.** The last valid radio frame decides, and a lost radio does not move it. When offboard begins in the air, the brain sends no take-off command and its targets at once. Every flight that is offboard throughout is bit for bit what it was before this rule.
+- **Offboard flying** goes over MAVLink in GUIDED. The radio's arm switch arms (in GUIDED this needs `GUID_OPTIONS` bit 0). The take-off command is sent when the pulses say armed, and again each second until the vehicle is 0.3 m up. Position targets follow once it is within 0.3 m of the take-off height: on every change of our setpoint, and otherwise each second while our setpoints keep arriving. (A single target sent during the take-off climb was dropped after 3 s; a target sent in flight is held without limit, see the table below.) Every one of these decisions is taken from the exchange number, our setpoint, the true height and the motor pulses. Commands are sent from the physics thread at fixed simulated times, and the set of requested telemetry messages is fixed, because both change the instant ArduCopter acts and with it the whole flight.
+- **MAVLink is read all the time.** SITL stops when its send queue fills, which would hang both processes.
+- **ArduCopter says nothing on a link until it has heard a heartbeat there**: no status text and no parameter value (measured). The bridge's own client therefore sends a heartbeat every second at fixed simulated times, under a system id that is not the ground station's (250), so that it never counts as one. A scenario's ground station is a separate link (ArduCopter's third serial port) that sends heartbeats under the ground station's id (255), and only when the scenario has one. Proven on the binary with the ground-station failsafe switched on: when the bridge's own heartbeats stop, nothing happens; the same flight with the bridge's client under id 255 goes into the failsafe 5.1 s after its last heartbeat.
+- **Faults** reach ArduCopter by the route that works. Each row was flown through the bridge on run 0 of its scenario file, with the failsafe settings of the gate-criteria record; times are from the start of the fault. The rows were first measured on the starting gains and are now pinned by tests on the parameter set that is flown (base, set-up, tuned gains, failsafes). Where the tuned gains changed what happened, the row gives both:
+
+| Our fault | How it is applied | What ArduCopter did |
+|---|---|---|
+| GPS lost | `SIM_GPS1_ENABLE 0` | estimator failsafe after 8.0 s: LAND; down 21.5 m from home at 0.55 m/s. A loss of 4 s that ends is not noticed |
+| Barometer lost | `SIM_BARO_DISABLE`, `SIM_BAR2_DISABLE`, `SIM_BAR3_DISABLE` 1 | no failsafe and no mode change: climbs without limit (60 m after 25 s, 138 m after 45 s, still climbing) |
+| Compass lost | `SIM_MAG1_FAIL` to `SIM_MAG3_FAIL` 1 | nothing in a hover of 75 s |
+| IMU lost | `SIM_ACC_FAIL_MSK 3`, `SIM_GYR_FAIL_MSK 3` (both of its IMUs; one alone changes nothing) | the program stops; its outputs stay at their last values for 2.0 s, then go to 1000 µs; the vehicle falls (11.0 m/s at the ground; 9.4 m/s on the starting gains) |
+| Radio lost | the `rc` channels leave the reply (at once for a receiver that reports the loss, within one radio period for one that falls silent) | radio failsafe after 0.98 s: returns, lands, disarms |
+| Ground station lost | its heartbeats stop | ground-station failsafe 5.1 s after the last heartbeat: returns, lands, disarms. After a radio failsafe it changes nothing more |
+| Brain crashed or hung, setpoints missing | our brain's heartbeats and setpoints are forwarded only while they arrive | nothing: ArduCopter has no failsafe for a companion computer. It holds its last position target without limit, and flies to a far one first |
+| Motor lost | our physics gives that rotor no thrust (needs `SIM_FLOAT_EXCEPT 0`, or SITL aborts) | nothing that answers it: beyond 60° of tilt after 0.3 s, on the ground after 2.2 s at 7.0 m/s, 24 m from home, still armed with its motors commanded to the end. Its estimator's failsafe switches to LAND 3.4 s after the fault, when the vehicle is already down. On the starting gains it tumbled for 8.9 s, came down 180 m from home at 5.7 m/s, and changed no mode |
+| Battery low, critical | our pack voltage in the reply; thresholds as in the gate-criteria record | acts 10.1 s after the pack crosses a threshold (its own timer): low returns (climbing to 15 m first), critical lands. It arms on a nearly empty pack |
+| Geofence | `FENCE_ENABLE 1`, `FENCE_TYPE 2`, `FENCE_RADIUS`, `FENCE_ACTION 1`, at start | in GUIDED it refuses a target outside the fence and holds where it is, with no message; it never reaches the fence, so it never returns |
+
+A fault applied by a parameter is written before the exchange of the fault's own tick, on the bridge's own link (ArduCopter accepts a parameter from system 250), and the echo is read 2.0 ms later. The write and the echo are in the flight's record; nothing waits for the echo. For an IMU loss the replies carry the last sample from before the fault, from the fault's own tick on, because our model's IMU gives none. The held sample does reach the flight: on the flown set, the same flight with fresh samples in every reply is equal up to 1.0 ms after the fault and differs from 1.5 ms on, before the echo of the masks is read (on the starting gains the two flights happened to be equal to the last bit). Whether ArduCopter still reads the samples once its masks are applied was not isolated. The held sample is the fault as our model has it, so that is what the runner sends. Two limits of the program met on the way: a parameter name longer than 16 characters cannot be sent, and of more than about 20 parameter reads asked at once some are not answered.
+- **The companion computer** (our "brain") is a second MAVLink link, so that losing the brain and losing the ground station stay different faults. ArduCopter accepts the take-off command and position targets on its second serial port, under a system id of the brain's own (251): proven on the binary. The same flight with the commands on the bridge's own link has the same trace hash. The second and third ports do not listen until SITL has run about 30 steps, so the bridge opens them at exchange 1000 of the pre-roll.
+
+Which of ArduCopter's failsafes are switched on for the gate, and which scenarios are scored, is decided in the gate-criteria record, not here.
+
+### 7. Wind and seeds
+
+A seed gives both autopilots **the same wind, sample for sample**. The wind's turbulence is drawn once per step, so a bridged flight (500 µs) draws its wind on the 1000 µs grid of the F405 profile, and a test holds the two wind traces equal bit for bit.
+
+ArduCopter's own random numbers (its barometer and compass noise) are never seeded: they are the same sequence in every run. Over many seeds ArduCopter therefore sees varying wind, IMU noise and GPS error, which are ours, and one fixed realisation of its barometer and compass noise.
+
+### 8. Repeatability
+
+A bridged flight repeats bit for bit when: SITL's file log is off (`LOG_BACKEND_TYPE 0`); the start time is fixed (`--start-time`); the working directory is new and empty and the stored parameters are wiped (`-w`); the parameter file is the same; every command is sent at a fixed simulated time; the set of requested messages is the same.
+
+Measured with the bridge: one gust-hold flight flown on two instances side by side, and once more at a tenth of the speed-up, gave the same trace hash, motor-packet hash and reply hash in every one of 15 flights, also with other flights running on the machine.
+
+Nothing the bridge reads from MAVLink decides anything it sends, and a test of the source holds that rule. The repeat tests do not prove it: on one machine SITL writes its MAVLink answers before the motor packet of the same frame, so even a command timed by an answer repeated. Only a command timed by the wall clock made flights differ. The rule stays, so that repeating does not rest on the order of delivery.
+
+The runner can fly any bridged flight twice and compare the trace hashes, and the gate does so for a sample. Bridged flights stay outside the determinism contract between operating systems (DESIGN §5.2): they are as repeatable as the binary is, on the machine it runs on.
+
+### 9. Running many flights
+
+- Each flight is one new SITL process in its own empty directory, with its own ports (`-I n` shifts them by 10 n). SITL is never restarted over MAVLink: that keeps its stored parameters.
+- Each simulator-and-SITL pair is pinned to one core.
+- SITL runs with a large speed-up and its time synchronisation on, which keeps its default estimator (EKF3).
+- A child that dies or stays silent past a wall-clock limit ends that flight as failed, with the reason. A dead child is noticed within 0.1 s. The wall clock decides nothing else.
+- The runner is the binary `oxide-bridge`: `fly` flies one run of a scenario file, `batch` flies many, each as a child process of its own on its own instance number and its own core, and writes one table with a row per run in index order. A run that does not start is flown once more; a second failure stops the batch. The same binary flies our own core on the same file and index and writes the same columns, so that one table serves both sides of a gate.
+
+### 10. Where the code lives
+
+A new crate, `oxide-bridge`, holds the JSON exchange, the SITL process runner, the MAVLink client, the translation of pilots, faults and scenario files, and the runner's binary of the same name. The runner is not part of `oxide-sim`'s own command line, so that nobody who only flies our core needs the MAVLink packages. It depends on `oxide-sim` and on the `mavlink` crate, version 0.21.0 with its default features off and `std`, `transport-tcp` and `dialect-ardupilotmega` on (11 new packages in the lock file, each under MIT, Apache-2.0 or the Unlicense). `oxide-core`, `oxide-log` and `oxide-sim` gain no dependency.
+
+### 11. What is recorded for each bridged flight
+
+The binary's checksum, version and command line; the parameter file's hash; every parameter written during the flight with the time of its acknowledgement; every MAVLink command sent with its time; a hash of the motor packets and of the replies; ArduCopter's mode changes and status texts with their times; the seed, the scenario file's hash and our commit. The runner writes it into the flight's directory as `audit.txt`, beside `row.csv`, the flight's row of the table: the scenario, index, seed and autopilot; whether it started; the outcome class and the verdict with its counts; the hold errors, tilt, heights and distances; touchdown speed, disarm time and the time of the last motor command above zero; where it ended; the three hashes; wall time, whether it was flown again, and a note.
+
+## Consequences
+
+- Gate 1 can be flown. From the measured speed, 500 gust flights of 40 s (85 s with the pre-roll) should take about a quarter of an hour with three pinned pairs, and under an hour and a half with one. This was arithmetic from the prototype's measurements. Measured with the runner: 100 gust flights took 81 s with four pairs on four idle cores (3.2 s per flight in the middle, 3.6 s at most), so 500 should take about 7 minutes; our own core flies the same 100 in 2 s.
+- Half of every bridged flight is pre-roll.
+- The comparison is between whole systems: ArduCopter's estimator and controller against ours. The gate also reports our core on true state, to separate the two (gate-criteria record).
+- ArduCopter flies with no computation delay and our core with one tick of it; the difference is at most 1 ms.
+- ArduCopter must be given gains before it can be tuned: its defaults oscillate on this airframe, and its automatic tuner refuses a vehicle that is not steady. The tuning flight therefore starts from reduced gains (`starting-gains.parm`), which is the manual step ArduPilot's own tuning guide puts before the tuner. Every other bridged flight flies the file the tuner wrote.
+- The first MAVLink code in the workspace arrives with the bridge. The flight core's own MAVLink link (DESIGN §4.13) is a later, separate piece of work.
+
+## Deferred
+
+- PX4's bridge (gate 2). PX4 takes every sensor from the simulator, so its bridge sends our sensor models' frames; the seam already carries them.
+- Running bridged flights in CI. It needs the binary on the CI machine, which is the owner's decision.
+- Other ArduPilot vehicles, and airframes other than the reference quad.
+- A notch filter set-up for ArduCopter driven by our vibration model: SITL cannot be told our rotor speeds on this interface.

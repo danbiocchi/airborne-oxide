@@ -64,9 +64,17 @@ pub fn battery(t: Micros, voltage_v: f64, current_a: f64) -> Stamped<BatterySamp
 
 const TWO_PI: f64 = 2.0 * core::f64::consts::PI;
 
-/// IMU error model, one sample per simulator tick.
+/// IMU error model: one sample per simulator tick, or per
+/// [`period_us`](ImuModel::period_us) when that is set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImuModel {
+    /// Sample period, µs: 0 samples at every simulator tick (and every
+    /// formula uses the tick as its `dt`); otherwise a whole multiple of the
+    /// tick, the IMU is sampled at the ticks where `t` is a multiple of it,
+    /// and `dt` is the period in every formula (bias walk, noise density,
+    /// rotor phase). Our flight core needs a sample on every tick, so only
+    /// another autopilot may set it.
+    pub period_us: u64,
     /// Gyro white-noise density, rad/s/√Hz.
     pub gyro_noise_density: f64,
     /// Accelerometer white-noise density, m/s²/√Hz.
@@ -170,6 +178,7 @@ impl SensorConfig {
     pub fn realistic() -> Self {
         Self {
             imu: ImuModel {
+                period_us: 0,
                 gyro_noise_density: 8.7e-5,
                 accel_noise_density: 3.9e-3,
                 gyro_bias_sigma: 0.005,
@@ -344,6 +353,7 @@ impl<const N: usize> SensorSuite<N> {
         ];
         if base_us == 0
             || periods.iter().any(|&p| p == 0 || !ok(p))
+            || !ok(config.imu.period_us)
             || !ok(config.gps.latency_us)
             || !ok(config.gps.first_fix_us)
         {
@@ -379,12 +389,25 @@ impl<const N: usize> SensorSuite<N> {
     /// by `base_us`.
     pub fn sample(&mut self, t: Micros, truth: &Truth<'_, N>) -> SensorFrame {
         SensorFrame {
-            imu: Some(self.sample_imu(t, truth)),
+            imu: self.sample_imu(t, truth),
             gps: self.sample_gps(t, truth),
             baro: self.sample_baro(t, truth),
             mag: self.sample_mag(t, truth),
             battery: self.sample_battery(t, truth),
         }
+    }
+
+    /// The IMU sample of pre-roll step `k` (the steps count from 0, one per
+    /// tick) for a vehicle at rest: `None` when the IMU's period has no
+    /// sample due at `k` ticks, else the sample, built by the code `sample`
+    /// uses. Advances only the IMU's state (its random stream, bias walk and
+    /// rotor phases): no other sensor, no queue and no clock.
+    pub fn preroll_imu(&mut self, k: u64, truth: &Truth<'_, N>) -> Option<ImuSample> {
+        let p = self.config.imu.period_us;
+        if p != 0 && !due(k.saturating_mul(self.base_us), p) {
+            return None;
+        }
+        Some(self.imu_sample(truth))
     }
 
     /// Current gyro bias (truth, for diagnostics), rad/s body.
@@ -401,9 +424,26 @@ impl<const N: usize> SensorSuite<N> {
         &self.config
     }
 
-    fn sample_imu(&mut self, t: Micros, truth: &Truth<'_, N>) -> Stamped<ImuSample> {
+    /// The IMU sample due at `t`, or `None` between the samples of a
+    /// coarser period (nothing is drawn then).
+    fn sample_imu(&mut self, t: Micros, truth: &Truth<'_, N>) -> Option<Stamped<ImuSample>> {
+        let p = self.config.imu.period_us;
+        if p != 0 && !due(t.0, p) {
+            return None;
+        }
+        Some(Stamped::ideal(t, self.imu_sample(truth)))
+    }
+
+    /// One IMU sample from `truth`, advancing the IMU's random stream, bias
+    /// walk and rotor phases and nothing else. `dt` is the IMU's period, or
+    /// the tick when it has none.
+    fn imu_sample(&mut self, truth: &Truth<'_, N>) -> ImuSample {
         let m = self.config.imu;
-        let dt = period_s(self.base_us);
+        let dt = period_s(if m.period_us == 0 {
+            self.base_us
+        } else {
+            m.period_us
+        });
         let sqrt_dt = Real::sqrt(dt);
         let inv_sqrt_dt = Real::sqrt(1.0 / dt);
         let rng = &mut self.imu_rng;
@@ -462,13 +502,10 @@ impl<const N: usize> SensorSuite<N> {
         );
         let gyro = gyro.clamp_abs(Vec3::splat(m.gyro_range));
         let accel = accel.clamp_abs(Vec3::splat(m.accel_range));
-        Stamped::ideal(
-            t,
-            ImuSample {
-                gyro: gyro.cast(),
-                accel: accel.cast(),
-            },
-        )
+        ImuSample {
+            gyro: gyro.cast(),
+            accel: accel.cast(),
+        }
     }
 
     #[allow(clippy::cast_possible_truncation)]

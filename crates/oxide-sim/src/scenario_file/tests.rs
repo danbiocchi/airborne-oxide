@@ -467,7 +467,10 @@ fn the_hold_of_gust_hold_is_judged_as_fly_gust_hold_judges_it() {
         let v = f.fly_checked(profile, index, &[]).expect("flies");
         let want = fly_gust_hold(profile, index, &HoldCriteria::default()).expect("flies");
         assert_eq!(v.hold, Some(want), "{} index {index}", profile.name);
-        assert_eq!(v.violations, want.failures(&HoldCriteria::default()));
+        assert_eq!(
+            v.violations,
+            want.judge(&HoldCriteria::default()).violations
+        );
     }
 }
 
@@ -504,8 +507,8 @@ fn a_file_with_no_expect_is_still_judged_by_the_invariants() {
     let f = load_str(MINIMAL).expect("loads");
     assert!(f.expect.is_none() && f.hold.is_none());
     let mut clean = Checker::new(&f);
-    assert!(clean.outcome.invariant_violations().is_empty());
-    clean.outcome.max_action = Action::Hold;
+    assert!(clean.outcome.invariants().violations.is_empty());
+    clean.outcome.core_mut().max_action = Action::Hold;
     assert!(
         clean.finish().violations.is_empty(),
         "a quiet flight passes"
@@ -513,9 +516,9 @@ fn a_file_with_no_expect_is_still_judged_by_the_invariants() {
 
     let mut c = Checker::new(&f);
     c.outcome.non_finite = true;
-    c.outcome.timing_faults = 2;
+    c.outcome.core_mut().timing_faults = 2;
     c.outcome.motor_ticks_while_disarmed = 3;
-    c.outcome.action_decreased = true;
+    c.outcome.core_mut().action_decreased = true;
     c.outcome.physics_faults = 1;
     let v = c.finish();
     assert_eq!(v.violations.len(), 5, "{:?}", v.violations);

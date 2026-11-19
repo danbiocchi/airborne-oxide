@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480" font-family="sans-serif" font-size="12">
+<rect width="640" height="480" fill="#ffffff"/>
+<text x="320.00" y="18" text-anchor="middle" fill="#222222">Gust hold: one point for each index</text>
+<line x1="64.00" y1="424.00" x2="64.00" y2="28.00" stroke="#dddddd"/>
+<line x1="64.00" y1="424.00" x2="616.00" y2="424.00" stroke="#dddddd"/>
+<text x="64.00" y="440.00" text-anchor="middle" fill="#444444">0.000</text>
+<text x="58.00" y="428.00" text-anchor="end" fill="#444444">0.000</text>
+<line x1="174.40" y1="424.00" x2="174.40" y2="28.00" stroke="#dddddd"/>
+<line x1="64.00" y1="344.80" x2="616.00" y2="344.80" stroke="#dddddd"/>
+<text x="174.40" y="440.00" text-anchor="middle" fill="#444444">0.041</text>
+<text x="58.00" y="348.80" text-anchor="end" fill="#444444">0.041</text>
+<line x1="284.80" y1="424.00" x2="284.80" y2="28.00" stroke="#dddddd"/>
+<line x1="64.00" y1="265.60" x2="616.00" y2="265.60" stroke="#dddddd"/>
+<text x="284.80" y="440.00" text-anchor="middle" fill="#444444">0.083</text>
+<text x="58.00" y="269.60" text-anchor="end" fill="#444444">0.083</text>
+<line x1="395.20" y1="424.00" x2="395.20" y2="28.00" stroke="#dddddd"/>
+<line x1="64.00" y1="186.40" x2="616.00" y2="186.40" stroke="#dddddd"/>
+<text x="395.20" y="440.00" text-anchor="middle" fill="#444444">0.124</text>
+<text x="58.00" y="190.40" text-anchor="end" fill="#444444">0.124</text>
+<line x1="505.60" y1="424.00" x2="505.60" y2="28.00" stroke="#dddddd"/>
+<line x1="64.00" y1="107.20" x2="616.00" y2="107.20" stroke="#dddddd"/>
+<text x="505.60" y="440.00" text-anchor="middle" fill="#444444">0.166</text>
+<text x="58.00" y="111.20" text-anchor="end" fill="#444444">0.166</text>
+<line x1="616.00" y1="424.00" x2="616.00" y2="28.00" stroke="#dddddd"/>
+<line x1="64.00" y1="28.00" x2="616.00" y2="28.00" stroke="#dddddd"/>
+<text x="616.00" y="440.00" text-anchor="middle" fill="#444444">0.207</text>
+<text x="58.00" y="32.00" text-anchor="end" fill="#444444">0.207</text>
+<text x="340.00" y="466.00" text-anchor="middle" fill="#222222">ArduCopter rms_h_m (m)</text>
+<text x="14" y="226.00" text-anchor="middle" fill="#222222" transform="rotate(-90 14 226.00)">core-f405 rms_h_m (m)</text>
+<line x1="64.00" y1="424.00" x2="616.00" y2="28.00" stroke="#444444" stroke-dasharray="4 3"/>
+<circle cx="463.28" cy="156.66" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="509.86" cy="152.84" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="556.44" cy="149.02" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="469.93" cy="145.20" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="563.10" cy="137.56" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="476.59" cy="133.74" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="523.17" cy="129.92" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="569.75" cy="126.10" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="483.24" cy="122.29" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="529.82" cy="118.47" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="576.41" cy="114.65" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="489.90" cy="110.83" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="536.48" cy="107.01" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="583.06" cy="103.19" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="496.55" cy="99.37" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="543.13" cy="95.55" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="589.71" cy="91.73" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="503.20" cy="87.91" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+<circle cx="549.79" cy="84.09" r="2" fill="#1b9e77" fill-opacity="0.6"/>
+</svg>

@@ -6,6 +6,7 @@
 //! simulation state (DESIGN §5.2).
 
 pub mod airframe;
+pub mod autopilot;
 pub mod battery;
 pub mod fault_scenarios;
 pub mod faults;
@@ -24,8 +25,9 @@ pub mod vehicle;
 pub mod wind;
 
 pub use airframe::Airframe;
+pub use autopilot::{Autopilot, AutopilotInput, AutopilotOutput, CoreAutopilot, PrerollInput};
 pub use scenario_file::{ScenarioError, ScenarioFile};
-pub use sim::{SimOptions, Simulation, StepRecord};
+pub use sim::{CoreRecord, PrerollError, SimOptions, Simulation, StepRecord};
 
 use core::fmt;
 
@@ -37,6 +39,8 @@ pub enum SimError {
     Core(oxide_core::config::ConfigError),
     /// A period is not a whole number of base ticks (µs value given).
     TimeBase(u64),
+    /// The wind's sampling period is not a whole multiple of the step.
+    WindPeriod { period_us: u64, step_us: u64 },
     /// Fault number `index` of the options can never happen as written.
     Fault { index: usize, reason: String },
     /// A parameter override was refused (ADR-0004).
@@ -53,6 +57,10 @@ impl fmt::Display for SimError {
             SimError::TimeBase(us) => write!(
                 f,
                 "periods must be whole multiples of the {us} µs base tick"
+            ),
+            SimError::WindPeriod { period_us, step_us } => write!(
+                f,
+                "the wind period of {period_us} µs must be a whole multiple of the {step_us} µs step"
             ),
             SimError::Fault { index, reason } => write!(f, "fault {index}: {reason}"),
             SimError::Param { name, reason } => write!(f, "parameter {name}: {reason}"),

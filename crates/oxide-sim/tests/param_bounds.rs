@@ -76,7 +76,10 @@ fn rc_loss_position_with_the_largest_accepted_idle_still_lands_and_disarms() {
                 "{pname} seed {seed} LIM_IDLE {idle}: {:?}",
                 v.violations
             );
-            assert_eq!(v.outcome.disarm_reason, Some(DisarmReason::Touchdown));
+            assert_eq!(
+                v.outcome.core.as_ref().expect("core part").disarm_reason,
+                Some(DisarmReason::Touchdown)
+            );
             assert!(!v.outcome.armed_at_end);
         }
     }
@@ -144,7 +147,7 @@ fn rc_loss_position_at_the_smallest_touchdown_speed_lands_and_disarms_by_touchdo
                 v.violations
             );
             assert_eq!(
-                v.outcome.disarm_reason,
+                v.outcome.core.as_ref().expect("core part").disarm_reason,
                 Some(DisarmReason::Touchdown),
                 "{pname} seed {seed}"
             );
@@ -165,10 +168,10 @@ fn a_touchdown_time_of_a_tenth_of_a_second_does_not_disarm_above_the_ground() {
             let mut was_armed = false;
             let mut disarm_height = None;
             sim.run_until(f.end(), |r| {
-                if was_armed && !r.status.armed && disarm_height.is_none() {
+                if was_armed && !r.armed && disarm_height.is_none() {
                     disarm_height = Some(-r.position.z);
                 }
-                was_armed |= r.status.armed;
+                was_armed |= r.armed;
             });
             let h = disarm_height.expect("disarmed");
             assert!(
@@ -194,7 +197,7 @@ fn fly_bound(f: &ScenarioFile, name: &str, value: f64) -> Vec<String> {
         let (mut max_h, mut max_d, mut timing) = (0.0_f64, 0.0_f64, 0);
         let mut finite = true;
         sim.run_until(f.end(), |r| {
-            let est_ok = r.estimate.is_none_or(|e| {
+            let est_ok = r.estimate().is_none_or(|e| {
                 e.position.is_finite()
                     && e.velocity.is_finite()
                     && e.attitude.is_finite()
@@ -214,7 +217,7 @@ fn fly_bound(f: &ScenarioFile, name: &str, value: f64) -> Vec<String> {
                 let de = r.position.y - s.y;
                 max_d = max_d.max(Real::sqrt(dn * dn + de * de));
             }
-            timing = r.status.timing_faults;
+            timing = r.status().expect("core part").timing_faults;
         });
         if !finite {
             bad.push("a truth or estimate value is not finite".to_string());

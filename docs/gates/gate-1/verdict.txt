@@ -1,0 +1,103 @@
+gate 1: NOT PASSED
+  commit 2c2fedb1dab3c65f8d52a431b38b369e9ffa4091
+A1  HOLDS
+    core-f405: 500 of 500 flights are safe and pass the scenario file's limits
+    core-h743: 500 of 500 flights are safe and pass the scenario file's limits
+A2  FAILS
+    ArduCopter: 0 of 500 flights are not safe and are left out of its statistics
+    median: core-f405 0.17141266574579617 m, ArduCopter 0.1754460832792722 m (ours at most theirs)
+    95th percentile: core-f405 0.22612433204370755 m, ArduCopter 0.2208698311507864 m (ours above theirs)
+    fails: the 95th percentile of core-f405 0.22612433204370755 is above ArduCopter's 0.2208698311507864
+      arducopter: median 0.1754 p95 0.2209 mean 0.1765 worst 0.2907 (500 flights, 0 not safe)
+      core-f405: median 0.1714 p95 0.2261 mean 0.1738 worst 0.2966 (500 flights, 0 not safe)
+      core-h743: median 0.1570 p95 0.2116 mean 0.1593 worst 0.2502 (500 flights, 0 not safe)
+      core-f405-truth: median 0.0301 p95 0.0435 mean 0.0308 worst 0.0573 (500 flights, 0 not safe)
+      lower rms_h_m: core-f405 in 266 indices, ArduCopter in 234, equal in 0
+B1  HOLDS
+    gps-loss: core-f405 0 crash or fly-away, ArduCopter 0
+    gps-loss-pilot: core-f405 0 crash or fly-away, ArduCopter 0
+    gps-loss-recovers: core-f405 0 crash or fly-away, ArduCopter 0
+    baro-loss: core-f405 0 crash or fly-away, ArduCopter 10
+    mag-loss: core-f405 0 crash or fly-away, ArduCopter 0
+    rc-loss-position: core-f405 0 crash or fly-away, ArduCopter 0
+    rc-loss-override: core-f405 0 crash or fly-away, ArduCopter 0
+    rc-loss-on-ground: core-f405 0 crash or fly-away, ArduCopter 0
+    rc-loss-offboard-gcs: core-f405 0 crash or fly-away, ArduCopter 0
+    gcs-loss: core-f405 0 crash or fly-away, ArduCopter 0
+    no-human-link: core-f405 0 crash or fly-away, ArduCopter 0
+    battery-low: core-f405 0 crash or fly-away, ArduCopter 0
+    battery-critical: core-f405 0 crash or fly-away, ArduCopter 0
+    geofence: core-f405 0 crash or fly-away, ArduCopter 0
+    brain-crash: core-f405 0 crash or fly-away, ArduCopter 0
+    brain-hang: core-f405 0 crash or fly-away, ArduCopter 0
+    setpoint-gap: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-battery-critical+baro-loss: core-f405 0 crash or fly-away, ArduCopter 10
+    pair-battery-critical+brain-crash: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-battery-critical+geofence: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-battery-low+baro-loss: core-f405 0 crash or fly-away, ArduCopter 10
+    pair-battery-low+battery-critical: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-battery-low+brain-crash: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-battery-low+geofence: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-brain-crash+baro-loss: core-f405 0 crash or fly-away, ArduCopter 10
+    pair-brain-crash+geofence: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-geofence+baro-loss: core-f405 0 crash or fly-away, ArduCopter 10
+    pair-gps-loss+baro-loss: core-f405 0 crash or fly-away, ArduCopter 10
+    pair-gps-loss+battery-critical: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-gps-loss+battery-low: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-gps-loss+brain-crash: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-gps-loss+geofence: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-rc-loss+baro-loss: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-rc-loss+battery-critical: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-rc-loss+battery-low: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-rc-loss+brain-crash: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-rc-loss+geofence: core-f405 0 crash or fly-away, ArduCopter 0
+    pair-rc-loss+gps-loss: core-f405 0 crash or fly-away, ArduCopter 0
+B2  HOLDS
+    gps-loss: core-f405 10 of 10 flights safe and pass
+    gps-loss-pilot: core-f405 10 of 10 flights safe and pass
+    gps-loss-recovers: core-f405 10 of 10 flights safe and pass
+    baro-loss: core-f405 10 of 10 flights safe and pass
+    mag-loss: core-f405 10 of 10 flights safe and pass
+    rc-loss-position: core-f405 10 of 10 flights safe and pass
+    rc-loss-override: core-f405 10 of 10 flights safe and pass
+    rc-loss-on-ground: core-f405 10 of 10 flights safe and pass
+    rc-loss-offboard-gcs: core-f405 10 of 10 flights safe and pass
+    gcs-loss: core-f405 10 of 10 flights safe and pass
+    no-human-link: core-f405 10 of 10 flights safe and pass
+    battery-low: core-f405 10 of 10 flights safe and pass
+    battery-critical: core-f405 10 of 10 flights safe and pass
+    geofence: core-f405 10 of 10 flights safe and pass
+    brain-crash: core-f405 10 of 10 flights safe and pass
+    brain-hang: core-f405 10 of 10 flights safe and pass
+    setpoint-gap: core-f405 10 of 10 flights safe and pass
+    pair-battery-critical+baro-loss: core-f405 10 of 10 flights safe and pass
+    pair-battery-critical+brain-crash: core-f405 10 of 10 flights safe and pass
+    pair-battery-critical+geofence: core-f405 10 of 10 flights safe and pass
+    pair-battery-low+baro-loss: core-f405 10 of 10 flights safe and pass
+    pair-battery-low+battery-critical: core-f405 10 of 10 flights safe and pass
+    pair-battery-low+brain-crash: core-f405 10 of 10 flights safe and pass
+    pair-battery-low+geofence: core-f405 10 of 10 flights safe and pass
+    pair-brain-crash+baro-loss: core-f405 10 of 10 flights safe and pass
+    pair-brain-crash+geofence: core-f405 10 of 10 flights safe and pass
+    pair-geofence+baro-loss: core-f405 10 of 10 flights safe and pass
+    pair-gps-loss+baro-loss: core-f405 10 of 10 flights safe and pass
+    pair-gps-loss+battery-critical: core-f405 10 of 10 flights safe and pass
+    pair-gps-loss+battery-low: core-f405 10 of 10 flights safe and pass
+    pair-gps-loss+brain-crash: core-f405 10 of 10 flights safe and pass
+    pair-gps-loss+geofence: core-f405 10 of 10 flights safe and pass
+    pair-rc-loss+baro-loss: core-f405 10 of 10 flights safe and pass
+    pair-rc-loss+battery-critical: core-f405 10 of 10 flights safe and pass
+    pair-rc-loss+battery-low: core-f405 10 of 10 flights safe and pass
+    pair-rc-loss+brain-crash: core-f405 10 of 10 flights safe and pass
+    pair-rc-loss+geofence: core-f405 10 of 10 flights safe and pass
+    pair-rc-loss+gps-loss: core-f405 10 of 10 flights safe and pass
+B3  HOLDS
+    motor-loss: median time from the failure to motors off, core-f405 0.9989999999999988 s, ArduCopter 14.999499999999998 s
+    motor-loss: core-h743 (reported, decides nothing) 0.9997499999999988 s
+    imu-loss: median time from the failure to motors off, core-f405 0.13899999999999935 s, ArduCopter 2.0015 s
+    imu-loss: core-h743 (reported, decides nothing) 0.13974999999999937 s
+Repeats  HOLDS
+    10 flights flown twice, 10 repeat bit for bit and match the main table
+report     /tmp/claude-0/-home-user-airborne-oxide/f85058bd-73c8-560d-8ff0-64221580022a/scratchpad/m1d/gate1-report/gate-1.md
+report     /tmp/claude-0/-home-user-airborne-oxide/f85058bd-73c8-560d-8ff0-64221580022a/scratchpad/m1d/gate1-report/gate-1-cumulative.svg
+report     /tmp/claude-0/-home-user-airborne-oxide/f85058bd-73c8-560d-8ff0-64221580022a/scratchpad/m1d/gate1-report/gate-1-scatter.svg

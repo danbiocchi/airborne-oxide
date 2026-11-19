@@ -99,7 +99,7 @@ use crate::SimError;
 use crate::airframe::{Airframe, BatterySpec, ordered_params};
 use crate::faults::{Fault, FaultKind, LinkConfig, validate_faults};
 use crate::metrics::{HoldCriteria, HoldMetrics};
-use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, REASON_NAMES};
+use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, NotJudged, REASON_NAMES};
 use crate::rng::{Rng, Stream, run_seed};
 use crate::scenario::Script;
 use crate::sensors::SensorConfig;
@@ -349,6 +349,28 @@ pub struct Verdict {
     /// invariants every flight gets (finite truth, no timing faults, motors
     /// off while disarmed, the failsafe action never decreasing).
     pub violations: Vec<String>,
+    /// Expectations and invariants the outcome could not answer (they need
+    /// the flight core's status): neither passed nor violated. Empty for a
+    /// flight of our core.
+    pub not_judged: Vec<NotJudged>,
+}
+
+impl Verdict {
+    /// True when nothing is violated and nothing is left unjudged. A flight
+    /// with `not_judged` entries has not passed: its requirements were not
+    /// all answered.
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty() && self.not_judged.is_empty()
+    }
+
+    /// The first thing that stops the flight from passing, in words: the
+    /// first violation, else the first requirement that was not judged.
+    pub fn first_problem(&self) -> Option<String> {
+        self.violations
+            .first()
+            .cloned()
+            .or_else(|| self.not_judged.first().map(|n| format!("not judged: {n}")))
+    }
 }
 
 /// Collects a flight's outcome and hold statistics step by step, then judges
@@ -372,6 +394,14 @@ impl Checker {
         }
     }
 
+    /// Leaves the hold's `armed_from_s` limit out (listed as not judged): for
+    /// an autopilot whose start-up is not ours ([`HoldMetrics::without_armed_limit`]).
+    #[must_use]
+    pub fn without_armed_limit(mut self) -> Self {
+        self.hold = self.hold.map(|(m, c, t)| (m.without_armed_limit(), c, t));
+        self
+    }
+
     pub fn add(&mut self, r: &StepRecord<ROTORS>) {
         self.outcome.add(r);
         if let Some((m, c, target)) = &mut self.hold {
@@ -382,18 +412,21 @@ impl Checker {
     pub fn finish(self) -> Verdict {
         // `Expect::check` starts with the invariants every flight gets; a
         // file with no `[expect]` is still judged by those.
-        let mut violations = match &self.expect {
+        let mut judged = match &self.expect {
             Some(e) => e.check(&self.outcome),
-            None => self.outcome.invariant_violations(),
+            None => self.outcome.invariants(),
         };
         let hold = self.hold.map(|(m, c, _)| {
-            violations.extend(m.failures(&c));
+            let h = m.judge(&c);
+            judged.violations.extend(h.violations);
+            judged.not_judged.extend(h.not_judged);
             m
         });
         Verdict {
             outcome: self.outcome,
             hold,
-            violations,
+            violations: judged.violations,
+            not_judged: judged.not_judged,
         }
     }
 }
@@ -458,6 +491,7 @@ impl ScenarioFile {
         SimOptions {
             seed,
             sensors: self.sensors.config(),
+            wind_period_us: None,
             wind: self.wind.config(seed),
             estimator: self.estimator,
             faults: self.faults.clone(),
