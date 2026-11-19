@@ -73,6 +73,10 @@ pub enum Fusion<T> {
     Skipped,
 }
 
+/// The prediction step the process-noise parameters are stated for, s
+/// (PX4 EKF2's 10 ms filter period, whose default values these are).
+const Q_REF_DT_S: f64 = 0.01;
+
 /// Filter parameters converted to the filter's scalar type.
 #[derive(Clone, Copy, Debug)]
 struct Prm<T> {
@@ -287,11 +291,18 @@ impl<T: Real> Ekf<T> {
         let dt = d.dt;
         let mut p = f.mul(&self.p).mul(&f.transpose());
         let sq = |x: T| x * x;
+        // PX4 applies these parameters as (sigma * dt)^2 per 10 ms step, which
+        // is sigma^2 * 0.01 * dt per second. Applied per step of another
+        // length that form would grow the covariance by another amount per
+        // second (0.4 of PX4's at 4 ms). The variance added per step is
+        // therefore sigma^2 * dt * Q_REF_DT_S: exactly PX4's at dt = 10 ms,
+        // and the same per second at any filter rate.
+        let qdt = dt * T::from_f64(Q_REF_DT_S);
         let noise = [
-            (IV, sq(self.prm.accel_noise * dt)),
-            (ITH, sq(self.prm.gyro_noise * dt)),
-            (IBG, sq(self.prm.gyro_bias_noise * dt)),
-            (IBA, sq(self.prm.accel_bias_noise * dt)),
+            (IV, sq(self.prm.accel_noise) * qdt),
+            (ITH, sq(self.prm.gyro_noise) * qdt),
+            (IBG, sq(self.prm.gyro_bias_noise) * qdt),
+            (IBA, sq(self.prm.accel_bias_noise) * qdt),
         ];
         for (start, var) in noise {
             for k in 0..3 {
