@@ -1,0 +1,133 @@
+# ADR-0008: The IMU's anti-alias filter and decimation
+
+Status: **proposed, for the owner. Not accepted.** It changes what both autopilots of gate 1 sense ([ADR-0006](0006-ardupilot-bridge.md) §4), so by [ADR-0007](0007-gate-1-criteria.md) §7 it must be accepted as a record before the gate is flown again. It changes no criterion. Nothing in it was judged on gust-hold runs 0 to 499, the gate's seeds. The repository's default tests fly a few of those runs, as they always do: runs 0 to 7 against the file's limits (`gust_hold_quick`, which passes) and runs 0 and 1 to compare trace hashes. No figure from those runs is used here.
+
+## In short, for the owner
+
+- **The model:** the IMU samples at 8 kHz on its own clock. Its noise passes a 256 Hz second-order anti-alias filter, and each reader is given every Nth sample. The vibration is a density (6.325e-4 rad/s/√Hz and 1.581e-2 m/s²/√Hz at hover, flat to 4 kHz), equal to what the F405 and ArduCopter streams already carried. The noise a 1 kHz and a 4 kHz reader get agrees within 3 % (tested).
+- **Effect, runs 500 to 999:** the F405 does not move beyond the redraw, the H743 rises to the F405 (the gap is gone), and ArduCopter does not move. **The comparison with ArduCopter does not move measurably,** because both read one stream whose density in the loops' band is unchanged. This is not a fix for gate 1's failed A2.
+- **A gate-condition problem it creates:** ArduCopter's committed tuning procedure fails on the new IMU (yaw does not finish in its 480 s window, or the vehicle drifts 100 m in ALT_HOLD; none of 4 seeds succeeds, against 3 of 4 before). Three ways forward are below. Choosing one is the owner's decision, in this record, before the next run.
+- **Pins:** on our core's side, 124 of the 129 scenario hashes, 8 of the 10 `oxide-sim hash` lines, the gust-hold 0 pins of two bridge test files, and one bound of CI's bounds sweep. On ArduCopter's side, 13 tests that fail when run here, 3 tuning tests that fail by the procedure's own result, and the stick test's gust-hold 0 hashes. Nothing is regenerated until the owner says yes.
+
+## Context
+
+The simulated IMU's broadband vibration was a fixed rms per sample: 0.02 rad/s on the gyro and 0.5 m/s² on the accelerometer at the hover rotor speed. The white noise and the bias walk were densities, scaled to the sample period. The IMU was read once per tick of whoever read it, with no anti-alias filter and no decimation. A fixed rms per sample is a density that grows with the sample period (rms / √rate). So the F405 profile's 1 kHz stream had twice the vibration density, in amplitude, of the H743 profile's 4 kHz stream. ArduCopter reads the IMU on the F405's 1000 µs grid (ADR-0006 §4), so it had the F405's density too. ADR-0006 §4 described the model as having a fixed noise density. That was true of the white noise and not of the vibration.
+
+A diagnosis on gust-hold runs 500 to 999 found that this accounts for about 91 % of the gap between the F405 and the H743 in mean-square position error. With the H743 run at the F405's vibration density, the two medians match (0.1683 m against 0.1707 m). With the F405 run at the H743's density, they match the other way (0.1574 m against 0.1562 m).
+
+A real IMU does not work this way. It samples on its own clock, filters, and hands every reader the latest filtered sample (DESIGN §5.3).
+
+## Decision
+
+The IMU model (`oxide_sim::sensors::ImuModel`, whose documentation gives every value with its reason) becomes:
+
+- **Its own clock: 8 kHz** (125 µs), whatever the step and the reader. Every internal sample draws a bias-walk step and a noise sample. Every simulator step must be a whole multiple of 125 µs (refused otherwise, `SimError::Imu`). The steps in use are 250, 500 and 1000 µs.
+- **Anti-alias filter: second-order Butterworth, −3 dB at 256 Hz**, on the noise. The truth, the bias and the rotor-synchronous lines are added unfiltered at the reader's instant. Filtering the signal too would add about 0.88 ms of delay to every autopilot's rate loop. That is a second change to the gate's conditions, and DESIGN §5.4 already lists it for S2 ("output-filter delay").
+- **Decimation:** a reader is given the latest filtered sample at its own period. With the same seed, a 1 kHz reader's noise is every fourth sample of a 4 kHz reader's noise, bit for bit.
+- **Broadband vibration as a density**, flat from 0 to 4 kHz (the internal Nyquist frequency), at the reference rotor speed: gyro 6.325e-4 rad/s/√Hz, accelerometer 1.581e-2 m/s²/√Hz, scaled with the square of the mean rotor speed as before. These are the old figures as the 1 kHz stream carried them. The F405 and ArduCopter keep, below the filter's cut-off, the density they have flown on until now, and the H743 is raised to it. Because the filter passes only what lies below its cut-off, the 4 kHz band matters only by being far above 256 Hz.
+- **The white noise** keeps its densities and passes the filter too.
+
+Unchanged: ArduCopter's 1000 µs IMU grid, the wind, every other sensor, every criterion.
+
+## What was measured, on gust-hold runs 500 to 999 only
+
+Every flight of the 2,000 below was safe and passed the scenario file's own limits. The statistics are those of ADR-0007 §5: the median as (a + b) / 2, and the 95th percentile by linear interpolation at 0.95 × (n − 1). The rms horizontal error is in metres.
+
+| Runs 500 to 999 | Median before | Median after | 95th pct. before | 95th pct. after |
+|---|---|---|---|---|
+| Our core, F405 | 0.17070 | 0.16894 | 0.23019 | 0.23460 |
+| Our core, H743 | 0.15618 | 0.16997 | 0.21287 | 0.22985 |
+| ArduCopter (tuned file as committed) | 0.17467 | 0.17512 | 0.21373 | 0.21722 |
+
+Reproduced with `oxide-bridge batch --scenario scenarios/gust-hold.toml --indices 500..1000 --autopilot core-f405` (and `core-h743`, `arducopter`) at `6265126` for before and at this record's first commit for after.
+
+Paired by seed (the wind is the same per seed; only the IMU's draws change), with 95 % intervals from 4,000 bootstrap resamples of the seeds:
+
+- **F405: no change beyond the redraw.** Median −0.0018 m (−0.0050 to +0.0033), 95th percentile +0.0044 m (−0.0109 to +0.0128). The flight with the new model was the better in 249 of 500 runs. That is what keeping the F405's density below the cut-off should give: the F405 loses only the noise between about 256 and 500 Hz, most of which its 80 Hz gyro filter removed anyway.
+- **H743: worse, by what the diagnosis predicted.** Median +0.0138 m (+0.0100 to +0.0178), 95th percentile +0.0170 m (+0.0110 to +0.0267). Its vibration density below the cut-off has doubled, to the F405's.
+- **The two profiles now fly the same flight, seed by seed.** The mean of the F405-minus-H743 difference was −0.0152 m (standard error 0.0015) before and −0.0001 m (standard error 0.00026) after. The medians are 0.16894 m and 0.16997 m. The profiles read the same internal noise stream, and the gap the diagnosis found is gone.
+
+The model's own test (`noise_density_is_the_same_at_1_khz_and_4_khz` in `crates/oxide-sim/src/sensors.rs`) measures the density a 1 kHz and a 4 kHz reader are given, on independent seeds over 64 s, and requires agreement within 3 % in amplitude. The filter lets 0.4 % fold back into 1 to 100 Hz and 0.8 % into 100 to 250 Hz, and each estimate scatters by about 0.4 %. Measured: gyro 6.43e-4 and 6.34e-4 rad/s/√Hz in 1 to 100 Hz (configured 6.38e-4 with the white noise), ratio 1.013; accelerometer ratio 0.998; in 100 to 250 Hz, 1.013 and 0.995. A second test shows that, with the same seed, a 1 kHz reader's noise is every fourth sample of a 4 kHz reader's, bit for bit.
+
+Cost: 500 F405 flights took 17.9 s with four jobs, against 10.4 s before (about 280 times real time per core, against 480; DESIGN §5.1 asks for 100). The H743 took 33.3 s against 30.1 s. The IMU now draws 12 variates every 125 µs. A bias walk once per millisecond instead would cut the draws by about 40 % (estimated, not measured), and would change nothing a reader can measure.
+
+## What it changes in gate 1, and which way
+
+**What ArduCopter and our F405 core sense changes alike.** Both read the same stream, on the same 1000 µs grid, with the same seed, before and after. Below about 100 Hz the density is what it was (the filter passes at least 97.7 % of the power there). Between the filter's band and 500 Hz the noise is removed: at hover, the vibration per sample falls from 0.020 to 0.015 rad/s and from 0.50 to 0.38 m/s². Every flight's IMU noise is drawn afresh, so each seed is a new realisation. The turn-on biases are drawn as before and do not change.
+
+**Which way the comparison moves: measured, not at all beyond the redraw.** On runs 500 to 999, our F405 core's error over ArduCopter's moved as follows. The median ratio went from 0.977 to 0.965 (change −0.013; 95 % interval of the change −0.035 to +0.022). The 95th-percentile ratio went from 1.077 to 1.080 (+0.003; −0.071 to +0.048). ArduCopter's own median moved by +0.0005 m (−0.0026 to +0.0028), and its 95th percentile by +0.0035 m (−0.0022 to +0.0079). Neither autopilot's error moved by more than its seeds' scatter.
+
+Why: the two read one stream, and the density both use is unchanged. The only common change is the noise above the filter's band, and both throw most of it away (each has an 80 Hz gyro filter). The change takes an artefact out of the F405-against-H743 comparison and leaves the F405-against-ArduCopter comparison where it was. **It is not a fix for gate 1's failed criterion A2.** On runs 500 to 999 the 95th-percentile ratio is about 1.08 with either model.
+
+**The H743** (reported; it must meet A1) is worse by 0.014 m at the median and 0.017 m at the 95th percentile. All of runs 500 to 999 still pass the file's limits. A1 itself is judged on runs 0 to 499, which were not flown.
+
+**ArduCopter's tuning (ADR-0007 §2) does not survive the change as written.** The committed tuned file was written by the procedure on the old IMU. On this machine the old model's program still writes it byte for byte. With the new model, the same procedure (seed 0, unchanged script) fails its own acceptance: AUTOTUNE completes roll at 176.9 s and pitch at 270.3 s, slightly earlier than before, but yaw is still in its rate-P stage when the fixed 480 s window ends. Roll and pitch gains are saved and yaw's are not. As information only, the procedure was also flown on seeds 1 to 3:
+
+| Tuning flight | Old model | New model |
+|---|---|---|
+| seed 0 (the procedure's) | success, yaw complete at 524.6 s | yaw not complete by the descent (565.8 s) |
+| seed 1 | success, yaw at 526.1 s | fly-away (100 m out in ALT_HOLD at 252.1 s) |
+| seed 2 | fly-away (100 m out at 286.5 s) | fly-away (100 m out at 275.7 s) |
+| seed 3 | success, yaw at 535.5 s | yaw not complete by the descent |
+
+Yaw's rate-D stage took 110 to 134 s on the old model and 172 to 196 s on the new one, in every flight that reached it. The procedure's 480 s window was set on the old model with about 40 s to spare (ADR-0007 §2). Why the stage is slower was not isolated. Four seeds are few. The direction is the same in both pairs that can be compared (seeds 0 and 3), and the procedure succeeded on three seeds of four before and on none after. The spectrum rule of step 4 still finds no peak (largest line 2.0 to 2.5 times the band's median power, against 1.4 to 1.6 before; the rule is 10), so no notch either way.
+
+So, if this record is accepted, one of these must be decided in it, before the gate is flown again:
+
+1. **Keep the committed tuned file** and record that it was tuned on the old IMU. This is measured on gusts: with it, ArduCopter's error on runs 500 to 999 did not move (above). The test that a fresh run writes the committed file then fails until the procedure changes.
+2. **Change the tuning procedure** so that it completes on the new IMU, and commit what it writes. One example is yaw in a second flight, which ArduCopter's `AUTOTUNE_AXES` allows. A longer window is not possible: the pack is about empty 650 s into the flight. This is a change to ADR-0007 §2, so it needs this record, and the flights must be on seeds other than the gate's.
+3. **Keep the old IMU for gate 1's second run** and adopt this model after it. The F405-against-H743 artefact then stays in that run's H743 figures, which decide nothing.
+
+Criteria A1, A2, B1, B2 and B3 are unchanged in every case. On criterion B's side, our core was flown on every fault file, on the seeds each names and on both profiles (`fault_scenarios_full`), and every flight passes its file's expectations. ArduCopter's fault flights were not flown in bulk, because those are the gate's own flights of criterion B. Run 0 of several, from the binary's own tests, is listed below.
+
+## The pins that move
+
+None of these has been regenerated. Every one waits for the owner's yes. The failing tests on this branch are these pins and nothing else.
+
+**Our core's flights** (the default test run; every one was run):
+
+| Where | What moves | Test |
+|---|---|---|
+| `crates/oxide-sim/tests/data/scenario_hashes.txt` | 124 of its 129 trace hashes. They stay only for hover-step on all three cases (ideal sensors) and rc-loss-on-ground on F405 runs 0 and 1 | `scenario_files`: `every_scenario_file_still_flies_its_pinned_flight` (41 of its 43 move) and `…_full` (CI's release sweep) |
+| `crates/oxide-sim-cli/src/main.rs`, `PINNED` (what `oxide-sim hash` prints) | 8 of 10 lines: gust-hold#0, rc-loss-position#0, pair-gps-loss+baro-loss#0 and motor-loss#0 on both profiles. The two hover-step lines stay | `hash_prints_its_five_lines_as_before_then_one_per_logged_flight` |
+| `crates/oxide-bridge/tests/runner_core.rs` | `GUST_HOLD_0_F405`, `GUST_HOLD_0_H743`, and gust-hold 0's `rms_v_m` and `max_v_m` (`last_motor_on_s` is the flight's end and stays) | `the_core_f405_row_…`, `the_core_h743_row_…`, `the_core_row_of_gust_hold_0_pins_the_vertical_error_…` |
+| `crates/oxide-bridge/tests/cli.rs`, lines 246 and 247 | the same two gust-hold 0 hashes | `the_core_routes_of_the_binary_fly_the_profile_they_name` |
+
+One more, from CI's release sweeps (the other three pass: the fault files, the replay sweep and the replay damage). `crates/oxide-sim/tests/param_bounds.rs`, `every_bound_flies`, now fails on one bound: `POS_VELZ_P` at its minimum, 0, in rc-loss-position on seed 0, climbs to 316 m (the sweep's limit is 200 m). A zero vertical velocity gain leaves the vertical speed uncontrolled on either model. Flown on seeds 0 to 19, the old model went above 200 m on 2 of them and was a fly-away by ADR-0007 §4 on 9; the new one on 5 and 11. The old model passed the sweep because its seed 0 stayed at 114 m. This is the vertical twin of the `POS_VELX_P` entry already in the sweep's `KNOWN` list. Adding it there is accepting a changed flight, so it waits with the pins.
+
+The regeneration, once approved: `OXIDE_REGENERATE=1 cargo test --release -p oxide-sim --test scenario_files -- --ignored regenerate_scenario_hashes` for the table, and the new values copied into the three other files from what the failing tests print. `crates/oxide-bridge/src/record.rs` uses the old gust-hold 0 hash as sample data in a formatting test. That test passes and needs nothing. One test asserted the old model itself and is rewritten on this branch: `imu_period.rs`'s `the_noise_is_the_1000_us_noise_and_with_period_0_the_500_us_noise`, which is now `the_noise_per_sample_is_the_same_at_1000_us_and_at_the_500_us_step`.
+
+**ArduCopter's flights** (the tests that need the pinned binary, which skip without it). They were run here on the binary of ADR-0006 (checksum checked), at the base commit and on this branch, on separate instance ranges. Thirteen pass at the base and fail on this branch. Each stops at its first value that moved, so others in the same test may have moved too:
+
+| Test | First value that moved (now, against the pin) |
+|---|---|
+| `arducopter_faults`: `a_brain_hang_is_not_noticed_…` | lands 14.99 m from home, the pin reads "15." |
+| `…`: `a_lost_radio_in_guided_with_the_brain_alive_…` | disarm at 36.04 s, pin 35.5 ± 0.3 |
+| `…`: `battery_critical_arms_returns_at_low_lands_at_critical_…` | disarm at 43.40 s, pin 43.88 ± 0.3 |
+| `…`: `battery_low_arms_and_returns_10_s_after_the_threshold_…` | "Battery 1 is low" at 33.82 s, pin 33.52 ± 0.05 |
+| `…`: `gps_loss_ends_in_the_estimator_failsafe_8_s_later_…` | 6 status texts after the loss, pin 9 (the estimator failsafe and LAND now come at 23.0 s) |
+| `…`: `imu_loss_stops_the_program_…` | touchdown 9.54 m/s, pin 11.0 ± 0.5 (still a crash) |
+| `…`: `motor_loss_is_not_answered_…` | modes STABILIZE, GUIDED: the estimator's switch to LAND, 3.4 s after the fault on the old model, does not come |
+| `…`: `no_human_link_is_the_radio_failsafe_first_…` | disarm at 36.24 s, pin 35.9 ± 0.3 |
+| `arducopter_sticks`: `gps_loss_pilot_ends_in_an_ekf_failsafe_land_…` | the violation texts: 3.40 m reached (3.39), disarm read at 41.41 s (40.73) |
+| `…`: `kill_in_rtl_stops_the_motors_…` | touchdown 15.554 m/s, pin 15.466 ± 0.05 |
+| `…`: `rc_loss_override_leaves_the_return_for_guided_…` | greatest height 14.851 m, pin 14.791 ± 0.05 |
+| `…`: `rc_loss_position_lifts_on_the_delayed_throttle_…` | last motor command at 73.313 s, pin 73.8705 ± 0.003 |
+| `arducopter_fly`: `the_imu_arducopter_reads_is_our_models` | seed 2 axis 0 residual 0.448 mrad/s, limit 0.3. That axis's bias is now 0.075 mrad/s after the walk (it was about 0.73), so the reports straddle zero, where the test's truncation correction does not hold. Re-pinning it needs another seed or another correction, not a new number. The figures of ADR-0006 §4 that come from this test (0.05 and 0.28 mrad/s) are measurements of the old model |
+
+Two boot tests (`a_message_interval_sets_the_rate`, `the_simulators_clock_is_ours`) failed at the base and passed on this branch. They time things on the wall clock and both runs were side by side, so they are not this change's.
+
+The tuning tests were not run as tests, because the procedure itself was flown (above). From what it wrote: `the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing` and `a_fresh_run_of_the_procedure_writes_the_committed_tuned_file_byte_for_byte_on_two_instances` fail, since the tuner does not complete. `the_hover_learns_the_thrust_and_the_spectrum_has_no_peak` fails on its range for the spectrum's largest line (1.0 to 2.0 times the median; now 2.03 to 2.47, because the filter slopes the 40 to 400 Hz band), though the no-peak verdict and the learned hover thrust (0.1495) hold.
+
+Not run, because they fly gust-hold's gate seeds or the gate program: `arducopter_sticks`' `the_offboard_flights_have_the_hashes_they_had_before_stick_flying`, whose three gust-hold 0 hashes move for certain (its hover-step hashes fly ideal sensors and stay); nine tests of `arducopter_fly` and `arducopter_scenario` that fly gust-hold runs 0 to 5 and hold limits or repeats, not values; and `gate_real`'s two trials of the gate program. Also not run: `gust_hold.rs`' `gust_hold_200_seeds`, which flies runs 0 to 199.
+
+**Records that stay:** `docs/gates/gate-1/` is the record of the run at `2c2fedb`, and its hashes are true of that commit.
+
+## Consequences
+
+- If accepted: the pins above are regenerated (with the owner's yes, as a separate step), and ADR-0006 §4's read-back figures are measured again on the new model. The tuning question of the section above is decided, and gate 1's second run then flies this IMU on both sides.
+- The F405 and H743 profiles become comparable on the IMU. A difference between them now measures the core's rates, not the IMU's sampling.
+- The noise a reader gets no longer depends on its period. A bridged flight could therefore read the IMU at every 500 µs step without the √2 of ADR-0006 §4. The 1000 µs grid is kept anyway, so that this record changes one thing.
+- The simulation of our core is slower (F405 by about 70 %, H743 by about 10 %), and still well inside DESIGN §5.1.
+- Still not modelled: the filter's delay on the signal (DESIGN §5.4, S2), and filtering of the rotor lines. At the reference quad's full speed (30,000 rpm) the rotor line reaches 500 Hz, the F405 reader's Nyquist frequency, and there a 1 kHz and a 4 kHz reader still see it differently. In gust-hold the rotors run near hover, where the line sits at about 225 Hz.
+- The white-noise densities keep the model's convention, standard deviation `D·√f` at an unfiltered rate `f`. MPU-6000-class datasheets quote noise as `D·√B` over a one-sided band `B`, which would be `D·√(f/2)`. The model's white noise is therefore √2 above the datasheet's figure. That was so before this record and is not changed by it.
