@@ -295,9 +295,10 @@ impl<T: Real> Ekf<T> {
         let mut p = f.mul(&self.p).mul(&f.transpose());
         let sq = |x: T| x * x;
         // PX4 applies these parameters as (sigma * dt)^2 per 10 ms step, which
-        // is sigma^2 * 0.01 * dt per second. Applied per step of another
-        // length that form would grow the covariance by another amount per
-        // second (0.4 of PX4's at 4 ms). The variance added per step is
+        // is sigma^2 * 0.01 s of variance per second (sigma^2 * 0.01 * dt
+        // over an interval dt). Applied per step of another length that form
+        // would grow the covariance by another amount per second (0.4 of
+        // PX4's at 4 ms). The variance added per step is
         // therefore sigma^2 * dt * Q_REF_DT_S: exactly PX4's at dt = 10 ms,
         // and the same per second at any filter rate.
         let qdt = dt * T::from_f64(Q_REF_DT_S);
@@ -922,7 +923,14 @@ mod tests {
     /// the one grown with all four noises zero.
     fn noise_added(params: &EkfParams, dt: f64, n: usize) -> Cov<f64> {
         let with = grown(params, dt, n);
-        let without = grown(&noise_params(0.0, 0.0, 0.0, 0.0), dt, n);
+        let quiet = EkfParams {
+            accel_noise: 0.0,
+            gyro_noise: 0.0,
+            gyro_bias_noise: 0.0,
+            accel_bias_noise: 0.0,
+            ..*params
+        };
+        let without = grown(&quiet, dt, n);
         let mut out = Cov::zeros();
         for i in 0..N_ERR {
             for j in 0..N_ERR {
@@ -934,31 +942,38 @@ mod tests {
 
     #[test]
     fn covariance_growth_per_second_does_not_depend_on_the_filter_step() {
-        // One second of prediction at 2.5, 4 and 10 ms (400, 250, 100 steps),
-        // from an initial covariance far below what one second adds, so that
-        // the growth is what is compared. The noise sums to sigma^2 * 0.01
-        // per second in every case; what differs is the discretisation of
-        // the first-order transition matrix, which feeds the attitude
-        // variance into velocity and position by terms of order dt / (1 s).
-        // The diagonals of the driven groups therefore agree to 1 % of their
-        // value. Before the fix they differed by the
-        // step ratio, 4x between 2.5 and 10 ms.
+        // The variance the noise terms add over one second (the grown
+        // covariance minus the noiseless one) at 2.5, 4 and 10 ms (400, 250,
+        // 100 steps). The noise sums to sigma^2 * 0.01 per second in every
+        // case. The initial variances are above the floors of VAR_LIMITS, so
+        // no clamp acts and the two runs differ only by the noise. What still
+        // differs is the first-order transition matrix, which feeds attitude
+        // variance into velocity by terms of order dt / (1 s): at most 6e-4
+        // for velocity and 2e-5 for attitude, so 1e-3 and 1e-4 are asserted.
+        // The bias groups have identity blocks in F and agree to rounding.
+        // Before the fix the groups differed by the step ratio, 4x between
+        // 2.5 and 10 ms.
         let params = EkfParams {
-            init_tilt_sigma_rad: 1e-6,
-            init_yaw_sigma_rad: 1e-6,
-            init_vel_sigma_mps: 1e-6,
-            init_pos_sigma_m: 1e-6,
-            init_gyro_bias_sigma: 1e-6,
-            init_accel_bias_sigma: 1e-6,
+            init_tilt_sigma_rad: 1e-3,
+            init_yaw_sigma_rad: 1e-3,
+            init_vel_sigma_mps: 1e-2,
+            init_pos_sigma_m: 1e-2,
+            init_gyro_bias_sigma: 1e-4,
+            init_accel_bias_sigma: 1e-3,
             ..EkfParams::default()
         };
         let steps = [(0.0025, 400), (0.004, 250), (0.01, 100)];
-        let grids: Vec<Cov<f64>> = steps.iter().map(|&(dt, n)| grown(&params, dt, n)).collect();
-        for i in IV..N_ERR {
-            let reference = grids[2].get(i, i);
-            for (g, &(dt, _)) in grids.iter().zip(&steps) {
-                let rel = (g.get(i, i) - reference).abs() / reference;
-                assert!(rel < 0.01, "P[{i}][{i}] at dt = {dt}: relative {rel}");
+        let grids: Vec<Cov<f64>> = steps
+            .iter()
+            .map(|&(dt, n)| noise_added(&params, dt, n))
+            .collect();
+        for (s, tol) in [(IV, 1e-3), (ITH, 1e-4), (IBG, 1e-9), (IBA, 1e-9)] {
+            for i in s..s + 3 {
+                let reference = grids[2].get(i, i);
+                for (g, &(dt, _)) in grids.iter().zip(&steps) {
+                    let rel = (g.get(i, i) - reference).abs() / reference;
+                    assert!(rel < tol, "P[{i}][{i}] at dt = {dt}: relative {rel}");
+                }
             }
         }
     }

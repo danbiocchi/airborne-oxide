@@ -75,7 +75,7 @@ fn a_core_flight_is_judged_with_its_status_so_nothing_is_left_unjudged() {
 
 #[test]
 fn the_core_row_of_gust_hold_0_pins_the_vertical_error_and_the_last_motor_command() {
-    // Values of the preview table of the same flight (rms_v_m over the hold
+    // Values oxide-sim flies for gust-hold run 0 at this commit (rms_v_m over the hold
     // window from 15 s; the last tick of a flight that never stops its
     // motors). A window that starts later, or a last-motor test that counts
     // zero, moves them.

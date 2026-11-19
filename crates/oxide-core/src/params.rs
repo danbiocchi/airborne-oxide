@@ -515,13 +515,13 @@ declare_params! {
         secs EKF_HORIZON = delay_horizon_us: 0.2, MIN_US, 0.248, "s", Estimator, disarmed,
             "How far the filter runs behind real time. Must exceed the largest GPS latency, fit the profile's IMU buffer, and not exceed EKF_OUT_TAU.";
         f32 EKF_GYR_NOISE = gyro_noise: 0.015, TINY, 1.0, "rad/s", Estimator, disarmed,
-            "Gyro process noise (1 sigma), stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate.";
+            "Gyro process noise (1 sigma), stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s.";
         f32 EKF_ACC_NOISE = accel_noise: 0.35, TINY, 10.0, "m/s^2", Estimator, disarmed,
-            "Accelerometer process noise (1 sigma), stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate.";
+            "Accelerometer process noise (1 sigma), stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s.";
         f32 EKF_GYR_BNOISE = gyro_bias_noise: 1.0e-3, TINY, 0.1, "rad/s^2", Estimator, disarmed,
-            "Gyro bias random walk, stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate.";
+            "Gyro bias random walk, stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s.";
         f32 EKF_ACC_BNOISE = accel_bias_noise: 3.0e-3, TINY, 1.0, "m/s^3", Estimator, disarmed,
-            "Accelerometer bias random walk, stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate.";
+            "Accelerometer bias random walk, stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s.";
         f32 EKF_GPS_POS_N = gps_pos_noise_m: 0.5, TINY, 1000.0, "m", Estimator, disarmed,
             "Lower bound on the GPS horizontal position noise; the receiver's own accuracy is used when larger.";
         f32 EKF_GPS_VEL_N = gps_vel_noise_mps: 0.3, TINY, 100.0, "m/s", Estimator, disarmed,
