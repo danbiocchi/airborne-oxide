@@ -91,6 +91,9 @@ struct Prm<T> {
     baro_gate: T,
     yaw_gate: T,
     declination: T,
+    /// `cos` and `sin` of the declination.
+    decl_cos: T,
+    decl_sin: T,
     init_tilt: T,
     init_yaw: T,
     init_vel: T,
@@ -111,6 +114,8 @@ impl<T: Real> Prm<T> {
             baro_gate: c(p.baro_gate),
             yaw_gate: c(p.yaw_gate),
             declination: c(p.mag_declination_rad),
+            decl_cos: c(p.mag_declination_rad).cos(),
+            decl_sin: c(p.mag_declination_rad).sin(),
             init_tilt: c(p.init_tilt_sigma_rad),
             init_yaw: c(p.init_yaw_sigma_rad),
             init_vel: c(p.init_vel_sigma_mps),
@@ -483,6 +488,20 @@ impl<T: Real> Ekf<T> {
     /// proportion to the field's dip (×1.7 at 60° inclination). Treating
     /// the innovation as a pure yaw error makes the filter overconfident
     /// in yaw.
+    ///
+    /// **Where `H` is evaluated.** An EKF linearises its measurement at the
+    /// state estimate, so the tilt entries are taken at the field the
+    /// filter predicts, not at the measured one: the measured world field
+    /// turned about Down until its horizontal part points along the
+    /// declination `D`, keeping the measured dip `m_z/h`. That gives
+    /// `H = (−cos D·dip, −sin D·dip, 1)` for the three attitude errors.
+    /// Built from the measured field, `H_E = −m_y·m_z/h²` is about
+    /// `tan(I)·ν` for a field pointing north (`D = 0`; the cross-field part
+    /// of the noise is `m_y`), so the gain depends on the innovation and
+    /// every update adds a correction of non-zero mean about the horizontal
+    /// axis perpendicular to the field (`tan(I)·P_EE·ν²/S` at `D = 0`). In hover that axis cannot be told from
+    /// the accelerometer bias, which it drives. Where `ν = 0` the two forms
+    /// are equal; the innovation itself is unchanged.
     fn heading_model(&self, mag_body: Vec3<T>) -> Option<(T, [(usize, T); 3])> {
         if !mag_body.is_finite() {
             return None;
@@ -495,9 +514,10 @@ impl<T: Real> Ekf<T> {
             return None;
         }
         let nu = wrap_pi(self.prm.declination - mw.y.atan2(mw.x));
+        let dip = mw.z / h2.sqrt();
         let h = [
-            (ITH, -mw.x * mw.z / h2),
-            (ITH + 1, -mw.y * mw.z / h2),
+            (ITH, -self.prm.decl_cos * dip),
+            (ITH + 1, -self.prm.decl_sin * dip),
             (ITH + 2, T::ONE),
         ];
         Some((nu, h))
