@@ -1,5 +1,7 @@
 # Benchmark gate 1: our flight core against ArduCopter
 
+> This is the report of the **first run**, which was not passed. After one change to the estimator, found on other seeds, the gate was flown again on 19 November 2026 and **passed**: [second run](run-2/README.md).
+
 **Verdict: NOT PASSED.** Flown once, on 18 November 2026, at commit `2c2fedb`.
 
 One criterion of five did not hold: **A2**, the comparison of position hold in gusts. Our core's median error is lower than ArduCopter's, but its 95th percentile is higher, and A2 asks for both.
