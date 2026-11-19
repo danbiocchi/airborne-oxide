@@ -167,7 +167,10 @@ pub enum EstimatorSource {
 }
 
 /// EKF tuning (ADR-0002). Noise values are 1σ. Defaults follow PX4 EKF2
-/// where a counterpart exists.
+/// where a counterpart exists. The four process-noise values are stated as
+/// PX4 EKF2 states them, for a 10 ms prediction step: the variance added per
+/// step is `σ² · dt · 0.01 s`, which is PX4's `(σ · dt)²` at 10 ms and the
+/// same growth per second at any filter rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EkfParams {
     /// How far the filter runs behind real time, µs. Must exceed the largest

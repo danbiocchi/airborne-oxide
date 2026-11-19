@@ -6,7 +6,10 @@
 //! state is `[δp, δv, δθ, δbg, δba]`; the attitude error is a **world-frame**
 //! rotation vector, `q_true = Exp(δθ) ⊗ q` (Solà 2017, "global angular
 //! error"). Prediction integrates IMU deltas; measurements are fused one
-//! scalar at a time with an innovation gate. Generic over the scalar so the
+//! scalar at a time with an innovation gate. The process-noise parameters
+//! are PX4 EKF2's, stated for its 10 ms prediction step; the variance added
+//! per prediction is `σ² · dt · 0.01 s`, the same per second at any filter
+//! rate. Generic over the scalar so the
 //! Jacobians can be checked in f64 while the core runs `Ekf<f32>`.
 
 use crate::config::EkfParams;
@@ -72,6 +75,10 @@ pub enum Fusion<T> {
     /// Not fused: numerical problem or unobservable geometry.
     Skipped,
 }
+
+/// The prediction step the process-noise parameters are stated for, s
+/// (PX4 EKF2's 10 ms filter period, whose default values these are).
+const Q_REF_DT_S: f64 = 0.01;
 
 /// Filter parameters converted to the filter's scalar type.
 #[derive(Clone, Copy, Debug)]
@@ -287,11 +294,19 @@ impl<T: Real> Ekf<T> {
         let dt = d.dt;
         let mut p = f.mul(&self.p).mul(&f.transpose());
         let sq = |x: T| x * x;
+        // PX4 applies these parameters as (sigma * dt)^2 per 10 ms step, which
+        // is sigma^2 * 0.01 s of variance per second (sigma^2 * 0.01 * dt
+        // over an interval dt). Applied per step of another length that form
+        // would grow the covariance by another amount per second (0.4 of
+        // PX4's at 4 ms). The variance added per step is
+        // therefore sigma^2 * dt * Q_REF_DT_S: exactly PX4's at dt = 10 ms,
+        // and the same per second at any filter rate.
+        let qdt = dt * T::from_f64(Q_REF_DT_S);
         let noise = [
-            (IV, sq(self.prm.accel_noise * dt)),
-            (ITH, sq(self.prm.gyro_noise * dt)),
-            (IBG, sq(self.prm.gyro_bias_noise * dt)),
-            (IBA, sq(self.prm.accel_bias_noise * dt)),
+            (IV, sq(self.prm.accel_noise) * qdt),
+            (ITH, sq(self.prm.gyro_noise) * qdt),
+            (IBG, sq(self.prm.gyro_bias_noise) * qdt),
+            (IBA, sq(self.prm.accel_bias_noise) * qdt),
         ];
         for (start, var) in noise {
             for k in 0..3 {
@@ -877,6 +892,161 @@ mod tests {
         assert!(ch.is_finite());
         assert_eq!(ekf.p.get(3, 3), 0.25);
         assert_eq!(ekf.p.get(3, 7), 0.0);
+    }
+
+    /// The four process-noise parameters with one scale applied to every
+    /// sigma, in the order accel, gyro, gyro bias, accel bias.
+    fn noise_params(accel: f32, gyro: f32, gyro_bias: f32, accel_bias: f32) -> EkfParams {
+        EkfParams {
+            accel_noise: accel,
+            gyro_noise: gyro,
+            gyro_bias_noise: gyro_bias,
+            accel_bias_noise: accel_bias,
+            ..EkfParams::default()
+        }
+    }
+
+    /// Covariance after `n` predictions of `dt` each, at rest, from the same
+    /// initial covariance, with no measurement fused.
+    fn grown(params: &EkfParams, dt: f64, n: usize) -> Cov<f64> {
+        let q = Quat::<f64>::from_euler(0.05, -0.03, 0.7);
+        let mut ekf = Ekf::<f64>::new(params, q);
+        let f = q.inverse_rotate(Vec3::new(0.0, 0.0, -G));
+        let d = delta::<f64>(dt, Vec3::zero(), f * dt);
+        for _ in 0..n {
+            ekf.predict(&d);
+        }
+        ekf.p
+    }
+
+    /// The covariance the noise terms alone add: the grown covariance minus
+    /// the one grown with all four noises zero.
+    fn noise_added(params: &EkfParams, dt: f64, n: usize) -> Cov<f64> {
+        let with = grown(params, dt, n);
+        let quiet = EkfParams {
+            accel_noise: 0.0,
+            gyro_noise: 0.0,
+            gyro_bias_noise: 0.0,
+            accel_bias_noise: 0.0,
+            ..*params
+        };
+        let without = grown(&quiet, dt, n);
+        let mut out = Cov::zeros();
+        for i in 0..N_ERR {
+            for j in 0..N_ERR {
+                out.set(i, j, with.get(i, j) - without.get(i, j));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn covariance_growth_per_second_does_not_depend_on_the_filter_step() {
+        // The variance the noise terms add over one second (the grown
+        // covariance minus the noiseless one) at 2.5, 4 and 10 ms (400, 250,
+        // 100 steps). The noise sums to sigma^2 * 0.01 per second in every
+        // case. The initial variances are above the floors of VAR_LIMITS, so
+        // no clamp acts and the two runs differ only by the noise. What still
+        // differs is the first-order transition matrix, which feeds attitude
+        // variance into velocity by terms of order dt / (1 s): at most 6e-4
+        // for velocity and 2e-5 for attitude, so 1e-3 and 1e-4 are asserted.
+        // The bias groups have identity blocks in F and agree to rounding.
+        // Before the fix the groups differed by the step ratio, 4x between
+        // 2.5 and 10 ms.
+        let params = EkfParams {
+            init_tilt_sigma_rad: 1e-3,
+            init_yaw_sigma_rad: 1e-3,
+            init_vel_sigma_mps: 1e-2,
+            init_pos_sigma_m: 1e-2,
+            init_gyro_bias_sigma: 1e-4,
+            init_accel_bias_sigma: 1e-3,
+            ..EkfParams::default()
+        };
+        let steps = [(0.0025, 400), (0.004, 250), (0.01, 100)];
+        let grids: Vec<Cov<f64>> = steps
+            .iter()
+            .map(|&(dt, n)| noise_added(&params, dt, n))
+            .collect();
+        for (s, tol) in [(IV, 1e-3), (ITH, 1e-4), (IBG, 1e-9), (IBA, 1e-9)] {
+            for i in s..s + 3 {
+                let reference = grids[2].get(i, i);
+                for (g, &(dt, _)) in grids.iter().zip(&steps) {
+                    let rel = (g.get(i, i) - reference).abs() / reference;
+                    assert!(rel < tol, "P[{i}][{i}] at dt = {dt}: relative {rel}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_step_at_ten_ms_adds_px4s_variance() {
+        // PX4 EKF2 adds (sigma * dt)^2 per 10 ms step. At dt = 10 ms the
+        // variance added here is exactly that, for each of the four
+        // parameters and on the three axes of each, and nothing else moves.
+        // (Tolerance 1e-6 relative: the difference of two f64 covariances
+        // carries their rounding, about 5e-10 of the smallest variance.)
+        let params = EkfParams::default();
+        // A step of 4 ms adds 0.4 of it, not (sigma * 0.004)^2 = 0.16 of it.
+        let four = noise_added(&params, 0.004, 1);
+        for (s, sigma) in [
+            (IV, params.accel_noise),
+            (ITH, params.gyro_noise),
+            (IBG, params.gyro_bias_noise),
+            (IBA, params.accel_bias_noise),
+        ] {
+            let want = f64::from(sigma) * f64::from(sigma) * 0.004 * 0.01;
+            assert!(
+                (four.get(s, s) - want).abs() <= 1e-6 * want,
+                "4 ms step at {s}: {:e}, want {want:e}",
+                four.get(s, s)
+            );
+        }
+        let a = noise_added(&params, 0.01, 1);
+        let want = |sigma: f32| (f64::from(sigma) * 0.01) * (f64::from(sigma) * 0.01);
+        let groups = [
+            (IV, want(params.accel_noise)),
+            (ITH, want(params.gyro_noise)),
+            (IBG, want(params.gyro_bias_noise)),
+            (IBA, want(params.accel_bias_noise)),
+        ];
+        for i in 0..N_ERR {
+            for j in 0..N_ERR {
+                let expected = groups
+                    .iter()
+                    .find(|&&(s, _)| i == j && (s..s + 3).contains(&i))
+                    .map_or(0.0, |&(_, v)| v);
+                let got = a.get(i, j);
+                assert!(
+                    (got - expected).abs() <= 1e-6 * expected.max(1e-12),
+                    "added[{i}][{j}] = {got:e}, want {expected:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn added_variance_is_linear_in_the_step_and_quadratic_in_sigma() {
+        let params = EkfParams::default();
+        let ten = noise_added(&params, 0.01, 1);
+        let four = noise_added(&params, 0.004, 1);
+        let double = noise_added(
+            &noise_params(
+                2.0 * params.accel_noise,
+                2.0 * params.gyro_noise,
+                2.0 * params.gyro_bias_noise,
+                2.0 * params.accel_bias_noise,
+            ),
+            0.01,
+            1,
+        );
+        for s in [IV, ITH, IBG, IBA] {
+            let t = ten.get(s, s);
+            assert!((four.get(s, s) / t - 0.4).abs() < 1e-6, "dt scaling at {s}");
+            assert!(
+                (double.get(s, s) / t - 4.0).abs() < 1e-6,
+                "sigma scaling at {s}"
+            );
+        }
     }
 
     #[test]

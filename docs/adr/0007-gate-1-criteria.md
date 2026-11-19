@@ -1,6 +1,6 @@
 # ADR-0007: The criteria of benchmark gate 1
 
-Status: accepted, before the run (DESIGN §8 rule 4). The gate was flown once, on 18 November 2026 at commit `2c2fedb`, and was **not passed**: criterion A2 failed on the 95th percentile. The result is at the end of this record and the report is [`docs/gates/gate-1/`](../gates/gate-1/README.md). The criteria stand.
+Status: accepted, before the run (DESIGN §8 rule 4). The gate was flown on 18 November 2026 at commit `2c2fedb` and was **not passed**: criterion A2 failed on the 95th percentile. After one change to the estimator, found on other seeds under the rules below, it was flown again on 19 November 2026 at commit `92fdaa2` and **passed**. Both runs are recorded at the end of this record; the reports are [`docs/gates/gate-1/`](../gates/gate-1/README.md) and [`docs/gates/gate-1/run-2/`](../gates/gate-1/run-2/README.md). The criteria did not change.
 
 ## Context
 
@@ -168,7 +168,7 @@ While the bridge was built, flights were flown that show how the two compare. Th
 
 ## The first run
 
-Flown once, on 18 November 2026, at commit `2c2fedb`, with everything above in place before it. The report, the tables of the plan's 3,233 flights and of the ten flown twice (3,253 flights in all), and what the program printed are in [`docs/gates/gate-1/`](../gates/gate-1/README.md).
+Flown on 18 November 2026, at commit `2c2fedb`, with everything above in place before it. The report, the tables of the plan's 3,233 flights and of the ten flown twice (3,253 flights in all), and what the program printed are in [`docs/gates/gate-1/`](../gates/gate-1/README.md).
 
 | Criterion | Result | Measured |
 |---|---|---|
@@ -185,13 +185,32 @@ What the run showed about the failure, for whoever improves the core:
 
 - Our core's errors are spread wider than ArduCopter's. It is better up to about the 75th flight in a hundred and worse above. Its worst twentieth is 5 mm worse.
 - It is not an accident of the seeds: by hundreds of runs, our 95th percentile is above ArduCopter's in four of five and level in the first, the hundred that the first looks were flown on.
-- The error is the estimate, not the control: on the true state the same core holds within 0.030 m at the median.
+- The error is the estimate, not the control: on the true state the same core holds about 0.030 m at the median.
 - The H743 profile, reported only, holds within 0.1570 m at the median and 0.2116 m at the 95th percentile, both below ArduCopter's.
 
 Two rules for the improvement, written now, before any is tried:
 
 1. **The 500 gust seeds of the gate are not a tuning set.** A change to the core is chosen and judged on other seeds of `gust-hold` (runs 500 to 999) and on the rest of the scenario files, and only then is the gate flown again on runs 0 to 499. Otherwise the second run would measure how well the core was fitted to those 500 winds.
 2. **A change must be one we would make without the gate:** a fault found, or a setting that is better on its own grounds, with its effect on every other scenario shown. A gain turned until this one number passes is not an improvement.
+
+## The second run
+
+Flown on 19 November 2026 at commit `92fdaa2`, with the criteria, ArduCopter, its parameter files, the binary and the scenario files of the first run. The report is [`docs/gates/gate-1/run-2/`](../gates/gate-1/run-2/README.md).
+
+**The change.** One change to our core: the estimator's process noise is applied per second, not per filter step (ADR-0002 item 12). It was found by a diagnosis on gust-hold runs 500 to 999 and on the other scenario files' runs 500 to 519, as rule 1 of the first run requires; nothing was chosen or judged on the gate's runs, which were flown only to re-pin trace hashes. It stands on PX4's meaning of the parameters and on a filter that behaves the same at every rate DESIGN allows, as rule 2 requires; it was not chosen by its effect on a flight. On runs 500 to 999 it had already met A2 (our F405 core 0.1574 m and 0.2009 m against ArduCopter's 0.1747 m and 0.2137 m) before the gate was flown again.
+
+| Criterion | Result | Measured |
+|---|---|---|
+| A1 | holds | 500 of 500 gust flights safe and passing, on each profile |
+| A2 | holds | median 0.15658 m against ArduCopter's 0.17545 m; 95th percentile 0.20278 m against 0.22087 m |
+| B1 | holds | as in the first run |
+| B2 | holds | 380 of 380 |
+| B3 | holds | `motor-loss` 0.999 s against 14.9995 s (never); `imu-loss` 0.139 s against 2.0015 s |
+| Repeats | hold | 10 of 10 |
+
+**Gate 1 is passed.** Our F405 core's error is below ArduCopter's at every percentile from the 1st to the 99th, and its 95th percentile is below ArduCopter's in each of the five hundreds of runs. ArduCopter's 921 rows of the tables (911 flights and the 10 repeats) equal the first run's in every column but the wall-clock time. A second, independent implementation of the verdict gives the same result to the last bit.
+
+What the pass rests on, stated so that it is not read as more: the gate was flown twice, and the second run followed a change chosen on other seeds. The change does not make the estimator well calibrated. Its consistency check found the filter underconfident before and after, and three faults outside the change, all deferred in ADR-0002: a drift through the heading fusion in long flights, the barometer's unmodelled drift, and the simulated GPS reporting twice its true noise.
 
 ## Consequences
 

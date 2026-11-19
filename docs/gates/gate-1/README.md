@@ -1,6 +1,8 @@
 # Benchmark gate 1: our flight core against ArduCopter
 
-**Verdict: NOT PASSED.** Flown once, on 18 November 2026, at commit `2c2fedb`.
+> This is the report of the **first run**, which was not passed. After one change to the estimator, found on other seeds, the gate was flown again on 19 November 2026 and **passed**: [second run](run-2/README.md).
+
+**Verdict: NOT PASSED.** The first run was flown on 18 November 2026, at commit `2c2fedb`.
 
 One criterion of five did not hold: **A2**, the comparison of position hold in gusts. Our core's median error is lower than ArduCopter's, but its 95th percentile is higher, and A2 asks for both.
 
@@ -57,7 +59,7 @@ What the numbers say:
 
 - **Our F405 core is better in the middle and worse at the edge.** It has the lower error in 266 of the 500 runs and the lower median, but its errors are spread wider (a standard deviation across runs of 0.030 m against 0.026 m), so its worst twentieth is worse. In the first figure its curve lies left of ArduCopter's up to about the 75th flight in a hundred and to the right above that: 8 mm better at the best twentieth, 4 mm better at the median, 5 mm worse at the 90th, 95th and 99th.
 - **This is not one unlucky block of seeds.** Taken a hundred runs at a time, our 95th percentile is above ArduCopter's in four of the five hundreds (0.2250 against 0.2182, 0.2245 against 0.2217, 0.2292 against 0.2142, 0.2218 against 0.2181) and level in the first (0.2211 against 0.2212). The first hundred is the one the first looks of ADR-0007 were flown on, which is why they looked level.
-- **The error is the estimate, not the control.** On the true state the same core holds position within 0.030 m at the median, against 0.171 m on its own estimate: nearly all of the error comes from what the estimator makes of the GPS, whose error is 0.3 m per axis for both autopilots.
+- **The error is the estimate, not the control.** On the true state the same core holds position at about 0.030 m at the median, against 0.171 m on its own estimate: nearly all of the error comes from what the estimator makes of the GPS, whose error is 0.3 m per axis for both autopilots.
 - **Our H743 profile would have met A2** (0.1570 m and 0.2116 m, both below ArduCopter's). The F405 profile decides because a bridged flight has the F405 flight's wind, sample for sample; the H743's flights have other wind samples of the same statistics. Why the 4 kHz profile holds 8 % tighter at the median (6 % at the 95th percentile) than the 1 kHz one is the first question for the improvement.
 - The two autopilots' errors on the same seed are unrelated (correlation −0.05; second figure): which runs are hard is decided by each one's own answer to the GPS noise, not by the wind they share.
 - Reported and deciding nothing: ArduCopter's vertical error is larger (median 0.093 m against our 0.063 m) and its tilt smaller (median 6.7° against 9.4°).

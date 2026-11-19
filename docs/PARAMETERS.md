@@ -69,10 +69,10 @@ Every tunable value of the flight core is one of these 93 parameters (ADR-0004).
 | Name | Type | Default | Min | Max | Unit | Change | Description |
 |---|---|---|---|---|---|---|---|
 | `EKF_HORIZON` | Float | 0.2 | 0.000001 | 0.248 | s | disarmed | How far the filter runs behind real time. Must exceed the largest GPS latency, fit the profile's IMU buffer, and not exceed EKF_OUT_TAU. |
-| `EKF_GYR_NOISE` | Float | 0.015 | > 0 | 1 | rad/s | disarmed | Gyro process noise (1 sigma). |
-| `EKF_ACC_NOISE` | Float | 0.35 | > 0 | 10 | m/s^2 | disarmed | Accelerometer process noise (1 sigma). |
-| `EKF_GYR_BNOISE` | Float | 0.001 | > 0 | 0.1 | rad/s^2 | disarmed | Gyro bias random walk. |
-| `EKF_ACC_BNOISE` | Float | 0.003 | > 0 | 1 | m/s^3 | disarmed | Accelerometer bias random walk. |
+| `EKF_GYR_NOISE` | Float | 0.015 | > 0 | 1 | rad/s | disarmed | Gyro process noise (1 sigma), stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s. |
+| `EKF_ACC_NOISE` | Float | 0.35 | > 0 | 10 | m/s^2 | disarmed | Accelerometer process noise (1 sigma), stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s. |
+| `EKF_GYR_BNOISE` | Float | 0.001 | > 0 | 0.1 | rad/s^2 | disarmed | Gyro bias random walk, stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s. |
+| `EKF_ACC_BNOISE` | Float | 0.003 | > 0 | 1 | m/s^3 | disarmed | Accelerometer bias random walk, stated as PX4 EKF2 states it for a 10 ms prediction step; the filter applies the same noise per second at any filter rate: the variance added per second is the value squared times 0.01 s. |
 | `EKF_GPS_POS_N` | Float | 0.5 | > 0 | 1000 | m | disarmed | Lower bound on the GPS horizontal position noise; the receiver's own accuracy is used when larger. |
 | `EKF_GPS_VEL_N` | Float | 0.3 | > 0 | 100 | m/s | disarmed | Lower bound on the GPS velocity noise. |
 | `EKF_BARO_NOISE` | Float | 0.5 | > 0 | 1000 | m | disarmed | Barometric height noise. |

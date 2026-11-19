@@ -18,8 +18,8 @@ fn scenario(name: &str) -> LoadedScenario {
 }
 
 /// The trace hashes `oxide-sim hash` pins for gust-hold run 0.
-const GUST_HOLD_0_F405: &str = "9712d37590a317dc";
-const GUST_HOLD_0_H743: &str = "476abddf98142653";
+const GUST_HOLD_0_F405: &str = "9a63745df2eb227a";
+const GUST_HOLD_0_H743: &str = "d2ecef5541ba9e88";
 
 #[test]
 fn the_core_f405_row_of_gust_hold_0_carries_the_pinned_trace_hash() {
@@ -75,13 +75,13 @@ fn a_core_flight_is_judged_with_its_status_so_nothing_is_left_unjudged() {
 
 #[test]
 fn the_core_row_of_gust_hold_0_pins_the_vertical_error_and_the_last_motor_command() {
-    // Values of the preview table of the same flight (rms_v_m over the hold
+    // Values oxide-sim flies for gust-hold run 0 at this commit (rms_v_m over the hold
     // window from 15 s; the last tick of a flight that never stops its
     // motors). A window that starts later, or a last-motor test that counts
     // zero, moves them.
     let f = fly_core(&scenario("gust-hold"), 0, RunProfile::F405).expect("flies");
     let row = Row::of_flight(&f);
-    assert_eq!(row.get("rms_v_m"), "0.08154483892160544", "{}", row.line());
-    assert_eq!(row.get("max_v_m"), "0.18137856722087164");
+    assert_eq!(row.get("rms_v_m"), "0.070943102650111", "{}", row.line());
+    assert_eq!(row.get("max_v_m"), "0.16323683169359304");
     assert_eq!(row.get("last_motor_on_s"), "39.998999999999995");
 }
