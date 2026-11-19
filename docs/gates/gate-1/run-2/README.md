@@ -22,10 +22,10 @@ The four process-noise parameters carry PX4 EKF2's default values. PX4 applies t
 
 The change was found and judged under the two rules ADR-0007 set after the first run:
 
-- **It was found on other seeds.** The diagnosis that found it flew gust-hold runs 500 to 999 and the other scenario files on runs 500 to 519, never the gate's runs 0 to 499. On runs 500 to 999 it moved our F405 core from 0.1707 / 0.2302 m (median / 95th percentile) to 0.1574 / 0.2009 m, against ArduCopter's 0.1747 / 0.2137 m there.
+- **It was found on other seeds.** The diagnosis that found it flew gust-hold runs 500 to 999 and the other scenario files on runs 500 to 519. Nothing was chosen or judged on the gate's runs 0 to 499; run 0 of each file was flown only to re-pin its trace hash, as every change to the core does. On runs 500 to 999 it moved our F405 core from 0.1707 / 0.2302 m (median / 95th percentile) to 0.1574 / 0.2009 m, against ArduCopter's 0.1747 / 0.2137 m there.
 - **It stands on its own grounds:** PX4's meaning of the parameters, and a filter that behaves the same at every rate DESIGN allows. An independent check found that it does not make the filter's own uncertainty more truthful: the filter stays underconfident, because it assumes more measurement noise than the simulator has. ADR-0002 says so.
 
-ArduCopter, its parameter files, the bridge, the scenario files, the binary and the criteria are the same as in the first run. All 921 ArduCopter flights of the tables are identical in class, measures and hashes to the first run's, as is our core on the true state (500 of 500 trace hashes).
+ArduCopter, its parameter files, the bridge, the scenario files, the binary and the criteria are the same as in the first run. All 921 ArduCopter rows of the tables (911 flights and the 10 repeats) equal the first run's in every column but the wall-clock time, and so do the 500 rows of our core on the true state.
 
 ## The verdict, criterion by criterion
 
@@ -54,7 +54,7 @@ RMS of the horizontal distance from the hold point, from 15 s to the end of each
 - **Our F405 core is now lower at every point of the distribution,** not only in the middle. Its curve lies left of ArduCopter's at every percentile from the 1st to the 99th: 15 mm lower at the 5th, 19 mm at the median, 17 mm at the 90th, 18 mm at the 95th and 21 mm at the 99th. In the first run it was 4 mm lower at the median and 5 mm higher at the 95th.
 - **By hundreds of runs** our 95th percentile is below ArduCopter's in all five (0.2000 against 0.2212, 0.1960 against 0.2182, 0.1975 against 0.2217, 0.2069 against 0.2142, 0.1992 against 0.2181). In the first run it was above in four of the five.
 - **The spread across runs** narrowed: a standard deviation of 0.025 m, against 0.030 m in the first run and ArduCopter's 0.026 m.
-- **Most of the error is still the estimate.** On the true state the same core holds within 0.030 m at the median.
+- **Most of the error is still the estimate.** On the true state the same core holds about 0.030 m at the median.
 - Reported and deciding nothing: our vertical error is smaller than ArduCopter's (median 0.057 m against 0.093 m) and our tilt larger (median 9.4° against 6.7°), as in the first run.
 
 ![cumulative curves of the position error](gate-1-cumulative.svg)
@@ -117,7 +117,7 @@ The hashes in the tables it writes must equal the ones in [`tables/`](tables/). 
 |---|---|
 | [`gate-1.md`](gate-1.md), `gate-1-cumulative.svg`, `gate-1-scatter.svg` | the program's own report and figures, as written |
 | [`gate.txt`](gate.txt) | what was flown: the commit, the plan, the checksums of the binary, of every scenario file and of every parameter file |
-| [`verdict.txt`](verdict.txt) | what `gate verdict` printed |
+| [`verdict.txt`](verdict.txt) | what `gate verdict` printed (the paths in it and in `gate.txt` are those of the machine the gate was flown on) |
 | [`tables/`](tables/) | every flight's row: one file for each scenario and autopilot, and the ten flights flown twice |
 
 ArduCopter's tuning report is the first run's ([`../tuning-report.txt`](../tuning-report.txt)): its parameter files did not change. Each flight's own record (`audit.txt`) is not committed; flying the gate again writes them.
