@@ -643,7 +643,7 @@ fn the_failsafe_names_the_fault_names_and_the_battery_names_exist_in_the_program
 
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
-fn gps_loss_ends_in_the_estimator_failsafe_8_s_later_and_a_landing_21_m_away() {
+fn gps_loss_ends_in_the_estimator_failsafe_8_s_later_and_a_landing_14_m_away() {
     let (_lease, run) = run_of("gps-loss");
     assert_writes(&run, &[(s_us(15.0), "SIM_GPS1_ENABLE", 0.0)]);
     assert_echoes(&run);
@@ -652,15 +652,12 @@ fn gps_loss_ends_in_the_estimator_failsafe_8_s_later_and_a_landing_21_m_away() {
         &run,
         9.0,
         &[
-            ("EKF3 lane switch 1", 22.924, 0.15),
-            ("EKF primary changed:1", 22.927, 0.15),
             ("EKF variance", 23.024, 0.15),
             ("EKF Failsafe: changed to Land Mode", 23.024, 0.15),
             ("EKF3 IMU0 stopped aiding", 30.092, 0.15),
             ("EKF3 IMU1 stopped aiding", 30.097, 0.15),
             ("SmartRTL deactivated: bad position", 37.389, 0.3),
-            ("Disarming motors", 39.704, 0.3),
-            ("EKF primary changed:0", 39.862, 0.3),
+            ("Disarming motors", 40.654, 0.3),
         ],
     );
     let (t, _) = run
@@ -677,21 +674,21 @@ fn gps_loss_ends_in_the_estimator_failsafe_8_s_later_and_a_landing_21_m_away() {
     near("LAND read", land, t, 1.1);
     let o = run.outcome();
     assert!(!o.armed_at_end);
-    near("disarmed", o.disarmed_at_s.expect("disarmed"), 39.7, 0.3);
+    near("disarmed", o.disarmed_at_s.expect("disarmed"), 40.65, 0.3);
     near(
         "last motor command above zero",
         run.last_motor_on_s().expect("on"),
-        39.7,
+        40.65,
         0.3,
     );
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        0.545,
+        0.517,
         0.1,
     );
     let (_, away) = end_position(&run);
-    near("landing distance from home", away, 21.5, 2.0);
+    near("landing distance from home", away, 13.6, 2.0);
     assert!(o.max_height_m < 6.0, "no climb");
     assert_eq!(class_of(o), Class::Safe);
     assert!(
@@ -831,7 +828,7 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        11.0,
+        9.54,
         0.5,
     );
     assert_eq!(class_of(o), Class::Crash);
@@ -848,48 +845,41 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
 fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_ends_on_the_ground_with_its_motors_on() {
     let (_lease, run) = run_of("motor-loss");
     assert_writes(&run, &[]);
-    // On the flown set the vehicle is on the ground 2.2 s after the fault and
-    // the program's own estimator failsafe (EKF variance, LAND) comes 1.2 s
-    // after that, 3.4 s after the fault; on the starting gains it tumbled
-    // away for 8.9 s, over 100 m, and the estimator fell back to DCM with no
-    // mode change. The failsafe is not an answer to the lost motor, which the
-    // program never notices: the motors stay on to the end. Every number is
-    // as measured on the flown set.
-    assert_modes(&run, &["STABILIZE", "GUIDED", "LAND"]);
+    // The vehicle is on the ground 2.2 s after the fault, as it was with the
+    // IMU before ADR-0008. What follows depends on the draw of the IMU's
+    // noise. With the IMU model of that record (this pin) the motors, still
+    // on, drag it along the ground, never more than 0.1 m up: it is 100 m
+    // from the start 10.7 s after the fault and 237 m from home at the end,
+    // and the program changes no mode. With the IMU before, it stayed within
+    // 24 m and the program's own estimator failsafe (EKF variance, LAND)
+    // came 1.2 s after it was down. On the starting gains it tumbled away
+    // in the air for 8.9 s, over 100 m, with no mode change. In none is the
+    // lost motor answered: the program never notices it, and the motors
+    // stay on to the end. Every number is as measured on the flown set.
+    assert_modes(&run, &["STABILIZE", "GUIDED"]);
     assert_texts_after(
         &run,
         9.0,
         &[
             ("EKF3 lane switch 1", 17.689, 0.3),
             ("EKF primary changed:1", 17.689, 0.3),
-            ("EKF3 lane switch 0", 18.092, 0.3),
-            ("EKF primary changed:0", 18.092, 0.3),
-            ("EKF variance", 18.424, 0.3),
-            ("EKF Failsafe: changed to Land Mode", 18.424, 0.3),
-            ("Vibration compensation ON", 18.624, 0.3),
-            ("EKF3 IMU0 emergency yaw reset", 18.700, 0.3),
-            ("EKF3 IMU1 emergency yaw reset", 18.707, 0.3),
-            ("EKF Failsafe Cleared", 19.624, 0.3),
+            ("EKF3 lane switch 0", 18.089, 0.3),
+            ("EKF primary changed:0", 18.089, 0.3),
+            ("EKF3 IMU1 emergency yaw reset", 18.235, 0.3),
+            ("EKF3 IMU0 emergency yaw reset", 18.237, 0.3),
+            ("Vibration compensation ON", 19.124, 0.3),
+            ("Potential Thrust Loss (1)", 24.880, 0.3),
+            ("EKF3 lane switch 1", 29.487, 0.3),
+            ("EKF primary changed:1", 29.487, 0.3),
         ],
     );
-    let (failsafe, _) = run
-        .text("EKF Failsafe: changed to Land Mode")
-        .expect("the estimator failsafe");
-    near(
-        "the fault to the estimator failsafe",
-        failsafe - 15.0,
-        3.424,
-        0.3,
-    );
-    near(
-        "LAND read",
-        run.mode_at_or_after("LAND", 0.0).expect("land"),
-        failsafe,
-        1.1,
+    assert!(
+        !estimator_failsafe_read_after(&run, 0.0),
+        "no estimator failsafe on this run"
     );
     let o = run.outcome();
     assert!(o.armed_at_end, "the program never disarms");
-    near("greatest tilt", o.max_tilt_deg, 86.5, 5.0);
+    near("greatest tilt", o.max_tilt_deg, 127.1, 5.0);
     let last = run.ticks.last().expect("ticks");
     println!(
         "MEASURED tilt at the end: {:.1} deg, height {:.3} m",
@@ -908,25 +898,34 @@ fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_ends_on_the_ground_wi
     near(
         "time from the fault to a tilt beyond 60 degrees",
         beyond_60 - 15.0,
-        0.3035,
+        0.3045,
         0.1,
     );
     near(
         "time from the fault to the ground",
         ground - 15.0,
-        2.231,
+        2.2375,
         0.3,
     );
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        7.0,
+        6.93,
         0.5,
     );
-    near("furthest from home", o.max_distance_from_home_m, 23.6, 2.0);
-    assert!(
-        estimator_failsafe_read_after(&run, ground),
-        "the estimator failsafe comes after the vehicle is down"
+    near("furthest from home", o.max_distance_from_home_m, 237.5, 5.0);
+    let after = || run.between(ground + 1.0, 1e9);
+    let highest = after().map(|k| -k.position[2]).fold(0.0, f64::max);
+    let at_100 = run
+        .between(ground, 1e9)
+        .find(|k| k.position[0] * k.position[0] + k.position[1] * k.position[1] > 100.0 * 100.0)
+        .map(|k| k.t_s);
+    assert!(highest < 0.2, "it stays on the ground: {highest}");
+    near(
+        "time from the fault to 100 m from the start, along the ground",
+        at_100.expect("100 m out") - 15.0,
+        10.73,
+        1.0,
     );
     // All motor commands at zero: never.
     let off = run.last_motor_on_s().expect("on");
@@ -948,8 +947,8 @@ fn a_lost_radio_in_guided_with_the_brain_alive_returns_1_s_later_and_lands() {
         9.0,
         &[
             ("Radio Failsafe", 15.98, 0.05),
-            ("Disarming motors", 35.5, 0.3),
-            ("PreArm: Radio failsafe on", 36.93, 0.3),
+            ("Disarming motors", 36.04, 0.3),
+            ("PreArm: Radio failsafe on", 37.93, 0.3),
         ],
     );
     let (t, _) = run.text("Radio Failsafe").expect("text");
@@ -976,7 +975,7 @@ fn a_lost_radio_in_guided_with_the_brain_alive_returns_1_s_later_and_lands() {
         0.51,
         0.1,
     );
-    near("disarmed", o.disarmed_at_s.expect("disarmed"), 35.5, 0.3);
+    near("disarmed", o.disarmed_at_s.expect("disarmed"), 36.05, 0.3);
     assert!(o.max_height_m < 6.0, "it was at home and did not climb");
     let (_, away) = end_position(&run);
     assert!(away < 1.0, "{away}");
@@ -1052,11 +1051,11 @@ fn no_human_link_is_the_radio_failsafe_first_and_the_ground_station_failsafe_cha
         &[
             ("Radio Failsafe", 15.98, 0.05),
             ("GCS Failsafe", 24.09, 0.05),
-            ("Disarming motors", 35.9, 0.3),
-            ("PreArm: GCS failsafe on", 36.93, 0.3),
-            ("PreArm: Radio failsafe on", 36.93, 0.3),
-            ("PreArm: GCS failsafe on", 67.93, 0.3),
-            ("PreArm: Radio failsafe on", 67.93, 0.3),
+            ("Disarming motors", 36.24, 0.3),
+            ("PreArm: GCS failsafe on", 37.93, 0.3),
+            ("PreArm: Radio failsafe on", 37.93, 0.3),
+            ("PreArm: GCS failsafe on", 68.93, 0.3),
+            ("PreArm: Radio failsafe on", 68.93, 0.3),
         ],
     );
     let (t, _) = run.text("GCS Failsafe").expect("text");
@@ -1068,7 +1067,7 @@ fn no_human_link_is_the_radio_failsafe_first_and_the_ground_station_failsafe_cha
     );
     let o = run.outcome();
     assert!(!o.armed_at_end);
-    near("disarmed", o.disarmed_at_s.expect("disarmed"), 35.9, 0.3);
+    near("disarmed", o.disarmed_at_s.expect("disarmed"), 36.24, 0.3);
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
@@ -1116,8 +1115,8 @@ fn battery_low_arms_and_returns_10_s_after_the_threshold_and_is_still_coming_dow
         &run,
         9.0,
         &[
-            ("Battery 1 is low", 33.52, 0.05),
-            ("Battery Failsafe", 33.52, 0.05),
+            ("Battery 1 is low", 33.82, 0.05),
+            ("Battery Failsafe", 33.82, 0.05),
         ],
     );
     let (t, text) = run.text("Battery 1 is low").expect("text");
@@ -1162,7 +1161,7 @@ fn battery_low_arms_and_returns_10_s_after_the_threshold_and_is_still_coming_dow
     near(
         "greatest height (it climbs to its return height)",
         o.max_height_m,
-        14.96,
+        14.88,
         0.3,
     );
     // It ends in the final descent, not yet down.
@@ -1170,7 +1169,7 @@ fn battery_low_arms_and_returns_10_s_after_the_threshold_and_is_still_coming_dow
     let (_, away) = end_position(&run);
     assert!(away < 1.0, "back above home: {away}");
     let last = run.ticks.last().expect("ticks");
-    near("height at the end", -last.position[2], 3.58, 0.3);
+    near("height at the end", -last.position[2], 3.79, 0.3);
     assert!(last.velocity[2] > 0.1, "descending");
     assert_eq!(class_of(o), Class::Safe);
     assert_violations(&run, &["still armed", "never came down"]);
@@ -1178,7 +1177,7 @@ fn battery_low_arms_and_returns_10_s_after_the_threshold_and_is_still_coming_dow
 
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
-fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() {
+fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_43_s() {
     let (_lease, run) = run_of("battery-critical");
     assert_writes(&run, &[]);
     assert_eq!(
@@ -1194,7 +1193,7 @@ fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() 
             ("Battery Failsafe", 21.62, 0.05),
             ("Battery 1 is critical", 27.32, 0.05),
             ("Battery Failsafe", 27.32, 0.05),
-            ("Disarming motors", 43.88, 0.3),
+            ("Disarming motors", 43.40, 0.3),
             ("PreArm: Battery 1 low voltage failsafe", 44.93, 0.3),
             ("PreArm: Battery failsafe", 44.93, 0.3),
         ],
@@ -1230,7 +1229,7 @@ fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() 
     );
     let o = run.outcome();
     assert!(!o.armed_at_end);
-    near("disarmed", o.disarmed_at_s.expect("disarmed"), 43.88, 0.3);
+    near("disarmed", o.disarmed_at_s.expect("disarmed"), 43.40, 0.3);
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
@@ -1238,7 +1237,7 @@ fn battery_critical_arms_returns_at_low_lands_at_critical_and_is_down_at_44_s() 
         0.15,
     );
     assert_eq!(class_of(o), Class::Safe);
-    assert_violations(&run, &["disarmed at 43.88 s, later than 40 s"]);
+    assert_violations(&run, &["disarmed at 43.40 s, later than 40 s"]);
 }
 
 // ---- The brain --------------------------------------------------------------
@@ -1289,7 +1288,9 @@ fn a_brain_hang_is_not_noticed_either_its_heartbeats_go_on_and_its_targets_stop(
         1e-9,
     );
     assert!(targets_sent(&run).iter().all(|t| *t < 20.0));
-    assert_violations(&run, &["still armed", "never came down", "landed 15."]);
+    // 14.99 m from home on this run: the distance itself is held by
+    // `end north` above, to 0.5 m.
+    assert_violations(&run, &["still armed", "never came down", "landed 14.99 m"]);
 }
 
 #[test]
