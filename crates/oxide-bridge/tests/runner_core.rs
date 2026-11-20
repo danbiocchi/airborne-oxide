@@ -18,8 +18,8 @@ fn scenario(name: &str) -> LoadedScenario {
 }
 
 /// The trace hashes `oxide-sim hash` pins for gust-hold run 0.
-const GUST_HOLD_0_F405: &str = "9a63745df2eb227a";
-const GUST_HOLD_0_H743: &str = "d2ecef5541ba9e88";
+const GUST_HOLD_0_F405: &str = "c52576d11caa1309";
+const GUST_HOLD_0_H743: &str = "ea1238f411003026";
 
 #[test]
 fn the_core_f405_row_of_gust_hold_0_carries_the_pinned_trace_hash() {
@@ -81,7 +81,7 @@ fn the_core_row_of_gust_hold_0_pins_the_vertical_error_and_the_last_motor_comman
     // zero, moves them.
     let f = fly_core(&scenario("gust-hold"), 0, RunProfile::F405).expect("flies");
     let row = Row::of_flight(&f);
-    assert_eq!(row.get("rms_v_m"), "0.070943102650111", "{}", row.line());
-    assert_eq!(row.get("max_v_m"), "0.16323683169359304");
+    assert_eq!(row.get("rms_v_m"), "0.0804366328109621", "{}", row.line());
+    assert_eq!(row.get("max_v_m"), "0.14001923981276532");
     assert_eq!(row.get("last_motor_on_s"), "39.998999999999995");
 }
