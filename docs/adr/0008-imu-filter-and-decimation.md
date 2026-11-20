@@ -1,13 +1,14 @@
 # ADR-0008: The IMU's anti-alias filter and decimation
 
-Status: **proposed, for the owner. Not accepted.** It changes what both autopilots of gate 1 sense ([ADR-0006](0006-ardupilot-bridge.md) §4), so by [ADR-0007](0007-gate-1-criteria.md) §7 it must be accepted as a record before the gate is flown again. It changes no criterion. Nothing in it was judged on gust-hold runs 0 to 499, the gate's seeds. The repository's default tests fly a few of those runs, as they always do: runs 0 to 7 against the file's limits (`gust_hold_quick`, which passes) and runs 0 and 1 to compare trace hashes. No figure from those runs is used here.
+Status: **accepted by the owner on 20 November 2026 as the simulator's IMU model. It takes effect after gate 1's second run.** That run is flown on the IMU of the first run, with every condition of [ADR-0007](0007-gate-1-criteria.md) as it was, and this branch is merged after it (the decision and its reasons are below). The model changes what both autopilots sense ([ADR-0006](0006-ardupilot-bridge.md) §4), which is why it does not go under a gate between two of its runs. It changes no criterion. Nothing in it was judged on gust-hold runs 0 to 499, the gate's seeds. The repository's default tests fly a few of those runs, as they always do: runs 0 to 7 against the file's limits (`gust_hold_quick`, which passes) and runs 0 and 1 to compare trace hashes. No figure from those runs is used here.
 
 ## In short, for the owner
 
 - **The model:** the IMU samples at 8 kHz on its own clock. Its noise passes a 256 Hz second-order anti-alias filter, and each reader is given every Nth sample. The vibration is a density (6.325e-4 rad/s/√Hz and 1.581e-2 m/s²/√Hz at hover, flat to 4 kHz), equal to what the F405 and ArduCopter streams already carried. The noise a 1 kHz and a 4 kHz reader get agrees within 3 % (tested).
 - **Effect, runs 500 to 999:** the F405 does not move beyond the redraw, the H743 rises to the F405 (the gap is gone), and ArduCopter does not move. **The comparison with ArduCopter does not move measurably,** because both read one stream whose density in the loops' band is unchanged. This is not a fix for gate 1's failed A2.
-- **A gate-condition problem it creates:** ArduCopter's committed tuning procedure fails on the new IMU (yaw does not finish in its 480 s window, or the vehicle drifts 100 m in ALT_HOLD; none of 4 seeds succeeds, against 3 of 4 before). Three ways forward are below. Choosing one is the owner's decision, in this record, before the next run.
-- **Pins:** on our core's side, 124 of the 129 scenario hashes, 8 of the 10 `oxide-sim hash` lines, the gust-hold 0 pins of two bridge test files, and one bound of CI's bounds sweep. On ArduCopter's side, 13 tests that fail when run here, 3 tuning tests that fail by the procedure's own result, and the stick test's gust-hold 0 hashes. Nothing is regenerated until the owner says yes.
+- **A gate-condition problem it creates:** ArduCopter's committed tuning procedure fails on the new IMU on its own seed (yaw does not finish in its 480 s window). Twenty seeds show that the procedure is fragile on both models (accepted on 6 of 20 on the old IMU and 4 of 20 on the new), not that the new IMU breaks it.
+- **Decided:** gate 1's second run keeps the old IMU. The model is merged after it, the tuning procedure is changed in gate 2's record, and the pins are regenerated once, at the merge.
+- **Pins:** on our core's side, 124 of the 129 scenario hashes, 8 of the 10 `oxide-sim hash` lines, the gust-hold 0 pins of two bridge test files, and one bound of CI's bounds sweep. On ArduCopter's side, 13 tests that fail when run here, 3 tuning tests that fail by the procedure's own result, and the stick test's gust-hold 0 hashes. None is regenerated before the merge.
 
 ## Context
 
@@ -70,19 +71,45 @@ Why: the two read one stream, and the density both use is unchanged. The only co
 | seed 2 | fly-away (100 m out at 286.5 s) | fly-away (100 m out at 275.7 s) |
 | seed 3 | success, yaw at 535.5 s | yaw not complete by the descent |
 
-Yaw's rate-D stage took 110 to 134 s on the old model and 172 to 196 s on the new one, in every flight that reached it. The procedure's 480 s window was set on the old model with about 40 s to spare (ADR-0007 §2). Why the stage is slower was not isolated. Four seeds are few. The direction is the same in both pairs that can be compared (seeds 0 and 3), and the procedure succeeded on three seeds of four before and on none after. The spectrum rule of step 4 still finds no peak (largest line 2.0 to 2.5 times the band's median power, against 1.4 to 1.6 before; the rule is 10), so no notch either way.
+In these four, yaw's rate-D stage took 110 to 134 s on the old model and 172 to 196 s on the new one, which read as the new IMU slowing the tuner. **Twenty seeds, flown after the owner's decision, show that it does not** (below): the four were too few. The procedure's 480 s window was set on the old model with about 40 s to spare (ADR-0007 §2). The spectrum rule of step 4 still finds no peak (largest line 2.0 to 2.5 times the band's median power, against 1.4 to 1.6 before; the rule is 10), so no notch either way.
 
-So, if this record is accepted, one of these must be decided in it, before the gate is flown again:
+Three ways forward were put to the owner:
 
 1. **Keep the committed tuned file** and record that it was tuned on the old IMU. This is measured on gusts: with it, ArduCopter's error on runs 500 to 999 did not move (above). The test that a fresh run writes the committed file then fails until the procedure changes.
 2. **Change the tuning procedure** so that it completes on the new IMU, and commit what it writes. One example is yaw in a second flight, which ArduCopter's `AUTOTUNE_AXES` allows. A longer window is not possible: the pack is about empty 650 s into the flight. This is a change to ADR-0007 §2, so it needs this record, and the flights must be on seeds other than the gate's.
 3. **Keep the old IMU for gate 1's second run** and adopt this model after it. The F405-against-H743 artefact then stays in that run's H743 figures, which decide nothing.
 
+**The owner chose the third** (20 November 2026), with these reasons:
+
+- **The model buys gate 1 nothing.** The comparison that decides (F405 against ArduCopter) did not move on runs 500 to 999, and the gap it removes (F405 against H743) decides nothing in gate 1.
+- **It would redraw a criterion that failed narrowly.** A2 failed by 0.0053 m at the 95th percentile (0.22612 m against 0.22087 m). Redrawing the IMU's noise alone moved ArduCopter's 95th percentile on runs 500 to 999 by +0.0035 m (−0.0022 to +0.0079) and our core's by +0.0044 m (−0.0109 to +0.0128). A pass after the change could not be told from the redraw.
+- **On the old IMU the target stays where it is.** A bridged flight repeats bit for bit when nothing on its side changes (ADR-0006 §8), so ArduCopter's 500 gust flights and its two figures are the first run's, and the second run measures the core alone.
+- **The tuning result was not explained** when the decision was taken: on four seeds the tuner looked slower on the new IMU although the density in the band it uses is unchanged. The twenty seeds below explain it as chance, so this reason has fallen away. The first three do not depend on it.
+
+Two things follow for gate 1's second run:
+
+1. **A change to the core is judged on both IMUs before the gate is flown** (runs 500 to 999, the old model on the main line and the new one on this branch), so that a pass does not rest on the noise between 256 and 500 Hz that the new model removes.
+2. **The report says that the H743's figures carry the artefact:** on the old IMU the H743 reads half the F405's vibration density, which is worth about 0.014 m at the median (this record's measurement).
+
+**The tuning, when the model is adopted.** The procedure is changed so that it completes on the new IMU (the second way above), in gate 2's record, where the tuning rule is written anew in any case (ADR-0007, deferred). The committed file is not carried on as a file the code can no longer write. What a change must mend is shown by twenty seeds of the procedure on each model (seeds 0 to 19, the committed script, calm air; the tuning's seed is its own, and none of these is a gust-hold run):
+
+| Seeds 0 to 19 | Old model | New model |
+|---|---|---|
+| Accepted: the tuner's success, gains saved, the flight safe | 6 | 4 |
+| Fly-away: 100 m from where it armed, drifting in ALT_HOLD | 9 | 13 |
+| Yaw not complete when the 480 s window ends | 5 | 3 |
+| Yaw's rate-D stage, where it finished | median 158 s (110 to 276 s, 11 flights) | median 164 s (112 to 244 s, 7 flights) |
+
+- **The procedure is fragile on both models.** The committed file comes from seed 0 on the old model, one of the six seeds in twenty on which the procedure is accepted. ADR-0007 §2 is met by it as written: the procedure is that one flight.
+- **Twenty seeds do not tell the two models apart.** Six seeds are accepted on the old model only and four on the new one only (none on both). Yaw's slow stage takes the same time. The seed decides, not the IMU: each seed is a different draw of the noise on each model.
+- **The gains are the airframe's.** Where the procedure is accepted it writes the same family of gains on either model: roll and pitch rate P 0.0547 to 0.0608, their angle P 25.4 or 27.75, yaw rate P 0.0483 to 0.0538, hover thrust 0.1499 to 0.1500. The committed file lies inside these ranges, at the low end of several. ADR-0007's first looks found that going from angle gains of 4.5 to 25 moved no gust run by more than 1.5 mm, so this spread should not matter to criterion A (not flown).
+- **What a change must mend** is therefore in the procedure and not in the IMU: the drift in ALT_HOLD, which carries the vehicle 100 m away in about half the flights, and yaw's tuning, which does not always fit in what the pack allows.
+
 Criteria A1, A2, B1, B2 and B3 are unchanged in every case. On criterion B's side, our core was flown on every fault file, on the seeds each names and on both profiles (`fault_scenarios_full`), and every flight passes its file's expectations. ArduCopter's fault flights were not flown in bulk, because those are the gate's own flights of criterion B. Run 0 of several, from the binary's own tests, is listed below.
 
 ## The pins that move
 
-None of these has been regenerated. Every one waits for the owner's yes. The failing tests on this branch are these pins and nothing else.
+None of these has been regenerated. By the owner's decision they are regenerated once, when this branch is merged after gate 1's second run, in a commit of their own: the core's improvement for that run moves every pin of our core's flights anyway. Until then the failing tests on this branch are these pins and nothing else. At the merge, `POS_VELZ_P` at its minimum goes into the bounds sweep's `KNOWN` list (below), and the IMU read-back test gets another seed or a correction that holds across zero, not a new number.
 
 **Our core's flights** (the default test run; every one was run):
 
@@ -125,7 +152,8 @@ Not run, because they fly gust-hold's gate seeds or the gate program: `arducopte
 
 ## Consequences
 
-- If accepted: the pins above are regenerated (with the owner's yes, as a separate step), and ADR-0006 §4's read-back figures are measured again on the new model. The tuning question of the section above is decided, and gate 1's second run then flies this IMU on both sides.
+- Gate 1's second run is flown on the main line as it is, on the IMU of the first run. This branch is merged after it. At the merge the pins above are regenerated, ADR-0006 §4's read-back figures are measured again on the new model, and ArduCopter's tuning procedure is changed in gate 2's record.
+- Until the merge this branch is rebased onto the main line as the core changes. The model is in `sensors.rs`, one test file and three documents, so the rebase is small.
 - The F405 and H743 profiles become comparable on the IMU. A difference between them now measures the core's rates, not the IMU's sampling.
 - The noise a reader gets no longer depends on its period. A bridged flight could therefore read the IMU at every 500 µs step without the √2 of ADR-0006 §4. The 1000 µs grid is kept anyway, so that this record changes one thing.
 - The simulation of our core is slower (F405 by about 70 %, H743 by about 10 %), and still well inside DESIGN §5.1.
