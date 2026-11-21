@@ -283,6 +283,17 @@ fn the_fence_parameters_are_in_the_program_and_the_flight_shows_the_fence_acting
     let setup = Setup::new(binary(), root.path().join("flight"), lease.0);
     let f = fly_scenario(&src, 0, &setup).unwrap_or_else(|e| panic!("{e}"));
     let a = f.audit.as_ref().expect("audit");
+    // The effective parameter file this real flight was given has the hash
+    // the gate expects of a flight of this scenario (the fenced value, which
+    // the code reconstructs and which `files.rs` pins).
+    println!("MEASURED geofence params sha256 {}", a.params_sha256);
+    assert_eq!(
+        Some(a.params_sha256.as_str()),
+        oxide_bridge::gate::files::expected_params_sha256("geofence")
+            .ok()
+            .as_deref(),
+        "the effective parameter file of a geofence flight"
+    );
     let o = &f.verdict.outcome;
     println!(
         "MEASURED geofence 0: class {}, max distance from home {:.2} m, max height {:.2} m, \
