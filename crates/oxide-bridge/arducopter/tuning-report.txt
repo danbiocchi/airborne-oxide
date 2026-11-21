@@ -1,18 +1,18 @@
 oxide-bridge tune: report
-  commit e927c6e70873c6b54e86f533cc91b6b6659a1bc7
-  seed 0, instance 0
+  commit 9f1d8903a371c8ecfe6703b9a245e5c11030d3e9
+  seed 0, instance 2
   binary sha256 caed35e4cb796ec06cac40b09566a18251771486b1cbac5e2bf16b7a5ed5045d
   RESULT: the tuner ran to its success and saved-gains messages
   procedure: two tuning flights from POSHOLD (roll and pitch, then yaw on the gains the first saved), the notch decided once, on the hover of the first flight flown
   notch: none; the hover of flight 1 showed no peak, and no flight has a notch
-  the tuner's settings as read back from the program (flight 1): AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 3, AUTOTUNE_MIN_D 0.0005
-  simulated flight time of the procedure 1195.3 s (and 45 s of pre-roll per flight), wall time 77.4 s
+  simulated flight time of the procedure 1195.3 s (and 45 s of pre-roll per flight), wall time 139.9 s
 flight 1 (flight-1)
   tunes: Roll Pitch (AUTOTUNE_AXES 3); a peak in its hover lands it after the hover instead
   its hover decides the notch: yes (a peak lands it after the hover)
   parameter files base.parm setup.parm starting-gains.parm
+  the tuner's settings as read back from the program before this flight: AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 3, AUTOTUNE_MIN_D 0.0005
   extra parameters AUTOTUNE_AXES=3
-  trace hash 891b4011f3429c26, simulated 597.649 s, wall 38.7 s
+  trace hash 891b4011f3429c26, simulated 597.649 s, wall 69.1 s
   stages (flight time): POSHOLD command 2.000 s, arm switch 13.000 s, throttle up 16.000 s, hover 24.759 s, spectrum 84.759 s, AUTOTUNE 85.759 s, descent 565.759 s, on the ground (throttle low) 581.806 s, disarmed (pulses) 583.649 s, read-back 588.649 s, end 597.649 s
   furthest 2.77 m out (at 216.3 s), highest 10.65 m; hover (last 20 s): tilt rms 1.339 deg, position rms 0.159 m about its mean, height rms 0.077 m; in AUTOTUNE: furthest 2.54 m from where it began, height change up to 0.31 m, tilt up to 15.57 deg
   physics outcome (the gate's own): furthest from where it armed 2.77 m (limit 100 m), highest 10.65 m (limit 60 m), largest tilt while armed 15.57 deg, touchdown speed Some(0.6866311408616877) m/s, worst impact Some(0.6866311408616877) m/s
@@ -252,8 +252,9 @@ flight 2 (flight-2)
   tunes: Yaw (AUTOTUNE_AXES 4)
   its hover decides the notch: no (its spectrum is reported and decides nothing)
   parameter files base.parm setup.parm starting-gains.parm tuned-gains-1.parm
+  the tuner's settings as read back from the program before this flight: AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 4, AUTOTUNE_MIN_D 0.0005
   extra parameters AUTOTUNE_AXES=4
-  trace hash 824ac2b626d85c4c, simulated 597.649 s, wall 38.6 s
+  trace hash 824ac2b626d85c4c, simulated 597.649 s, wall 70.8 s
   stages (flight time): POSHOLD command 2.000 s, arm switch 13.000 s, throttle up 16.000 s, hover 24.759 s, spectrum 84.760 s, AUTOTUNE 85.760 s, descent 565.760 s, on the ground (throttle low) 581.808 s, disarmed (pulses) 583.649 s, read-back 588.649 s, end 597.649 s
   furthest 1.57 m out (at 156.3 s), highest 10.63 m; hover (last 20 s): tilt rms 1.321 deg, position rms 0.159 m about its mean, height rms 0.077 m; in AUTOTUNE: furthest 1.54 m from where it began, height change up to 0.29 m, tilt up to 0.85 deg
   physics outcome (the gate's own): furthest from where it armed 1.57 m (limit 100 m), highest 10.63 m (limit 60 m), largest tilt while armed 3.12 deg, touchdown speed Some(0.686433761576502) m/s, worst impact Some(0.686433761576502) m/s
