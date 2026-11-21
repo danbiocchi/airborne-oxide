@@ -55,6 +55,7 @@ RMS of the horizontal distance from the hold point, from 15 s to the end of each
 - **By hundreds of runs** our 95th percentile is below ArduCopter's in all five (0.2000 against 0.2212, 0.1960 against 0.2182, 0.1975 against 0.2217, 0.2069 against 0.2142, 0.1992 against 0.2181). In the first run it was above in four of the five.
 - **The spread across runs** narrowed: a standard deviation of 0.025 m, against 0.030 m in the first run and ArduCopter's 0.026 m.
 - **Most of the error is still the estimate.** On the true state the same core holds about 0.030 m at the median.
+- **The H743 figures here are flattered.** This run was flown before the simulator's IMU model changed ([ADR-0008](../../../adr/0008-imu-filter-and-decimation.md), in force since 21 November). The IMU of this run gave the 4 kHz H743 profile half the vibration noise density that the 1 kHz F405 profile and ArduCopter got. On gust-hold runs 500 to 999 the new model raises the H743's error by 0.007 m at the median and 0.015 m at the 95th percentile, to the F405's level. The F405's figures, which decide, and ArduCopter's did not move there beyond the redraw of the noise: our F405 core's 95th percentile is 0.940 of ArduCopter's on either IMU. The H743 decides nothing in A2, and the gate was not flown again.
 - Reported and deciding nothing: our vertical error is smaller than ArduCopter's (median 0.057 m against 0.093 m) and our tilt larger (median 9.4° against 6.7°), as in the first run.
 
 ![cumulative curves of the position error](gate-1-cumulative.svg)
