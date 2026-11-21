@@ -3889,36 +3889,60 @@ mod tests {
             (Fault::SetupIgnored, "INS_GYRO_FILTER"),
             (Fault::ClassExit, "not class safe"),
         ];
-        for (flight, axes_text) in [
-            (1, "AutoTune: Roll"),
-            (1, "AutoTune: Pitch"),
-            (2, "AutoTune: Yaw"),
+        // Both paths: with no peak the flights are 1 (roll and pitch) and 2
+        // (yaw); with a peak in the first hover flight 1 lands on it and the
+        // tuning flights, which fly the notch, are 2 and 3.
+        for (peaks, flights) in [
+            (
+                Vec::new(),
+                [
+                    (1, "AutoTune: Roll"),
+                    (1, "AutoTune: Pitch"),
+                    (2, "AutoTune: Yaw"),
+                ],
+            ),
+            (
+                vec![1],
+                [
+                    (2, "AutoTune: Roll"),
+                    (2, "AutoTune: Pitch"),
+                    (3, "AutoTune: Yaw"),
+                ],
+            ),
         ] {
-            let mut cases: Vec<(Fault, String)> =
-                faults.iter().map(|(f, w)| (*f, (*w).to_string())).collect();
-            cases.push((Fault::NoText(axes_text), axes_text.to_string()));
-            for (fault, want) in cases {
-                let tag =
-                    format!("fault-{flight}-{fault:?}").replace(['"', ' ', ':', '(', ')', '.'], "");
-                let (dir, plans, result) = run(
-                    &tag,
-                    &Fake {
-                        peaks: Vec::new(),
-                        fault: Some((flight, fault)),
-                    },
-                );
-                let e = result.expect_err(&format!("flight {flight}: {fault:?}"));
-                let e = e.to_string();
-                assert!(
-                    e.contains(&format!("flight {flight}:")) && e.contains(&want),
-                    "flight {flight}, {fault:?}: {e}"
-                );
-                assert_eq!(plans.len(), flight, "the procedure stops at the failure");
-                assert!(!exists(&dir, "tuned-gains.parm"), "{fault:?}");
-                assert_eq!(exists(&dir, "tuned-gains-1.parm"), flight == 2, "{fault:?}");
-                assert!(exists(&dir, "report.txt"));
-                let report = std::fs::read_to_string(dir.0.join("report.txt")).expect("report");
-                assert!(report.contains("RESULT: FAILED: flight"), "{report}");
+            let last = flights.iter().map(|(n, _)| *n).max().expect("flights");
+            for (flight, axes_text) in flights {
+                let mut cases: Vec<(Fault, String)> =
+                    faults.iter().map(|(f, w)| (*f, (*w).to_string())).collect();
+                cases.push((Fault::NoText(axes_text), axes_text.to_string()));
+                for (fault, want) in cases {
+                    let tag = format!("fault-{}-{flight}-{fault:?}", peaks.len())
+                        .replace(['"', ' ', ':', '(', ')', '.'], "");
+                    let (dir, plans, result) = run(
+                        &tag,
+                        &Fake {
+                            peaks: peaks.clone(),
+                            fault: Some((flight, fault)),
+                        },
+                    );
+                    let e = result.expect_err(&format!("flight {flight}: {fault:?}"));
+                    let e = e.to_string();
+                    assert!(
+                        e.contains(&format!("flight {flight}:")) && e.contains(&want),
+                        "{} peaks, flight {flight}, {fault:?}: {e}",
+                        peaks.len()
+                    );
+                    assert_eq!(plans.len(), flight, "the procedure stops at the failure");
+                    assert!(!exists(&dir, "tuned-gains.parm"), "{fault:?}");
+                    assert_eq!(
+                        exists(&dir, "tuned-gains-1.parm"),
+                        flight == last,
+                        "{fault:?}"
+                    );
+                    assert!(exists(&dir, "report.txt"));
+                    let report = std::fs::read_to_string(dir.0.join("report.txt")).expect("report");
+                    assert!(report.contains("RESULT: FAILED: flight"), "{report}");
+                }
             }
         }
         // The roll-and-pitch flight is not asked for the yaw message and the
