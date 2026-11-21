@@ -1,6 +1,6 @@
 # ADR-0007: The criteria of benchmark gate 1
 
-Status: accepted, before the run (DESIGN §8 rule 4). The gate was flown on 18 November 2026 at commit `2c2fedb` and was **not passed**: criterion A2 failed on the 95th percentile. After one change to the estimator, found on other seeds under the rules below, it was flown again on 19 November 2026 at commit `92fdaa2` and **passed**. Both runs are recorded at the end of this record; the reports are [`docs/gates/gate-1/`](../gates/gate-1/README.md) and [`docs/gates/gate-1/run-2/`](../gates/gate-1/run-2/README.md). The criteria did not change.
+Status: accepted, before the run (DESIGN §8 rule 4). The gate was flown on 18 November 2026 at commit `2c2fedb` and was **not passed**: criterion A2 failed on the 95th percentile. After one change to the estimator, found on other seeds under the rules below, it was flown again on 19 November 2026 at commit `92fdaa2` and **passed**. Both runs are recorded at the end of this record; the reports are [`docs/gates/gate-1/`](../gates/gate-1/README.md) and [`docs/gates/gate-1/run-2/`](../gates/gate-1/run-2/README.md). The criteria did not change. **From gate 2 on ArduCopter is tuned by [ADR-0009](0009-arducopter-tuning.md):** §2 below is gate 1's procedure, kept as that gate's record.
 
 ## Context
 
@@ -22,6 +22,8 @@ How ArduCopter is flown is in [ADR-0006](0006-ardupilot-bridge.md). Four points 
 - **Our core:** the commit the gate is run on, with the parameters that commit ships. Both chip profiles are flown. The **F405 profile decides**, because a bridged flight has the same wind as the F405 flight of the same seed, sample for sample (ADR-0006 §7). The H743 profile is reported and must meet criterion A1 as well.
 
 ### 2. How ArduCopter is tuned
+
+*This is how ArduCopter was tuned for gate 1. On the IMU model of ADR-0008 the tuning flight below is no longer accepted on its own seed, and [ADR-0009](0009-arducopter-tuning.md) replaces it for every later gate: two flights from POSHOLD in place of one from ALT_HOLD, with the notch decided once. The five steps, the set-up values, the acceptance checks and the rule about what the script may decide carry over. The file at the path named below is now ADR-0009's. Gate 1's file and script are at the commits of its two runs.*
 
 In this order, in calm air on a full pack, by a script that is committed with the report:
 
