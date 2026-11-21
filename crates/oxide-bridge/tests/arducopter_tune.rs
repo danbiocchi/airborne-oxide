@@ -801,6 +801,16 @@ fn a_flight_that_loads_a_tuned_file_with_notch_lines_has_the_notch_set_in_the_pr
                 assert_eq!(read(name), value, "{name}");
             }
         } else {
+            // The list this flight was started with is a gate flight's: the
+            // effective file the program was given has the hash the gate
+            // expects of a flight of a plain scenario.
+            assert_eq!(
+                Some(audit.params_sha256.as_str()),
+                oxide_bridge::gate::files::expected_params_sha256("gust-hold")
+                    .ok()
+                    .as_deref(),
+                "the effective parameter file of a gate flight"
+            );
             assert_eq!(
                 read("INS_HNTCH_ENABLE"),
                 0.0,

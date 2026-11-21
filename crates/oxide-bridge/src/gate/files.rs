@@ -433,13 +433,15 @@ mod tests {
         assert_eq!(hashes.len(), committed_params(&airframe).0.len());
     }
 
-    /// The effective parameter file the real program was given in flights of
-    /// the trial of ADR-0007's gate (the audits' `params sha256`): the
-    /// reconstruction here is the runner's.
+    /// The effective parameter file the real program is given in a bridged
+    /// flight (the audits' `params sha256`): the reconstruction here is the
+    /// runner's. The values moved with the tuned file of ADR-0009; the first
+    /// is the hash of a real flight's audit, which `arducopter_tune` compares
+    /// (`a_flight_that_loads_a_tuned_file_with_notch_lines_...`).
     #[test]
     fn the_expected_parameter_hash_is_the_one_real_flights_recorded() {
-        let plain = "8db5323869d2895814634b63e9890f40738e0241c0801a65079ed8f70c479017";
-        let fenced = "2fae2241d0c105580e781cbea337071e2f87cd1ce9e36795a090a4eceb464b62";
+        let plain = "71b263adc1cc30e8984eb0a2ac3a782f5bea17c3db6e51a3e54a78a3fe5caf65";
+        let fenced = "49be7ab7308148c26a9bb7477378b34db679684b22f1e17453db8f652bc9d75c";
         for s in ["gps-loss", "gust-hold", "battery-low"] {
             assert_eq!(expected_params_sha256(s).as_deref(), Ok(plain), "{s}");
         }
