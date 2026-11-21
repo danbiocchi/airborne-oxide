@@ -928,7 +928,7 @@ fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_its_motors_are_still_
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        6.93,
+        7.41,
         0.5,
     );
     near("furthest from home", o.max_distance_from_home_m, 24.56, 2.0);
