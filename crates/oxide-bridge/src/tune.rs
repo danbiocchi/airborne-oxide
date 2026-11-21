@@ -3295,4 +3295,896 @@ mod tests {
             "the spectrum is not taken from the truth"
         );
     }
+
+    // ---- The two-flight procedure, without the program --------------------------
+
+    fn names_of(files: &[PathBuf]) -> Vec<String> {
+        files
+            .iter()
+            .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn extra_of(plan: &FlightPlan) -> Vec<(&str, f64)> {
+        plan.extra.iter().map(|(n, v)| (n.as_str(), *v)).collect()
+    }
+
+    fn config() -> TuneConfig {
+        TuneConfig {
+            binary: PathBuf::from("/nonexistent/arducopter"),
+            out: PathBuf::from("/nonexistent/out"),
+            instance: 3,
+            seed: 5,
+        }
+    }
+
+    fn a_notch() -> Notch {
+        let line = Line {
+            axis: 1,
+            freq_hz: 222.5,
+            ratio: 19.0,
+        };
+        Notch {
+            flight: 1,
+            line,
+            reference: 0.1495,
+            params: notch_params(222.5, 0.1495),
+        }
+    }
+
+    #[test]
+    fn the_notch_names_are_those_of_the_notch_params_in_their_order() {
+        let p = notch_params(150.0, 0.18);
+        let names: Vec<&str> = p.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, NOTCH_NAMES);
+        assert!(NOTCH_NAMES.iter().all(|n| n.starts_with("INS_HNTCH_")));
+        assert!(NOTCH_NAMES.iter().all(|n| n.len() <= 16));
+    }
+
+    #[test]
+    fn the_flights_are_planned_as_the_decision_says_with_and_without_a_notch() {
+        let cfg = config();
+        let one = Path::new("/out/tuned-gains-1.parm");
+        let none = ["base.parm", "setup.parm", "starting-gains.parm"];
+        // Roll and pitch, no notch decided yet: the first flight flown. It
+        // stops on a peak, and flies the starting gains with AUTOTUNE_AXES 3.
+        let p = flight_plan(&cfg, 1, Part::RollPitch, None);
+        assert_eq!(names_of(&p.files), none);
+        assert_eq!(extra_of(&p), [("AUTOTUNE_AXES", 3.0)]);
+        assert!(p.stop_on_peak && !p.read_notch && !p.stop_after_hover);
+        assert_eq!(p.flight_name, "flight-1");
+        assert_eq!((p.instance, p.seed, p.autotune_s), (3, 5, AUTOTUNE_S));
+        assert!(p.enforce_class);
+        // Roll and pitch with the notch: from the start, with the notch and
+        // MOT_THST_HOVER at the learned thrust; the hover decides nothing.
+        let n = a_notch();
+        let p = flight_plan(&cfg, 2, Part::RollPitch, Some(&n));
+        assert_eq!(names_of(&p.files), none);
+        let mut want = vec![("AUTOTUNE_AXES", 3.0)];
+        want.extend(n.params.iter().map(|(k, v)| (k.as_str(), *v)));
+        want.push(("MOT_THST_HOVER", 0.1495));
+        assert_eq!(extra_of(&p), want);
+        assert!(!p.stop_on_peak && !p.read_notch);
+        // Yaw with no notch: the first flight's gains after the starting
+        // gains, AUTOTUNE_AXES 4, no notch, the hover decides nothing.
+        let p = flight_plan(
+            &cfg,
+            2,
+            Part::Yaw {
+                roll_pitch_file: one,
+            },
+            None,
+        );
+        assert_eq!(
+            names_of(&p.files),
+            [
+                "base.parm",
+                "setup.parm",
+                "starting-gains.parm",
+                "tuned-gains-1.parm"
+            ]
+        );
+        assert_eq!(extra_of(&p), [("AUTOTUNE_AXES", 4.0)]);
+        assert!(!p.stop_on_peak && !p.read_notch);
+        // Yaw with the notch: the same six values, no MOT_THST_HOVER (the
+        // file carries the thrust the first flight saved), the notch read
+        // back after it.
+        let p = flight_plan(
+            &cfg,
+            3,
+            Part::Yaw {
+                roll_pitch_file: one,
+            },
+            Some(&n),
+        );
+        let mut want = vec![("AUTOTUNE_AXES", 4.0)];
+        want.extend(n.params.iter().map(|(k, v)| (k.as_str(), *v)));
+        assert_eq!(extra_of(&p), want);
+        assert!(!p.stop_on_peak && p.read_notch);
+        assert_eq!(p.files.last().map(PathBuf::as_path), Some(one));
+        assert_eq!(Part::RollPitch.axes(), ["Roll", "Pitch"]);
+        assert_eq!(
+            Part::Yaw {
+                roll_pitch_file: one
+            }
+            .axes(),
+            ["Yaw"]
+        );
+    }
+
+    /// What goes wrong in a fake flight.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Fault {
+        /// No status text that starts with this.
+        NoText(&'static str),
+        /// The read-back after the flight lacks this name.
+        Unread(&'static str),
+        /// The pack voltage before the descent.
+        Pack(f64),
+        /// The program kept its 20 Hz gyro filter.
+        SetupIgnored,
+        /// The flight left class safe.
+        ClassExit,
+        /// The yaw flight moves this value.
+        YawMoves(&'static str),
+        /// The program is not given the roll-and-pitch flight's file.
+        FileNotLoaded,
+        /// The notch's frequency reads back differently.
+        NotchDiffers,
+        /// A notch name is not read back.
+        NotchUnread,
+        /// The learned hover thrust is not read at the end of the hover.
+        ThrustUnread,
+    }
+
+    #[derive(Clone, Default)]
+    struct Fake {
+        /// The flights (from 1) whose hover shows a peak.
+        peaks: Vec<usize>,
+        fault: Option<(usize, Fault)>,
+    }
+
+    fn fake_flight(plan: &FlightPlan, fake: &Fake) -> FlightResult {
+        use crate::arducopter::{Heard, LinkName};
+        use crate::mav::MavEvent;
+        let number: usize = plan
+            .flight_name
+            .strip_prefix("flight-")
+            .and_then(|n| n.parse().ok())
+            .expect("a flight name");
+        let fault = fake.fault.filter(|(n, _)| *n == number).map(|(_, f)| f);
+        let is = |f: Fault| fault == Some(f);
+        let bits = plan
+            .extra
+            .iter()
+            .find(|(n, _)| n == "AUTOTUNE_AXES")
+            .map_or(7.0, |(_, v)| *v);
+        // What the program holds at the start: the files, then the extras.
+        let mut held: BTreeMap<String, f64> =
+            GAIN_NAMES.iter().map(|n| ((*n).to_string(), 1.0)).collect();
+        for file in &plan.files {
+            if is(Fault::FileNotLoaded)
+                && names_of(std::slice::from_ref(file)) == ["tuned-gains-1.parm"]
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(file).expect("a parameter file");
+            for (n, v) in parm::parse(&text).expect("parses") {
+                held.insert(n, v);
+            }
+        }
+        for (n, v) in &plan.extra {
+            held.insert(n.clone(), *v);
+        }
+        let param = |at_us: u64, name: &str, value: f32| Heard {
+            at_us,
+            link: LinkName::Instrument,
+            event: MavEvent::ParamValue {
+                name: name.to_string(),
+                value,
+                index: 0,
+                count: 0,
+            },
+        };
+        let mut heard = Vec::new();
+        for n in before_names() {
+            let mut v = held.get(n).copied().unwrap_or(0.0) as f32;
+            if n == "INS_GYRO_FILTER" && is(Fault::SetupIgnored) {
+                v = 20.0;
+            }
+            heard.push(param(program_us(5 * S), n, v));
+        }
+        let peak_here = fake.peaks.contains(&number);
+        let line = Line {
+            axis: 1,
+            freq_hz: 200.0 + number as f64,
+            ratio: if peak_here { 19.0 } else { 1.5 },
+        };
+        let spectrum = (
+            Spectrum {
+                sample_hz: 1000.0,
+                bin_hz: 1000.0 / SEGMENT as f64,
+                amplitude: [vec![0.0; 513], vec![0.0; 513], vec![0.0; 513]],
+                samples: 30_000,
+                segments: 57,
+            },
+            Verdict {
+                lines: [line; 3],
+                peak: peak_here.then_some(line),
+            },
+        );
+        let learned = 0.15 + 0.001 * number as f64;
+        let mut marks = Marks {
+            arm: 13 * S,
+            climb: Some(16 * S),
+            hover: Some(25 * S),
+            spectrum: Some(85 * S),
+            ..Marks::default()
+        };
+        if !is(Fault::ThrustUnread) {
+            heard.push(param(
+                program_us(85 * S + S / 2),
+                "MOT_THST_HOVER",
+                learned as f32,
+            ));
+        }
+        let landed_on_peak = plan.stop_on_peak && peak_here;
+        let mut texts: Vec<(u64, u8, String)> = Vec::new();
+        let mut stats = Stats {
+            class: Some(FlightClass::Safe),
+            ..Stats::default()
+        };
+        let sim_s;
+        if landed_on_peak {
+            // Landed after the hover: ends 5 s after the disarm, no tuner.
+            marks.descent = Some(87 * S);
+            marks.throttle_low = Some(100 * S);
+            marks.disarmed = Some(101 * S);
+            marks.end = Some(106 * S);
+            sim_s = 106.0;
+        } else {
+            marks.autotune = Some(86 * S);
+            marks.descent = Some(566 * S);
+            marks.throttle_low = Some(580 * S);
+            marks.disarmed = Some(582 * S);
+            marks.read_back = Some(587 * S);
+            marks.end = Some(600 * S);
+            sim_s = 600.0;
+            let mut say = |t: u64, text: &str| texts.push((program_us(t * S), 6, text.to_string()));
+            say(86, "AutoTune: Started");
+            let mut saved = Vec::new();
+            if bits == 3.0 {
+                say(190, "AutoTune: Roll complete");
+                say(280, "AutoTune: Pitch complete");
+                saved = vec!["Roll", "Pitch"];
+            } else if bits == 4.0 {
+                say(400, "AutoTune: Yaw(E) complete");
+                saved = vec!["Yaw(E)"];
+            }
+            say(500, "AutoTune: Success");
+            say(
+                582,
+                &format!("AutoTune: Saved gains for {}", saved.join(" ")),
+            );
+            if let Some(Fault::NoText(prefix)) = fault {
+                texts.retain(|(_, _, t)| !t.starts_with(prefix));
+            }
+            // The tuner moves what it tunes.
+            for (n, v) in &mut held {
+                // The tuner leaves what setup.parm sets alone (the real
+                // tuner's changes to those are the yaw error filter's, later).
+                if !GAIN_NAMES.contains(&n.as_str()) || SETUP_NAMES.contains(&n.as_str()) {
+                    continue;
+                }
+                let roll_pitch = n.contains("RLL")
+                    || n.contains("PIT")
+                    || n == "ATC_ACC_R_MAX"
+                    || n == "ATC_ACC_P_MAX";
+                let yaw = n.contains("YAW") || n == "ATC_ACC_Y_MAX";
+                if bits == 3.0 && roll_pitch {
+                    *v = *v * 2.0 + 0.5;
+                } else if bits == 4.0 && yaw {
+                    *v = *v * 3.0 + 0.25;
+                } else if n == "MOT_THST_HOVER" {
+                    *v = learned;
+                }
+            }
+            if let Some(Fault::YawMoves(name)) = fault
+                && bits == 4.0
+                && let Some(v) = held.get_mut(name)
+            {
+                *v += 1.0;
+            }
+            for (n, v) in &held {
+                if GAIN_NAMES.contains(&n.as_str())
+                    && !matches!(fault, Some(Fault::Unread(u)) if u == n)
+                {
+                    heard.push(param(program_us(588 * S), n, *v as f32));
+                }
+            }
+            if plan.read_notch {
+                for n in NOTCH_NAMES {
+                    let mut v = held.get(n).copied().unwrap_or(0.0) as f32;
+                    if n == "INS_HNTCH_FREQ" && is(Fault::NotchDiffers) {
+                        v += 1.0;
+                    }
+                    if n == "INS_HNTCH_ATT" && is(Fault::NotchUnread) {
+                        continue;
+                    }
+                    heard.push(param(program_us(594 * S), n, v));
+                }
+            }
+            stats.pack_before_landing_v = Some(match fault {
+                Some(Fault::Pack(v)) => v,
+                _ => 21.66,
+            });
+        }
+        FlightResult {
+            plan: plan.clone(),
+            audit: FlightAudit {
+                binary_sha256: "ab12".into(),
+                status_texts: texts,
+                heard,
+                ..FlightAudit::default()
+            },
+            trace_hash: 0x1234,
+            marks,
+            commands: Vec::new(),
+            spectrum: Some(spectrum),
+            stats,
+            pack: Vec::new(),
+            track: Vec::new(),
+            sim_s,
+            wall_s: 0.0,
+            failure: is(Fault::ClassExit).then(|| "the flight is not class safe".to_string()),
+        }
+    }
+
+    /// A directory that is removed when it goes out of scope.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("oxide-tune-unit-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("a directory");
+            Self(p)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Runs the procedure on fake flights; the plans flown, in order, and the
+    /// result.
+    fn run(tag: &str, fake: &Fake) -> (Dir, Vec<FlightPlan>, Result<Outcome, TuneError>) {
+        let dir = Dir::new(tag);
+        let cfg = TuneConfig {
+            out: dir.0.clone(),
+            ..config()
+        };
+        let mut plans = Vec::new();
+        let result = procedure(&cfg, &mut |p| {
+            plans.push(p.clone());
+            Ok(fake_flight(p, fake))
+        });
+        (dir, plans, result)
+    }
+
+    fn exists(dir: &Dir, name: &str) -> bool {
+        dir.0.join(name).exists()
+    }
+
+    #[test]
+    fn with_no_peak_two_flights_are_flown_roll_and_pitch_then_yaw_on_the_first_flights_gains() {
+        let (dir, plans, result) = run("nopeak", &Fake::default());
+        let o = result.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plans.len(), 2);
+        assert_eq!(o.flights.len(), 2);
+        assert!(
+            plans
+                .iter()
+                .all(|p| p.extra.iter().all(|(n, _)| !n.starts_with("INS_HNTCH")))
+        );
+        assert_eq!(extra_of(&plans[0]), [("AUTOTUNE_AXES", 3.0)]);
+        assert_eq!(extra_of(&plans[1]), [("AUTOTUNE_AXES", 4.0)]);
+        assert!(plans[0].stop_on_peak && !plans[1].stop_on_peak);
+        assert_eq!(
+            names_of(&plans[1].files),
+            [
+                "base.parm",
+                "setup.parm",
+                "starting-gains.parm",
+                "tuned-gains-1.parm"
+            ]
+        );
+        assert_eq!(plans[1].files[3], dir.0.join("tuned-gains-1.parm"));
+        // The first flight's file holds what it read back: the roll gain was
+        // moved by the fake tuner from 1.0 (the file's starting value is the
+        // committed one: read it).
+        let first = std::fs::read_to_string(dir.0.join("tuned-gains-1.parm")).expect("file 1");
+        assert_eq!(parm::parse(&first).expect("parses").len(), GAIN_NAMES.len());
+        assert!(first.contains("ATC_RAT_RLL_P "), "{first}");
+        // The result is the yaw flight's read-back: 29 values, no notch.
+        let tuned = std::fs::read_to_string(dir.0.join("tuned-gains.parm")).expect("tuned");
+        assert_eq!(tuned, o.tuned);
+        assert!(!tuned.contains("INS_HNTCH"), "{tuned}");
+        assert_eq!(o.values_written(), 29);
+        assert_eq!(o.notch, None);
+        assert!(o.notch_read.is_empty());
+        assert!(exists(&dir, "report.txt") && exists(&dir, "spectrum.csv"));
+        // Roll and pitch are the first flight's, yaw the second's.
+        let get = |n: &str| -> f64 {
+            parm::parse(&tuned)
+                .expect("parses")
+                .into_iter()
+                .find(|(m, _)| m == n)
+                .expect(n)
+                .1
+        };
+        let start = |n: &str| -> f64 {
+            parm::parse(parm::STARTING_GAINS)
+                .expect("parses")
+                .into_iter()
+                .find(|(m, _)| m == n)
+                .map_or(1.0, |x| x.1)
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-5 * b.abs().max(1.0);
+        assert!(near(
+            get("ATC_RAT_RLL_P"),
+            start("ATC_RAT_RLL_P") * 2.0 + 0.5
+        ));
+        assert!(near(
+            get("ATC_ACC_R_MAX"),
+            start("ATC_ACC_R_MAX") * 2.0 + 0.5
+        ));
+        assert!(near(
+            get("ATC_RAT_YAW_P"),
+            start("ATC_RAT_YAW_P") * 3.0 + 0.25
+        ));
+        let report = &o.report;
+        assert!(report.contains("notch: none"), "{report}");
+        assert!(report.contains("flight 1 (flight-1)") && report.contains("flight 2 (flight-2)"));
+        assert!(
+            report.contains("tunes: Roll Pitch (AUTOTUNE_AXES 3); a peak in its hover lands it")
+        );
+        assert!(report.contains("tunes: Yaw (AUTOTUNE_AXES 4)"));
+        assert!(report.contains(
+            "parameter files base.parm setup.parm starting-gains.parm tuned-gains-1.parm"
+        ));
+        assert!(report.contains("extra parameters AUTOTUNE_AXES=4"));
+        assert!(report.contains("its hover decides the notch: yes"));
+        assert!(report.contains("its hover decides the notch: no"));
+        assert!(report.contains("POSHOLD command 2.000 s"));
+    }
+
+    #[test]
+    fn with_a_peak_in_the_first_hover_three_flights_are_flown_and_the_file_ends_with_the_notch() {
+        let fake = Fake {
+            peaks: vec![1],
+            fault: None,
+        };
+        let (dir, plans, result) = run("peak", &fake);
+        let o = result.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plans.len(), 3);
+        let names: Vec<&str> = plans.iter().map(|p| p.flight_name.as_str()).collect();
+        assert_eq!(names, ["flight-1", "flight-2", "flight-3"]);
+        // Flight 1: the starting gains, stops on its peak. Flights 2 and 3:
+        // roll and pitch and yaw, both with the notch of flight 1's hover
+        // (201 Hz in the fake), and neither stops on a peak.
+        assert_eq!(extra_of(&plans[0]), [("AUTOTUNE_AXES", 3.0)]);
+        assert!(plans[0].stop_on_peak);
+        let notch = notch_params(201.0, f64::from((0.15f64 + 0.001) as f32));
+        let mut want = vec![("AUTOTUNE_AXES", 3.0)];
+        want.extend(notch.iter().map(|(k, v)| (k.as_str(), *v)));
+        want.push(("MOT_THST_HOVER", notch[4].1));
+        assert_eq!(extra_of(&plans[1]), want);
+        let mut want = vec![("AUTOTUNE_AXES", 4.0)];
+        want.extend(notch.iter().map(|(k, v)| (k.as_str(), *v)));
+        assert_eq!(extra_of(&plans[2]), want);
+        assert!(!plans[1].stop_on_peak && !plans[2].stop_on_peak);
+        assert!(!plans[1].read_notch && plans[2].read_notch);
+        assert_eq!(names_of(&plans[1].files).len(), 3);
+        assert_eq!(
+            names_of(&plans[2].files).last().map(String::as_str),
+            Some("tuned-gains-1.parm")
+        );
+        // The file: 29 gains, then the six notch lines read back, in order.
+        let lines: Vec<&str> = o.tuned.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(lines.len(), 35);
+        let tail: Vec<&str> = lines[29..]
+            .iter()
+            .map(|l| l.split(' ').next().expect("name"))
+            .collect();
+        assert_eq!(tail, NOTCH_NAMES);
+        assert!(o.tuned.contains("INS_HNTCH_FREQ 201\n"), "{}", o.tuned);
+        assert!(o.tuned.contains("INS_HNTCH_ENABLE 1\n"));
+        assert_eq!(o.values_written(), 35);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("tuned-gains.parm")).expect("tuned"),
+            o.tuned
+        );
+        assert_eq!(parm::parse(&o.tuned).expect("parses").len(), 35);
+        // tuned-gains-1.parm has no notch line.
+        let first = std::fs::read_to_string(dir.0.join("tuned-gains-1.parm")).expect("file 1");
+        assert!(!first.contains("INS_HNTCH"));
+        let n = o.notch.as_ref().expect("a notch");
+        assert_eq!((n.flight, n.line.freq_hz), (1, 201.0));
+        let report = &o.report;
+        assert!(
+            report.contains("notch: decided by the hover of flight 1: PEAK at 201.00 Hz"),
+            "{report}"
+        );
+        assert!(report.contains("notch as read back after the last flight: INS_HNTCH_ENABLE=1"));
+        assert!(report.contains("extra parameters AUTOTUNE_AXES=3 INS_HNTCH_ENABLE=1"));
+        // Flight 1's report names that it landed instead of tuning.
+        assert!(
+            report.contains("tunes: Roll Pitch (AUTOTUNE_AXES 3); a peak in its hover lands it")
+        );
+    }
+
+    #[test]
+    fn the_notch_is_decided_by_the_first_hover_only() {
+        // No peak in the first hover; the second flight's (yaw) hover shows
+        // one: it decides nothing, two flights, no notch anywhere.
+        let (_dir, plans, result) = run(
+            "late-peak",
+            &Fake {
+                peaks: vec![2, 3],
+                fault: None,
+            },
+        );
+        let o = result.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plans.len(), 2);
+        assert_eq!(o.notch, None);
+        assert!(!o.tuned.contains("INS_HNTCH"));
+        assert!(
+            plans[1]
+                .extra
+                .iter()
+                .all(|(n, _)| !n.starts_with("INS_HNTCH"))
+        );
+        assert!(!plans[1].stop_on_peak);
+        // A peak in every hover: flight 1 decides it, 201 Hz; the peaks of
+        // flights 2 and 3 (202 and 203 Hz) change nothing, and no fourth
+        // flight is flown.
+        let (_dir, plans, result) = run(
+            "all-peaks",
+            &Fake {
+                peaks: vec![1, 2, 3, 4],
+                fault: None,
+            },
+        );
+        let o = result.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plans.len(), 3);
+        assert!(o.tuned.contains("INS_HNTCH_FREQ 201\n"), "{}", o.tuned);
+        for p in &plans[1..] {
+            assert!(
+                p.extra
+                    .iter()
+                    .any(|(n, v)| n == "INS_HNTCH_FREQ" && *v == 201.0),
+                "{:?}",
+                p.extra
+            );
+        }
+        // The later hovers' spectra are in the report all the same.
+        assert_eq!(o.report.matches("verdict: PEAK at").count(), 3);
+    }
+
+    /// Each acceptance check, failing in each flight in turn: the procedure
+    /// ends with an error that says why, no tuned file is written, and the
+    /// roll-and-pitch file only when that flight was accepted.
+    #[test]
+    fn each_acceptance_check_fails_the_procedure_in_each_flight_and_no_tuned_file_is_written() {
+        let faults: [(Fault, &str); 7] = [
+            (Fault::NoText("AutoTune: Success"), "AutoTune: Success"),
+            (Fault::NoText("AutoTune: Saved gains"), "Saved gains"),
+            (Fault::Unread("ATC_ACC_P_MAX"), "no value for ATC_ACC_P_MAX"),
+            (Fault::Pack(20.7), "low-battery threshold"),
+            (Fault::Pack(f64::NAN), "low-battery threshold"),
+            (Fault::SetupIgnored, "INS_GYRO_FILTER"),
+            (Fault::ClassExit, "not class safe"),
+        ];
+        for (flight, axes_text) in [
+            (1, "AutoTune: Roll"),
+            (1, "AutoTune: Pitch"),
+            (2, "AutoTune: Yaw"),
+        ] {
+            let mut cases: Vec<(Fault, String)> =
+                faults.iter().map(|(f, w)| (*f, (*w).to_string())).collect();
+            cases.push((Fault::NoText(axes_text), axes_text.to_string()));
+            for (fault, want) in cases {
+                let tag =
+                    format!("fault-{flight}-{fault:?}").replace(['"', ' ', ':', '(', ')', '.'], "");
+                let (dir, plans, result) = run(
+                    &tag,
+                    &Fake {
+                        peaks: Vec::new(),
+                        fault: Some((flight, fault)),
+                    },
+                );
+                let e = result.expect_err(&format!("flight {flight}: {fault:?}"));
+                let e = e.to_string();
+                assert!(
+                    e.contains(&format!("flight {flight}:")) && e.contains(&want),
+                    "flight {flight}, {fault:?}: {e}"
+                );
+                assert_eq!(plans.len(), flight, "the procedure stops at the failure");
+                assert!(!exists(&dir, "tuned-gains.parm"), "{fault:?}");
+                assert_eq!(exists(&dir, "tuned-gains-1.parm"), flight == 2, "{fault:?}");
+                assert!(exists(&dir, "report.txt"));
+                let report = std::fs::read_to_string(dir.0.join("report.txt")).expect("report");
+                assert!(report.contains("RESULT: FAILED: flight"), "{report}");
+            }
+        }
+        // The roll-and-pitch flight is not asked for the yaw message and the
+        // yaw flight is not asked for the roll and pitch messages: a flight
+        // that lacks only what the other flight tunes is accepted.
+        let (_dir, _, result) = run("axes-own", &Fake::default());
+        let o = result.expect("accepted");
+        let texts_of = |i: usize| texts(&o.flights[i].audit);
+        assert!(texts_of(0).iter().all(|(_, t)| !t.contains("Yaw")));
+        assert!(
+            texts_of(1)
+                .iter()
+                .all(|(_, t)| !t.contains("Roll") && !t.contains("Pitch"))
+        );
+    }
+
+    #[test]
+    fn a_failed_roll_and_pitch_flight_flies_no_yaw_flight_and_leaves_no_tuned_file() {
+        let (dir, plans, result) = run(
+            "first-fails",
+            &Fake {
+                peaks: Vec::new(),
+                fault: Some((1, Fault::ClassExit)),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(plans.len(), 1);
+        assert!(!exists(&dir, "tuned-gains.parm") && !exists(&dir, "tuned-gains-1.parm"));
+    }
+
+    #[test]
+    fn the_yaw_flight_must_change_nothing_but_yaw() {
+        // Every value the roll-and-pitch flight tunes, moved by the yaw
+        // flight: ATC_ACC_R_MAX and ATC_ACC_P_MAX included.
+        for name in GAIN_NAMES {
+            let moves =
+                !(name.contains("YAW") || name == "ATC_ACC_Y_MAX" || name == "MOT_THST_HOVER");
+            let (dir, plans, result) = run(
+                &format!("carried-{name}"),
+                &Fake {
+                    peaks: Vec::new(),
+                    fault: Some((2, Fault::YawMoves(name))),
+                },
+            );
+            assert_eq!(plans.len(), 2);
+            if moves {
+                let e = result.expect_err(name).to_string();
+                assert!(
+                    e.contains(name) && e.contains("must change nothing but yaw"),
+                    "{name}: {e}"
+                );
+                assert!(!exists(&dir, "tuned-gains.parm"), "{name}");
+            } else {
+                result.unwrap_or_else(|e| panic!("{name} is the yaw flight's to change: {e}"));
+            }
+        }
+        // A yaw flight that was not given the first flight's gains starts from
+        // the starting gains: the roll and pitch values differ.
+        let (dir, _, result) = run(
+            "not-loaded",
+            &Fake {
+                peaks: Vec::new(),
+                fault: Some((2, Fault::FileNotLoaded)),
+            },
+        );
+        let e = result.expect_err("not loaded").to_string();
+        assert!(e.contains("must change nothing but yaw"), "{e}");
+        assert!(!exists(&dir, "tuned-gains.parm"));
+    }
+
+    #[test]
+    fn the_notch_must_read_back_as_it_was_set_and_a_peak_needs_the_learned_thrust() {
+        let peak = |flight: usize, fault: Fault| {
+            run(
+                &format!("notch-{flight}-{fault:?}"),
+                &Fake {
+                    peaks: vec![1],
+                    fault: Some((flight, fault)),
+                },
+            )
+        };
+        let (dir, plans, result) = peak(3, Fault::NotchDiffers);
+        let e = result.expect_err("differs").to_string();
+        assert!(
+            e.contains("flight 3:") && e.contains("INS_HNTCH_FREQ"),
+            "{e}"
+        );
+        assert_eq!(plans.len(), 3);
+        assert!(!exists(&dir, "tuned-gains.parm"));
+        let (dir, _, result) = peak(3, Fault::NotchUnread);
+        let e = result.expect_err("unread").to_string();
+        assert!(e.contains("INS_HNTCH_ATT was not read back"), "{e}");
+        assert!(!exists(&dir, "tuned-gains.parm"));
+        let (dir, plans, result) = peak(1, Fault::ThrustUnread);
+        let e = result.expect_err("no thrust").to_string();
+        assert!(e.contains("learned hover thrust was not read"), "{e}");
+        assert_eq!(plans.len(), 1);
+        assert!(!exists(&dir, "tuned-gains.parm"));
+        // The set-up file is checked of the flight that landed on the peak, as
+        // it was of the first flight before.
+        let (_dir, plans, result) = peak(1, Fault::SetupIgnored);
+        let e = result.expect_err("setup").to_string();
+        assert!(
+            e.contains("flight 1:") && e.contains("INS_GYRO_FILTER"),
+            "{e}"
+        );
+        assert_eq!(plans.len(), 1);
+    }
+
+    #[test]
+    fn the_checks_of_each_flight_name_its_own_axes() {
+        let low = low_battery_volt();
+        let ok = |axes: &[&str], t: &[(f64, String)]| {
+            check_axes(t, &all_gains(), Some(low + 1.0), low, axes)
+        };
+        let said = |lines: &[&str]| -> Vec<(f64, String)> {
+            lines.iter().map(|t| (0.0, (*t).to_string())).collect()
+        };
+        let rp = said(&[
+            "AutoTune: Roll complete",
+            "AutoTune: Pitch complete",
+            "AutoTune: Success",
+            "AutoTune: Saved gains for Roll Pitch",
+        ]);
+        let yaw = said(&[
+            "AutoTune: Yaw(E) complete",
+            "AutoTune: Success",
+            "AutoTune: Saved gains for Yaw(E)",
+        ]);
+        assert_eq!(ok(&ROLL_PITCH_AXES, &rp), Ok(()));
+        assert_eq!(ok(&YAW_AXES, &yaw), Ok(()));
+        // Each flight needs its own axes' messages.
+        assert!(
+            ok(&ROLL_PITCH_AXES, &yaw)
+                .unwrap_err()
+                .contains("AutoTune: Roll")
+        );
+        assert!(ok(&YAW_AXES, &rp).unwrap_err().contains("AutoTune: Yaw"));
+        let half = said(&[
+            "AutoTune: Roll complete",
+            "AutoTune: Success",
+            "AutoTune: Saved gains for Roll",
+        ]);
+        assert!(
+            ok(&ROLL_PITCH_AXES, &half)
+                .unwrap_err()
+                .contains("AutoTune: Pitch")
+        );
+    }
+
+    #[test]
+    fn the_carried_values_check_names_every_roll_and_pitch_value_and_only_those() {
+        let first = all_gains();
+        assert_eq!(check_carried(&first, &first), Ok(()));
+        for name in GAIN_NAMES {
+            let mut second = first.clone();
+            second.insert(name.to_string(), 99.0);
+            let yaw_own =
+                name.contains("YAW") || name == "ATC_ACC_Y_MAX" || name == "MOT_THST_HOVER";
+            assert_eq!(check_carried(&first, &second).is_ok(), yaw_own, "{name}");
+            // A value missing after the yaw flight, or before, is a difference.
+            if !yaw_own {
+                let mut missing = first.clone();
+                missing.remove(name);
+                assert!(check_carried(&first, &missing).is_err(), "{name}");
+                assert!(check_carried(&missing, &first).is_err(), "{name}");
+            }
+        }
+        for name in ["ATC_ACC_R_MAX", "ATC_ACC_P_MAX"] {
+            let mut second = first.clone();
+            second.insert(name.to_string(), 2.0);
+            assert!(check_carried(&first, &second).unwrap_err().contains(name));
+        }
+    }
+
+    #[test]
+    fn the_notch_read_back_must_equal_the_notch_set_as_a_32_bit_float() {
+        let set = notch_params(222.65625, f64::from(0.149_507_88_f32));
+        let mut read: BTreeMap<String, f32> =
+            set.iter().map(|(n, v)| (n.clone(), *v as f32)).collect();
+        assert_eq!(check_notch_read(&set, &read), Ok(()));
+        for (name, _) in &set {
+            let mut other = read.clone();
+            *other.get_mut(name).expect("present") += 1.0;
+            assert!(
+                check_notch_read(&set, &other)
+                    .unwrap_err()
+                    .contains(name.as_str())
+            );
+            let mut missing = read.clone();
+            missing.remove(name);
+            assert!(
+                check_notch_read(&set, &missing)
+                    .unwrap_err()
+                    .contains("not read back")
+            );
+        }
+        // The smallest step of a 32-bit float is a difference.
+        let v = read["INS_HNTCH_REF"];
+        read.insert("INS_HNTCH_REF".into(), f32::from_bits(v.to_bits() + 1));
+        assert!(check_notch_read(&set, &read).is_err());
+    }
+
+    #[test]
+    fn the_tuned_file_carries_the_notch_after_the_gains_only_when_one_was_set() {
+        let gains: BTreeMap<String, f32> =
+            GAIN_NAMES.iter().map(|n| ((*n).to_string(), 0.5)).collect();
+        let none = tuned_file(&gains, &BTreeMap::new(), "ab", 0, 600.0);
+        assert!(!none.contains("INS_HNTCH"), "{none}");
+        assert!(none.contains("# ArduCopter parameters after the tuning of ADR-0009."));
+        assert!(none.contains("# harmonic notch: none"));
+        assert!(none.contains("simulated flight time of the procedure 600.000 s"));
+        assert!(!none.contains("ADR-0007"), "{none}");
+        assert_eq!(parm::parse(&none).expect("parses").len(), 29);
+        // The six values, given out of order, follow the gains in the order
+        // of the names.
+        let notch: BTreeMap<String, f32> = notch_params(222.65625, 0.1495)
+            .into_iter()
+            .rev()
+            .map(|(n, v)| (n, v as f32))
+            .collect();
+        let with = tuned_file(&gains, &notch, "ab", 0, 600.0);
+        assert!(with.contains("# harmonic notch: set"));
+        let values: Vec<&str> = with.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(values.len(), 35);
+        assert_eq!(
+            &values[..29],
+            &none
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .collect::<Vec<_>>()[..]
+        );
+        let tail: Vec<&str> = values[29..]
+            .iter()
+            .map(|l| l.split(' ').next().expect("n"))
+            .collect();
+        assert_eq!(tail, NOTCH_NAMES);
+        assert_eq!(values[31], "INS_HNTCH_FREQ 222.65625");
+        assert_eq!(values[34], "INS_HNTCH_ATT 40");
+        // The file's header says every value in it was read back.
+        assert!(with.contains("values read back from the program"));
+    }
+
+    #[test]
+    fn the_read_back_after_a_flight_with_a_notch_asks_for_the_six_names_after_the_gains() {
+        let run = drive(
+            Script::new(true, false, 10).with_notch_read(),
+            false,
+            Some(150 * S),
+        );
+        assert!(run.error.is_none(), "{:?}", run.error);
+        let after: Vec<_> = run.reads.iter().filter(|(t, _)| *t >= 155 * S).collect();
+        assert_eq!(after.len(), 6, "{after:?}");
+        let names: Vec<&str> = after.iter().flat_map(|(_, g)| g.iter().copied()).collect();
+        let mut want = GAIN_NAMES.to_vec();
+        want.extend(NOTCH_NAMES);
+        assert_eq!(names, want);
+        assert_eq!(run.end, Some(155 * S + 6 * S + READ_END_US));
+        // Without it: 29 names, five groups.
+        let run = drive(Script::new(true, false, 10), false, Some(150 * S));
+        let n: usize = run
+            .reads
+            .iter()
+            .filter(|(t, _)| *t >= 155 * S)
+            .map(|(_, g)| g.len())
+            .sum();
+        assert_eq!(n, 29);
+    }
 }
