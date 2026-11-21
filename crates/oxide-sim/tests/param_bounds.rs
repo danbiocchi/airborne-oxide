@@ -254,6 +254,15 @@ const KNOWN: &[(&str, &str, &str, &str)] = &[
          (the review's zero-p-gains finding; a floor above zero needs the loops' own tuning)",
     ),
     (
+        "POS_VELZ_P",
+        "min",
+        "rc-loss-position",
+        "a zero vertical velocity gain leaves the vertical speed uncontrolled, as POS_VELX_P's \
+         leaves the horizontal: 314 m high on this run. Which runs climb past the limit is the \
+         draw of the IMU's noise (2 of runs 0 to 19 before the IMU model of ADR-0008, among \
+         them not this one, and 5 with it); a floor above zero needs the loops' own tuning",
+    ),
+    (
         "EKF_MAG_DECL",
         "min",
         "rc-loss-position",

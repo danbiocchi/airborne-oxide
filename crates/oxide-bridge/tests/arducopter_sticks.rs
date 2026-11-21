@@ -624,9 +624,10 @@ fn brain_commands(a: &FlightAudit) -> Vec<(f64, SentKind)> {
 /// Test 3. Offboard flights are what they were: the same three hashes as
 /// before the brain acted only in offboard and before the radio was set up
 /// (measured on the commit before that part, `oxide-bridge fly` run 0), until
-/// the tuned parameter set (ADR-0007 section 2) changed the flown set: the
-/// hashes are now those of run 0 on that set (every other change since the
-/// first pin is a parameter, so the flights still say nothing but their set).
+/// the tuned parameter set (ADR-0007 section 2) changed the flown set, and
+/// then the IMU model of ADR-0008 changed what gust-hold's flight senses:
+/// its hashes are now those of run 0 on that set and that IMU. Hover-step
+/// flies ideal sensors, and its hashes are those of the flown set as before.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_offboard_flights_have_the_hashes_they_had_before_stick_flying() {
@@ -635,9 +636,9 @@ fn the_offboard_flights_have_the_hashes_they_had_before_stick_flying() {
         (
             "gust-hold",
             (
-                0xd9a6_8d1d_9586_0d72u64,
-                0xe967_c25f_893b_ca4cu64,
-                0x30ee_7b05_aa5f_2860u64,
+                0x1b99_d683_ad95_23f4u64,
+                0x76a2_6c8b_9761_156cu64,
+                0x5ddb_11d5_6774_768du64,
             ),
         ),
         (
@@ -678,7 +679,7 @@ fn rc_loss_position_lifts_on_the_delayed_throttle_flies_out_returns_and_lands() 
                 "reasons: needs the flight core's status",
                 "ending landed: disarm reason Touchdown: needs the flight core's status",
             ],
-            last_motor_on_s: Some(73.8705),
+            last_motor_on_s: Some(73.313),
             modes: &[(0.2, 5), (25.98, 6)],
             texts: &[
                 (0.0, "RCInput: decoding FDM (Pulses)"),
@@ -686,16 +687,16 @@ fn rc_loss_position_lifts_on_the_delayed_throttle_flies_out_returns_and_lands() 
                 (8.17, "EKF3 IMU0 MAG0 in-flight yaw alignment complete"),
                 (8.17, "EKF3 IMU1 MAG0 in-flight yaw alignment complete"),
                 (25.98, "Radio Failsafe"),
-                (73.87, "Disarming motors"),
+                (73.31, "Disarming motors"),
                 (74.93, "PreArm: Radio failsafe on"),
             ],
             armed_at_end: false,
-            disarmed_at_s: Some(73.8735),
-            touchdown_mps: Some(0.5045),
-            max_height_m: 14.984,
-            max_distance_m: 25.086,
-            max_tilt_deg: 19.21,
-            end_m: [0.297, 0.147, 0.0],
+            disarmed_at_s: Some(73.316),
+            touchdown_mps: Some(0.4582),
+            max_height_m: 14.951,
+            max_distance_m: 25.082,
+            max_tilt_deg: 19.39,
+            end_m: [0.223, 0.105, 0.0],
         },
     );
     // The pilot's script, the track: the same flight again with its log.
@@ -827,8 +828,8 @@ fn gps_loss_pilot_ends_in_an_ekf_failsafe_land_and_a_disarm() {
         &Pin {
             class: FlightClass::Safe,
             violations: &[
-                "only reached 3.39 m high, required 4 m",
-                "not armed at the end (disarmed None at Some(40.731) s)",
+                "only reached 3.40 m high, required 4 m",
+                "not armed at the end (disarmed None at Some(41.4135) s)",
                 "ended at 0.00 m, 5.00 m off 5 m (limit 3 m)",
             ],
             not_judged: &[
@@ -840,26 +841,29 @@ fn gps_loss_pilot_ends_in_an_ekf_failsafe_land_and_a_disarm() {
                 "events: needs the flight core's status",
                 "ending flying: navigation not Terminated: needs the flight core's status",
             ],
-            last_motor_on_s: Some(40.728),
+            last_motor_on_s: Some(41.4105),
             modes: &[(0.2, 5), (28.02, 9)],
             texts: &[
                 (0.0, "RCInput: decoding FDM (Pulses)"),
                 (3.22, "Arming motors"),
                 (8.17, "EKF3 IMU0 MAG0 in-flight yaw alignment complete"),
                 (8.17, "EKF3 IMU1 MAG0 in-flight yaw alignment complete"),
+                (27.92, "EKF3 lane switch 1"),
+                (27.93, "EKF primary changed:1"),
                 (28.02, "EKF variance"),
                 (28.02, "EKF Failsafe: changed to Land Mode"),
                 (35.09, "EKF3 IMU0 stopped aiding"),
                 (35.10, "EKF3 IMU1 stopped aiding"),
-                (40.73, "Disarming motors"),
+                (41.41, "Disarming motors"),
+                (41.56, "EKF primary changed:0"),
             ],
             armed_at_end: false,
-            disarmed_at_s: Some(40.731),
-            touchdown_mps: Some(0.4944),
-            max_height_m: 3.393,
-            max_distance_m: 5.771,
-            max_tilt_deg: 2.53,
-            end_m: [0.033, 5.771, 0.0],
+            disarmed_at_s: Some(41.4135),
+            touchdown_mps: Some(0.5187),
+            max_height_m: 3.402,
+            max_distance_m: 10.754,
+            max_tilt_deg: 2.64,
+            end_m: [-6.134, 8.833, 0.0],
         },
     );
 }
@@ -902,10 +906,10 @@ fn rc_loss_override_leaves_the_return_for_guided_and_flies_to_the_brains_setpoin
             armed_at_end: true,
             disarmed_at_s: None,
             touchdown_mps: None,
-            max_height_m: 14.791,
-            max_distance_m: 24.876,
-            max_tilt_deg: 20.74,
-            end_m: [6.832, 0.208, 10.069],
+            max_height_m: 14.851,
+            max_distance_m: 24.968,
+            max_tilt_deg: 20.75,
+            end_m: [6.909, 0.224, 10.203],
         },
     );
     let a = f.audit.as_ref().expect("audit");
@@ -973,9 +977,9 @@ fn kill_in_rtl_stops_the_motors_a_fifth_of_a_second_after_the_switch_and_the_veh
                 (25.98, "Radio Failsafe"),
                 (32.0, "Radio Failsafe Cleared"),
                 (34.22, "RC7: MotorEStop HIGH"),
-                (35.26, "Potential Thrust Loss (4)"),
-                (36.29, "EKF3 lane switch 1"),
-                (36.29, "EKF primary changed:1"),
+                (35.28, "Potential Thrust Loss (4)"),
+                (36.09, "EKF3 lane switch 1"),
+                (36.09, "EKF primary changed:1"),
                 (36.69, "EKF3 lane switch 0"),
                 (36.69, "EKF primary changed:0"),
                 (37.12, "Potential Thrust Loss (4)"),
@@ -985,11 +989,11 @@ fn kill_in_rtl_stops_the_motors_a_fifth_of_a_second_after_the_switch_and_the_veh
             ],
             armed_at_end: false,
             disarmed_at_s: Some(34.226),
-            touchdown_mps: Some(15.4662),
-            max_height_m: 14.763,
-            max_distance_m: 24.911,
-            max_tilt_deg: 21.95,
-            end_m: [21.001, 0.522, 0.0],
+            touchdown_mps: Some(15.5542),
+            max_height_m: 14.942,
+            max_distance_m: 24.894,
+            max_tilt_deg: 21.84,
+            end_m: [19.333, 0.482, 0.0],
         },
     );
     let off = f.last_motor_on_s.expect("motors were on") - 34.0;

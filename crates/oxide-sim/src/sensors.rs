@@ -6,8 +6,9 @@
 //!
 //! Frames: world NED, body FRD. Time is `Micros`; SI units (magnetic field
 //! in µT). Each sensor draws from its own [`Stream`], always in a fixed
-//! order, and always the same number of draws per sample regardless of the
-//! configured sigmas, so changing one parameter never shifts the sequence.
+//! order, and always the same number of draws per sample (for the IMU, per
+//! internal sample: see [`ImuModel`]) regardless of the configured sigmas,
+//! so changing one parameter never shifts the sequence.
 
 use std::collections::VecDeque;
 
@@ -64,17 +65,93 @@ pub fn battery(t: Micros, voltage_v: f64, current_a: f64) -> Stamped<BatterySamp
 
 const TWO_PI: f64 = 2.0 * core::f64::consts::PI;
 
-/// IMU error model: one sample per simulator tick, or per
-/// [`period_us`](ImuModel::period_us) when that is set.
+/// IMU error model.
+///
+/// # How a sample is made
+///
+/// The IMU runs on a clock of its own, as a real one does, whoever reads it.
+/// Every [`internal_period_us`](ImuModel::internal_period_us) it draws its
+/// bias walk and its noise, and the noise passes its anti-alias low-pass
+/// filter. A reader is given the latest filtered sample at its own
+/// [`period_us`](ImuModel::period_us) (decimation), with the truth, the bias
+/// and the rotor-synchronous lines of that instant added. So the noise a
+/// reader sees has the same density in the band the filter passes whatever
+/// its period: a reader at 1 kHz and one at 4 kHz are given the same internal
+/// stream, one every eighth and one every second sample of it (with the same
+/// seed and the same truth, the 1 kHz samples' noise is every fourth 4 kHz
+/// sample's noise, bit for bit). Only what lies above the reader's Nyquist
+/// frequency and still
+/// passes the filter folds back: in 0 to 200 Hz a 1 kHz reader gets 0.45 %
+/// more noise amplitude than a 4 kHz reader, worked out from the filter
+/// below.
+///
+/// A density `D` here means what it has always meant for the white noise:
+/// samples of it taken at a rate `f`, unfiltered, would have a standard
+/// deviation of `D·√f`; filtered, the power at each frequency is `D²·|H|²`.
+///
+/// # The values of [`SensorConfig::realistic`], and why
+///
+/// - **Internal rate 8 kHz** (125 µs): the gyro sample rate of the
+///   MPU-6000, the class of IMU this model stands for, with its widest
+///   low-pass setting (`DLPF_CFG` 0 in its register map). It divides every
+///   step the simulator flies (250 µs for the H743 profile, 500 µs for a
+///   bridged flight, 1000 µs for the F405 profile), and it puts the
+///   filter's band far below its own Nyquist frequency.
+/// - **Anti-alias filter: second-order Butterworth, −3 dB at 256 Hz**, by
+///   the bilinear transform at the internal rate. 256 Hz is the MPU-6000's
+///   gyro bandwidth at that setting. It is half the Nyquist frequency of the
+///   slowest reader (500 Hz at 1 kHz), so little folds back (above), and it
+///   is above the band the loops use (our core's gyro filter and
+///   ArduCopter's `INS_GYRO_FILTER` are both at 80 Hz), so what they use is
+///   the density itself (at 100 Hz the filter passes 97.7 % of the power).
+///   The datasheet gives a bandwidth and a delay, not a shape; second order
+///   is the lowest that keeps the fold-back that small. The filter acts on
+///   the noise only. The truth, the bias and the rotor lines reach the
+///   reader unfiltered: the delay the filter would put on the signal (about
+///   0.88 ms below 100 Hz for this one) is the separate S2 item
+///   "output-filter delay" of DESIGN §5.4. Its power gain on white noise is
+///   that of a band of 565.6 Hz (two-sided), so a density `D` reaches every
+///   reader as a standard deviation of `D·√565.6`.
+/// - **Broadband vibration: a density, flat from 0 to 4 kHz** (the internal
+///   Nyquist frequency), at the reference rotor speed: gyro
+///   6.325e-4 rad/s/√Hz, accelerometer 1.581e-2 m/s²/√Hz, scaled with the
+///   square of the mean rotor speed. These are 0.02 rad/s and 0.5 m/s² rms
+///   at 1 kHz, the figures the model had as a fixed rms per sample: the
+///   density the F405 profile and ArduCopter (on the same 1000 µs grid)
+///   have flown on until now, kept where the loops use it so that the
+///   change takes away the dependence on the reader's rate and nothing else.
+///   ArduCopter's tuning flight (ADR-0007 §2) was flown on it too. At the
+///   H743's 4 kHz the old fixed rms was half this density. The 4 kHz band
+///   matters to what a reader gets only by being far above 256 Hz: the
+///   filter passes the density below its cut-off and removes the rest.
+///   Delivered at hover, the vibration is 0.0150 rad/s and 0.376 m/s² rms
+///   per sample, at every reader's rate.
+/// - **White noise** keeps its MPU-6000 densities and now passes the filter
+///   too: 2.1e-3 rad/s and 0.093 m/s² rms per sample at every rate, where
+///   it was `D·√f` at the reader's rate `f` (the same density below 256 Hz).
+///
+/// Every internal sample draws the same number of variates in the same
+/// order (bias walk, gyro then accelerometer; noise, gyro then
+/// accelerometer; the white noise and the vibration share one draw per
+/// axis, with the variance of both), whatever the densities, so changing
+/// one never shifts the sequence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImuModel {
-    /// Sample period, µs: 0 samples at every simulator tick (and every
-    /// formula uses the tick as its `dt`); otherwise a whole multiple of the
-    /// tick, the IMU is sampled at the ticks where `t` is a multiple of it,
-    /// and `dt` is the period in every formula (bias walk, noise density,
-    /// rotor phase). Our flight core needs a sample on every tick, so only
-    /// another autopilot may set it.
+    /// The reader's sample period, µs: 0 gives a sample at every simulator
+    /// tick; otherwise a whole multiple of the tick, and a sample is given at
+    /// the ticks where `t` is a multiple of it. The rotor lines' phase
+    /// advances by this period (or the tick) from one sample to the next. The
+    /// IMU's own clock, bias walk and noise run whatever this is. Our flight
+    /// core needs a sample on every tick, so only another autopilot may set
+    /// it.
     pub period_us: u64,
+    /// The IMU's internal sampling period, µs: every simulator tick must be a
+    /// whole multiple of it.
+    pub internal_period_us: u64,
+    /// The anti-alias filter's −3 dB frequency, Hz (second-order
+    /// Butterworth at the internal rate, on the noise), below the internal
+    /// Nyquist frequency.
+    pub filter_cutoff_hz: f64,
     /// Gyro white-noise density, rad/s/√Hz.
     pub gyro_noise_density: f64,
     /// Accelerometer white-noise density, m/s²/√Hz.
@@ -87,20 +164,91 @@ pub struct ImuModel {
     pub gyro_bias_walk: f64,
     /// Accelerometer bias random walk, m/s²/√s.
     pub accel_bias_walk: f64,
-    /// Broadband gyro vibration at the reference rotor speed, rad/s rms.
-    pub gyro_vibration_rms: f64,
-    /// Broadband accelerometer vibration at the reference speed, m/s² rms.
-    pub accel_vibration_rms: f64,
-    /// Rotor-synchronous gyro amplitude per rotor at full speed, rad/s.
+    /// Broadband gyro vibration density at the reference rotor speed,
+    /// rad/s/√Hz, flat up to the internal Nyquist frequency.
+    pub gyro_vibration_density: f64,
+    /// Broadband accelerometer vibration density at the reference speed,
+    /// m/s²/√Hz, flat up to the internal Nyquist frequency.
+    pub accel_vibration_density: f64,
+    /// Rotor-synchronous gyro amplitude per rotor at full speed, rad/s, as
+    /// delivered (not filtered; a line above the reader's Nyquist frequency
+    /// folds back, as it would on an IMU with no filter: at the reference
+    /// quad's 30,000 rpm the line reaches 500 Hz at full speed, 225 Hz at
+    /// hover).
     pub gyro_harmonic_amp: f64,
-    /// Rotor-synchronous accelerometer amplitude per rotor at full speed, m/s².
+    /// Rotor-synchronous accelerometer amplitude per rotor at full speed,
+    /// m/s², as delivered (as the gyro's).
     pub accel_harmonic_amp: f64,
-    /// Normalised rotor speed the rms values refer to.
+    /// Normalised rotor speed the vibration densities refer to.
     pub vibration_ref_speed: f64,
     /// Gyro saturation, rad/s.
     pub gyro_range: f64,
     /// Accelerometer saturation, m/s².
     pub accel_range: f64,
+}
+
+impl ImuModel {
+    /// The anti-alias filter's coefficients `[b0, b1, b2, a1, a2]`
+    /// (second-order Butterworth by the bilinear transform with the cut-off
+    /// prewarped), or `None` when the internal period is zero or the cut-off
+    /// is not between 0 and the internal Nyquist frequency.
+    pub fn filter_coefficients(&self) -> Option<[f64; 5]> {
+        if self.internal_period_us == 0 {
+            return None;
+        }
+        let fs = 1.0 / period_s(self.internal_period_us);
+        let fc = self.filter_cutoff_hz;
+        if !(fc.is_finite() && fc > 0.0 && fc < 0.5 * fs) {
+            return None;
+        }
+        let k = Real::tan(core::f64::consts::PI * fc / fs);
+        let r2 = core::f64::consts::SQRT_2;
+        let kk = k * k;
+        let n = 1.0 / (1.0 + r2 * k + kk);
+        let b0 = kk * n;
+        Some([
+            b0,
+            2.0 * b0,
+            b0,
+            2.0 * (kk - 1.0) * n,
+            (1.0 - r2 * k + kk) * n,
+        ])
+    }
+
+    /// The filter's power gain on white noise as a two-sided bandwidth, Hz:
+    /// a density `D` reaches the reader as a standard deviation of
+    /// `D·√(this)`. Summed over the impulse response (`None` as for
+    /// [`filter_coefficients`](Self::filter_coefficients)).
+    pub fn noise_bandwidth_hz(&self) -> Option<f64> {
+        let c = self.filter_coefficients()?;
+        let mut f = Lowpass::default();
+        let mut sum = 0.0;
+        for i in 0..16_384 {
+            let x = if i == 0 { 1.0 } else { 0.0 };
+            let y = f.step(&c, Vec3::splat(x)).x;
+            sum += y * y;
+        }
+        Some(sum / period_s(self.internal_period_us))
+    }
+}
+
+/// A second-order section per axis, transposed direct form II.
+#[derive(Clone, Copy, Debug, Default)]
+struct Lowpass {
+    z1: Vec3<f64>,
+    z2: Vec3<f64>,
+}
+
+impl Lowpass {
+    /// One input sample through the filter; returns the output. Zero in and
+    /// zero state give exactly zero out.
+    fn step(&mut self, c: &[f64; 5], x: Vec3<f64>) -> Vec3<f64> {
+        let [b0, b1, b2, a1, a2] = *c;
+        let y = x * b0 + self.z1;
+        self.z1 = x * b1 - y * a1 + self.z2;
+        self.z2 = x * b2 - y * a2;
+        y
+    }
 }
 
 /// GPS receiver model.
@@ -179,14 +327,17 @@ impl SensorConfig {
         Self {
             imu: ImuModel {
                 period_us: 0,
+                internal_period_us: 125,
+                filter_cutoff_hz: 256.0,
                 gyro_noise_density: 8.7e-5,
                 accel_noise_density: 3.9e-3,
                 gyro_bias_sigma: 0.005,
                 accel_bias_sigma: 0.05,
                 gyro_bias_walk: 1e-4,
                 accel_bias_walk: 5e-4,
-                gyro_vibration_rms: 0.02,
-                accel_vibration_rms: 0.5,
+                // 0.02 rad/s and 0.5 m/s² rms at 1 kHz (see ImuModel).
+                gyro_vibration_density: 6.324_555_320_336_759e-4,
+                accel_vibration_density: 1.581_138_830_084_189_6e-2,
                 gyro_harmonic_amp: 0.01,
                 accel_harmonic_amp: 1.0,
                 vibration_ref_speed: 0.45,
@@ -236,8 +387,8 @@ impl SensorConfig {
                 accel_bias_sigma: 0.0,
                 gyro_bias_walk: 0.0,
                 accel_bias_walk: 0.0,
-                gyro_vibration_rms: 0.0,
-                accel_vibration_rms: 0.0,
+                gyro_vibration_density: 0.0,
+                accel_vibration_density: 0.0,
                 gyro_harmonic_amp: 0.0,
                 accel_harmonic_amp: 0.0,
                 ..r.imu
@@ -333,6 +484,19 @@ pub struct SensorSuite<const N: usize> {
     gyro_bias: Vec3<f64>,
     accel_bias: Vec3<f64>,
     rotor_phase: [f64; N],
+    /// The IMU's own clock: the time of the next tick, µs, counted from the
+    /// first tick (pre-roll included) and advanced by the tick.
+    imu_clock_us: u64,
+    /// Index of the next internal sample: internal sample `j` is at
+    /// `j · internal_period_us` on the IMU's clock.
+    imu_next: u64,
+    /// Anti-alias filter coefficients and state, gyro and accelerometer.
+    imu_filter: [f64; 5],
+    gyro_lp: Lowpass,
+    accel_lp: Lowpass,
+    /// The latest filtered noise, what a reader is given.
+    gyro_noise: Vec3<f64>,
+    accel_noise: Vec3<f64>,
     baro_offset: f64,
     baro_drift: f64,
     gps_queue: VecDeque<Stamped<GpsSample>>,
@@ -342,7 +506,9 @@ pub struct SensorSuite<const N: usize> {
 impl<const N: usize> SensorSuite<N> {
     /// Fails with [`SimError::TimeBase`] if any period, the GPS latency or
     /// the first-fix time is not a whole multiple of `base_us`, or a period
-    /// is zero.
+    /// is zero; with [`SimError::Imu`] if `base_us` is not a whole multiple
+    /// of the IMU's internal period or its filter cannot be built
+    /// ([`ImuModel::filter_coefficients`]).
     pub fn new(config: SensorConfig, run_seed: u64, base_us: u64) -> Result<Self, SimError> {
         let ok = |us: u64| base_us != 0 && us.is_multiple_of(base_us);
         let periods = [
@@ -359,6 +525,18 @@ impl<const N: usize> SensorSuite<N> {
         {
             return Err(SimError::TimeBase(base_us));
         }
+        let ip = config.imu.internal_period_us;
+        if ip == 0 || !base_us.is_multiple_of(ip) {
+            return Err(SimError::Imu(format!(
+                "the {base_us} µs step is not a whole multiple of the IMU's internal period of {ip} µs"
+            )));
+        }
+        let Some(imu_filter) = config.imu.filter_coefficients() else {
+            return Err(SimError::Imu(format!(
+                "the IMU filter's cut-off of {} Hz is not between 0 and the internal Nyquist frequency",
+                config.imu.filter_cutoff_hz
+            )));
+        };
         let mut imu_rng = Rng::stream(run_seed, Stream::Imu);
         let gyro_bias = unit_normals(&mut imu_rng) * config.imu.gyro_bias_sigma;
         let accel_bias = unit_normals(&mut imu_rng) * config.imu.accel_bias_sigma;
@@ -378,6 +556,13 @@ impl<const N: usize> SensorSuite<N> {
             gyro_bias,
             accel_bias,
             rotor_phase,
+            imu_clock_us: 0,
+            imu_next: 0,
+            imu_filter,
+            gyro_lp: Lowpass::default(),
+            accel_lp: Lowpass::default(),
+            gyro_noise: Vec3::zero(),
+            accel_noise: Vec3::zero(),
             baro_offset,
             baro_drift: 0.0,
             gps_queue: VecDeque::new(),
@@ -400,9 +585,11 @@ impl<const N: usize> SensorSuite<N> {
     /// The IMU sample of pre-roll step `k` (the steps count from 0, one per
     /// tick) for a vehicle at rest: `None` when the IMU's period has no
     /// sample due at `k` ticks, else the sample, built by the code `sample`
-    /// uses. Advances only the IMU's state (its random stream, bias walk and
-    /// rotor phases): no other sensor, no queue and no clock.
+    /// uses. Advances only the IMU's state (its own clock, random stream,
+    /// bias walk, filter and rotor phases), by one tick: no other sensor and
+    /// no queue.
     pub fn preroll_imu(&mut self, k: u64, truth: &Truth<'_, N>) -> Option<ImuSample> {
+        self.advance_imu(truth);
         let p = self.config.imu.period_us;
         if p != 0 && !due(k.saturating_mul(self.base_us), p) {
             return None;
@@ -425,8 +612,9 @@ impl<const N: usize> SensorSuite<N> {
     }
 
     /// The IMU sample due at `t`, or `None` between the samples of a
-    /// coarser period (nothing is drawn then).
+    /// coarser period. The IMU's own clock advances by one tick either way.
     fn sample_imu(&mut self, t: Micros, truth: &Truth<'_, N>) -> Option<Stamped<ImuSample>> {
+        self.advance_imu(truth);
         let p = self.config.imu.period_us;
         if p != 0 && !due(t.0, p) {
             return None;
@@ -434,35 +622,17 @@ impl<const N: usize> SensorSuite<N> {
         Some(Stamped::ideal(t, self.imu_sample(truth)))
     }
 
-    /// One IMU sample from `truth`, advancing the IMU's random stream, bias
-    /// walk and rotor phases and nothing else. `dt` is the IMU's period, or
-    /// the tick when it has none.
-    fn imu_sample(&mut self, truth: &Truth<'_, N>) -> ImuSample {
+    /// Runs the IMU's internal sampling up to this tick: every internal
+    /// sample due at or before the tick's time on the IMU's clock (the first
+    /// tick makes sample 0), each a bias-walk step and one noise sample
+    /// through the filter. The noise's density is set from the rotor speeds
+    /// of this tick. Then the clock moves on by one tick.
+    fn advance_imu(&mut self, truth: &Truth<'_, N>) {
         let m = self.config.imu;
-        let dt = period_s(if m.period_us == 0 {
-            self.base_us
-        } else {
-            m.period_us
-        });
+        let ip = m.internal_period_us;
+        let dt = period_s(ip);
         let sqrt_dt = Real::sqrt(dt);
-        let inv_sqrt_dt = Real::sqrt(1.0 / dt);
-        let rng = &mut self.imu_rng;
-
-        // Draw order: bias walk (gyro, accel), white noise (gyro, accel),
-        // broadband vibration (gyro, accel).
-        self.gyro_bias = add_vec(
-            self.gyro_bias,
-            unit_normals(rng) * (m.gyro_bias_walk * sqrt_dt),
-        );
-        self.accel_bias = add_vec(
-            self.accel_bias,
-            unit_normals(rng) * (m.accel_bias_walk * sqrt_dt),
-        );
-        let gyro_white = unit_normals(rng) * (m.gyro_noise_density * inv_sqrt_dt);
-        let accel_white = unit_normals(rng) * (m.accel_noise_density * inv_sqrt_dt);
-        let gyro_bb = unit_normals(rng);
-        let accel_bb = unit_normals(rng);
-
+        let sqrt_rate = Real::sqrt(1.0 / dt);
         // Vibration scales with the square of the mean rotor speed.
         let speeds = truth.body.rotor_speed.map(|n| n.max(0.0));
         #[allow(clippy::cast_precision_loss)]
@@ -477,28 +647,69 @@ impl<const N: usize> SensorSuite<N> {
         } else {
             0.0
         };
-        let mut gyro_vib = gyro_bb * (m.gyro_vibration_rms * scale);
-        let mut accel_vib = accel_bb * (m.accel_vibration_rms * scale);
+        // White noise and broadband vibration are independent and both white
+        // at the internal rate: one draw per axis with the variance of both.
+        let density = |white: f64, vib: f64| {
+            let v = vib * scale;
+            Real::sqrt(white * white + v * v)
+        };
+        let gyro_sigma = density(m.gyro_noise_density, m.gyro_vibration_density) * sqrt_rate;
+        let accel_sigma = density(m.accel_noise_density, m.accel_vibration_density) * sqrt_rate;
+        let last = self.imu_clock_us / ip;
+        let rng = &mut self.imu_rng;
+        while self.imu_next <= last {
+            // Draw order: bias walk (gyro, accel), noise (gyro, accel).
+            self.gyro_bias = add_vec(
+                self.gyro_bias,
+                unit_normals(rng) * (m.gyro_bias_walk * sqrt_dt),
+            );
+            self.accel_bias = add_vec(
+                self.accel_bias,
+                unit_normals(rng) * (m.accel_bias_walk * sqrt_dt),
+            );
+            let g = unit_normals(rng) * gyro_sigma;
+            let a = unit_normals(rng) * accel_sigma;
+            self.gyro_noise = self.gyro_lp.step(&self.imu_filter, g);
+            self.accel_noise = self.accel_lp.step(&self.imu_filter, a);
+            self.imu_next += 1;
+        }
+        self.imu_clock_us = self.imu_clock_us.saturating_add(self.base_us);
+    }
+
+    /// The sample a reader is given now: the truth, the bias, the latest
+    /// filtered noise and the rotor lines, saturated. Advances the rotor
+    /// phases (by the reader's period, or the tick when it has none) and
+    /// nothing else.
+    fn imu_sample(&mut self, truth: &Truth<'_, N>) -> ImuSample {
+        let m = self.config.imu;
+        let dt = period_s(if m.period_us == 0 {
+            self.base_us
+        } else {
+            m.period_us
+        });
+        let speeds = truth.body.rotor_speed.map(|n| n.max(0.0));
+        let mut gyro_line = Vec3::zero();
+        let mut accel_line = Vec3::zero();
         for (phase, &n) in self.rotor_phase.iter_mut().zip(speeds.iter()) {
             *phase += n * truth.max_omega * dt;
             *phase -= TWO_PI * (*phase / TWO_PI).floor();
             let (s, c) = (Real::sin(*phase), Real::cos(*phase));
             let n2 = n * n;
-            gyro_vib += Vec3::new(c, s, 0.0) * (m.gyro_harmonic_amp * n2);
-            accel_vib += Vec3::new(0.5 * c, 0.5 * s, s) * (m.accel_harmonic_amp * n2);
+            gyro_line += Vec3::new(c, s, 0.0) * (m.gyro_harmonic_amp * n2);
+            accel_line += Vec3::new(0.5 * c, 0.5 * s, s) * (m.accel_harmonic_amp * n2);
         }
 
         let gyro = add_vec(
-            add_vec(add_vec(truth.body.rate, self.gyro_bias), gyro_white),
-            gyro_vib,
+            add_vec(add_vec(truth.body.rate, self.gyro_bias), self.gyro_noise),
+            gyro_line,
         );
         let f_body = truth
             .body
             .attitude
             .inverse_rotate(truth.specific_force_world);
         let accel = add_vec(
-            add_vec(add_vec(f_body, self.accel_bias), accel_white),
-            accel_vib,
+            add_vec(add_vec(f_body, self.accel_bias), self.accel_noise),
+            accel_line,
         );
         let gyro = gyro.clamp_abs(Vec3::splat(m.gyro_range));
         let accel = accel.clamp_abs(Vec3::splat(m.accel_range));
@@ -679,25 +890,215 @@ mod tests {
         }
     }
 
+    /// The filter's power gain on white noise, as a two-sided band: the
+    /// integral of |H|² over the internal band, worked out numerically from
+    /// the coefficients (`2·∫₀^{4 kHz} |H(f)|² df`), independently of
+    /// `noise_bandwidth_hz`.
+    const NOISE_BAND_HZ: f64 = 565.576;
+
+    #[test]
+    fn the_filter_is_the_documented_one() {
+        let m = SensorConfig::realistic().imu;
+        assert_eq!(m.internal_period_us, 125);
+        assert_eq!(m.filter_cutoff_hz, 256.0);
+        let [b0, b1, b2, a1, a2] = m.filter_coefficients().expect("filter");
+        // Unit gain at DC, as a low-pass must have.
+        assert!(((b0 + b1 + b2) / (1.0 + a1 + a2) - 1.0).abs() < 1e-12);
+        let band = m.noise_bandwidth_hz().expect("band");
+        assert!((band - NOISE_BAND_HZ).abs() < 0.01, "band {band}");
+        // The vibration densities are the 1 kHz rms figures as densities.
+        let want = |rms: f64| rms / Real::sqrt(1000.0);
+        assert!((m.gyro_vibration_density / want(0.02) - 1.0).abs() < 1e-12);
+        assert!((m.accel_vibration_density / want(0.5) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_step_or_filter_that_does_not_fit_is_refused() {
+        let mk = |f: fn(&mut SensorConfig), base: u64| {
+            let mut c = SensorConfig::realistic();
+            f(&mut c);
+            SensorSuite::<4>::new(c, 1, base).map(|_| ())
+        };
+        assert!(mk(|_| {}, 250).is_ok());
+        assert!(mk(|_| {}, 500).is_ok());
+        assert!(matches!(mk(|_| {}, 200), Err(SimError::Imu(_))));
+        assert!(matches!(
+            mk(|c| c.imu.internal_period_us = 0, 1000),
+            Err(SimError::Imu(_))
+        ));
+        assert!(matches!(
+            mk(|c| c.imu.filter_cutoff_hz = 4000.0, 1000),
+            Err(SimError::Imu(_))
+        ));
+        assert!(matches!(
+            mk(|c| c.imu.filter_cutoff_hz = 0.0, 1000),
+            Err(SimError::Imu(_))
+        ));
+        assert!(matches!(
+            mk(|c| c.imu.filter_cutoff_hz = f64::NAN, 1000),
+            Err(SimError::Imu(_))
+        ));
+    }
+
+    /// The white noise reaches every reader through the filter, with the
+    /// same standard deviation per sample: `D·√565.6`.
     #[test]
     fn gyro_white_noise_matches_density() {
         let mut cfg = SensorConfig::ideal();
         cfg.imu.gyro_noise_density = 8.7e-5;
         let body = BodyState::<4>::default();
         let tr = truth(&body);
-        let mut s = SensorSuite::<4>::new(cfg, 11, BASE).unwrap();
-        let n = 100_000_u32;
-        let (mut sum, mut sum2) = (0.0, 0.0);
-        for k in 0..u64::from(n) {
-            let g = f64::from(s.sample(Micros(k * BASE), &tr).imu.unwrap().value.gyro.x);
-            sum += g;
-            sum2 += g * g;
+        let want = 8.7e-5 * Real::sqrt(NOISE_BAND_HZ);
+        for base in [1000_u64, 250] {
+            let mut s = SensorSuite::<4>::new(cfg, 11, base).unwrap();
+            let n = 100_000_u32;
+            let (mut sum, mut sum2) = (0.0, 0.0);
+            for k in 0..u64::from(n) {
+                let g = f64::from(s.sample(Micros(k * base), &tr).imu.unwrap().value.gyro.x);
+                sum += g;
+                sum2 += g * g;
+            }
+            let mean = sum / f64::from(n);
+            let var = sum2 / f64::from(n) - mean * mean;
+            let std = Real::sqrt(var);
+            assert!(
+                (std / want - 1.0).abs() < 0.05,
+                "step {base}: std {std} want {want}"
+            );
         }
-        let mean = sum / f64::from(n);
-        let var = sum2 / f64::from(n) - mean * mean;
-        let std = Real::sqrt(var);
-        let want = 8.7e-5 / Real::sqrt(BASE as f64 * 1e-6);
-        assert!((std / want - 1.0).abs() < 0.05, "std {std} want {want}");
+    }
+
+    /// A vehicle hovering at the reference rotor speed, with no rotor lines,
+    /// bias or walk: the IMU's noise alone (white and vibration).
+    fn noise_only() -> (SensorConfig, BodyState<4>) {
+        let r = SensorConfig::realistic().imu;
+        let mut cfg = SensorConfig::ideal();
+        cfg.imu.gyro_noise_density = r.gyro_noise_density;
+        cfg.imu.accel_noise_density = r.accel_noise_density;
+        cfg.imu.gyro_vibration_density = r.gyro_vibration_density;
+        cfg.imu.accel_vibration_density = r.accel_vibration_density;
+        let body = BodyState::<4> {
+            rotor_speed: [r.vibration_ref_speed; 4],
+            ..BodyState::default()
+        };
+        (cfg, body)
+    }
+
+    /// The gyro and accelerometer samples of `seconds` of a reader at the
+    /// step `base` (its period).
+    fn noise_samples(seed: u64, base: u64, seconds: u64) -> Vec<[f64; 6]> {
+        let (cfg, body) = noise_only();
+        let tr = truth(&body);
+        let mut s = SensorSuite::<4>::new(cfg, seed, base).unwrap();
+        (0..seconds * 1_000_000 / base)
+            .map(|k| {
+                let v = s.sample(Micros(k * base), &tr).imu.unwrap().value;
+                let (g, a) = (v.gyro, v.accel);
+                [g.x, g.y, g.z, a.x, a.y, a.z].map(f64::from)
+            })
+            .collect()
+    }
+
+    /// Mean two-sided power density of channel `c` over the whole-hertz
+    /// bins `lo..=hi`, from periodograms of one-second segments (Goertzel per
+    /// bin): `|X|² / (N · fs)`, which is `D²` for white noise of density `D`.
+    fn mean_density2(x: &[[f64; 6]], fs: usize, c: usize, lo: usize, hi: usize) -> f64 {
+        let segments = x.len() / fs;
+        let mut total = 0.0;
+        for seg in x.chunks_exact(fs) {
+            for k in lo..=hi {
+                #[allow(clippy::cast_precision_loss)]
+                let coeff = 2.0 * Real::cos(TWO_PI * k as f64 / fs as f64);
+                let (mut s1, mut s2) = (0.0, 0.0);
+                for v in seg {
+                    let s0 = v[c] + coeff * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                total += s1 * s1 + s2 * s2 - coeff * s1 * s2;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let n = (segments * (hi - lo + 1)) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let norm = (fs * fs) as f64;
+        total / n / norm
+    }
+
+    /// The goal of the IMU's filter and decimation: the noise a reader is
+    /// given has the same density at 1 kHz and at 4 kHz (the F405 and H743
+    /// steps). Measured on independent seeds over 64 s, in 1 to 100 Hz
+    /// (against the configured density too) and in 100 to 250 Hz, within
+    /// 3 % in amplitude. What the filter lets fold back into a 1 kHz
+    /// reader is 0.4 % in 1 to 100 Hz and 0.8 % in 100 to 250 Hz (worked
+    /// out from the filter); each estimate scatters by about 0.4 % (19,200
+    /// periodogram values in the low band). The model this replaced gave the
+    /// 1 kHz reader twice the 4 kHz reader's vibration density.
+    #[test]
+    fn noise_density_is_the_same_at_1_khz_and_4_khz() {
+        let (cfg, _) = noise_only();
+        let m = cfg.imu;
+        let hypot = |a: f64, b: f64| Real::sqrt(a * a + b * b);
+        let d = [
+            hypot(m.gyro_noise_density, m.gyro_vibration_density),
+            hypot(m.accel_noise_density, m.accel_vibration_density),
+        ];
+        let slow = noise_samples(21, 1000, 64);
+        let fast = noise_samples(22, 250, 64);
+        for (sensor, channels) in [(0, 0..3), (1, 3..6)] {
+            let want = d[sensor];
+            let band = |x: &[[f64; 6]], fs, lo, hi| {
+                let p = channels
+                    .clone()
+                    .map(|c| mean_density2(x, fs, c, lo, hi))
+                    .sum::<f64>()
+                    / 3.0;
+                Real::sqrt(p)
+            };
+            let (s_lo, f_lo) = (band(&slow, 1000, 1, 100), band(&fast, 4000, 1, 100));
+            let (s_hi, f_hi) = (band(&slow, 1000, 100, 250), band(&fast, 4000, 100, 250));
+            for (name, got) in [("1 kHz", s_lo), ("4 kHz", f_lo)] {
+                assert!(
+                    (got / want - 1.0).abs() < 0.03,
+                    "sensor {sensor}, {name}, 1-100 Hz: {got:e} against the density {want:e}"
+                );
+            }
+            assert!(
+                (s_lo / f_lo - 1.0).abs() < 0.03,
+                "sensor {sensor}, 1-100 Hz: 1 kHz {s_lo:e}, 4 kHz {f_lo:e}"
+            );
+            assert!(
+                (s_hi / f_hi - 1.0).abs() < 0.03,
+                "sensor {sensor}, 100-250 Hz: 1 kHz {s_hi:e}, 4 kHz {f_hi:e}"
+            );
+        }
+    }
+
+    /// With the same seed the two readers are given the same internal
+    /// stream: the noise (and bias) of every 1 kHz sample is that of every
+    /// fourth 4 kHz sample, bit for bit.
+    #[test]
+    fn a_1_khz_reader_gets_every_fourth_sample_of_a_4_khz_reader() {
+        let (mut cfg, body) = noise_only();
+        let r = SensorConfig::realistic().imu;
+        cfg.imu.gyro_bias_sigma = r.gyro_bias_sigma;
+        cfg.imu.accel_bias_sigma = r.accel_bias_sigma;
+        cfg.imu.gyro_bias_walk = r.gyro_bias_walk;
+        cfg.imu.accel_bias_walk = r.accel_bias_walk;
+        let tr = truth(&body);
+        let mut slow = SensorSuite::<4>::new(cfg, 5, 1000).unwrap();
+        let mut fast = SensorSuite::<4>::new(cfg, 5, 250).unwrap();
+        let mut compared = 0;
+        for k in 0..8000_u64 {
+            let f = fast.sample(Micros(k * 250), &tr).imu.unwrap().value;
+            if k % 4 == 0 {
+                let s = slow.sample(Micros(k / 4 * 1000), &tr).imu.unwrap().value;
+                assert_eq!(s, f, "sample at {} us", k * 250);
+                assert_eq!(slow.gyro_bias(), fast.gyro_bias());
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 2000);
     }
 
     #[test]
@@ -752,8 +1153,8 @@ mod tests {
     #[test]
     fn vibration_zero_when_stopped_present_when_spinning() {
         let mut cfg = SensorConfig::ideal();
-        cfg.imu.gyro_vibration_rms = 0.02;
-        cfg.imu.accel_vibration_rms = 0.5;
+        cfg.imu.gyro_vibration_density = 6.3e-4;
+        cfg.imu.accel_vibration_density = 1.6e-2;
         cfg.imu.gyro_harmonic_amp = 0.01;
         cfg.imu.accel_harmonic_amp = 1.0;
         let mut body = BodyState::<4>::default();

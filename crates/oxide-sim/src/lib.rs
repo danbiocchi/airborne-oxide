@@ -41,6 +41,9 @@ pub enum SimError {
     TimeBase(u64),
     /// The wind's sampling period is not a whole multiple of the step.
     WindPeriod { period_us: u64, step_us: u64 },
+    /// The IMU model cannot run at this step (the step is not a whole
+    /// multiple of its internal period) or its filter cannot be built.
+    Imu(String),
     /// Fault number `index` of the options can never happen as written.
     Fault { index: usize, reason: String },
     /// A parameter override was refused (ADR-0004).
@@ -62,6 +65,7 @@ impl fmt::Display for SimError {
                 f,
                 "the wind period of {period_us} µs must be a whole multiple of the {step_us} µs step"
             ),
+            SimError::Imu(m) => write!(f, "IMU model: {m}"),
             SimError::Fault { index, reason } => write!(f, "fault {index}: {reason}"),
             SimError::Param { name, reason } => write!(f, "parameter {name}: {reason}"),
             SimError::Scenario(e) => write!(f, "scenario: {e}"),

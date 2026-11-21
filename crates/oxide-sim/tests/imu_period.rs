@@ -158,12 +158,15 @@ fn gyro_std(frames: &[SensorFrame]) -> [f64; 3] {
     })
 }
 
+/// The IMU's noise passes its filter on its own clock (ADR-0008), so a
+/// reader every 1000 us and one every 500 us step get the same noise per
+/// sample: the white-noise density times the root of the filter's noise
+/// band (565.6 Hz). At rest there is no vibration.
 #[test]
-fn the_noise_is_the_1000_us_noise_and_with_period_0_the_500_us_noise() {
-    let density = SensorConfig::realistic().imu.gyro_noise_density;
-    let want_1000 = density / Real::sqrt(0.001_f64);
-    let want_500 = density / Real::sqrt(0.0005_f64);
-    for (period, want) in [(1000, want_1000), (0, want_500)] {
+fn the_noise_per_sample_is_the_same_at_1000_us_and_at_the_500_us_step() {
+    let m = SensorConfig::realistic().imu;
+    let want = m.gyro_noise_density * Real::sqrt(m.noise_bandwidth_hz().expect("filter"));
+    for period in [1000, 0] {
         let std = gyro_std(&stub_frames(11, period, 500, 3));
         for s in std {
             assert!(
