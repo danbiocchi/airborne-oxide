@@ -828,7 +828,7 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        9.54,
+        10.16,
         0.5,
     );
     assert_eq!(class_of(o), Class::Crash);

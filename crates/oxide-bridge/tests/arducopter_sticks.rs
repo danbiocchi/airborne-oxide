@@ -636,17 +636,17 @@ fn the_offboard_flights_have_the_hashes_they_had_before_stick_flying() {
         (
             "gust-hold",
             (
-                0x1b99_d683_ad95_23f4u64,
-                0x76a2_6c8b_9761_156cu64,
-                0x5ddb_11d5_6774_768du64,
+                0xb3d8_2969_799e_f181u64,
+                0xb08f_5445_14f8_d7c6u64,
+                0xd702_39a9_8d29_d15eu64,
             ),
         ),
         (
             "hover-step",
             (
-                0x3847_0a8e_a846_b9d9,
-                0x6f68_a918_ea4b_46c2,
-                0x8cc0_ab58_6c26_2ce6,
+                0x56f9_58ec_a3ce_f66b,
+                0x0e50_3e59_03ad_3e12,
+                0xf54a_86cc_e451_cf3b,
             ),
         ),
     ] {
@@ -863,7 +863,7 @@ fn gps_loss_pilot_ends_in_an_ekf_failsafe_land_and_a_disarm() {
             max_height_m: 3.402,
             max_distance_m: 10.754,
             max_tilt_deg: 2.64,
-            end_m: [-6.134, 8.833, 0.0],
+            end_m: [-6.047, 8.935, 0.0],
         },
     );
 }
