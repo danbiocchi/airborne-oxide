@@ -846,9 +846,9 @@ fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_its_motors_are_still_
 {
     let (_lease, run) = run_of("motor-loss");
     assert_writes(&run, &[]);
-    // With either tuned file the vehicle is on the ground 2.2 s after the
-    // fault. What follows depends on the draw of the IMU's noise. (a) The IMU
-    // before ADR-0008 with gate 1's tuned file: it stayed within 24 m, the
+    // In run 0, with either tuned file, the vehicle is on the ground 2.2 s
+    // after the fault. What follows depends on the draw of the IMU's noise.
+    // (a) The IMU before ADR-0008 with gate 1's tuned file: it stayed within 24 m, the
     // program's own estimator failsafe (EKF variance, LAND) came 1.2 s after
     // it was down, and it was still armed at the end. (b) The IMU of ADR-0008
     // with gate 1's file: the motors, still on, dragged it along the ground

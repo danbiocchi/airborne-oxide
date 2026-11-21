@@ -272,8 +272,8 @@ The test of `motor-loss` run 0 said that ArduCopter's motors stay on to the end 
 **The order of events.**
 
 1. The planner first ruled that "still armed, motors on to the end" was a rule of the test and had to hold unedited. The re-pin stopped on it, as it should.
-2. The planner then read gate 1's record and ruled again, from what LAND is known to do: the statement was an observation. That second ruling still held a figure of the planner's own, that the motors stay on for at least 5 s after the vehicle is down.
-3. While the test was re-stated, ArduPilot's documentation was read and twenty runs that are not the gate's were flown. Both are below, and both agree with the second ruling's main point.
+2. The planner then read gate 1's record and ruled again, from what the planner knew of LAND (the program disarms once it judges the vehicle landed): the statement was an observation. That second ruling still held a figure of the planner's own, that the motors stay on for at least 5 s after the vehicle is down.
+3. While the test was re-stated, that knowledge was checked against ArduPilot's Land and crash-check pages, and twenty runs that are not the gate's were flown. Both are below, and both agree with the second ruling's main point.
 4. A reviewer then held this record against those twenty runs and found that the 5 s figure fails in two of them. It was a second observation written as a rule. It is gone from the test.
 
 What the three sources say:
@@ -295,7 +295,7 @@ Our core, on the same runs: motors off 0.999 s after the failure in all 20.
 **What this shows.**
 
 - **"Motors on to the end" was an observation, not a rule.** It was seen in gate 1's ten flights, on the IMU before ADR-0008, and in run 0 on the IMU of ADR-0008. With either file, some flights end disarmed: when the estimator's failsafe happens to come and LAND then completes, or when the vehicle happens to lie still enough for the crash check.
-- **Neither file makes ArduCopter answer a lost motor.** In none of the forty flights does the program do anything in the first 3.2 s after the failure: the LAND comes 3.2 to 6.4 s after it, and the earliest disarm 5.2 s after it. In run 0 the vehicle is down after 2.2 s. With this record's file the motors stay on to the end in 19 of 20 flights, and the vehicle gets a median of 103 m from home.
+- **Neither file makes ArduCopter answer a lost motor.** In none of the forty flights does the program change mode or disarm in the first 3.2 s after the failure: the LAND comes 3.2 to 6.4 s after it, and the earliest disarm 5.2 s after it. (Its estimator switches lanes 2.7 to 3.1 s after the failure in 25 of the forty, which is no answer to the failure.) In run 0 the vehicle is down after 2.2 s. With this record's file the motors stay on to the end in 19 of 20 flights, and the vehicle gets a median of 103 m from home.
 - **Criterion B3 does not move.** Its median is "never" with both files.
 
 The test now pins the course of this one flight. Beside that it states only what held in all three flights of run 0 known to us (gate 1's file on each IMU model, and this record's file): nothing is done before the vehicle is down, the motors are still on when it is down, the flight is a crash, and the scenario's limit (motors off 2 s after the failure) is missed. Of these, the last two could be checked on the forty other flights, and they hold in all forty. In run 0 the new gains happen to favour ArduCopter (11.3 s where it was never). That decides nothing: gate 1 stands as flown, and a later gate counts the median of its own ten flights.
