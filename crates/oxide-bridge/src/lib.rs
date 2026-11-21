@@ -33,9 +33,11 @@
 //! - [`record`]: the flight's record as files (`audit.txt`, `row.csv`) and the
 //!   table's row format.
 //! - [`batch`]: many flights, each in a child process of its own.
-//! - [`tune`]: ArduCopter's tuning procedure as a script (ADR-0007 section 2):
-//!   hover and learn, the gyro spectrum and its notch rule, the automatic
-//!   tuner, the read-back of the gains, and the check.
+//! - [`tune`]: ArduCopter's tuning procedure as a script (ADR-0007 section 2
+//!   as changed by ADR-0009): in two flights from POSHOLD, hover and learn,
+//!   the gyro spectrum and its notch rule (decided once), the automatic tuner
+//!   on roll and pitch and then on yaw, the read-back of the gains, and the
+//!   check of each flight.
 //! - [`gate`]: gate 1 (ADR-0007): the plan as data ([`gate::plan`]), `oxide-bridge
 //!   gate fly` ([`gate::fly`]) and `oxide-bridge gate verdict`
 //!   ([`gate::verdict`], [`gate::report`]).
@@ -54,10 +56,13 @@
 //! fly our own core on the same file. Both write the same row
 //! ([`record::COLUMNS`]) and the same record (`audit.txt`, `row.csv`), judged
 //! by the same checker and classed by the same code. `oxide-bridge tune --out
-//! DIR` flies the tuning procedure ([`tune`]) and writes `report.txt`,
-//! `spectrum.csv` and, when the check passes, `tuned-gains.parm`, which is
-//! committed as it was written and never edited by hand (a real-binary test
-//! flies the procedure again and compares); the set-up of ArduPilot's tuning
+//! DIR` flies the tuning procedure ([`tune`]: two tuning flights from POSHOLD,
+//! roll and pitch and then yaw, the harmonic notch decided once on the first
+//! hover) and writes `report.txt`, `spectrum.csv`, `tuned-gains-1.parm` and,
+//! when every check of every flight passes, `tuned-gains.parm` (the 29 gains
+//! and, when a notch was set, its six values), which is committed as it was
+//! written and never edited by hand (a real-binary test flies the procedure
+//! again and compares); the set-up of ArduPilot's tuning
 //! guide is `arducopter/setup.parm`, and `starting-gains.parm` is the tuning
 //! flights' own start. A scenario that
 //! needs an airframe other than the reference quad or a parameter without a

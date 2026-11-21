@@ -18,7 +18,9 @@ pub const SETUP: &str = include_str!("../arducopter/setup.parm");
 /// the tuning flights only.
 pub const STARTING_GAINS: &str = include_str!("../arducopter/starting-gains.parm");
 /// `arducopter/tuned-gains.parm`: what `oxide-bridge tune` wrote after the
-/// automatic tuner saved its gains (ADR-0007 section 2). Never edited by hand.
+/// automatic tuner saved its gains (ADR-0007 section 2 as changed by
+/// ADR-0009): the 29 gains and, when the procedure set a harmonic notch, its
+/// six `INS_HNTCH_*` values. Never edited by hand.
 pub const TUNED_GAINS: &str = include_str!("../arducopter/tuned-gains.parm");
 /// `arducopter/failsafes.parm`: ADR-0007 section 3, each failsafe switched on
 /// with its usual action. Not in the default file list of

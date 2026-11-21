@@ -90,6 +90,7 @@ fn plan(root: &Path, instance: u8, seed: u64, stop_after_hover: bool) -> FlightP
         extra: Vec::new(),
         stop_on_peak: false,
         stop_after_hover,
+        read_notch: false,
         autotune_s: AUTOTUNE_S,
         // The tuner is let run to its end where a test says so.
         enforce_class: stop_after_hover,
@@ -304,7 +305,14 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
         ra.pack, ra.stats.pack_before_landing_v, ra.stats
     );
     assert_eq!(
-        tune::check(&tune::texts(&ra.audit), &after, None, 0.0).expect_err("no pack"),
+        tune::check_axes(
+            &tune::texts(&ra.audit),
+            &after,
+            None,
+            0.0,
+            &["Roll", "Pitch", "Yaw"]
+        )
+        .expect_err("no pack"),
         "the pack voltage before the landing was not measured"
     );
     // The gains after the save, as the program reported them.
@@ -337,11 +345,12 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing() {
     assert!((pack - 21.6549).abs() < 0.001, "{pack}");
     assert!(pack > tune::low_battery_volt());
     assert_eq!(
-        tune::check(
+        tune::check_axes(
             &tune::texts(&ra.audit),
             &after,
             Some(pack),
-            tune::low_battery_volt()
+            tune::low_battery_volt(),
+            &["Roll", "Pitch", "Yaw"]
         ),
         Ok(())
     );
