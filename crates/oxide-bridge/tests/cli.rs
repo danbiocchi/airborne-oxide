@@ -243,8 +243,8 @@ fn a_batch_whose_run_fails_twice_writes_what_it_has_and_exits_3() {
 #[test]
 fn the_core_routes_of_the_binary_fly_the_profile_they_name() {
     for (name, hash) in [
-        ("core-f405", "c52576d11caa1309"),
-        ("core-h743", "ea1238f411003026"),
+        ("core-f405", "e17e14ecc34ba686"),
+        ("core-h743", "95681a10db291758"),
     ] {
         let out = scratch(name);
         let o = bridge(&[

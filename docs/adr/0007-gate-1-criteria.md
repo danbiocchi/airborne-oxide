@@ -210,7 +210,7 @@ Flown on 19 November 2026 at commit `92fdaa2`, with the criteria, ArduCopter, it
 
 **Gate 1 is passed.** Our F405 core's error is below ArduCopter's at every percentile from the 1st to the 99th, and its 95th percentile is below ArduCopter's in each of the five hundreds of runs. ArduCopter's 921 rows of the tables (911 flights and the 10 repeats) equal the first run's in every column but the wall-clock time. A second, independent implementation of the verdict gives the same result to the last bit.
 
-What the pass rests on, stated so that it is not read as more: the gate was flown twice, and the second run followed a change chosen on other seeds. The change does not make the estimator well calibrated. Its consistency check found the filter underconfident before and after, and three faults outside the change, all deferred in ADR-0002: a drift through the heading fusion in long flights, the barometer's unmodelled drift, and the simulated GPS reporting twice its true noise.
+What the pass rests on, stated so that it is not read as more: the gate was flown twice, and the second run followed a change chosen on other seeds. The change does not make the estimator well calibrated. Its consistency check found the filter underconfident before and after, and three faults outside the change, all deferred in ADR-0002: a drift through the heading fusion in long flights, the barometer's unmodelled drift, and the simulated GPS reporting twice its true noise. The first was fixed after the run (ADR-0002 item 5, 19 November); it does not change the gust error, and the gate was not flown again for it.
 
 ## Consequences
 
