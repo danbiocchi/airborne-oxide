@@ -194,8 +194,8 @@ pub const GAIN_NAMES: [&str; 29] = [
 ];
 
 /// The names of the harmonic notch ([`notch_params`], in its order): read back
-/// after the last flight when a notch was set, and written after the gains of
-/// `tuned-gains.parm`.
+/// after each tuning flight that flies a notch, and those read after the last
+/// flight are written after the gains of `tuned-gains.parm`.
 pub const NOTCH_NAMES: [&str; 6] = [
     "INS_HNTCH_ENABLE",
     "INS_HNTCH_MODE",
@@ -1556,8 +1556,9 @@ pub fn check_carried(
     Ok(())
 }
 
-/// Each of the six notch values read back after the last flight equals the one
-/// that was set, as a 32-bit float (the program holds 32-bit floats).
+/// Each of the six notch values read back after a flight that flies the notch
+/// equals the one that was set, as a 32-bit float (the program holds 32-bit
+/// floats).
 pub fn check_notch_read(set: &[(String, f64)], read: &BTreeMap<String, f32>) -> Result<(), String> {
     for (name, value) in set {
         #[allow(clippy::cast_possible_truncation)] // the program holds 32-bit floats

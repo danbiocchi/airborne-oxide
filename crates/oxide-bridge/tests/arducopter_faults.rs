@@ -846,21 +846,25 @@ fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_its_motors_are_still_
 {
     let (_lease, run) = run_of("motor-loss");
     assert_writes(&run, &[]);
-    // The vehicle is on the ground 2.2 s after the fault in every case known.
-    // What follows depends on the draw of the IMU's noise. (a) The IMU before
-    // ADR-0008 with gate 1's tuned file: it stayed within 24 m, the program's
-    // own estimator failsafe (EKF variance, LAND) came 1.2 s after it was
-    // down, and it was still armed at the end. (b) The IMU of ADR-0008 with
-    // gate 1's file: the motors, still on, dragged it 237 m along the ground,
-    // never more than 0.1 m up, with no mode change, armed to the end. (c) The
-    // IMU of ADR-0008 with the tuned file of ADR-0009 (this pin): it stays
-    // within 25 m, the estimator failsafe and LAND come 1.2 s after it is
-    // down, and the program, in LAND, judges it landed and disarms 11.3 s
-    // after the fault. On the starting gains it tumbled away in the air for
-    // 8.9 s, over 100 m, with no mode change. In none is the lost motor
-    // noticed or answered before the vehicle is down: the motors are on when
-    // it touches the ground and for 8 s or more after. What follows on the
-    // ground is the draw. Every number is as measured on the flown set.
+    // With either tuned file the vehicle is on the ground 2.2 s after the
+    // fault. What follows depends on the draw of the IMU's noise. (a) The IMU
+    // before ADR-0008 with gate 1's tuned file: it stayed within 24 m, the
+    // program's own estimator failsafe (EKF variance, LAND) came 1.2 s after
+    // it was down, and it was still armed at the end. (b) The IMU of ADR-0008
+    // with gate 1's file: the motors, still on, dragged it along the ground
+    // to 237 m from home, never more than 0.1 m up, with no mode change,
+    // armed to the end. (c) The IMU of ADR-0008 with the tuned file of
+    // ADR-0009 (this pin): it stays within 25 m, the estimator failsafe and
+    // LAND come 1.2 s after it is down, and the program, in LAND, judges it
+    // landed and disarms 11.3 s after the fault. On the starting gains it
+    // tumbled away in the air for 8.9 s, over 100 m, with no mode change. In
+    // none of the four is the lost motor noticed or answered before the
+    // vehicle is down, and with either tuned file the motors are still on
+    // when it touches the ground. How long they stay on is the draw: on runs
+    // 500 to 519 the program's crash check or a completed LAND disarms 1
+    // flight of 20 on this file and 4 of 20 on gate 1's, 5.2 s after the
+    // fault at the earliest (ADR-0009). Every number is as measured on the
+    // flown set.
     assert_modes(&run, &["STABILIZE", "GUIDED", "LAND"]);
     assert_texts_after(
         &run,
@@ -955,12 +959,12 @@ fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_its_motors_are_still_
         estimator_failsafe_read_after(&run, ground),
         "the estimator failsafe comes after the vehicle is down"
     );
-    // The motors are on when it is down and for long after.
+    // The motors are still on when it is down. How long after is this
+    // flight's draw (the pin below), not a rule.
     let off = run.last_motor_on_s().expect("on");
     assert!(
-        off - ground >= 5.0,
-        "the last motor command above zero is {} s after the ground contact",
-        off - ground
+        off > ground,
+        "the last motor command above zero, at {off} s, is before the ground contact at {ground} s"
     );
     near("last motor command above zero", off, 26.318, 0.3);
     near("disarmed", o.disarmed_at_s.expect("disarmed"), 26.321, 0.3);

@@ -624,10 +624,12 @@ fn brain_commands(a: &FlightAudit) -> Vec<(f64, SentKind)> {
 /// Test 3. Offboard flights are what they were: the same three hashes as
 /// before the brain acted only in offboard and before the radio was set up
 /// (measured on the commit before that part, `oxide-bridge fly` run 0), until
-/// the tuned parameter set (ADR-0007 section 2) changed the flown set, and
-/// then the IMU model of ADR-0008 changed what gust-hold's flight senses:
-/// its hashes are now those of run 0 on that set and that IMU. Hover-step
-/// flies ideal sensors, and its hashes are those of the flown set as before.
+/// the tuned parameter set changed the flown set (ADR-0007 section 2, and
+/// since ADR-0009 the tuned file of that record), and the IMU model of
+/// ADR-0008 changed what gust-hold's flight senses: its hashes are now those
+/// of run 0 on the flown set with ADR-0009's tuned file and that IMU.
+/// Hover-step flies ideal sensors, and its hashes are those of the flown set,
+/// which moved with the tuned file.
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
 fn the_offboard_flights_have_the_hashes_they_had_before_stick_flying() {

@@ -23,7 +23,7 @@ How ArduCopter is flown is in [ADR-0006](0006-ardupilot-bridge.md). Four points 
 
 ### 2. How ArduCopter is tuned
 
-*This is how ArduCopter was tuned for gate 1. On the IMU model of ADR-0008 the tuning flight below is no longer accepted on its own seed, and [ADR-0009](0009-arducopter-tuning.md) replaces it for every later gate: two flights from POSHOLD in place of one from ALT_HOLD, with the notch decided once. The five steps, the set-up values, the acceptance checks and the rule about what the script may decide carry over. The file at the path named below is now ADR-0009's. Gate 1's file and script are at the commits of its two runs.*
+*This is how ArduCopter was tuned for gate 1. On the IMU model of ADR-0008 the tuning flight below is no longer accepted on its own seed, and [ADR-0009](0009-arducopter-tuning.md) replaces it for every later gate: two flights from POSHOLD in place of one from ALT_HOLD, with the notch decided once. The five steps, the set-up values and the acceptance checks carry over (step 5 now takes two flights). The rule about what the script may decide holds within each flight, with three stated exceptions between flights. The file at the path named below is now ADR-0009's. Gate 1's file and script are at the commits of its two runs.*
 
 In this order, in calm air on a full pack, by a script that is committed with the report:
 

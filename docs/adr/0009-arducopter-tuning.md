@@ -5,7 +5,7 @@ Status: **proposed on 21 November 2026. It takes effect when the owner merges it
 ## In short, for the owner
 
 - **The problem:** on the IMU model of [ADR-0008](0008-imu-filter-and-decimation.md), gate 1's tuning flight is accepted on 4 of 20 tuning seeds, and it fails on its own seed. The committed tuned file could no longer be written by the code, and three tests waited.
-- **Why it failed:** the flight starts in ALT_HOLD, which holds no position, and the vehicle slides 100 m away in 13 of 20 flights. In 3 more, yaw's tuning does not finish before the pack is empty.
+- **Why it failed:** the flight starts in ALT_HOLD, which holds no position, and the vehicle slides 100 m away in 13 of 20 flights. In 3 more, yaw's tuning does not finish before the tuner's window ends, and the window cannot grow: the pack is nearly empty soon after.
 - **The procedure now:** two tuning flights, each started in POSHOLD, which holds position. The first tunes roll and pitch. The second, on a full pack, tunes yaw. The notch is decided once, on the first hover, and the tuned file carries it when one is set.
 - **Measured:** accepted on 20 of 20 seeds, where gate 1's flight is accepted on 4. No flight goes further than 4.03 m from where it armed.
 - **The comparison with our core does not move.** ArduCopter's gust error on runs 500 to 999 is within 0.0003 m of what it was with gate 1's file, whichever procedure wrote the gains.
@@ -32,7 +32,7 @@ Measured on tuning seeds 0 to 19 on the IMU of ADR-0008, in calm air. The tuning
 - In the 60 s hover, with the sticks centred, the vehicle already moves at 0.17 to 0.74 m/s in one direction (median 0.36 m/s). The tuner's twitches add a jitter around that and no net motion.
 - The drift follows a small true tilt: 0.14° to 0.72°, at 1.09 m/s for each degree, pointing opposite to the tilt on all 20 seeds.
 - The tilt follows the IMU's accelerometer bias at power-on (0.05 m/s² per axis, one sigma, in the model). The size of the horizontal bias correlates with the drift speed at 0.70. ArduCopter's estimator takes part of the bias as tilt, and the controller then holds the wrong level.
-- ALT_HOLD has no position loop to correct it. Even the four accepted flights were 61 to 68 m out.
+- ALT_HOLD has no position loop to correct it. Even the four accepted flights were 61.5 to 67.5 m out.
 
 ADR-0007 §2 measured this drift on the old model (0.15 to 0.2 m/s on five seeds) and judged it harmless within the gate's 100 m limit. Twenty seeds show that it is not.
 
@@ -41,7 +41,7 @@ ADR-0007 §2 measured this drift on the old model (0.15 to 0.2 m/s on five seeds
 - Over 67 completed flights it took 96 to 254 s (median 138 s). The four stages after it take about 130 s together, with little spread. Roll and pitch take about 92 s each.
 - Yaw starts about 270 s into the flight and the window ends at 566 s, so yaw fits only if its first stage is shorter than about 165 s.
 - The length does not depend on the start mode, on the drift, or on `AUTOTUNE_AGGR` (0.1 against the binary's 0.075).
-- The window cannot grow: the pack is nearly empty 650 s into the flight. The pack itself was never the reason for a refusal (14.5 % of its charge and 21.65 V under load when the descent begins, against a threshold of 20.77 V).
+- The window cannot grow: the pack is nearly empty 650 s into the flight. The pack itself was never the reason for a refusal (14.5 to 14.6 % of its charge and 21.65 to 21.66 V under load when the descent begins, against a threshold of 20.767 V).
 
 What happens inside that stage was not read: ArduPilot is a behaviour reference here, and only the binary's messages and timing were measured.
 
@@ -56,7 +56,7 @@ From its AutoTune, Tuning Process, and notch-filter pages:
 
 ## Decision
 
-The procedure of ADR-0007 §2 stays as it is in everything not named here: the frame and motor settings, the guide's filter settings, the starting gains, the hover-thrust learning, the tuner's own settings, the 60 s hover, the 480 s window, the landing, and the rule that the script decides everything from simulated time, the true height and the motor pulses.
+The procedure of ADR-0007 §2 stays as it is in everything not named here: the frame and motor settings, the guide's filter settings, the starting gains, the hover-thrust learning, the tuner's own settings, the 60 s hover, the 480 s window, the landing, and the rule that the script decides everything from simulated time, the true height, the motor pulses and the gyro samples it gave the program itself.
 
 That rule still holds for everything a flight does while it flies. With more than one flight, three things that the program reported now pass from one flight to the next, and the code names them:
 
@@ -142,7 +142,7 @@ Not chosen:
 
 ArduPilot says a tune from AltHold is often the better one, so starting from POSHOLD could lean against ArduCopter. Measured, it does not:
 
-- **The gains hardly differ.** Over the accepted seeds, roll rate P is 0.0549 to 0.0576 from ALT_HOLD and 0.0547 to 0.0577 from POSHOLD in two flights; pitch rate P 0.0549 to 0.0608 and 0.0524 to 0.0579; yaw rate P 0.0497 to 0.0538 and 0.0494 to 0.0555. The roll and pitch angle gains are 25.4 or 27.75 either way.
+- **The gains hardly differ.** Over the accepted seeds, roll rate P is 0.0549 to 0.0576 from ALT_HOLD and 0.0547 to 0.0577 from POSHOLD in two flights, as built; pitch rate P 0.0549 to 0.0608 and 0.0524 to 0.0579; yaw rate P 0.0497 to 0.0538 and 0.0500 to 0.0555. The pitch angle gain is 27.75 on every accepted seed either way. The roll angle gain is 27.75 on every accepted seed from ALT_HOLD, and 25.4 or 27.75 from POSHOLD.
 - **The gust error does not move.** Runs 500 to 999, all 500 flights safe in every row:
 
 | Tuned file | Median | 95th percentile |
@@ -165,7 +165,7 @@ An independent check found what decides it: **the four rotors' lines add or canc
 
 - The model gives each rotor its own line, with a phase that starts at random and advances at that rotor's speed. In a hover the four speeds are within 0.07 Hz of each other, so the gyro sees the sum of four lines of almost one frequency. That sum is anything from nothing to four times one rotor's line, by how their phases happen to stand.
 - Measured over the 40 hovers of the twenty seeds: the line's strength follows the distribution of four lines with random phases. Each rotor's own amplitude, the steadiness of the rotor speed and the rest of the band are the same in both hovers of a seed, and the line still changes up to 36 times between them.
-- It is not the gains. The line was above the threshold on 2 of 20 first hovers (starting gains) and on 6 of 18 second hovers (tuned roll and pitch gains). That difference is within chance (Fisher's exact test, p = 0.12), and on seeds 9 and 13 the line fell on the tuned gains.
+- It is not the gains. The line was above the threshold on 2 of 20 first hovers (starting gains) and on 6 of 18 second hovers (tuned roll and pitch gains; seeds 9 and 13 are left out of the 18, because their second hover flies the notch). That difference is within chance (Fisher's exact test, p = 0.12, or p = 0.24 counting all 20 seeds), and on seeds 9 and 13 the line fell on the tuned gains.
 - It is not the spectrum's own scatter either: 57 averaged segments scatter by about 13 %, not by a factor of ten.
 
 Not done: the phases were not rebuilt hover by hover from the simulator, so the alignment of each hover is inferred from the model and the distribution. A small real shift on the tuned gains is not excluded by twenty seeds.
@@ -179,7 +179,7 @@ On seed 0, the committed file's seed, the first hover shows no peak (largest lin
 
 ## The procedure as flown
 
-Seed 0, the committed file's seed, at the commit of this record. A second run on another instance of the program gives the same two flights bit for bit and the same file byte for byte, and a test flies that comparison.
+Seed 0, the committed file's seed. The report committed beside the file was written at commit `9f1d890`, on instance 2 of the program; since then the tuning code has changed only in its comments. A second run on another instance of the program gives the same two flights bit for bit and the same file byte for byte, and a test flies that comparison.
 
 | | Roll-and-pitch flight | Yaw flight |
 |---|---|---|
@@ -199,7 +199,7 @@ Seed 0, the committed file's seed, at the commit of this record. A second run on
 
 The low-battery threshold is 20.767 V. Both flights are safe by the gate's class. The procedure takes 1,195 s of simulated flight.
 
-| Parameter | Starting gains | Gate 1's file | This procedure |
+| Parameter | Before tuning | Gate 1's file | This procedure |
 |---|---|---|---|
 | `ATC_RAT_RLL_P`, `_I` | 0.05 | 0.0547 | 0.0549 |
 | `ATC_RAT_RLL_D` | 0.0012 | 0.00117 | 0.00123 |
@@ -227,7 +227,7 @@ The file holds every digit. The other values of the 29 it lists did not change, 
 | Pitch complete | 268 to 282 s, with 283 to 297 s of the window left |
 | Yaw complete | 311 to 465 s, with 101 to 255 s of the window left (the slowest is seed 9) |
 | Furthest from where it armed | 1.88 to 4.03 m |
-| Pack when the descent begins | 21.658 to 21.678 V, 14.6 to 14.9 % |
+| Pack when each tuning flight's descent begins | 21.658 to 21.678 V, 14.6 to 14.9 % |
 
 On seeds 9 and 13 the file ends with the six notch lines, read back as set. On seed 9 these are `INS_HNTCH_ENABLE` 1, `INS_HNTCH_MODE` 1, `INS_HNTCH_FREQ` 222.65625, `INS_HNTCH_BW` 111.328125, `INS_HNTCH_REF` 0.14950788 and `INS_HNTCH_ATT` 40.
 
@@ -236,38 +236,47 @@ On seeds 9 and 13 the file ends with the six notch lines, read back as set. On s
 - **By its builder:** unit tests that fly the whole procedure on made-up flights, and seven tests on the real program.
 - **By a reviewer, a separate agent:** it compared the decision above with the code line by line and found no check weaker than gate 1's. It then broke the code on purpose in 28 ways, to see a test fail each time. One break went unnoticed: skipping every acceptance check on the flights that fly a notch. A test now catches it. Ten smaller findings were mended. Among them: the second new check of §5 was added, and the third now holds after every flight that flies a notch, not only the last.
 - **By a verifier, a third agent:** it confirmed each mend and flew seed 13. It broke the new guards in 9 more ways: 8 were caught, and the ninth removes one of two guards that each do the job alone.
-- **Fresh runs:** seed 0 wrote the committed file byte for byte on each of four instances of the program.
+- **Fresh runs:** seed 0 wrote the committed file byte for byte in every fresh run: on instances 0, 2 and 4, and in the test that compares two instances, which was run again on other instances for this record.
+- **The record itself:** two more reviewers traced its figures to the measurements and held the documents against the code. They found the 5 s figure of the motor-loss section below, a false sentence about the angle gains, a stale comment, and smaller slips. All are corrected here.
 
 ### What is not shown
 
 - **That ArduCopter's filter applies the notch.** A test shows that a flight started the way a gate flight is, from a file with the six lines, has the six values in the program. That the gyro signal is then filtered is shown only indirectly: taking the lines out changes the flight (the last two rows of the gust table).
 - **The gust rows of seed 9** are of the diagnosis's code. As built, the roll-and-pitch flight after a peak also sets the learned hover thrust, so seed 9's gains differ slightly from those rows' (its yaw completes at 465 s, where the diagnosis had 444 s). The seed 0 row is the committed file's own values.
-- **The notch's reference thrust and the file's hover thrust differ slightly** on a seed with a notch: 0.1495 learned in the first hover against 0.1500 saved by the tuning flights. Gate 1's script would have done the same.
+- **The notch's reference thrust and the file's hover thrust differ slightly** on a seed with a notch: about 0.1495 learned in the first hover against about 0.1500 saved by the tuning flights (seed 9: 0.14951 and 0.14993; seed 13: 0.14959 and 0.14998). Gate 1's script would have done the same.
+- **When each vehicle met the ground in the motor-loss runs 500 to 519** (below). The runner's tables do not hold it.
 - **Windows.** The tests on the real program run on Linux only, as before.
 
 ## The pins that moved
 
-ArduCopter's flights now fly other gains, so what single flights are pinned to moved in places. Each new value was seen on two instances of the program before it was pinned. No tolerance was widened, and no test was removed or switched off.
+ArduCopter's flights now fly other gains, so what single flights are pinned to moved in places. Each new value was seen on two instances of the program before it was pinned, with one exception: the second parameter hash below is computed by the code, was pinned as computed, and was then confirmed by real geofence flights on two instances. No tolerance was widened, and no test was removed or switched off.
 
 | Where | What moved |
 |---|---|
 | `src/gate/files.rs` | The two parameter hashes the gate expects (the tuned file is part of what is hashed). Each is now compared with the record of a real flight. |
-| `arducopter_sticks` | The three hashes of gust-hold 0 and of hover-step 0. In `gps-loss-pilot`, where the blind landing ends, by 0.1 m. |
+| `arducopter_sticks` | The three hashes of gust-hold 0 and of hover-step 0. In `gps-loss-pilot`, where the blind landing ends, by 0.13 m. |
 | `arducopter_faults`, `imu-loss` | The falling vehicle meets the ground at 10.2 m/s, where it was 9.5 m/s. |
-| `arducopter_faults`, `motor-loss` | What the vehicle does once it is down (next section). |
+| `arducopter_faults`, `motor-loss` | The touchdown speed (7.4 m/s, where it was 6.9 m/s), the greatest tilt, and what the vehicle does once it is down. The test was renamed (next section). |
 | `arducopter_tune` | Every pin of the tuning flights: they are other flights now. |
 
-Everything else held unedited: all of `arducopter_boot`, `arducopter_fly` and `arducopter_scenario`, the gate program's two trials, and the other tests of the two files above. Our core's ten `oxide-sim hash` lines and its scenario hashes are unchanged.
+No other pin moved: none in `arducopter_boot`, `arducopter_fly` or `arducopter_scenario` (which gained one assertion: the second parameter hash, compared with a real geofence flight), none in the gate program's two trials, and none in the other tests of the two files above. Our core's ten `oxide-sim hash` lines and its scenario hashes are unchanged.
 
 ### Motor loss: a statement that was an observation
 
 The test of `motor-loss` run 0 said that ArduCopter's motors stay on to the end of the flight. On the new gains that flight goes another way:
 
-- The vehicle is on the ground 2.2 s after the failure, as before, at 7.4 m/s.
+- The vehicle is on the ground 2.2 s after the failure, as before, at 7.4 m/s (6.9 m/s before).
 - The estimator's failsafe switches to LAND 1.2 s after that.
 - The program, in LAND, judges the vehicle landed and disarms, 11.3 s after the failure.
 
-**The order of events.** The planner first ruled that "still armed, motors on to the end" was a rule of the test and had to hold unedited. The re-pin stopped on it, as it should. Only then was the statement checked, in three ways:
+**The order of events.**
+
+1. The planner first ruled that "still armed, motors on to the end" was a rule of the test and had to hold unedited. The re-pin stopped on it, as it should.
+2. The planner then read gate 1's record and ruled again, from what LAND is known to do: the statement was an observation. That second ruling still held a figure of the planner's own, that the motors stay on for at least 5 s after the vehicle is down.
+3. While the test was re-stated, ArduPilot's documentation was read and twenty runs that are not the gate's were flown. Both are below, and both agree with the second ruling's main point.
+4. A reviewer then held this record against those twenty runs and found that the 5 s figure fails in two of them. It was a second observation written as a rule. It is gone from the test.
+
+What the three sources say:
 
 - **ArduPilot's documentation.** Its Land page: "Upon reaching the ground the copter will automatically shut-down the motors and disarm the copter if the pilot's throttle is at minimum." Its crash check "disarms the motors in cases where the vehicle is likely out of control and has hit the ground", when the lean angle is more than 30° from the wanted one and the vehicle accelerates by less than 3 m/s², for 2 s. So a disarm on the ground is the program's documented behaviour, by either route.
 - **Gate 1's own record.** None of ArduCopter's ten `motor-loss` flights disarmed there.
@@ -285,17 +294,17 @@ Our core, on the same runs: motors off 0.999 s after the failure in all 20.
 
 **What this shows.**
 
-- **"Motors on to the end" was an observation of two flights, not a rule.** With either file, some flights end disarmed: when the estimator's failsafe happens to come and LAND then completes, or when the vehicle happens to lie still enough for the crash check.
-- **Neither file makes ArduCopter answer a lost motor.** The LAND comes 3.2 to 6.4 s after the failure, when the vehicle has been down for seconds. In most flights three running motors keep dragging it.
+- **"Motors on to the end" was an observation, not a rule.** It was seen in gate 1's ten flights, on the IMU before ADR-0008, and in run 0 on the IMU of ADR-0008. With either file, some flights end disarmed: when the estimator's failsafe happens to come and LAND then completes, or when the vehicle happens to lie still enough for the crash check.
+- **Neither file makes ArduCopter answer a lost motor.** In none of the forty flights does the program do anything in the first 3.2 s after the failure: the LAND comes 3.2 to 6.4 s after it, and the earliest disarm 5.2 s after it. In run 0 the vehicle is down after 2.2 s. With this record's file the motors stay on to the end in 19 of 20 flights, and the vehicle gets a median of 103 m from home.
 - **Criterion B3 does not move.** Its median is "never" with both files.
 
-The test now states what held in every case known: nothing is done before the vehicle is down, the motors are on when it is down and for at least 5 s after, the flight is a crash, and the scenario's limit (motors off 2 s after the failure) is missed. This flight's own course is pinned beside that. In run 0 the new gains happen to favour ArduCopter (11.3 s where it was never). That decides nothing: gate 1 stands as flown, and a later gate counts the median of its own ten flights.
+The test now pins the course of this one flight. Beside that it states only what held in all three flights of run 0 known to us (gate 1's file on each IMU model, and this record's file): nothing is done before the vehicle is down, the motors are still on when it is down, the flight is a crash, and the scenario's limit (motors off 2 s after the failure) is missed. Of these, the last two could be checked on the forty other flights, and they hold in all forty. In run 0 the new gains happen to favour ArduCopter (11.3 s where it was never). That decides nothing: gate 1 stands as flown, and a later gate counts the median of its own ten flights.
 
 ## Consequences
 
 - `crates/oxide-bridge/arducopter/tuned-gains.parm` is replaced by what this procedure writes on seed 0. The run's report is beside it (`tuning-report.txt`).
 - The three tuning tests that waited fly again, and three are new: a seed whose first hover shows a peak, a flight that loads a file with a notch, and the twenty seeds (behind a switch, `OXIDE_TUNE_TWENTY=1`, since it takes ten minutes).
-- Pinned values of ArduCopter's flights move with the new file (below). Our core's pins do not move: it does not fly ArduCopter's gains.
+- Pinned values of ArduCopter's flights move with the new file (above). Our core's pins do not move: it does not fly ArduCopter's gains.
 - Gate 1's reports are unchanged. They are records of runs at their commits, where gate 1's file and script are.
 - DESIGN §8 rule 3 already names this procedure for ArduCopter: "the initial-tune parameters, harmonic notch setup and AUTOTUNE in SITL".
 - Tuning ArduCopter now takes about 1,200 s of simulated flight in two flights (about 140 s of wall time here), or about 1,300 s in three when the first hover shows a peak.

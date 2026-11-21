@@ -438,8 +438,8 @@ mod tests {
     /// runner's. The values moved with the tuned file of ADR-0009. Both are
     /// the hash of a real flight's audit: the first is compared in
     /// `arducopter_tune` (`a_flight_that_loads_a_tuned_file_with_notch_lines_...`),
-    /// the second in `arducopter_scenario` (`the_fence_parameters_are_in_the_
-    /// program_and_the_flight_shows_the_fence_acting`, a geofence flight).
+    /// the second in `arducopter_scenario`, by a geofence flight:
+    /// `the_fence_parameters_are_in_the_program_and_the_flight_shows_the_fence_acting`.
     #[test]
     fn the_expected_parameter_hash_is_the_one_real_flights_recorded() {
         let plain = "71b263adc1cc30e8984eb0a2ac3a782f5bea17c3db6e51a3e54a78a3fe5caf65";

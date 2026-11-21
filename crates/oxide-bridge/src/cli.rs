@@ -84,7 +84,7 @@ pub struct BatchArgs {
     pub first_core: usize,
 }
 
-/// What `tune` is given (ADR-0007 section 2).
+/// What `tune` is given (ADR-0007 section 2 as changed by ADR-0009).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TuneArgs {
     pub out: PathBuf,
