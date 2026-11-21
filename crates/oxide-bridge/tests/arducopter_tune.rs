@@ -166,10 +166,7 @@ fn the_hover_from_poshold_learns_the_thrust_and_the_spectrum_has_no_peak() {
             .map(|l| (l.axis, l.freq_hz, l.ratio))
             .collect::<Vec<_>>()
     );
-    assert!(
-        ratios.iter().all(|r| (1.0..tune::PEAK_RATIO).contains(r)),
-        "{ratios:?}"
-    );
+    assert!(ratios.iter().all(|r| (2.0..2.5).contains(r)), "{ratios:?}");
     // The largest line of each axis (x, y, z): its frequency and its power
     // over the band's median, 2.0 to 2.5 times: no line near 10.
     for (l, (hz, ratio)) in v.lines.iter().zip([
@@ -270,6 +267,9 @@ struct Pins {
     /// the descent.
     pack_v: f64,
     soc_descent: f64,
+    /// The state of charge on the ground and at the disarm (the same: the
+    /// pack is not drawn after the motors stop to within the pin).
+    soc_ground: f64,
     /// The gate's own judgement: furthest from where it armed, highest, tilt
     /// up to; the touchdown; the descent from, and its greatest speed.
     furthest_m: f64,
@@ -358,6 +358,11 @@ fn check_flight_against(f: &FlightResult, want: &Pins) {
         (soc("descent start") - want.soc_descent).abs() < 0.001,
         "{tag}"
     );
+    assert!(
+        (soc("on the ground") - want.soc_ground).abs() < 0.001,
+        "{tag}"
+    );
+    assert!((soc("disarmed") - want.soc_ground).abs() < 0.001, "{tag}");
     // The class: safe, far inside the gate's limits, a slow touchdown.
     let st = &f.stats;
     assert_eq!(
@@ -430,6 +435,7 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing_in_both_flights
             saved_after_ground_s: 1.841,
             pack_v: 21.6601,
             soc_descent: 0.1462,
+            soc_ground: 0.1200,
             furthest_m: 2.766,
             highest_m: 10.648,
             tilt_deg: 15.565,
@@ -516,6 +522,7 @@ fn the_tuner_runs_to_its_messages_and_saves_its_gains_on_landing_in_both_flights
             saved_after_ground_s: 1.8395,
             pack_v: 21.6776,
             soc_descent: 0.1490,
+            soc_ground: 0.1230,
             furthest_m: 1.5715,
             highest_m: 10.630,
             tilt_deg: 3.118,
@@ -604,15 +611,33 @@ fn a_fresh_run_of_the_procedure_writes_the_committed_tuned_file_byte_for_byte_on
             2,
             "{report}"
         );
-        assert_eq!(
-            report
-                .matches(
-                    "pack voltage under load, mean of the last second before the descent began"
-                )
-                .count(),
-            2
+        // The pack before each descent, as the tuner test pins it.
+        for volts in ["21.660 V", "21.678 V"] {
+            assert!(
+                report.contains(&format!(
+                    "pack voltage under load, mean of the last second before the descent \
+                     began: {volts}"
+                )),
+                "{volts}"
+            );
+        }
+        // The settings the program read back before each flight: roll and
+        // pitch (3) in the first, yaw (4) in the second.
+        let settings: Vec<&str> = report
+            .lines()
+            .filter(|l| l.contains("settings as read back from the program before this flight"))
+            .collect();
+        assert_eq!(settings.len(), 2, "{report}");
+        assert!(
+            settings[0].ends_with("AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 3, AUTOTUNE_MIN_D 0.0005"),
+            "{}",
+            settings[0]
         );
-        assert!(report.contains("AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 3, AUTOTUNE_MIN_D 0.0005"));
+        assert!(
+            settings[1].ends_with("AUTOTUNE_AGGR 0.075, AUTOTUNE_AXES 4, AUTOTUNE_MIN_D 0.0005"),
+            "{}",
+            settings[1]
+        );
         assert!(report.contains("AutoTune: Saved gains for Roll Pitch"));
         assert!(report.contains("AutoTune: Saved gains for Yaw(E)"));
         assert!(report.contains("notch: none"));
@@ -684,6 +709,21 @@ fn a_seed_whose_first_hover_shows_a_peak_flies_three_flights_and_its_file_ends_w
         }
     }
     assert!(has(f2, "MOT_THST_HOVER", n.reference));
+    // The program took them in both flights: the six values read back after
+    // the roll-and-pitch flight's disarm, and `AUTOTUNE_AXES` and the thrust
+    // as read before it, are what the plan set (the procedure checks it).
+    for f in [f2, f3] {
+        let t = f.marks.read_back.expect("read back");
+        let read = tune::echoes(&f.audit, tune::program_us(t), u64::MAX);
+        for (name, value) in &n.params {
+            assert_eq!(read.get(name.as_str()), Some(&(*value as f32)), "{name}");
+        }
+    }
+    let (before2, _) = tune::read_back(f2);
+    assert_eq!(before2.get("AUTOTUNE_AXES"), Some(&3.0));
+    assert_eq!(before2.get("MOT_THST_HOVER"), Some(&(n.reference as f32)));
+    let (before3, _) = tune::read_back(f3);
+    assert_eq!(before3.get("AUTOTUNE_AXES"), Some(&4.0));
     assert!(f3.plan.extra.iter().all(|(n, _)| n != "MOT_THST_HOVER"));
     // Later hovers' spectra are reported, and decide nothing.
     assert!(f2.spectrum.is_some() && f3.spectrum.is_some());
