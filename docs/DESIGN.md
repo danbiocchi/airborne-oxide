@@ -325,7 +325,8 @@ Auto-disarm follows detected touchdown.
   - The simulator tick is a whole number of microseconds.
   - Every physics, sensor, actuator and core period is a whole multiple of it, and the scenario loader rejects anything else.
   - The physics step is at least as fast as the core's rate loop, and equal to it by default.
-- **Sensor sampling.** Sensor models sample sub-stepped truth and apply the real sensor's anti-alias filter and output data rate. Vibration is synthesised in the sensor model at the sampling instants, so the rigid-body integrator doesn't have to resolve it.
+- **Sensor sampling.** Sensor models sample sub-stepped truth and apply the real sensor's anti-alias filter and output data rate. Vibration is synthesised in the sensor model, so the rigid-body integrator doesn't have to resolve it.
+  - **The IMU as built ([ADR-0008](adr/0008-imu-filter-and-decimation.md)).** It runs on its own 8 kHz clock whatever the step. Its noise (white noise and broadband vibration, both given as densities) passes its anti-alias filter (second-order, 256 Hz), and a reader gets the latest sample at its own period. So the noise the core sees does not depend on its tick rate: the F405 (1 kHz) and the H743 (4 kHz) read the same stream. The truth is the tick's, not sub-stepped. The filter acts on the noise only: the delay it would add to the signal is the S2 item "output-filter delay" (§5.4). The values and the reason for each are in `oxide_sim::sensors::ImuModel`.
 - **Collisions:** `parry`/`rapier` (S2).
 
 ### 5.4 Phases (Q12)

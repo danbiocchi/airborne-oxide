@@ -2072,15 +2072,15 @@ mod tests {
     /// The five lines `hash` has always printed for a profile.
     const PINNED: [&str; 10] = [
         "f405-lean hover-step 3de16d7a9847deaf",
-        "f405-lean gust-hold#0 0bf6a39d9ee488ea",
-        "f405-lean rc-loss-position#0 9d2ac3d06deaf3dd",
-        "f405-lean pair-gps-loss+baro-loss#0 14c7b29479af27bf",
-        "f405-lean motor-loss#0 79885495fde5759a",
+        "f405-lean gust-hold#0 e17e14ecc34ba686",
+        "f405-lean rc-loss-position#0 8496c2d98802c57d",
+        "f405-lean pair-gps-loss+baro-loss#0 93a02e3bac6c67ec",
+        "f405-lean motor-loss#0 aea1fc271efee43d",
         "h743-full hover-step 9ff026845c342fbd",
-        "h743-full gust-hold#0 3c22d54c9e9d87a0",
-        "h743-full rc-loss-position#0 986ee1c6842fc711",
-        "h743-full pair-gps-loss+baro-loss#0 aaf9cd7b28cf316d",
-        "h743-full motor-loss#0 f0b9d3cec4536a4a",
+        "h743-full gust-hold#0 95681a10db291758",
+        "h743-full rc-loss-position#0 d7fe692090e72b1c",
+        "h743-full pair-gps-loss+baro-loss#0 820932819d0a859b",
+        "h743-full motor-loss#0 6d5b21b4f7e9fe8a",
     ];
 
     fn hash_output(profile: &str) -> Vec<String> {

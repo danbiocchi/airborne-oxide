@@ -26,6 +26,7 @@ use oxide_core::time::Micros;
 use oxide_sim::metrics::{HoldCriteria, HoldMetrics};
 use oxide_sim::outcome::{FlightClass, FlightOutcome};
 use oxide_sim::scenario::{GustHold, HoverStep, NoPilot, Pilot, gust_hold};
+use oxide_sim::sensors::SensorConfig;
 use oxide_sim::{Airframe, SimOptions, Simulation, StepRecord};
 
 #[path = "support/pool.rs"]
@@ -1174,6 +1175,11 @@ fn the_imu_arducopter_reads_is_our_models() {
     };
     let lease = Instance::lease();
     let runs = [run(lease.0, 1), run(lease.0, 2)];
+    // The white noise of one sample as the IMU gives it, mrad/s: the density
+    // through the IMU's own filter (ADR-0008), the same at every period.
+    let imu = SensorConfig::realistic().imu;
+    let sample_noise =
+        imu.gyro_noise_density * Real::sqrt(imu.noise_bandwidth_hz().expect("filter")) * 1000.0;
     let mut reported_bias = Vec::new();
     let mut our_bias = Vec::new();
     for (run, seed) in runs.iter().zip([1, 2]) {
@@ -1198,44 +1204,45 @@ fn the_imu_arducopter_reads_is_our_models() {
                 }
             }
             assert!(gyro_raw.len() >= 900, "{} messages", gyro_raw.len());
-            // The message truncates to whole milli-rad/s: its mean is the
-            // true mean moved 0.5 mrad/s toward zero. Put it back.
+            // The message truncates to whole milli-rad/s, towards zero: a
+            // positive report is 0.5 mrad/s below its value on average and a
+            // negative one 0.5 above. Put back 0.5 times the share of
+            // positive reports less the share of negative ones. For reports
+            // of one sign that is the whole 0.5; for an axis whose bias is
+            // near zero, where the reports straddle it, it is the part that
+            // does not cancel. (The first form of this test put back a whole
+            // 0.5 by the sign of the mean. That was 0.15 to 0.28 mrad/s off
+            // on seed 2's axis 0 with the IMU model before ADR-0008, whose
+            // bias there was 0.73 mrad/s, and 0.45 off with that record's
+            // model, where the bias walk leaves 0.075 mrad/s.)
             let raw_mean = mean(&gyro_raw);
-            let corrected = raw_mean + 0.5 * raw_mean.signum();
+            let share = |f: fn(f64) -> bool| {
+                gyro_raw.iter().filter(|g| f(**g)).count() as f64 / gyro_raw.len() as f64
+            };
+            let corrected = raw_mean + 0.5 * (share(|g| g > 0.0) - share(|g| g < 0.0));
             let residual = corrected - mean(&ours);
             let sd = std_dev(&gyro_raw);
             println!(
                 "MEASURED IMU seed {seed} gyro axis {axis}: reported mean {raw_mean:.3} mrad/s, \
                  corrected for truncation {corrected:.3}, our bias over the window {:.3}, \
-                 residual {residual:.3}, reported sd {sd:.3} (our per-sample white noise {:.3}); \
+                 residual {residual:.3}, reported sd {sd:.3} (our white noise per sample {:.3}); \
                  accel residual mean {:.4} m/s2 sd {:.4}",
                 mean(&ours),
-                8.7e-5 * Real::sqrt(1000.0) * 1000.0,
+                sample_noise,
                 mean(&accel_resid),
                 std_dev(&accel_resid)
             );
-            // 0.3 mrad/s (0.15 on the starting gains): the truncation
-            // correction is exact only while the reports keep one sign, and
-            // seed 2 axis 0 has a bias of 0.73 mrad/s under a reported sd of
-            // 0.9 mrad/s, so its reports straddle zero. It was 0.15 off on
-            // the starting gains and is 0.275 off on the flown set. The cause
-            // was found by a review that flew the parts of the set alone:
-            // `setup.parm` (the guide's 80 Hz gyro filter, INS_GYRO_FILTER 80,
-            // and INS_ACCEL_FILTER 10) with the starting gains gives the same
-            // 0.275 and sd 0.899, the tuned gains without it 0.147 and sd
-            // 0.508; the tuned gains are not the cause. The other five axes
-            // are within 0.044.
+            // 0.15 mrad/s: the six axes measured are within 0.09 (0.014 to
+            // 0.086), and the mean of some 950 reports of 1.2 mrad/s sd is
+            // itself known to 0.04.
             assert!(
-                residual.abs() <= 0.3,
+                residual.abs() <= 0.15,
                 "seed {seed} axis {axis}: residual {residual}"
             );
             // ArduCopter reports a filtered value (INS_GYRO_FILTER 80 Hz on
             // the flown set): quieter than one 1000 us sample, but not
             // silent.
-            assert!(
-                sd > 0.2 && sd < 8.7e-5 * Real::sqrt(1000.0) * 1000.0,
-                "sd {sd}"
-            );
+            assert!(sd > 0.2 && sd < sample_noise, "sd {sd}");
             // The accelerometer, to the truncation of one milli-g (0.0098 m/s2)
             // and the bias.
             assert!(
