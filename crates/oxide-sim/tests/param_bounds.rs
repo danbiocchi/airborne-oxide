@@ -187,11 +187,13 @@ fn a_touchdown_time_of_a_tenth_of_a_second_does_not_disarm_above_the_ground() {
 /// The most a bound may do to a flight: not fly away, blow up or panic.
 const RUNAWAY_M: f64 = 200.0;
 
-/// What one flight at one bound did wrong; empty = nothing.
-fn fly_bound(f: &ScenarioFile, name: &str, value: f64) -> Vec<String> {
+/// What run `index` of `f` at one bound did wrong; empty = nothing.
+fn fly_bound(f: &ScenarioFile, index: u64, name: &str, value: f64) -> Vec<String> {
     let params = vec![(name.to_string(), value)];
     let run = std::panic::catch_unwind(|| {
-        let mut sim = f.build_with_params(F405_LEAN, 0, &params).expect("builds");
+        let mut sim = f
+            .build_with_params(F405_LEAN, index, &params)
+            .expect("builds");
         let mut bad = Vec::new();
         let mut start: Option<oxide_core::math::Vec3<f64>> = None;
         let (mut max_h, mut max_d, mut timing) = (0.0_f64, 0.0_f64, 0);
@@ -243,15 +245,24 @@ fn fly_bound(f: &ScenarioFile, name: &str, value: f64) -> Vec<String> {
     }
 }
 
+/// The runs a known bound is flown on before it is called fixed: whether an
+/// uncontrolled vehicle passes [`RUNAWAY_M`] on one run is the draw of that
+/// run's noise, so run 0 alone cannot say that a known bound flies now.
+const KNOWN_RUNS: u64 = 20;
+
 /// A bound that does not fly well on the reference quad and is known: the
-/// parameter, the bound, the scenario, and why.
+/// parameter, the bound, the scenario, and why. Every bound is flown on run 0.
+/// A known one that flies there is flown on runs 1 to 19 as well, and must
+/// fail on at least one of the twenty.
 const KNOWN: &[(&str, &str, &str, &str)] = &[
     (
         "POS_VELX_P",
         "min",
         "rc-loss-position",
-        "a zero north velocity gain leaves the horizontal speed uncontrolled: 250 m out \
-         (the review's zero-p-gains finding; a floor above zero needs the loops' own tuning)",
+        "a zero north velocity gain leaves the horizontal speed uncontrolled: more than \
+         200 m out on 5 of runs 0 to 19 (447 m on run 18; 190 m on run 0, which is the draw of \
+         the noise), and no run lands (the review's zero-p-gains finding; a floor above zero \
+         needs the loops' own tuning)",
     ),
     (
         "POS_VELZ_P",
@@ -307,7 +318,7 @@ fn every_bound_flies() {
     let results = oxide_sim::montecarlo::run_indexed(n, 2, |k| {
         let (name, bound, value) = jobs[k / files.len()];
         let f = &files[k % files.len()];
-        (name, bound, f.name.clone(), fly_bound(f, name, value))
+        (name, bound, f.name.clone(), fly_bound(f, 0, name, value))
     });
     let mut failing: Vec<(String, String, String, Vec<String>)> = Vec::new();
     for (name, bound, scen, bad) in results {
@@ -345,9 +356,25 @@ fn every_bound_flies() {
     }
     assert!(unknown.is_empty(), "bounds that do not fly: {unknown:#?}");
     for (n, b, s, why) in KNOWN {
-        assert!(
-            failing.iter().any(|f| f.0 == *n && f.1 == *b && f.2 == *s),
-            "{n} {b} {s} is listed as known ({why}) but flies now: remove it"
-        );
+        if failing.iter().any(|f| f.0 == *n && f.1 == *b && f.2 == *s) {
+            continue;
+        }
+        let value = jobs
+            .iter()
+            .find(|j| j.0 == *n && j.1 == *b)
+            .unwrap_or_else(|| panic!("{n} {b} is listed as known and is not a bound that flies"))
+            .2;
+        let file = files
+            .iter()
+            .find(|f| f.name == *s)
+            .unwrap_or_else(|| panic!("{s} is listed as known and is not flown here"));
+        let later = (1..KNOWN_RUNS).find(|&i| !fly_bound(file, i, n, value).is_empty());
+        match later {
+            Some(i) => println!("  known {n} {b} {s}: flies on run 0, fails on run {i}"),
+            None => panic!(
+                "{n} {b} {s} is listed as known ({why}) but flies on runs 0 to {} now: remove it",
+                KNOWN_RUNS - 1
+            ),
+        }
     }
 }
