@@ -1,6 +1,6 @@
 # ADR-0009: ArduCopter's tuning procedure from gate 2 on
 
-Status: **proposed on 21 November 2026. It takes effect when the owner merges it.** It replaces the tuning flight of [ADR-0007](0007-gate-1-criteria.md) §2 for every gate after gate 1. Gate 1's procedure and its tuned file stay as that gate's record, at the commits its two runs were flown on. Nothing here was judged on gust-hold runs 0 to 499, the gate's seeds.
+Status: **accepted. Proposed on 21 November 2026 and merged on 27 November 2026 on the owner's yes ([#10](https://github.com/danbiocchi/airborne-oxide/pull/10)); it is in force.** It replaces the tuning flight of [ADR-0007](0007-gate-1-criteria.md) §2 for every gate after gate 1. Gate 1's procedure and its tuned file stay as that gate's record, at the commits its two runs were flown on. Nothing here was judged on gust-hold runs 0 to 499, the gate's seeds.
 
 ## In short, for the owner
 
