@@ -476,7 +476,7 @@ The strategy (option "c+") is to build our own core and **measure** it against A
    - **PX4:** `HIL_SENSOR`/`HIL_GPS` timestamps. `oxide-sim` supplies all sensors.
 2. **Fairness.** Each autopilot gets sensors only through the channels its bridge supports. For each autopilot, every scenario lists whether each fault is applied natively, translated (e.g. `SIM_GPS_DISABLE`), or marked n/a and not scored.
 3. **Tuning parity.** Before each gate, every autopilot is tuned on the same simulated airframe by its own standard procedure, with the same effort budget:
-   - **ArduCopter:** the initial-tune parameters, harmonic notch setup and AUTOTUNE in SITL;
+   - **ArduCopter:** the initial-tune parameters, harmonic notch setup and AUTOTUNE in SITL ([ADR-0009](adr/0009-arducopter-tuning.md) from gate 2 on);
    - **PX4:** its autotune;
    - **oxide-core:** our auto-tune.
 

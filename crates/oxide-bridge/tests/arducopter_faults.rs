@@ -828,7 +828,7 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        9.54,
+        10.16,
         0.5,
     );
     assert_eq!(class_of(o), Class::Crash);
@@ -842,44 +842,66 @@ fn imu_loss_stops_the_program_and_its_motors_go_to_zero_2_s_later_and_the_vehicl
 
 #[test]
 #[ignore = "needs the ArduCopter SITL binary: set OXIDE_ARDUCOPTER"]
-fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_ends_on_the_ground_with_its_motors_on() {
+fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_its_motors_are_still_on_when_it_is_down()
+{
     let (_lease, run) = run_of("motor-loss");
     assert_writes(&run, &[]);
-    // The vehicle is on the ground 2.2 s after the fault, as it was with the
-    // IMU before ADR-0008. What follows depends on the draw of the IMU's
-    // noise. With the IMU model of that record (this pin) the motors, still
-    // on, drag it along the ground, never more than 0.1 m up: it is 100 m
-    // from the start 10.7 s after the fault and 237 m from home at the end,
-    // and the program changes no mode. With the IMU before, it stayed within
-    // 24 m and the program's own estimator failsafe (EKF variance, LAND)
-    // came 1.2 s after it was down. On the starting gains it tumbled away
-    // in the air for 8.9 s, over 100 m, with no mode change. In none is the
-    // lost motor answered: the program never notices it, and the motors
-    // stay on to the end. Every number is as measured on the flown set.
-    assert_modes(&run, &["STABILIZE", "GUIDED"]);
+    // In run 0, with either tuned file, the vehicle is on the ground 2.2 s
+    // after the fault. What follows depends on the draw of the IMU's noise.
+    // (a) The IMU before ADR-0008 with gate 1's tuned file: it stayed within 24 m, the
+    // program's own estimator failsafe (EKF variance, LAND) came 1.2 s after
+    // it was down, and it was still armed at the end. (b) The IMU of ADR-0008
+    // with gate 1's file: the motors, still on, dragged it along the ground
+    // to 237 m from home, never more than 0.1 m up, with no mode change,
+    // armed to the end. (c) The IMU of ADR-0008 with the tuned file of
+    // ADR-0009 (this pin): it stays within 25 m, the estimator failsafe and
+    // LAND come 1.2 s after it is down, and the program, in LAND, judges it
+    // landed and disarms 11.3 s after the fault. On the starting gains it
+    // tumbled away in the air for 8.9 s, over 100 m, with no mode change. In
+    // none of the four is the lost motor noticed or answered before the
+    // vehicle is down, and with either tuned file the motors are still on
+    // when it touches the ground. How long they stay on is the draw: on runs
+    // 500 to 519 the program's crash check or a completed LAND disarms 1
+    // flight of 20 on this file and 4 of 20 on gate 1's, 5.2 s after the
+    // fault at the earliest (ADR-0009). Every number is as measured on the
+    // flown set.
+    assert_modes(&run, &["STABILIZE", "GUIDED", "LAND"]);
     assert_texts_after(
         &run,
         9.0,
         &[
-            ("EKF3 lane switch 1", 17.689, 0.3),
-            ("EKF primary changed:1", 17.689, 0.3),
-            ("EKF3 lane switch 0", 18.089, 0.3),
-            ("EKF primary changed:0", 18.089, 0.3),
-            ("EKF3 IMU1 emergency yaw reset", 18.235, 0.3),
-            ("EKF3 IMU0 emergency yaw reset", 18.237, 0.3),
-            ("Vibration compensation ON", 19.124, 0.3),
-            ("Potential Thrust Loss (1)", 24.880, 0.3),
-            ("EKF3 lane switch 1", 29.487, 0.3),
-            ("EKF primary changed:1", 29.487, 0.3),
+            ("EKF3 lane switch 1", 17.6895, 0.3),
+            ("EKF primary changed:1", 17.6895, 0.3),
+            ("EKF variance", 18.4245, 0.3),
+            ("EKF Failsafe: changed to Land Mode", 18.4245, 0.3),
+            ("GPS Glitch or Compass error", 18.5245, 0.3),
+            ("EKF3 IMU0 emergency yaw reset", 18.8995, 0.3),
+            ("EKF3 lane switch 0", 18.8995, 0.3),
+            ("EKF primary changed:0", 18.8995, 0.3),
+            ("EKF3 IMU1 emergency yaw reset", 19.107, 0.3),
+            ("EKF Failsafe Cleared", 19.8245, 0.3),
+            ("Disarming motors", 26.3195, 0.3),
+            ("Glitch cleared", 29.1245, 0.3),
         ],
     );
-    assert!(
-        !estimator_failsafe_read_after(&run, 0.0),
-        "no estimator failsafe on this run"
+    let (failsafe, _) = run
+        .text("EKF Failsafe: changed to Land Mode")
+        .expect("the estimator failsafe");
+    near(
+        "the fault to the estimator failsafe",
+        failsafe - 15.0,
+        3.4245,
+        0.3,
+    );
+    near(
+        "LAND read",
+        run.mode_at_or_after("LAND", 0.0).expect("land"),
+        failsafe,
+        1.1,
     );
     let o = run.outcome();
-    assert!(o.armed_at_end, "the program never disarms");
-    near("greatest tilt", o.max_tilt_deg, 127.1, 5.0);
+    assert!(!o.armed_at_end, "the program disarmed in LAND");
+    near("greatest tilt", o.max_tilt_deg, 112.7, 5.0);
     let last = run.ticks.last().expect("ticks");
     println!(
         "MEASURED tilt at the end: {:.1} deg, height {:.3} m",
@@ -910,28 +932,44 @@ fn motor_loss_is_not_answered_the_vehicle_falls_in_2_s_and_ends_on_the_ground_wi
     near(
         "touchdown speed",
         o.touchdown_speed_mps.expect("touchdown"),
-        6.93,
+        7.41,
         0.5,
     );
-    near("furthest from home", o.max_distance_from_home_m, 237.5, 5.0);
+    near("furthest from home", o.max_distance_from_home_m, 24.56, 2.0);
     let after = || run.between(ground + 1.0, 1e9);
     let highest = after().map(|k| -k.position[2]).fold(0.0, f64::max);
-    let at_100 = run
-        .between(ground, 1e9)
-        .find(|k| k.position[0] * k.position[0] + k.position[1] * k.position[1] > 100.0 * 100.0)
-        .map(|k| k.t_s);
     assert!(highest < 0.2, "it stays on the ground: {highest}");
-    near(
-        "time from the fault to 100 m from the start, along the ground",
-        at_100.expect("100 m out") - 15.0,
-        10.73,
-        1.0,
+    // The program does nothing before the vehicle is down: every mode change
+    // after the arming, and the estimator failsafe, come after the contact.
+    let armed_at = run
+        .audit()
+        .armed_changes
+        .iter()
+        .find(|(_, armed)| *armed)
+        .map(|(t, _)| run.flight_s(*t))
+        .expect("armed");
+    println!("MEASURED armed read at {armed_at:.3} s, ground contact at {ground:.3} s");
+    for (t, m) in run.modes().into_iter().filter(|(t, _)| *t > armed_at) {
+        assert!(
+            t > ground,
+            "the mode {m} read at {t} is before the ground {ground}"
+        );
+    }
+    assert!(
+        estimator_failsafe_read_after(&run, ground),
+        "the estimator failsafe comes after the vehicle is down"
     );
-    // All motor commands at zero: never.
+    // The motors are still on when it is down. How long after is this
+    // flight's draw (the pin below), not a rule.
     let off = run.last_motor_on_s().expect("on");
-    near("last motor command above zero", off, o.end_s, 0.01);
+    assert!(
+        off > ground,
+        "the last motor command above zero, at {off} s, is before the ground contact at {ground} s"
+    );
+    near("last motor command above zero", off, 26.318, 0.3);
+    near("disarmed", o.disarmed_at_s.expect("disarmed"), 26.321, 0.3);
     assert_eq!(class_of(o), Class::Crash);
-    assert_violations(&run, &["still armed"]);
+    assert_violations(&run, &["disarmed at 26.32 s, later than 17 s"]);
 }
 
 // ---- Radio, ground station --------------------------------------------------

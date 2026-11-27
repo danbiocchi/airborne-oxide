@@ -84,7 +84,7 @@ pub struct BatchArgs {
     pub first_core: usize,
 }
 
-/// What `tune` is given (ADR-0007 section 2).
+/// What `tune` is given (ADR-0007 section 2 as changed by ADR-0009).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TuneArgs {
     pub out: PathBuf,
@@ -120,8 +120,13 @@ oxide-bridge tune  --out DIR [--binary PATH] [--instance N] [--seed N]
                    [--hover-only [--gains FILE]]
 The simulator program is --binary, or the path in OXIDE_ARDUCOPTER. A batch runs
 each flight as `oxide-bridge fly` in a child process of its own and writes
-DIR/flights.csv. `tune` flies ArduCopter's tuning procedure (ADR-0007 section 2) and
-writes DIR/report.txt, DIR/spectrum.csv and DIR/tuned-gains.parm; with --hover-only it
+DIR/flights.csv. `tune` flies ArduCopter's tuning procedure (ADR-0007 section 2 as
+changed by ADR-0009): two tuning flights from POSHOLD, roll and pitch and then yaw, with the
+harmonic notch decided once, on the hover of the first flight (a peak makes that flight land
+after its hover, and the tuning flights are then flown with the notch). It writes
+DIR/report.txt, DIR/spectrum.csv (the hover that decides the notch), DIR/tuned-gains-1.parm
+(what the roll-and-pitch flight saved) and, when every check of every flight holds,
+DIR/tuned-gains.parm (the 29 gains and, when a notch was set, its six values). With --hover-only it
 flies only the hover of the script and prints its quality. Exit codes: 0 done, 1 wrong use, 2 the flight did not start or
 the bridge failed, 3 a run failed twice and the batch stopped.
 oxide-bridge gate fly|verdict: flies gate 1 and computes its verdict (`oxide-bridge gate`).";
@@ -439,9 +444,10 @@ pub fn run_tune(args: &TuneArgs) -> ExitCode {
     match crate::tune::tune(&cfg) {
         Ok(o) => {
             println!(
-                "tuned      {} gains written to {}",
-                o.after.len(),
-                args.out.join("tuned-gains.parm").display()
+                "tuned      {} values written to {} ({} flights)",
+                o.values_written(),
+                args.out.join("tuned-gains.parm").display(),
+                o.flights.len()
             );
             println!("report     {}", args.out.join("report.txt").display());
             ExitCode::SUCCESS
