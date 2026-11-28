@@ -16,6 +16,9 @@ struct Outcome {
     judged_before_arming: u32,
     /// Fixes judged by the end.
     judged: u32,
+    /// Fixes judged while the vehicle had been armed and landed for 0.3 s
+    /// or more (before take-off and after touchdown): none expected.
+    judged_landed: u32,
     /// Fixes at which the verdict was `Correct`.
     verdicts: u32,
     /// `t_sample` of the first fix with the verdict, s.
@@ -36,18 +39,32 @@ fn fly(scenario: &str, profile: Profile, index: u64, params: &[(&str, f64)]) -> 
     let mut out = Outcome {
         judged_before_arming: 0,
         judged: 0,
+        judged_landed: 0,
         verdicts: 0,
         first_verdict_s: None,
         trace: Vec::new(),
     };
     let mut armed_once = false;
+    let mut landed_ticks = 0u32;
+    let mut prev_seq = 0;
     loop {
         let r = sim.step();
         if r.t >= end {
             break;
         }
         armed_once |= r.armed;
-        let fit = sim.core().telemetry().heading_fit;
+        let tel = sim.core().telemetry();
+        let fit = tel.heading_fit;
+        landed_ticks = if r.armed && tel.landed {
+            landed_ticks + 1
+        } else {
+            0
+        };
+        // 0.3 s at the base tick of either profile is at least 300 ticks.
+        if landed_ticks > 1200 && fit.seq != prev_seq {
+            out.judged_landed += 1;
+        }
+        prev_seq = fit.seq;
         if !armed_once {
             out.judged_before_arming = fit.seq;
         }
@@ -80,6 +97,7 @@ fn the_airborne_state_reaches_the_check_and_a_right_heading_gets_no_verdict() {
     for profile in [F405_LEAN, H743_FULL] {
         let o = fly("gust-hold", profile, 500, &[]);
         assert_eq!(o.judged_before_arming, 0, "{}", profile.name);
+        assert_eq!(o.judged_landed, 0, "{}", profile.name);
         // Take-off at about 3 s of a 40 s flight at 5 fixes a second.
         assert!(
             o.judged > 100,
@@ -123,6 +141,7 @@ fn the_check_parameters_change_nothing_in_a_healthy_flight() {
     let a = fly("rc-loss-position", F405_LEAN, 500, &[]);
     let b = fly("rc-loss-position", F405_LEAN, 500, &SILENT);
     assert_eq!(a.verdicts, 0);
+    assert_eq!(a.judged_landed, 0, "no fix is judged after touchdown");
     assert!(a.judged > 100);
     assert!(a.trace == b.trace);
 }
