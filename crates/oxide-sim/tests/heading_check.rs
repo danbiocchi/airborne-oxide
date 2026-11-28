@@ -268,3 +268,34 @@ fn corrected_and_contained_flights_replay_bit_for_bit() {
         );
     }
 }
+
+/// A flight with a non-zero `EKF_MAG_DECL` that the guard never corrects is
+/// the flight the reference simulator (built before any of the guard's code)
+/// flies, bit for bit: the alignment takes the declination parameter as it
+/// is when there is no shift (no wrap, no recomputed cosine and sine). The
+/// pinned hashes are the reference simulator's own for these flights.
+#[test]
+fn an_uncorrected_flight_with_a_declination_is_the_flight_before_the_guard() {
+    for (decl, index, reference) in [
+        (0.3_f64, 500_u64, 0x47cd_7094_5b13_926e_u64),
+        (0.7, 500, 0xe07b_80e8_7562_2c05),
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/gust-hold.toml");
+        let file = scenario_file::load_path(&path).expect("the file loads");
+        let params = vec![("EKF_MAG_DECL".to_string(), decl)];
+        let mut sim = file
+            .build_with_params(F405_LEAN, index, &params)
+            .expect("builds");
+        sim.run_until(oxide_core::time::Micros(file.end().0), |_| {});
+        assert_eq!(
+            sim.core().estimator().heading_corrections(),
+            0,
+            "decl {decl}: the flight must not be corrected"
+        );
+        assert_eq!(
+            sim.trace_hash(),
+            reference,
+            "decl {decl}: not the reference simulator's flight"
+        );
+    }
+}

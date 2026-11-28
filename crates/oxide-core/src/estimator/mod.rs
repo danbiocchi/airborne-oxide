@@ -585,14 +585,23 @@ impl Estimator {
             return;
         };
         // The declination of the heading model: the parameter and this
-        // flight's shift (zero unless the filter was dropped in flight).
-        let declination = wrap_pi(self.params.mag_declination_rad + self.decl_shift);
+        // flight's shift. With no shift (a flight never corrected, or the
+        // filter dropped before any correction) the parameter is used as it
+        // is: no wrap and no recomputed cosine and sine, so the flight is
+        // bit for bit what it was before the guard existed.
+        let declination = if self.decl_shift == 0.0 {
+            self.params.mag_declination_rad
+        } else {
+            wrap_pi(self.params.mag_declination_rad + self.decl_shift)
+        };
         let heading = mag.and_then(|m| heading_from_mag(m, roll, pitch, declination));
         let q0 = Quat::from_euler(roll, pitch, heading.unwrap_or(0.0));
         let mut ekf = Ekf::new(&self.params, q0);
         // A new filter reads the declination from the parameters: apply the
-        // shift of the corrections again.
-        ekf.shift_declination(self.decl_shift);
+        // shift of the corrections again (only when there is one).
+        if self.decl_shift != 0.0 {
+            ekf.shift_declination(self.decl_shift);
+        }
         // At rest the mean gyro rate is the turn-on bias (Earth rate is
         // negligible).
         let limit = <f32 as Real>::from_f64(GYRO_BIAS_LIMIT);
@@ -758,7 +767,8 @@ impl Estimator {
         }
         // The heading check judges the fix (with the velocity change the
         // filter integrated since the previous one) before the fusion
-        // changes anything. Its verdict is counted and logged, not acted on.
+        // changes anything. Its verdict is acted on below: a correction, or
+        // the containment latch when the budget is used up.
         let verdict = self.hdg.on_fix(
             s.t_sample,
             Some(([g.velocity.x, g.velocity.y], g.s_acc_mps)),

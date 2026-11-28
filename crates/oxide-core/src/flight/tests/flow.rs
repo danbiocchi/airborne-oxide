@@ -2623,3 +2623,46 @@ fn the_rate_command_torque_is_the_inertia_times_the_rate_loops_demand() {
     assert_eq!(checked, 300);
     assert_eq!(seen, [true; 3], "torque on every axis");
 }
+
+/// The heading check judges only while the vehicle is armed **and not
+/// landed**: the core hands the estimator `armed && !landed`, not `armed`.
+/// A vehicle that has landed and still sits armed (throttle down), then is
+/// carried on a path with a filter whose heading is 3 rad wrong, must give
+/// the check nothing to judge for as long as the landing detector says
+/// landed: no fix judged. A core that handed over `armed` alone would judge
+/// the carried vehicle at once.
+#[test]
+fn a_vehicle_that_has_landed_and_sits_armed_is_not_judged_when_it_is_moved() {
+    let mut rig = wrong_heading_rig(0, 3.0, 2);
+    rig.path_from_s = None;
+    rig.rc.throttle = 0.0;
+    assert!(
+        rig.run_until(20.0, |r| r.core.sup_state.land.landed()),
+        "the vehicle never counted as landed"
+    );
+    assert!(rig.out.status.armed);
+    // (Fixes were judged between arming and the landing detector's verdict.)
+    let judged = rig.core.estimator.heading_fit().seq;
+    rig.path_from_s = Some(rig.k as f64 * 1.0e-3);
+    // Carried while it counts as landed (the wrong heading and the path
+    // move the vertical speed estimate within a few seconds, which ends
+    // it: from then on judging is right).
+    let mut carried_ms = 0_u32;
+    for _ in 0..30_000 {
+        rig.step();
+        if !rig.core.sup_state.land.landed() {
+            break;
+        }
+        carried_ms += 1;
+        assert_eq!(
+            rig.core.estimator.heading_fit().seq,
+            judged,
+            "a fix was judged after {carried_ms} ms on the ground"
+        );
+    }
+    assert!(rig.out.status.armed);
+    assert!(
+        carried_ms > 1_500,
+        "carried while landed for only {carried_ms} ms"
+    );
+}
