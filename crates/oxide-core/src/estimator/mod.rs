@@ -40,6 +40,11 @@ use ring::Ring;
 /// the corrected heading (D2 section 12).
 const HDG_RESET_SIGMA_MIN_RAD: f32 = 0.1;
 
+/// A rejection this soon after a snap to GPS that followed continuous
+/// rejection is reported (log only, no action): the snap-and-reject cycle
+/// a wrong heading makes, D1 section 9.4.
+const SNAP_REPEAT_US: u64 = 3_000_000;
+
 /// IMU delta ring capacity (also the output predictor's history depth).
 pub const IMU_BUFFER: usize = 64;
 /// GPS sample ring capacity.
@@ -164,6 +169,13 @@ pub struct Estimator {
     pending_corrected: Option<f32>,
     /// The containment latch was set and not yet reported.
     pending_contained: bool,
+    /// `t_sample` of the fix at which the filter last snapped to GPS after
+    /// continuous rejection (the snap-and-reject cycle of a heading the
+    /// GPS no longer agrees with), while it waits for another rejection.
+    snap_at: Option<Micros>,
+    /// A rejection followed such a snap within [`SNAP_REPEAT_US`] and was
+    /// not yet reported.
+    pending_snap_repeat: bool,
 }
 
 impl Estimator {
@@ -214,6 +226,8 @@ impl Estimator {
             armed: false,
             pending_corrected: None,
             pending_contained: false,
+            snap_at: None,
+            pending_snap_repeat: false,
         })
     }
 
@@ -242,6 +256,8 @@ impl Estimator {
         self.decl_shift = 0.0;
         self.pending_corrected = None;
         self.pending_contained = false;
+        self.snap_at = None;
+        self.pending_snap_repeat = false;
         if dirty && self.ekf.is_some() {
             self.drop_to_unaligned();
         }
@@ -268,6 +284,13 @@ impl Estimator {
     /// any: the core reports it as an event.
     pub fn take_heading_corrected(&mut self) -> Option<f32> {
         self.pending_corrected.take()
+    }
+
+    /// True once after a rejection followed, within 3 s, a snap to GPS that
+    /// had followed continuous rejection while airborne (an event for the
+    /// log; nothing acts on it).
+    pub fn take_gps_snap_repeated(&mut self) -> bool {
+        core::mem::take(&mut self.pending_snap_repeat)
     }
 
     /// True once after the containment latch was set.
@@ -799,6 +822,19 @@ impl Estimator {
             self.gps.last_accept = t;
             self.gps.reject_since = None;
         }
+        // The snap-and-reject cycle: a rejection soon after the filter had
+        // snapped to GPS after continuous rejection. Reported, not acted on,
+        // and only in the air (on the ground after a kill the receiver is
+        // simply not agreeing with a vehicle that is not there).
+        if let Some(ts) = self.snap_at
+            && t.since(ts) > SNAP_REPEAT_US
+        {
+            self.snap_at = None;
+        }
+        if (rejected(pos) || rejected(vel)) && self.hdg.airborne() && self.snap_at.is_some() {
+            self.pending_snap_repeat = true;
+            self.snap_at = None;
+        }
         // Two timers: the whole fix rejected (nothing accepted), and the
         // position alone rejected. The second catches a position offset that
         // comes with consistent velocity, which the first never sees because
@@ -817,7 +853,9 @@ impl Estimator {
         }
         if stuck {
             self.reset_to_gps(ekf, s, sigma_p, sigma_v);
+            self.snap_at = Some(t);
         } else if vel_stuck {
+            self.snap_at = Some(t);
             let dv = ekf.reset_velocity(g.velocity, sigma_v);
             self.output.shift(Vec3::zero(), dv);
             self.resets = self.resets.saturating_add(1);
@@ -1643,6 +1681,46 @@ mod tests {
         assert!(e.velocity.x > 3.5, "v = {:?}", e.velocity);
         rig.run_until(4.0 + 9.0);
         assert_eq!(rig.est.status().resets, resets + 1, "one reset only");
+    }
+
+    /// The filter snaps its velocity to a GPS that disagreed for the timeout,
+    /// airborne; the GPS then disagrees again `gap_s` later. Returns whether
+    /// the repeat was reported.
+    fn snap_then_reject(airborne: bool, gap_s: f64) -> bool {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(4.0);
+        rig.est.set_airborne(airborne);
+        rig.gps_vel = Vec3::new(5.0, 0.0, 0.0);
+        let resets = rig.est.status().resets;
+        // Until the snap (the velocity-only rejection timer, 5 s).
+        while rig.est.status().resets == resets && rig.now().as_secs_f64() < 20.0 {
+            rig.tick();
+        }
+        assert_eq!(rig.est.status().resets, resets + 1, "the snap");
+        assert!(!rig.est.take_gps_snap_repeated(), "not yet");
+        // The fixes after it agree (the receiver's position now moves with
+        // its velocity): no event.
+        let until = rig.now().as_secs_f64() + gap_s;
+        while rig.now().as_secs_f64() < until {
+            rig.gps_pos.x += rig.gps_vel.x * 0.001;
+            rig.tick();
+        }
+        assert!(!rig.est.take_gps_snap_repeated(), "agreeing fixes");
+        rig.gps_vel = Vec3::new(-6.0, 0.0, 0.0);
+        let until = rig.now().as_secs_f64() + 0.8;
+        rig.run_until(until);
+        rig.est.take_gps_snap_repeated()
+    }
+
+    #[test]
+    fn a_rejection_soon_after_a_snap_to_gps_is_reported_once_in_the_air() {
+        assert!(snap_then_reject(true, 1.0), "1 s after the snap, airborne");
+        assert!(snap_then_reject(true, 2.0), "2 s after the snap, airborne");
+        // On the ground (after a kill the receiver simply does not agree
+        // with a vehicle that is not there): nothing is reported.
+        assert!(!snap_then_reject(false, 1.0));
+        // Not after the window.
+        assert!(!snap_then_reject(true, 3.5));
     }
 
     // ---- the heading check, wired into the filter -------------------------

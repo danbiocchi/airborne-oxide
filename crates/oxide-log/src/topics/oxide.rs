@@ -216,7 +216,7 @@ pub fn oxide_logger<S: Sink + ?Sized>(w: &mut RecordWriter<'_, S>, now: Micros, 
 /// | `ParamRefused` | `param_key`, `param_index`, `why` the [`ParamError`] code, `why_detail` its detail code |
 /// | `ParamLoadFault`, `ParamLoadRecovered` | `applied`, `unknown`, `dropped`, `torn`, `invalid`, `unreadable` |
 /// | `HeadingCorrected` | `mask` the yaw change in milliradians (two's complement), `code_a` the corrections made in this flight |
-/// | `HeadingContained` | none |
+/// | `HeadingContained`, `GpsSnapRepeated` | none |
 ///
 /// A parameter is identified by its stable key (`params::key_of`);
 /// `param_index` is where the table had it when the log was written, a note
@@ -299,7 +299,8 @@ impl EventFields {
             | EventKind::Touchdown
             | EventKind::HomeSet
             | EventKind::ParamFaultAcked
-            | EventKind::HeadingContained => {}
+            | EventKind::HeadingContained
+            | EventKind::GpsSnapRepeated => {}
             EventKind::HeadingCorrected { angle_mrad, count } => {
                 f.mask = u16::from_ne_bytes(angle_mrad.to_ne_bytes());
                 f.code_a = count;
@@ -398,6 +399,7 @@ impl EventFields {
                 count: a,
             },
             17 => EventKind::HeadingContained,
+            18 => EventKind::GpsSnapRepeated,
             k => return Err(EventError::BadKind(k)),
         };
         let event = Event {

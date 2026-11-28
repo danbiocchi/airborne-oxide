@@ -274,6 +274,11 @@ fn pins() -> Vec<(EventKind, String, u8)> {
             "Heading untrustworthy: contained until disarm",
             WARNING,
         ),
+        p(
+            EventKind::GpsSnapRepeated,
+            "GPS rejected again soon after a reset to it",
+            INFO,
+        ),
     ]
 }
 
@@ -298,7 +303,8 @@ fn variant_code(k: &EventKind) -> u8 {
         | EventKind::ParamLoadRecovered(_)
         | EventKind::ParamFaultAcked
         | EventKind::HeadingCorrected { .. }
-        | EventKind::HeadingContained => k.code(),
+        | EventKind::HeadingContained
+        | EventKind::GpsSnapRepeated => k.code(),
     }
 }
 

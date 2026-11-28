@@ -441,9 +441,10 @@ fn variant_index(k: &EventKind) -> usize {
         EventKind::ParamFaultAcked => 15,
         EventKind::HeadingCorrected { .. } => 16,
         EventKind::HeadingContained => 17,
+        EventKind::GpsSnapRepeated => 18,
     }
 }
-const VARIANTS: usize = 18;
+const VARIANTS: usize = 19;
 
 const NAVS: [NavState; 10] = [
     NavState::Disarmed,
@@ -620,6 +621,8 @@ fn events() -> Vec<Event> {
     }
     kinds.push(EventKind::HeadingContained);
     kinds.push(EventKind::HeadingContained);
+    kinds.push(EventKind::GpsSnapRepeated);
+    kinds.push(EventKind::GpsSnapRepeated);
     let times = [0_u64, 1, 123_456_789, 4_294_967_296, u64::MAX];
     kinds
         .into_iter()
@@ -737,7 +740,7 @@ fn base(kind: EventKind) -> EventFields {
 #[test]
 fn every_other_code_is_refused_by_the_decoder() {
     // Event kinds.
-    for k in 18..=255_u8 {
+    for k in 19..=255_u8 {
         let fields = EventFields {
             kind: k,
             ..base(EventKind::Armed)

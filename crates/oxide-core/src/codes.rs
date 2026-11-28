@@ -255,6 +255,7 @@ impl EventKind {
             EventKind::ParamFaultAcked => 15,
             EventKind::HeadingCorrected { .. } => 16,
             EventKind::HeadingContained => 17,
+            EventKind::GpsSnapRepeated => 18,
         }
     }
 }
@@ -450,6 +451,7 @@ mod tests {
                 16,
             ),
             (EventKind::HeadingContained, 17),
+            (EventKind::GpsSnapRepeated, 18),
         ];
         for (k, c) in table {
             assert_eq!(k.code(), *c, "{k:?}");

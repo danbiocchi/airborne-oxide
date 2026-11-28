@@ -295,6 +295,9 @@ pub fn event_text(kind: &EventKind, b: &mut TextBuf) {
         EventKind::HeadingContained => {
             b.push("Heading untrustworthy: contained until disarm");
         }
+        EventKind::GpsSnapRepeated => {
+            b.push("GPS rejected again soon after a reset to it");
+        }
     }
 }
 
@@ -331,6 +334,7 @@ pub fn event_level(kind: &EventKind) -> u8 {
         | EventKind::ParamChanged(_)
         | EventKind::ParamLoadRecovered(_)
         | EventKind::HeadingCorrected { .. }
+        | EventKind::GpsSnapRepeated
         | EventKind::ParamFaultAcked => level::INFO,
     }
 }

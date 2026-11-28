@@ -430,6 +430,10 @@ pub enum EventKind {
     /// heading untrustworthy until disarm, so velocity and position are not
     /// valid and `ESTIMATOR_UNHEALTHY` follows.
     HeadingContained,
+    /// The filter snapped to GPS after continuous rejection of it and rejected
+    /// it again within 3 s, in the air: what a heading the GPS no longer
+    /// agrees with does (log only; nothing acts on it).
+    GpsSnapRepeated,
 }
 
 /// An event with the tick time it happened at.

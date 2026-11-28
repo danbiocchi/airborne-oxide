@@ -532,6 +532,9 @@ impl<const N: usize> Core<N> {
             if self.estimator.take_heading_contained() {
                 self.emit(now, EventKind::HeadingContained);
             }
+            if self.estimator.take_gps_snap_repeated() {
+                self.emit(now, EventKind::GpsSnapRepeated);
+            }
             let state = self.estimator.state();
             let valid = if state.is_some() {
                 self.estimator.validity()

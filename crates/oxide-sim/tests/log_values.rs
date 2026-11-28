@@ -1095,6 +1095,7 @@ fn check_events(fl: &Flight, file: &UlogFile, cov: &mut Coverage) -> usize {
                 a = count;
             }
             EventKind::HeadingContained => kind = 17,
+            EventKind::GpsSnapRepeated => kind = 18,
         }
         let mut e = Exp {
             topic: "oxide_event",
@@ -1283,6 +1284,34 @@ fn param_changes(sim: &mut Sim, now: Micros) {
     }
 }
 
+/// A declination the site does not have, set while the vehicle waits to be
+/// armed: the heading guard corrects it (an event, the count and the shift in
+/// `oxide_estimator`).
+fn wrong_heading_corrected(sim: &mut Sim, now: Micros) {
+    if now.0 == 100_000 {
+        sim.queue_param_set(ParamSet {
+            id: params::find("EKF_MAG_DECL").expect("a parameter"),
+            value: ParamValue::F32(1.0),
+        });
+    }
+}
+
+/// A declination the site does not have and no correction budget, set
+/// while the vehicle waits to be armed: the heading guard contains the
+/// heading at the first disagreement (the latch, its event and its fields
+/// of `oxide_estimator`).
+fn wrong_heading_contained(sim: &mut Sim, now: Micros) {
+    let set = |name: &str, value: ParamValue| ParamSet {
+        id: params::find(name).expect("a parameter"),
+        value,
+    };
+    match now.0 {
+        100_000 => sim.queue_param_set(set("EKF_MAG_DECL", ParamValue::F32(1.0))),
+        200_000 => sim.queue_param_set(set("EKF_HDG_NMAX", ParamValue::I32(0))),
+        _ => {}
+    }
+}
+
 /// A stored-parameter load that skipped torn records but understood the rest:
 /// no fault, one event.
 fn torn_load(sim: &mut Sim, now: Micros) {
@@ -1308,6 +1337,12 @@ fn flown() -> Vec<(&'static str, Profile, &'static Script2)> {
         v.push(("gust-hold", p, params));
         v.push(("battery-low", p, torn));
     }
+    // A heading corrected (the default budget) and one contained, in flights
+    // that carry the guard's events and fields.
+    let corrected: &'static Script2 = &wrong_heading_corrected;
+    let contained: &'static Script2 = &wrong_heading_contained;
+    v.push(("gust-hold", F405_LEAN, corrected));
+    v.push(("gust-hold", H743_FULL, contained));
     v
 }
 
@@ -1441,8 +1476,10 @@ fn the_reader_gives_the_values_the_simulator_had_at_the_same_ticks() {
     assert_eq!(seen("manual_control_setpoint.mode switch"), set(&[0, 1, 2]));
     assert_eq!(
         seen("oxide_event.kind"),
-        (0..=15).collect(),
-        "every kind of event is in some flight"
+        (0..=17).collect(),
+        "every kind of event is in some flight (the heading guard's two in the wrong-heading \
+         flights; kind 18, the snap-and-reject cycle, is in none: no healthy flight has one, \
+         and its encoding is covered by the log crate's own tests)"
     );
     // Every PX4 navigation state the core can show.
     assert_eq!(
