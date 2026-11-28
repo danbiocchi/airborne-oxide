@@ -115,11 +115,11 @@ One TOML file per scenario in `scenarios/`. A file holds:
 | Table | Content |
 |---|---|
 | top level | `name` (also the random-seed key), `about`, `airframe`, `duration_s` |
-| `[sim]` | sensors (`ideal` or `realistic`), estimator source, links and heartbeats |
+| `[sim]` | sensors (`ideal` or `realistic`), `gps_latency_us` (the receiver's delay, which the filter knows: a whole number of ms up to 5 s), estimator source, links and heartbeats |
 | `[wind]` | calm, fixed, or the randomised gust generator with its ranges |
 | `[battery]` | capacity and starting charge, when the scenario overrides the airframe |
 | `[params]` | parameter overrides by name |
-| `[[fault]]` | kind, start, end |
+| `[[fault]]` | `kind`, `start_s`, `end_s` (absent: to the end of the run), and the fields of the kind: `motor-loss` takes `rotor` and `scale`; `mag-rotate` takes `angle_rad` and `ramp_s` (default 0); `gps-vel-offset` takes `north_mps` and `east_mps`; `gps-vel-noise` takes `sigma_mps` and an optional `s_acc_mps`; `gps-time-offset` takes `offset_s` (-1 to 1 s). `gps-loss`, `imu-loss`, `baro-loss`, `mag-loss`, `rc-loss`, `rc-silent`, `gcs-loss`, `brain-crash` and `brain-hang` take none (14 kinds in all). `mag-rotate`, `gps-vel-offset`, `gps-vel-noise` and `gps-time-offset` change what a sensor reports; the bridge refuses a file that uses one of them, or `gps_latency_us`, on the ArduCopter side. The commented schema is in `scenario_file.rs` |
 | `[pilot]` | arming, disarming and kill times, and timelines of mode switch, sticks and setpoints |
 | `[expect]` | states and reasons that must or must never appear, the ending, limits |
 | `[run]` | seeds and profiles for the Monte-Carlo job |

@@ -85,7 +85,7 @@ cargo run --release -p oxide-sim-cli -- scenarios scenarios
 
 ## Write and fly a scenario file
 
-A scenario is one TOML file: the pilot, the faults, the wind, the parameter overrides, and what must happen. The 43 in [`scenarios/`](scenarios/) define those scenarios; they are compiled into the simulator, and any other file is flown by its path. (`hover-step` and `gust-hold` also keep a pilot written in Rust, which the `run`, `hash` and `montecarlo` commands and the viewer use; a test checks that both forms fly the same flight.) Unknown keys are errors, and heights are up-positive. The fully commented schema is in the documentation of [`scenario_file.rs`](crates/oxide-sim/src/scenario_file.rs).
+A scenario is one TOML file: the pilot, the faults, the wind, the parameter overrides, and what must happen. The 43 in [`scenarios/`](scenarios/) define those scenarios; they are compiled into the simulator, and any other file is flown by its path. (`hover-step` and `gust-hold` also keep a pilot written in Rust, which the `run`, `hash` and `montecarlo` commands and the viewer use; a test checks that both forms fly the same flight.) Unknown keys are errors, and heights are up-positive. A `[[fault]]` is one of 14 kinds (sensor and link losses, a rotor lost, and the sensor-value faults `mag-rotate`, `gps-vel-offset`, `gps-vel-noise` and `gps-time-offset`); `[sim] gps_latency_us` sets the GPS receiver's delay. The fully commented schema is in the documentation of [`scenario_file.rs`](crates/oxide-sim/src/scenario_file.rs).
 
 ```toml
 name = "gps-loss-short"
