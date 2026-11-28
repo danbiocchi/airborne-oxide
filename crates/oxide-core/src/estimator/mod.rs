@@ -2633,6 +2633,12 @@ mod tests {
         });
         assert_eq!(rig.est.tilt, Some(before), "a heading correction");
         assert_eq!(rig.est.heading_corrections(), 1);
+        // A fine step (the correction's own code path, not counted).
+        with_filter(&mut rig, |e, ekf| {
+            e.correct_heading(ekf, &fix, 0.2, 0.15, 0.6, 0.3, true)
+        });
+        assert_eq!(rig.est.tilt, Some(before), "a fine step");
+        assert_eq!(rig.est.heading_fine_steps(), 1);
         // The magnetometer's own yaw reset (the heading was lost).
         rig.est.heading_ok = false;
         let mag = Stamped::ideal(
