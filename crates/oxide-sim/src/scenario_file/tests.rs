@@ -682,3 +682,161 @@ fn a_value_that_another_entry_makes_valid_is_not_blamed_for_a_different_pair() {
     assert_eq!(e.key, "params", "{e}");
     assert!(e.reason.contains("together"), "{e}");
 }
+
+// ---- The sensor faults and the GPS delay ------------------------------------------
+
+#[test]
+fn the_three_sensor_faults_and_the_gps_delay_load_from_a_file() {
+    let s = load_str(&format!(
+        "{MINIMAL}[sim]\nsensors = \"realistic\"\ngps_latency_us = 250000\n\
+         [[fault]]\nkind = \"mag-rotate\"\nstart_s = 10.0\nend_s = 25.0\nangle_rad = -1.5\nramp_s = 2.0\n\
+         [[fault]]\nkind = \"mag-rotate\"\nstart_s = 30.0\nangle_rad = 0.5\n\
+         [[fault]]\nkind = \"gps-vel-offset\"\nstart_s = 10.0\nend_s = 11.0\nnorth_mps = 5.0\neast_mps = 0.0\n\
+         [[fault]]\nkind = \"gps-vel-noise\"\nstart_s = 10.0\nend_s = 15.0\nsigma_mps = 2.0\n\
+         [[fault]]\nkind = \"gps-vel-noise\"\nstart_s = 20.0\nend_s = 25.0\nsigma_mps = 1.0\ns_acc_mps = 1.0\n"
+    ))
+    .expect("loads");
+    let kinds: Vec<FaultKind> = s.faults.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            FaultKind::MagRotate {
+                angle_rad: -1.5,
+                ramp_s: 2.0
+            },
+            FaultKind::MagRotate {
+                angle_rad: 0.5,
+                ramp_s: 0.0
+            },
+            FaultKind::GpsVelOffset {
+                north_mps: 5.0,
+                east_mps: 0.0
+            },
+            FaultKind::GpsVelNoise {
+                sigma_mps: 2.0,
+                s_acc_mps: None
+            },
+            FaultKind::GpsVelNoise {
+                sigma_mps: 1.0,
+                s_acc_mps: Some(1.0)
+            },
+        ]
+    );
+    assert_eq!(s.faults[1].end_s, None);
+    assert_eq!(s.gps_latency_us, Some(250_000));
+    // The delay reaches the sensors of the flight; the preset's stays
+    // without it.
+    let airframe = Airframe::reference_quad().expect("airframe");
+    assert_eq!(s.options(&airframe, 0).sensors.gps.latency_us, 250_000);
+    let plain = load_str(&format!("{MINIMAL}[sim]\nsensors = \"realistic\"\n")).expect("loads");
+    assert_eq!(plain.gps_latency_us, None);
+    assert_eq!(
+        plain.options(&airframe, 0).sensors.gps.latency_us,
+        SensorConfig::realistic().gps.latency_us
+    );
+    // And on the ideal preset, whose delay is 0, it still applies.
+    let ideal = load_str(&format!("{MINIMAL}[sim]\ngps_latency_us = 50000\n")).expect("loads");
+    assert_eq!(ideal.options(&airframe, 0).sensors.gps.latency_us, 50_000);
+    assert_eq!(
+        load_str(&format!("{MINIMAL}[sim]\ngps_latency_us = 0\n"))
+            .expect("loads")
+            .gps_latency_us,
+        Some(0)
+    );
+}
+
+#[test]
+fn the_new_faults_are_refused_naming_the_field() {
+    let fault = |body: &str| format!("[[fault]]\nstart_s = 1.0\nend_s = 9.0\n{body}");
+    let key = |body: &str| refused(&fault(body)).key;
+    // Missing.
+    assert_eq!(key("kind = \"mag-rotate\"\n"), "fault[0].angle_rad");
+    assert_eq!(
+        key("kind = \"gps-vel-offset\"\neast_mps = 1.0\n"),
+        "fault[0].north_mps"
+    );
+    assert_eq!(
+        key("kind = \"gps-vel-offset\"\nnorth_mps = 1.0\n"),
+        "fault[0].east_mps"
+    );
+    assert_eq!(key("kind = \"gps-vel-noise\"\n"), "fault[0].sigma_mps");
+    // Negative where a size is meant, not finite anywhere.
+    assert_eq!(
+        key("kind = \"mag-rotate\"\nangle_rad = 1.0\nramp_s = -1.0\n"),
+        "fault[0].ramp_s"
+    );
+    assert_eq!(
+        key("kind = \"gps-vel-noise\"\nsigma_mps = -1.0\n"),
+        "fault[0].sigma_mps"
+    );
+    assert_eq!(
+        key("kind = \"gps-vel-noise\"\nsigma_mps = 1.0\ns_acc_mps = -0.5\n"),
+        "fault[0].s_acc_mps"
+    );
+    for (kind, name) in [
+        ("mag-rotate", "angle_rad"),
+        ("mag-rotate", "ramp_s"),
+        ("gps-vel-offset", "north_mps"),
+        ("gps-vel-offset", "east_mps"),
+        ("gps-vel-noise", "sigma_mps"),
+        ("gps-vel-noise", "s_acc_mps"),
+    ] {
+        // Every field of the three, as NaN and as infinity.
+        for bad in ["nan", "inf", "-inf"] {
+            let others = match kind {
+                "mag-rotate" => "angle_rad = 1.0\n",
+                "gps-vel-offset" => "north_mps = 1.0\neast_mps = 1.0\n",
+                _ => "sigma_mps = 1.0\n",
+            };
+            let text = fault(&format!("kind = \"{kind}\"\n{others}{name} = {bad}\n"));
+            let e = refused(&text);
+            assert_eq!(
+                e.key,
+                format!("fault[0].{name}"),
+                "{kind} {name} {bad}: {e}"
+            );
+        }
+    }
+    // A field of another kind, and a ramp that does not fit the window.
+    assert_eq!(
+        key("kind = \"gps-loss\"\nangle_rad = 1.0\n"),
+        "fault[0].angle_rad"
+    );
+    assert_eq!(
+        key("kind = \"gps-vel-offset\"\nnorth_mps = 1.0\neast_mps = 1.0\nsigma_mps = 1.0\n"),
+        "fault[0].sigma_mps"
+    );
+    assert_eq!(
+        key("kind = \"mag-rotate\"\nangle_rad = 1.0\nramp_s = 5.0\n"),
+        "fault[0]"
+    );
+    let e = refused(&fault(
+        "kind = \"mag-rotate\"\nangle_rad = 1.0\nramp_s = 5.0\n",
+    ));
+    assert!(e.reason.contains("ramp_s"), "{e}");
+    // A mistyped field is blamed by the TOML layer by name.
+    assert_eq!(
+        key("kind = \"mag-rotate\"\nangle_rad = \"big\"\n"),
+        "fault[0].angle_rad"
+    );
+    assert_eq!(key("kind = \"mag-rotate\"\nangle = 1.0\n"), "angle");
+    // The kind list names the new ones.
+    let e = refused(&fault("kind = \"gremlins\"\n"));
+    assert!(
+        e.reason.contains("mag-rotate") && e.reason.contains("gps-vel-noise"),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_gps_delay_is_validated() {
+    let key = |v: &str| refused(&format!("[sim]\ngps_latency_us = {v}\n")).key;
+    assert_eq!(key("-1"), "sim.gps_latency_us");
+    assert_eq!(key("0.5"), "sim.gps_latency_us");
+    assert_eq!(key("\"fast\""), "sim.gps_latency_us");
+    // Not a whole number of milliseconds (the slower profile's step).
+    assert_eq!(key("150500"), "sim.gps_latency_us");
+    // Beyond five seconds.
+    assert_eq!(key("5001000"), "sim.gps_latency_us");
+    assert!(load_str(&format!("{MINIMAL}[sim]\ngps_latency_us = 5000000\n")).is_ok());
+}

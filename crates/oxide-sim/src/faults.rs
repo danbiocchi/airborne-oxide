@@ -361,6 +361,114 @@ mod tests {
         assert!(ActiveFaults::at(&[], Micros(0)).none());
     }
 
+    fn mag(angle_rad: f64, ramp_s: f64, start_s: f64, end_s: Option<f64>) -> Fault {
+        Fault {
+            kind: FaultKind::MagRotate { angle_rad, ramp_s },
+            start_s,
+            end_s,
+        }
+    }
+
+    #[test]
+    fn the_ramp_weight_is_zero_outside_one_for_a_step_and_triangular_inside() {
+        let step = mag(1.0, 0.0, 1.0, Some(2.0));
+        assert_eq!(step.ramp_weight(Micros(999_999), 0.0), 0.0);
+        assert_eq!(step.ramp_weight(Micros(1_000_000), 0.0), 1.0);
+        assert_eq!(step.ramp_weight(Micros(1_999_999), 0.0), 1.0);
+        assert_eq!(step.ramp_weight(Micros(2_000_000), 0.0), 0.0);
+        let ramp = mag(1.0, 1.0, 10.0, Some(14.0));
+        let w = |us| ramp.ramp_weight(Micros(us), 1.0);
+        assert_eq!(w(9_999_999), 0.0);
+        assert_eq!(w(10_000_000), 0.0);
+        assert_eq!(w(10_250_000), 0.25);
+        assert_eq!(w(11_000_000), 1.0);
+        assert_eq!(w(12_000_000), 1.0);
+        assert_eq!(w(13_500_000), 0.5);
+        assert_eq!(w(13_999_000), 0.001);
+        assert_eq!(w(14_000_000), 0.0);
+        // No end: rises and stays.
+        let open = mag(1.0, 2.0, 1.0, None);
+        assert_eq!(open.ramp_weight(Micros(2_000_000), 2.0), 0.5);
+        assert_eq!(open.ramp_weight(Micros(3_000_000), 2.0), 1.0);
+        assert_eq!(open.ramp_weight(Micros(86_000_000_000), 2.0), 1.0);
+        // A window of exactly twice the ramp peaks at its middle.
+        let tri = mag(1.0, 1.0, 0.0, Some(2.0));
+        assert_eq!(tri.ramp_weight(Micros(1_000_000), 1.0), 1.0);
+        assert_eq!(tri.ramp_weight(Micros(500_000), 1.0), 0.5);
+        assert_eq!(tri.ramp_weight(Micros(1_500_000), 1.0), 0.5);
+    }
+
+    #[test]
+    fn the_new_faults_are_refused_when_a_field_is_not_acceptable() {
+        let links = LinkConfig::default();
+        let bad = |kind: FaultKind, end_s: Option<f64>, needle: &str| {
+            let f = Fault {
+                kind,
+                start_s: 1.0,
+                end_s,
+            };
+            match validate_faults(&[f], 4, &links) {
+                Err(SimError::Fault { index: 0, reason }) => {
+                    assert!(reason.contains(needle), "{reason}")
+                }
+                other => panic!("{kind:?}: {other:?}"),
+            }
+        };
+        let rot = |angle_rad, ramp_s| FaultKind::MagRotate { angle_rad, ramp_s };
+        bad(rot(f64::NAN, 0.0), None, "angle_rad");
+        bad(rot(f64::INFINITY, 0.0), None, "angle_rad");
+        bad(rot(1.0, -1.0), None, "ramp_s");
+        bad(rot(1.0, f64::NAN), None, "ramp_s");
+        bad(rot(1.0, f64::INFINITY), None, "ramp_s");
+        // A ramp that does not fit twice into the window.
+        bad(rot(1.0, 2.0), Some(4.9), "ramp_s");
+        let off = |north_mps, east_mps| FaultKind::GpsVelOffset {
+            north_mps,
+            east_mps,
+        };
+        bad(off(f64::NAN, 0.0), None, "north_mps");
+        bad(off(0.0, f64::INFINITY), None, "east_mps");
+        let noise = |sigma_mps, s_acc_mps| FaultKind::GpsVelNoise {
+            sigma_mps,
+            s_acc_mps,
+        };
+        bad(noise(-0.1, None), None, "sigma_mps");
+        bad(noise(f64::NAN, None), None, "sigma_mps");
+        bad(noise(1.0, Some(-1.0)), None, "s_acc_mps");
+        bad(noise(1.0, Some(f64::INFINITY)), None, "s_acc_mps");
+        // The acceptable ones.
+        let ok = |kind: FaultKind, end_s| {
+            let f = Fault {
+                kind,
+                start_s: 1.0,
+                end_s,
+            };
+            assert_eq!(validate_faults(&[f], 4, &links), Ok(()), "{kind:?}");
+        };
+        ok(rot(-3.0, 0.0), Some(2.0));
+        ok(rot(1.0, 2.0), Some(5.0));
+        ok(rot(1.0, 60.0), None);
+        ok(off(-5.0, 2.0), Some(2.0));
+        ok(noise(0.0, Some(0.0)), Some(2.0));
+        ok(noise(2.0, None), None);
+    }
+
+    #[test]
+    fn the_new_faults_set_no_flag_the_bridge_reads() {
+        let faults = [
+            mag(1.0, 0.0, 0.0, None),
+            Fault {
+                kind: FaultKind::GpsVelOffset {
+                    north_mps: 1.0,
+                    east_mps: 0.0,
+                },
+                start_s: 0.0,
+                end_s: None,
+            },
+        ];
+        assert!(ActiveFaults::at(&faults, Micros(1_000_000)).none());
+    }
+
     #[test]
     fn bad_heartbeat_period_rejected() {
         let l = LinkConfig::default();

@@ -1342,3 +1342,497 @@ mod tests {
         assert!(s.accel_bias().is_finite());
     }
 }
+
+/// The faults that change what a sensor reports (`mag-rotate`,
+/// `gps-vel-offset`, `gps-vel-noise`), seen on the sensor's output.
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    use oxide_core::math::Quat;
+
+    const BASE: u64 = 1000;
+
+    fn fault(kind: FaultKind, start_s: f64, end_s: Option<f64>) -> Fault {
+        Fault {
+            kind,
+            start_s,
+            end_s,
+        }
+    }
+
+    fn rotate(angle_rad: f64, ramp_s: f64, start_s: f64, end_s: Option<f64>) -> Fault {
+        fault(FaultKind::MagRotate { angle_rad, ramp_s }, start_s, end_s)
+    }
+
+    fn truth(body: &BodyState<4>) -> Truth<'_, 4> {
+        Truth {
+            body,
+            specific_force_world: Vec3::new(0.0, 0.0, -9.8),
+            battery_v: 15.2,
+            battery_a: 12.5,
+            max_omega: 2000.0,
+        }
+    }
+
+    /// The level vehicle, pointing north, moving: the field reads as the
+    /// Earth's field in NED.
+    fn level_body() -> BodyState<4> {
+        BodyState {
+            position: Vec3::new(1.0, -2.0, -3.5),
+            velocity: Vec3::new(0.5, 0.25, -0.1),
+            ..BodyState::default()
+        }
+    }
+
+    /// The magnetometer's samples every 20 ms for `seconds`: (t in µs, field).
+    fn mag(cfg: SensorConfig, faults: &[Fault], seconds: u64) -> Vec<(u64, Vec3<f32>)> {
+        let body = level_body();
+        let mut s = SensorSuite::<4>::new(cfg, 7, BASE)
+            .unwrap()
+            .with_faults(faults);
+        let mut out = Vec::new();
+        for k in 0..seconds * 1000 {
+            let t = Micros(k * BASE);
+            if let Some(m) = s.sample(t, &truth(&body)).mag {
+                out.push((t.0, m.value.field_ut));
+            }
+        }
+        out
+    }
+
+    /// The angle of the horizontal field from north, towards east, rad.
+    fn heading_of(f: Vec3<f32>) -> f64 {
+        Real::atan2(f64::from(f.y), f64::from(f.x))
+    }
+
+    fn at(v: &[(u64, Vec3<f32>)], t_us: u64) -> Vec3<f32> {
+        v.iter().find(|(t, _)| *t == t_us).expect("a sample").1
+    }
+
+    #[test]
+    fn a_mag_rotate_turns_the_field_about_down_by_the_angle() {
+        let cfg = SensorConfig::ideal();
+        let want0 = cfg.mag.field_ned_ut;
+        let faults = [rotate(1.0, 0.0, 1.0, Some(3.0))];
+        let got = mag(cfg, &faults, 4);
+        // Before the window the field is the Earth's field, bit for bit.
+        assert_eq!(at(&got, 500_000), want0.cast());
+        // Inside: the horizontal field turns north towards east by 1 rad,
+        // its length and its Down part do not change.
+        let f = at(&got, 2_000_000);
+        assert!((heading_of(f) - 1.0).abs() < 1e-6, "{f:?}");
+        let h = Real::sqrt(want0.x * want0.x + want0.y * want0.y);
+        let fh = Real::sqrt(f64::from(f.x * f.x + f.y * f.y));
+        assert!((fh - h).abs() < 1e-5);
+        assert_eq!(f.z, want0.z as f32);
+        // Against the rotation of the vector by the library's own quaternion.
+        let q = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 1.0);
+        let want = q.rotate(want0);
+        assert!((f64::from(f.x) - want.x).abs() < 1e-5 && (f64::from(f.y) - want.y).abs() < 1e-5);
+        // A negative angle turns it the other way.
+        let got = mag(cfg, &[rotate(-1.0, 0.0, 1.0, Some(3.0))], 4);
+        assert!((heading_of(at(&got, 2_000_000)) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_rotation_follows_the_vehicles_attitude_not_the_body_axes() {
+        // A vehicle yawed 90 degrees sees the rotated world field in its own
+        // frame: the same rotation of the world field, then the body's turn.
+        let cfg = SensorConfig::ideal();
+        let body = BodyState::<4> {
+            attitude: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.5 * core::f64::consts::PI),
+            ..level_body()
+        };
+        let mut s = SensorSuite::<4>::new(cfg, 7, BASE)
+            .unwrap()
+            .with_faults(&[rotate(0.4, 0.0, 0.0, None)]);
+        let f = s
+            .sample(Micros(0), &truth(&body))
+            .mag
+            .unwrap()
+            .value
+            .field_ut;
+        let world =
+            Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.4).rotate(cfg.mag.field_ned_ut);
+        let want = body.attitude.inverse_rotate(world);
+        assert!((f64::from(f.x) - want.x).abs() < 1e-5 && (f64::from(f.y) - want.y).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_window_is_start_inclusive_and_end_exclusive_at_the_tick() {
+        let cfg = SensorConfig::ideal();
+        let got = mag(cfg, &[rotate(0.8, 0.0, 1.0, Some(2.0))], 3);
+        let rotated = |t| (heading_of(at(&got, t)) - 0.8).abs() < 1e-6;
+        let plain = |t| heading_of(at(&got, t)).abs() < 1e-12;
+        assert!(plain(980_000) && rotated(1_000_000));
+        assert!(rotated(1_980_000) && plain(2_000_000));
+        // A window that starts between two samples acts from the next one.
+        let got = mag(cfg, &[rotate(0.8, 0.0, 1.01, Some(2.01))], 3);
+        assert!(heading_of(at(&got, 1_000_000)).abs() < 1e-12);
+        assert!((heading_of(at(&got, 1_020_000)) - 0.8).abs() < 1e-6);
+        assert!((heading_of(at(&got, 2_000_000)) - 0.8).abs() < 1e-6);
+        assert!(heading_of(at(&got, 2_020_000)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_ramp_rises_over_ramp_s_and_falls_over_the_last_ramp_s() {
+        let got = mag(
+            SensorConfig::ideal(),
+            &[rotate(1.2, 2.0, 10.0, Some(20.0))],
+            21,
+        );
+        let angle = |t_s: f64| heading_of(at(&got, (t_s * 1e6) as u64));
+        let want = |t_s: f64| {
+            1.2 * if t_s < 12.0 {
+                (t_s - 10.0) / 2.0
+            } else if t_s > 18.0 {
+                (20.0 - t_s) / 2.0
+            } else {
+                1.0
+            }
+        };
+        for t_s in [10.0, 10.5, 11.0, 11.98, 12.0, 15.0, 18.0, 18.5, 19.0, 19.98] {
+            assert!(
+                (angle(t_s) - want(t_s)).abs() < 1e-6,
+                "{t_s}: {} against {}",
+                angle(t_s),
+                want(t_s)
+            );
+        }
+        // Outside: no rotation.
+        assert!(angle(9.98).abs() < 1e-12 && angle(20.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_rotation_with_no_end_rises_and_stays() {
+        let got = mag(SensorConfig::ideal(), &[rotate(0.9, 1.0, 1.0, None)], 40);
+        let angle = |t_s: f64| heading_of(at(&got, (t_s * 1e6) as u64));
+        assert!(angle(0.98).abs() < 1e-12);
+        assert!((angle(1.5) - 0.45).abs() < 1e-6);
+        assert!((angle(2.0) - 0.9).abs() < 1e-6);
+        assert!((angle(39.98) - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn overlapping_rotations_add() {
+        let faults = [
+            rotate(0.5, 0.0, 1.0, Some(3.0)),
+            rotate(-0.2, 0.0, 2.0, None),
+        ];
+        let got = mag(SensorConfig::ideal(), &faults, 5);
+        let angle = |t_s: f64| heading_of(at(&got, (t_s * 1e6) as u64));
+        assert!((angle(1.5) - 0.5).abs() < 1e-6);
+        assert!((angle(2.5) - 0.3).abs() < 1e-6);
+        assert!((angle(3.5) + 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn faults_outside_their_windows_leave_every_sample_as_it_was() {
+        // Realistic noise on every sensor, and every sensor-value fault in a
+        // window that has not begun when the run ends.
+        let cfg = SensorConfig::realistic();
+        let body = level_body();
+        let faults = [
+            rotate(1.0, 0.5, 100.0, Some(110.0)),
+            fault(
+                FaultKind::GpsVelOffset {
+                    north_mps: 5.0,
+                    east_mps: 1.0,
+                },
+                100.0,
+                Some(101.0),
+            ),
+            fault(
+                FaultKind::GpsVelNoise {
+                    sigma_mps: 2.0,
+                    s_acc_mps: Some(1.0),
+                },
+                100.0,
+                Some(105.0),
+            ),
+        ];
+        let mut plain = SensorSuite::<4>::new(cfg, 3, BASE).unwrap();
+        let mut faulty = SensorSuite::<4>::new(cfg, 3, BASE)
+            .unwrap()
+            .with_faults(&faults);
+        for k in 0..20_000_u64 {
+            let t = Micros(k * BASE);
+            let (a, b) = (
+                plain.sample(t, &truth(&body)),
+                faulty.sample(t, &truth(&body)),
+            );
+            assert_eq!(a, b, "tick {k}");
+        }
+    }
+
+    /// Fixes (t_sample in µs, sample) of `seconds` with GPS every `period`.
+    fn fixes(cfg: SensorConfig, faults: &[Fault], seconds: u64) -> Vec<(u64, GpsSample)> {
+        let body = level_body();
+        let mut s = SensorSuite::<4>::new(cfg, 11, BASE)
+            .unwrap()
+            .with_faults(faults);
+        let mut out = Vec::new();
+        for k in 0..seconds * 1000 {
+            if let Some(g) = s.sample(Micros(k * BASE), &truth(&body)).gps {
+                out.push((g.t_sample.0, g.value));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_velocity_offset_is_added_to_the_fixes_measured_in_its_window_only() {
+        let cfg = SensorConfig::realistic();
+        let offset = fault(
+            FaultKind::GpsVelOffset {
+                north_mps: 5.0,
+                east_mps: -2.0,
+            },
+            10.0,
+            Some(11.0),
+        );
+        let base = fixes(cfg, &[], 14);
+        let hit = fixes(cfg, &[offset], 14);
+        assert_eq!(base.len(), hit.len());
+        let mut inside = 0;
+        for ((t, a), (t2, b)) in base.iter().zip(&hit) {
+            assert_eq!(t, t2);
+            // The position, the accuracies and the fix flag never change.
+            assert_eq!(a.position, b.position);
+            assert_eq!(
+                (a.h_acc_m, a.v_acc_m, a.s_acc_mps),
+                (b.h_acc_m, b.v_acc_m, b.s_acc_mps)
+            );
+            assert_eq!(a.fix_3d, b.fix_3d);
+            assert_eq!(a.velocity.z, b.velocity.z);
+            if (10_000_000..11_000_000).contains(t) {
+                inside += 1;
+                assert!((f64::from(b.velocity.x - a.velocity.x) - 5.0).abs() < 1e-4);
+                assert!((f64::from(b.velocity.y - a.velocity.y) + 2.0).abs() < 1e-4);
+            } else {
+                assert_eq!(a, b, "t {t}");
+            }
+        }
+        // 1 s of a 5 Hz receiver.
+        assert_eq!(inside, 5);
+    }
+
+    #[test]
+    fn a_jump_that_begins_between_two_fixes_starts_with_the_next_fix() {
+        // Fixes at 10.0, 10.2, ... : the window opens at 10.1 and closes at
+        // 10.5, so the fixes at 10.2 and 10.4 are moved (by their
+        // measurement time, not their arrival 150 ms later).
+        let cfg = SensorConfig::realistic();
+        let offset = fault(
+            FaultKind::GpsVelOffset {
+                north_mps: 3.0,
+                east_mps: 0.0,
+            },
+            10.1,
+            Some(10.5),
+        );
+        let base = fixes(cfg, &[], 11);
+        let hit = fixes(cfg, &[offset], 11);
+        let moved: Vec<u64> = base
+            .iter()
+            .zip(&hit)
+            .filter(|((_, a), (_, b))| a.velocity != b.velocity)
+            .map(|((t, _), _)| *t)
+            .collect();
+        assert_eq!(moved, vec![10_200_000, 10_400_000]);
+    }
+
+    #[test]
+    fn two_offsets_add() {
+        let cfg = SensorConfig::ideal();
+        let o = |n, e, s, end| {
+            fault(
+                FaultKind::GpsVelOffset {
+                    north_mps: n,
+                    east_mps: e,
+                },
+                s,
+                end,
+            )
+        };
+        let base = fixes(cfg, &[], 6);
+        let hit = fixes(
+            cfg,
+            &[o(1.0, 0.0, 1.0, None), o(0.5, 2.0, 3.0, Some(4.0))],
+            6,
+        );
+        let d = |t_us: u64| {
+            let a = base.iter().find(|(t, _)| *t == t_us).unwrap().1.velocity;
+            let b = hit.iter().find(|(t, _)| *t == t_us).unwrap().1.velocity;
+            (f64::from(b.x - a.x), f64::from(b.y - a.y))
+        };
+        assert_eq!(d(0), (0.0, 0.0));
+        assert_eq!(d(2_000_000), (1.0, 0.0));
+        assert_eq!(d(3_000_000), (1.5, 2.0));
+        assert_eq!(d(4_000_000), (1.0, 0.0));
+    }
+
+    /// A receiver that fixes every tick, so that a window holds many.
+    fn fast_gps() -> SensorConfig {
+        let mut cfg = SensorConfig::realistic();
+        cfg.gps.period_us = BASE;
+        cfg.gps.latency_us = 0;
+        cfg
+    }
+
+    fn std_of(v: &[f64]) -> f64 {
+        let n = v.len() as f64;
+        let mean = v.iter().sum::<f64>() / n;
+        Real::sqrt(v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n)
+    }
+
+    #[test]
+    fn the_extra_noise_has_the_stated_level_over_the_window_and_none_outside() {
+        let noise = |sigma_mps, s_acc_mps| {
+            fault(
+                FaultKind::GpsVelNoise {
+                    sigma_mps,
+                    s_acc_mps,
+                },
+                5.0,
+                Some(25.0),
+            )
+        };
+        let cfg = fast_gps();
+        let base = fixes(cfg, &[], 30);
+        let hit = fixes(cfg, &[noise(2.0, None)], 30);
+        let (mut dx, mut dy) = (Vec::new(), Vec::new());
+        for ((t, a), (_, b)) in base.iter().zip(&hit) {
+            // Position and the vertical velocity: never touched.
+            assert_eq!(a.position, b.position);
+            assert_eq!(a.velocity.z, b.velocity.z);
+            if (5_000_000..25_000_000).contains(t) {
+                dx.push(f64::from(b.velocity.x - a.velocity.x));
+                dy.push(f64::from(b.velocity.y - a.velocity.y));
+            } else {
+                assert_eq!(a, b, "t {t}");
+            }
+        }
+        assert_eq!(dx.len(), 20_000);
+        for d in [&dx, &dy] {
+            let mean = d.iter().sum::<f64>() / d.len() as f64;
+            assert!(mean.abs() < 0.1, "mean {mean}");
+            assert!((std_of(d) / 2.0 - 1.0).abs() < 0.03, "std {}", std_of(d));
+        }
+        // The two axes are not the same numbers.
+        assert_ne!(dx, dy);
+        // A noise of 1 m/s is half as large.
+        let one = fixes(cfg, &[noise(1.0, None)], 30);
+        let d1: Vec<f64> = base
+            .iter()
+            .zip(&one)
+            .filter(|((t, _), _)| (5_000_000..25_000_000).contains(t))
+            .map(|((_, a), (_, b))| f64::from(b.velocity.x - a.velocity.x))
+            .collect();
+        assert!((std_of(&d1) / 1.0 - 1.0).abs() < 0.03);
+    }
+
+    #[test]
+    fn the_reported_speed_accuracy_is_raised_only_when_the_fault_says_so() {
+        let noise = |s_acc_mps| {
+            fault(
+                FaultKind::GpsVelNoise {
+                    sigma_mps: 1.0,
+                    s_acc_mps,
+                },
+                5.0,
+                Some(10.0),
+            )
+        };
+        let cfg = SensorConfig::realistic();
+        let normal = cfg.gps.reported_s_acc_mps as f32;
+        let silent = fixes(cfg, &[noise(None)], 12);
+        let honest = fixes(cfg, &[noise(Some(1.0))], 12);
+        for ((t, a), (_, b)) in silent.iter().zip(&honest) {
+            assert_eq!(a.s_acc_mps, normal, "silent, t {t}");
+            let inside = (5_000_000..10_000_000).contains(t);
+            assert_eq!(b.s_acc_mps, if inside { 1.0 } else { normal }, "t {t}");
+            // The other accuracies are never raised.
+            assert_eq!((a.h_acc_m, a.v_acc_m), (b.h_acc_m, b.v_acc_m));
+        }
+        // Two noises at once: variances add, the largest figure is reported.
+        let two = [noise(Some(0.7)), noise(Some(1.5))];
+        let f = fixes(cfg, &two, 12);
+        assert!(f.iter().any(|(_, g)| g.s_acc_mps == 1.5));
+        assert!(f.iter().all(|(_, g)| g.s_acc_mps != 0.7));
+    }
+
+    #[test]
+    fn the_extra_noise_has_a_stream_of_its_own_and_moves_no_other_draw() {
+        // With the fault on, every other number the suite produces (all of
+        // the IMU, the baro, the mag, the battery, the GPS position and the
+        // GPS dropout) is bit for bit the number of the flight without it.
+        let mut cfg = SensorConfig::realistic();
+        cfg.gps.dropout_probability = 0.3;
+        let body = level_body();
+        let fault = fault(
+            FaultKind::GpsVelNoise {
+                sigma_mps: 3.0,
+                s_acc_mps: None,
+            },
+            1.0,
+            None,
+        );
+        let mut plain = SensorSuite::<4>::new(cfg, 5, BASE).unwrap();
+        let mut hit = SensorSuite::<4>::new(cfg, 5, BASE)
+            .unwrap()
+            .with_faults(&[fault]);
+        let mut moved = 0;
+        for k in 0..10_000_u64 {
+            let t = Micros(k * BASE);
+            let (a, mut b) = (plain.sample(t, &truth(&body)), hit.sample(t, &truth(&body)));
+            if let (Some(x), Some(y)) = (a.gps, b.gps) {
+                moved += u32::from(x.value.velocity != y.value.velocity);
+                // The queue holds the same fixes at the same times.
+                assert_eq!((x.t_sample, x.t_arrival), (y.t_sample, y.t_arrival));
+                assert_eq!(x.value.position, y.value.position);
+                b.gps = a.gps;
+            } else {
+                assert_eq!(a.gps.is_some(), b.gps.is_some());
+            }
+            assert_eq!(a, b, "tick {k}");
+        }
+        assert!(moved > 20, "{moved}");
+        // The stream is distinct from every other.
+        let id = Stream::GpsVelNoise.id();
+        assert!(
+            [
+                Stream::Imu,
+                Stream::Gps,
+                Stream::Baro,
+                Stream::Mag,
+                Stream::Battery,
+                Stream::Wind,
+                Stream::Scenario,
+                Stream::GpsError
+            ]
+            .iter()
+            .all(|s| s.id() != id)
+        );
+    }
+
+    #[test]
+    fn the_receiver_delay_is_applied_to_every_fix() {
+        for latency_us in [0, 50_000, 250_000, 350_000] {
+            let mut cfg = SensorConfig::realistic();
+            cfg.gps.latency_us = latency_us;
+            let body = level_body();
+            let mut s = SensorSuite::<4>::new(cfg, 2, BASE).unwrap();
+            let mut n = 0;
+            for k in 0..3000_u64 {
+                if let Some(g) = s.sample(Micros(k * BASE), &truth(&body)).gps {
+                    assert_eq!(g.t_arrival.0 - g.t_sample.0, latency_us);
+                    // It arrives when its delay has passed, not before.
+                    assert_eq!(g.t_arrival.0, k * BASE);
+                    n += 1;
+                }
+            }
+            assert!(n > 5);
+        }
+    }
+}
