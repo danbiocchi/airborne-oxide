@@ -55,6 +55,7 @@ M1b replaces the simulator's ground-truth state with an estimate made from noisy
 - Wind and drag-specific-force states (rotor-drag fusion as in PX4's `EKF2_MCOEF`).
 - Selecting f64 on the H743 profile.
 - A heading reset after sustained magnetometer rejection. It needs an independent check of heading (GPS velocity during acceleration) to be safe near magnetic disturbances.
+- A guard for a heading estimate that disagrees with the vehicle's own motion, in any mode (for example GPS velocity against the predicted acceleration; PX4 runs a second yaw estimator on the GPS velocity and resets the heading to it, `src/modules/ekf2/EKF/aid_sources/gnss/gps_control.cpp`). A declination at the end of its range against the simulated site's 0 flies away today (see [ADR-0003](0003-failsafes.md), amendment of 28 November 2026).
 - Keeping the covariance consistent when a bias state hits its clamp. Today the clamp is invisible to the covariance, as in PX4.
 
 - **The barometer's slow drift is not modelled**, so after a few minutes the vertical position and the vertical accelerometer bias are overconfident (NEES 4.6 and 2.3 times its expected value over 100 to 300 s after the change, 5.6 and 3.3 before). A barometer-bias state or extra height noise.

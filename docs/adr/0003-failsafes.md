@@ -188,16 +188,28 @@ Both references judge the thrust axis and neither counts the heading; ours now j
 - **A longer time or a larger angle.** It only moves the size of the step that kills the vehicle.
 - **A softer reaction to a heading error that persists** (for example a landing). Possibly right, but a new rule: deferred.
 
+### A gap this change makes visible: a heading estimate that is wrong by a large angle
+
+A heading estimate that is wrong by a large angle makes the position loop push the wrong way, and nothing in the core detects it, in any mode. The old rule did not guard against it either; it only looked as if it did in one flight. With `EKF_MAG_DECL` at either end of its range (plus or minus π) against a simulated site of declination 0, the heading estimate is turned round by 180°:
+
+- **Offboard, `gust-hold`, run 0, F405** (`oxide-sim scenario gust-hold --param EKF_MAG_DECL=-3.1415927`). Old rule: `LOSS_OF_CONTROL` at 3.58 s, `Terminate`, `Disarmed(Terminated)` 0.54 s after arming, with the vehicle on the ground (highest point 0.01 m). The heading term fired because the commanded heading (0) and the wrongly estimated heading were 180° apart while the vehicle sat on the ground. New rule: no loss of control; the vehicle takes off and flies away, 886 m out, largest tilt 69°. The same at plus π.
+- **Position mode, `rc-loss-position`.** The commanded heading follows the estimate, so the heading error is zero and the old rule saw nothing: the same declination flew away under the old rule too (1377 m out at minus π). This is the entry already listed as known in `crates/oxide-sim/tests/param_bounds.rs`.
+
+An accident of the heading term is not a protection, and it cannot be kept without keeping the fault this amendment mends: it is the same term that terminated healthy vehicles turning to a new heading. So `EKF_MAG_DECL` at its minimum and maximum on `gust-hold` join that sweep's list of known bounds, each with this reason; the sweep's own rule for a known bound (it must fail on at least one of runs 0 to 19) applies unchanged. The gap is recorded here and not hidden: a vehicle whose heading estimate is wrong is not detected by any rule of this ADR.
+
+What PX4 does about it (checkout as above, `src/modules/ekf2/EKF/aid_sources/gnss/gps_control.cpp`): a second yaw estimator is fed the GPS velocity (`_yawEstimator.fuseVelocity(vel_xy, vel_accuracy, _control_status.flags.in_air);`, line 388). `isYawFailure()` (lines 521 to 531) is true when that estimate is available and converged (`isYawEmergencyEstimateAvailable()`, lines 506 to 519: its yaw variance below `EKFGSF_yaw_err_max`) and differs from the filter's yaw by more than 25° (`fabsf(yaw_error) > math::radians(25.f)`, line 530). In the air, with no GNSS fault flagged, it is used at line 109 to reset the heading to the estimate (`tryYawEmergencyReset()`, lines 402 to 409: "A rapid reset to the yaw emergency estimate is performed if horizontal velocity innovation checks continuously fails while the difference between the yaw emergency estimator and the yaw estimate is large. This enables recovery from a bad yaw estimate."). That is a recovery inside the estimator, not a flight termination.
+
 ### Deferred
 
 - A reaction to a heading error that persists, if one is wanted (a vehicle that cannot turn, for example on a lost yaw authority). Today a vehicle that does not follow its heading command raises nothing.
 - A limit on the speed of the heading target (see above).
+- **A guard for a heading estimate that disagrees with the vehicle's own motion**, for example the GPS velocity against the predicted acceleration, which is how PX4 recovers a wrong heading (see the gap above). Nothing detects it today, in any mode. Also listed in [ADR-0002](0002-estimator.md)'s deferred list.
 
 ### Measurements
 
 All on runs 500 to 519 of every scenario file, both profiles, before and after, comparing the class, the verdict, the event timeline and the trace hash of each of the 1760 flights.
 
-- **Only loss-of-control flights changed.** 78 flights differ: the 38 of `motor-loss` that were terminated before and are terminated after (2 of the 40 are bit for bit the same), and the 40 flights of the new `yaw-step-large`, terminated before and flown clean after. The other 42 files, 1680 flights, are unchanged to the trace hash. (`imu-loss` fails its verdict on these runs before and after, identically: a finding outside this change.)
+- **Only loss-of-control flights changed.** 78 flights differ: the 38 of `motor-loss` that were terminated before and are terminated after (2 of the 40 are bit for bit the same), and the 40 flights of the new `yaw-step-large`, terminated before and flown clean after. The other 42 files, 1680 flights, are unchanged to the trace hash. (`imu-loss` passes its verdict on all 40 flights, before and after. An earlier draft of this record said it failed: that was a misreading of the measuring program's class column, which calls any flight with an impact above 1.5 m/s a crash, as `imu-loss`, `motor-loss` and `kill-in-rtl` must be by design. Its verdict column read pass.)
 - **Motor loss is still terminated, a little later.** Time from the fault (at 15 s) to the last motor command above zero, runs 500 to 519 (the criterion B3 measure of gate 1):
 
   | profile | median before | median after | latest before | latest after |
