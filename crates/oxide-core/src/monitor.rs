@@ -763,13 +763,9 @@ mod tests {
         let roll30 = Quat::<f32>::from_euler(30.0 * DEG, 0.0, 0.0);
         assert!((tilt_error_angle(roll10, roll30) - 20.0 * DEG).abs() < 1e-5);
         let pitch30 = Quat::<f32>::from_euler(0.0, 30.0 * DEG, 0.0);
-        // Roll 30 against pitch 30: cos = cos 30 * cos 30 + sin-sin cross terms.
-        let want = f64::acos(f64::from(
-            roll30
-                .rotate(Vec3::new(0.0, 0.0, 1.0))
-                .dot(pitch30.rotate(Vec3::new(0.0, 0.0, 1.0))),
-        ));
-        assert!((f64::from(tilt_error_angle(roll30, pitch30)) - want).abs() < 1e-4);
+        // Roll 30 against pitch 30: the thrust axes are (0, -sin 30, cos 30)
+        // and (sin 30, 0, cos 30), so cos(error) = cos 30 * cos 30 = 0.75.
+        assert!((tilt_error_angle(roll30, pitch30) - 0.722_734_2).abs() < 1e-5); // acos(0.75)
         assert!(tilt_error_angle(roll10, roll10) < 1e-6);
     }
 
