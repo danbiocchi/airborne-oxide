@@ -601,6 +601,36 @@ impl<T: Real> Ekf<T> {
         delta
     }
 
+    /// Sets the roll and pitch error variances (`ITH`, `ITH + 1`) back to
+    /// their initial value and zeroes their cross-covariances: the heading
+    /// check's correction does this so that the GPS velocity can undo within
+    /// seconds the tilt error a wrong heading forced into the filter.
+    pub fn reset_tilt_variance(&mut self) {
+        let sigma = self.prm.init_tilt;
+        self.reset_cov(&[ITH, ITH + 1], sigma);
+    }
+
+    /// Adds `dpsi` (rad) to the declination the heading model uses, with its
+    /// cosine and sine: after the heading was turned by `dpsi` the field's
+    /// direction in the world frame turned by `-dpsi`, and the model's
+    /// declination must follow so that the magnetometer innovation stays
+    /// about zero. The parameter `EKF_MAG_DECL` is not touched. A value that
+    /// is not finite is ignored.
+    pub fn shift_declination(&mut self, dpsi: T) {
+        if !dpsi.is_finite() {
+            return;
+        }
+        let d = wrap_pi(self.prm.declination + dpsi);
+        self.prm.declination = d;
+        self.prm.decl_cos = d.cos();
+        self.prm.decl_sin = d.sin();
+    }
+
+    /// The declination the heading model uses now, rad.
+    pub fn declination(&self) -> T {
+        self.prm.declination
+    }
+
     fn reset_cov(&mut self, idx: &[usize], sigma: T) {
         let var = (sigma * sigma).finite_or(T::ONE);
         for &i in idx {

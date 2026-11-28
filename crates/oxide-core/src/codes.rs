@@ -253,6 +253,8 @@ impl EventKind {
             EventKind::ParamLoadFault(_) => 13,
             EventKind::ParamLoadRecovered(_) => 14,
             EventKind::ParamFaultAcked => 15,
+            EventKind::HeadingCorrected { .. } => 16,
+            EventKind::HeadingContained => 17,
         }
     }
 }
@@ -440,6 +442,14 @@ mod tests {
             (EventKind::ParamLoadFault(load), 13),
             (EventKind::ParamLoadRecovered(load), 14),
             (EventKind::ParamFaultAcked, 15),
+            (
+                EventKind::HeadingCorrected {
+                    angle_mrad: -1000,
+                    count: 1,
+                },
+                16,
+            ),
+            (EventKind::HeadingContained, 17),
         ];
         for (k, c) in table {
             assert_eq!(k.code(), *c, "{k:?}");

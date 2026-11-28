@@ -26,14 +26,19 @@ use crate::config::{ConfigError, EkfParams};
 use crate::io::{
     BaroSample, EstimatorStatus, GpsSample, ImuSample, MagSample, Stamped, StateSample, Validity,
 };
-use crate::math::{Quat, Real, Vec3};
+use crate::math::{Quat, Real, Vec3, wrap_pi};
 use crate::schedule::Profile;
 use crate::time::Micros;
 use ekf::{Ekf, Fusion, GYRO_BIAS_LIMIT, heading_from_mag, tilt_from_accel};
-use heading_check::{HeadingCheck, HeadingConfig, HeadingFit};
+use heading_check::{HeadingCheck, HeadingConfig, HeadingFit, Verdict};
 use imu::{ImuAccumulator, ImuDelta};
 use output::OutputPredictor;
 use ring::Ring;
+
+/// The least sigma given to the yaw reset of a heading correction, rad: not
+/// smaller than this, so that the magnetometer and the GPS can still refine
+/// the corrected heading (D2 section 12).
+const HDG_RESET_SIGMA_MIN_RAD: f32 = 0.1;
 
 /// IMU delta ring capacity (also the output predictor's history depth).
 pub const IMU_BUFFER: usize = 64;
@@ -138,6 +143,27 @@ pub struct Estimator {
     /// version it only watches: its verdict is counted and logged, and
     /// nothing reads it to act.
     hdg: HeadingCheck,
+    /// Corrections made in this flight (cleared at disarm).
+    hdg_corrections: u8,
+    /// Corrections allowed per flight (`EKF_HDG_NMAX`).
+    hdg_max: u8,
+    /// The containment latch: the check said correct with the budget used
+    /// up. Read by [`Estimator::validity`] and by `fuse_gps`; it never
+    /// clears `heading_ok` (the next magnetometer sample would then reset
+    /// the yaw to the wrong magnetometer heading and call it good). Cleared
+    /// at disarm.
+    hdg_latched: bool,
+    /// Sum of the heading corrections of this flight, rad (wrapped): the run-time
+    /// shift of the declination. Held here, not only in the filter, because
+    /// a new filter (`drop_to_unaligned`) reads the declination from the
+    /// parameters again. `EKF_MAG_DECL` itself is never written.
+    decl_shift: f32,
+    /// The supervisor's `armed` (a fall clears the per-flight state).
+    armed: bool,
+    /// The last correction not yet reported (rad), for the core's event.
+    pending_corrected: Option<f32>,
+    /// The containment latch was set and not yet reported.
+    pending_contained: bool,
 }
 
 impl Estimator {
@@ -181,6 +207,13 @@ impl Estimator {
             rejected: 0,
             resets: 0,
             hdg: HeadingCheck::new(heading_config(p)),
+            hdg_corrections: 0,
+            hdg_max: u8::try_from(p.hdg_max_corrections).unwrap_or(u8::MAX),
+            hdg_latched: false,
+            decl_shift: 0.0,
+            armed: false,
+            pending_corrected: None,
+            pending_contained: false,
         })
     }
 
@@ -188,6 +221,58 @@ impl Estimator {
     /// accumulates only while airborne.
     pub fn set_airborne(&mut self, airborne: bool) {
         self.hdg.set_airborne(airborne);
+    }
+
+    /// The supervisor's `armed`. Falling to disarmed ends the flight: the
+    /// correction count, the containment latch and the declination shift
+    /// are cleared. If any of them was set the filter's heading and the
+    /// magnetometer now disagree by the shift, so the filter is dropped and
+    /// aligns again from the magnetometer with the declination parameter
+    /// (the estimator's own re-alignment, as after an IMU stall): the
+    /// vehicle cannot be armed until that is done (no estimate meanwhile).
+    pub fn set_armed(&mut self, armed: bool) {
+        let fell = self.armed && !armed;
+        self.armed = armed;
+        if !fell {
+            return;
+        }
+        let dirty = self.hdg_corrections != 0 || self.hdg_latched || self.decl_shift != 0.0;
+        self.hdg_corrections = 0;
+        self.hdg_latched = false;
+        self.decl_shift = 0.0;
+        self.pending_corrected = None;
+        self.pending_contained = false;
+        if dirty && self.ekf.is_some() {
+            self.drop_to_unaligned();
+        }
+    }
+
+    /// Heading corrections made in this flight.
+    pub fn heading_corrections(&self) -> u8 {
+        self.hdg_corrections
+    }
+
+    /// The containment latch (the heading is declared untrustworthy until
+    /// disarm).
+    pub fn heading_contained(&self) -> bool {
+        self.hdg_latched
+    }
+
+    /// The run-time shift of the declination, rad (sum of the corrections of
+    /// this flight).
+    pub fn declination_shift(&self) -> f32 {
+        self.decl_shift
+    }
+
+    /// The last heading correction (rad) made since the previous call, if
+    /// any: the core reports it as an event.
+    pub fn take_heading_corrected(&mut self) -> Option<f32> {
+        self.pending_corrected.take()
+    }
+
+    /// True once after the containment latch was set.
+    pub fn take_heading_contained(&mut self) -> bool {
+        core::mem::take(&mut self.pending_contained)
     }
 
     /// The heading check's record for the latest GPS fix it judged while
@@ -305,7 +390,8 @@ impl Estimator {
         }
         let recent =
             |t: Option<Micros>, timeout: u64| t.is_some_and(|t| self.t_ekf.since(t) <= timeout);
-        let heading = self.heading_ok && recent(self.mag_accept, self.mag_timeout_us);
+        let heading =
+            self.heading_ok && !self.hdg_latched && recent(self.mag_accept, self.mag_timeout_us);
         let altitude = recent(self.baro_accept, self.baro_timeout_us);
         let velocity = heading && recent(self.gps.vel_accept, self.gps_timeout_us);
         let position = velocity && recent(self.gps.pos_accept, self.pos_timeout_us);
@@ -363,6 +449,9 @@ impl Estimator {
             gps_aiding: aiding,
             rejected: self.rejected,
             resets: self.resets,
+            heading_corrections: self.hdg_corrections,
+            heading_contained: self.hdg_latched,
+            heading_shift_rad: self.decl_shift,
         }
     }
 
@@ -462,10 +551,15 @@ impl Estimator {
             self.restart_alignment();
             return;
         };
-        let heading =
-            mag.and_then(|m| heading_from_mag(m, roll, pitch, self.params.mag_declination_rad));
+        // The declination of the heading model: the parameter and this
+        // flight's shift (zero unless the filter was dropped in flight).
+        let declination = wrap_pi(self.params.mag_declination_rad + self.decl_shift);
+        let heading = mag.and_then(|m| heading_from_mag(m, roll, pitch, declination));
         let q0 = Quat::from_euler(roll, pitch, heading.unwrap_or(0.0));
         let mut ekf = Ekf::new(&self.params, q0);
+        // A new filter reads the declination from the parameters: apply the
+        // shift of the corrections again.
+        ekf.shift_declination(self.decl_shift);
         // At rest the mean gyro rate is the turn-on bias (Earth rate is
         // negligible).
         let limit = <f32 as Real>::from_f64(GYRO_BIAS_LIMIT);
@@ -632,7 +726,7 @@ impl Estimator {
         // The heading check judges the fix (with the velocity change the
         // filter integrated since the previous one) before the fusion
         // changes anything. Its verdict is counted and logged, not acted on.
-        let _ = self.hdg.on_fix(
+        let verdict = self.hdg.on_fix(
             s.t_sample,
             Some(([g.velocity.x, g.velocity.y], g.s_acc_mps)),
         );
@@ -642,6 +736,24 @@ impl Estimator {
             .finite_or(0.0)
             .max(self.params.gps_vel_noise_mps);
         let t = s.t_sample;
+
+        // Contained: the heading is declared untrustworthy until disarm, so
+        // GPS fusion stops (the check goes on judging, for the log).
+        if self.hdg_latched {
+            return;
+        }
+        if let Verdict::Correct { eps, sigma } = verdict {
+            if self.hdg_corrections < self.hdg_max {
+                self.correct_heading(ekf, s, eps, sigma, sigma_p, sigma_v);
+            } else {
+                // The budget is used up (or is zero): the next
+                // disagreement is containment, through the existing
+                // `ESTIMATOR_UNHEALTHY` and `LandNow` (`validity()`).
+                self.hdg_latched = true;
+                self.pending_contained = true;
+            }
+            return;
+        }
 
         let timed_out = self.gps.fused && t.since(self.gps.last_accept) > self.gps_timeout_us;
         if !self.gps.fused || timed_out {
@@ -705,6 +817,43 @@ impl Estimator {
         }
     }
 
+    /// The heading check says the filter's heading is wrong by `eps` (filter
+    /// minus truth, one-sigma `sigma`) and the budget allows a correction
+    /// (D2 2.3), at the delayed horizon, in this order:
+    ///
+    /// 1. the yaw is reset by the fitted angle with sigma `max(sigma, 0.1)`
+    ///    and the output predictor is turned by the same angle, as the
+    ///    magnetometer's own heading reset does;
+    /// 2. position (N/E) and velocity snap to this fix (`reset_to_gps`, which
+    ///    also counts the reset that guidance re-bases its held point and yaw
+    ///    set-point on) so that GPS fusion resumes at once;
+    /// 3. the tilt variances go back to their initial value;
+    /// 4. the declination of the heading model is shifted by the correction
+    ///    (and the shift kept here), so that the magnetometer goes on holding
+    ///    the corrected heading;
+    /// 5. the fit restarts, the corrections are counted and the event is
+    ///    queued.
+    fn correct_heading(
+        &mut self,
+        ekf: &mut Ekf<f32>,
+        s: &Stamped<GpsSample>,
+        eps: f32,
+        sigma: f32,
+        sigma_p: f32,
+        sigma_v: f32,
+    ) {
+        let yaw = ekf.x.q.yaw();
+        let dpsi = ekf.reset_yaw(yaw - eps, sigma.max(HDG_RESET_SIGMA_MIN_RAD));
+        self.output.rotate_yaw(dpsi);
+        self.reset_to_gps(ekf, s, sigma_p, sigma_v);
+        ekf.reset_tilt_variance();
+        ekf.shift_declination(dpsi);
+        self.decl_shift = wrap_pi(self.decl_shift + dpsi);
+        self.hdg.restart();
+        self.hdg_corrections = self.hdg_corrections.saturating_add(1);
+        self.pending_corrected = Some(dpsi);
+    }
+
     /// Snaps position (N/E) and velocity to a GPS fix.
     fn reset_to_gps(
         &mut self,
@@ -760,7 +909,7 @@ fn micros_to_s(us: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::wrap_pi;
+    use crate::math::{Quat, wrap_pi};
     use crate::schedule::{F405_LEAN, H743_FULL};
 
     const MAG: Vec3<f32> = Vec3::new(25.0, 0.0, 43.3);
@@ -1533,6 +1682,7 @@ mod tests {
         assert!(f.used && f.sa > 1.0, "{f:?}");
         assert!(f.eps.abs() < 0.2, "eps {}", f.eps);
         assert_eq!(rig.est.heading_verdicts(), 0);
+        assert_eq!(rig.est.heading_corrections(), 0);
         assert_eq!(rig.est.validity(), Validity::ALL);
         // The fix's own record: its time is a GPS sample time, and the
         // filter's velocity test ratio is there (the fix was fused).
@@ -1540,51 +1690,542 @@ mod tests {
         assert!((0.0..=1.0).contains(&f.vel_ratio), "ratio {}", f.vel_ratio);
 
         // The same flight with a declination of 1 rad the site does not
-        // have: the filter's heading is wrong by +1 rad.
-        let wrong = EkfParams {
-            mag_declination_rad: 1.0,
-            ..EkfParams::default()
-        };
-        let mut rig = Rig::new(&wrong);
-        rig.run_until(3.0);
-        rig.est.set_airborne(true);
-        fly_path(&mut rig, 3.0, 14.0);
-        assert!(
-            rig.est.heading_verdicts() > 0,
-            "{:?}",
-            rig.est.heading_fit()
-        );
-        let f = rig.est.heading_fit();
-        assert!((f.eps - 1.0).abs() < 0.5, "eps {} (true +1.0)", f.eps);
+        // have: the filter's heading is wrong by +1 rad. The fit reads it
+        // at the fix where the verdict is first correct.
+        let mut rig = wrong_rig(1.0, 3.0);
+        let mut at_verdict = None;
+        while rig.now().as_secs_f64() < 14.0 && at_verdict.is_none() {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            if rig.est.heading_verdicts() > 0 {
+                at_verdict = Some(rig.est.heading_fit());
+            }
+        }
+        let f = at_verdict.expect("a verdict");
         assert_eq!(f.verdict, 1);
-        // Nothing acts on it: the heading is still valid and the flight is
-        // exactly what it was without the check.
-        assert!(rig.est.validity().heading);
+        assert!((f.eps - 1.0).abs() < 0.5, "eps {} (true +1.0)", f.eps);
+    }
+
+    /// A rig with the declination `decl` the site does not have, aligned
+    /// and told it is airborne at `t0` (s).
+    fn wrong_rig(decl: f32, t0: f64) -> Rig {
+        wrong_rig_with(
+            &EkfParams {
+                mag_declination_rad: decl,
+                ..EkfParams::default()
+            },
+            t0,
+        )
+    }
+
+    fn wrong_rig_with(params: &EkfParams, t0: f64) -> Rig {
+        let mut rig = Rig::new(params);
+        rig.run_until(t0);
+        rig.est.set_armed(true);
+        rig.est.set_airborne(true);
+        rig
+    }
+
+    /// `fly_path` with the vehicle's true heading `psi(t)` (rad, `t` in s
+    /// from the start of the path) against the world: the accelerometer and
+    /// the magnetometer read in the body frame, the GPS in the world frame.
+    fn fly_path_heading(rig: &mut Rig, t0: f64, until: f64, psi: impl Fn(f32) -> f32) {
+        let (w1, w2) = (1.1f32, 0.7f32);
+        while rig.now().as_secs_f64() < until {
+            let t = (rig.now().as_secs_f64() - t0).max(0.0) as f32;
+            let (an, ae) = (6.0 * w1 * Real::cos(w1 * t), 5.0 * w2 * Real::cos(w2 * t));
+            let (s, c) = (Real::sin(psi(t)), Real::cos(psi(t)));
+            // Body = world rotated by -psi about Down.
+            rig.accel = Vec3::new(c * an + s * ae, -s * an + c * ae, -GRAVITY);
+            rig.mag_field = Vec3::new(c * MAG.x + s * MAG.y, -s * MAG.x + c * MAG.y, MAG.z);
+            rig.gps_vel = Vec3::new(6.0 * Real::sin(w1 * t), 5.0 * Real::sin(w2 * t), 0.0);
+            rig.gps_pos = Vec3::new(
+                6.0 * (1.0 - Real::cos(w1 * t)) / w1,
+                5.0 * (1.0 - Real::cos(w2 * t)) / w2,
+                0.0,
+            );
+            rig.tick();
+        }
+    }
+
+    /// Flies `wrong_rig(decl, 3.0)` along the path until the first
+    /// correction (or `limit` s); returns the rig, the correction angle and
+    /// the check's record at the correcting fix.
+    fn until_first_correction(mut rig: Rig, limit: f64) -> (Rig, f32, HeadingFit) {
+        let mut fit = rig.est.heading_fit();
+        while rig.now().as_secs_f64() < limit {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            if rig.est.heading_verdicts() > 0 {
+                fit = rig.est.heading_fit();
+            }
+            if let Some(dpsi) = rig.est.take_heading_corrected() {
+                return (rig, dpsi, fit);
+            }
+        }
+        panic!("no correction by {limit} s");
     }
 
     #[test]
-    fn the_verdict_changes_nothing_in_the_filter() {
-        // Two rigs with a wrong heading, one told it is airborne and one
-        // not: the filter's state is bit for bit the same.
-        let wrong = EkfParams {
+    fn a_wrong_declination_is_corrected_once_and_the_heading_stays_valid() {
+        let mut rig = wrong_rig(1.0, 3.0);
+        let mut corrections = 0;
+        let mut yaw_err_at_end = f32::NAN;
+        while rig.now().as_secs_f64() < 16.0 {
+            let before = rig.est.state().map(|s| s.attitude.yaw());
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            // The heading is valid in every tick, the correction included.
+            assert!(rig.est.validity().heading, "t = {:?}", rig.now());
+            if let Some(dpsi) = rig.est.take_heading_corrected() {
+                corrections += 1;
+                // The published attitude was turned in the same step.
+                let after = rig.est.state().unwrap().attitude.yaw();
+                let turned = wrap_pi(after - before.unwrap());
+                assert!((turned - dpsi).abs() < 0.02, "turned {turned}, dpsi {dpsi}");
+                assert!(dpsi < -0.5, "the filter was +1 rad wrong, dpsi {dpsi}");
+            }
+            yaw_err_at_end = wrap_pi(rig.est.state().unwrap().attitude.yaw());
+        }
+        assert_eq!(corrections, 1, "one correction");
+        assert_eq!(rig.est.heading_corrections(), 1);
+        assert!(!rig.est.heading_contained());
+        // The heading error after it is within the fit's one-sigma band
+        // (the rig's body frame is the world frame: the true yaw is 0).
+        let sigma = rig.est.heading_fit().sigma.max(0.1);
+        assert!(
+            yaw_err_at_end.abs() < 0.2 + sigma,
+            "yaw error {yaw_err_at_end}"
+        );
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        assert!(rig.est.status().gps_aiding);
+    }
+
+    #[test]
+    fn the_correction_snaps_to_the_fix_and_gps_is_fused_again_at_once() {
+        // Before the correction the wrong heading has the filter's position
+        // and velocity away from the fixes and the fixes rejected.
+        let rig = wrong_rig(1.0, 3.0);
+        let mut rig = rig;
+        let mut resets_before = 0;
+        let mut rejected_before = 0;
+        let mut corrected = None;
+        while rig.now().as_secs_f64() < 14.0 && corrected.is_none() {
+            resets_before = rig.est.status().resets;
+            rejected_before = rig.est.status().rejected;
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            corrected = rig.est.take_heading_corrected();
+        }
+        corrected.expect("a correction");
+        // Counted as a reset, exactly one (guidance re-bases on the change).
+        assert_eq!(rig.est.status().resets, resets_before + 1);
+        // Position and velocity are the fix's (the filter's own delayed
+        // state: look at it, not at the output a tick later).
+        let ekf = rig.est.ekf().unwrap();
+        let fit = rig.est.heading_fit();
+        let fix_t = fit.t_us;
+        let w1 = 1.1f32;
+        let w2 = 0.7f32;
+        let t = (fix_t as f64 * 1e-6 - 3.0) as f32;
+        let want_v = [6.0 * Real::sin(w1 * t), 5.0 * Real::sin(w2 * t)];
+        // The filter has stepped on to the end of the 4 ms step that
+        // contained the fix: at most a few mm/s of acceleration times 4 ms.
+        assert!(
+            (ekf.x.v.x - want_v[0]).abs() < 0.2,
+            "v {:?} want {want_v:?}",
+            ekf.x.v
+        );
+        assert!(
+            (ekf.x.v.y - want_v[1]).abs() < 0.2,
+            "v {:?} want {want_v:?}",
+            ekf.x.v
+        );
+        // No rejection at the very next fixes and the heading is right.
+        let until = rig.now().as_secs_f64() + 2.0;
+        fly_path(&mut rig, 3.0, until);
+        assert!(rig.est.status().rejected <= rejected_before + 1);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        assert!(rig.est.status().gps_aiding);
+    }
+
+    #[test]
+    fn the_correction_sets_the_yaw_sigma_to_the_fits_but_not_below_a_tenth() {
+        let var_after = |sigma: f32| {
+            let mut rig = Rig::new(&EkfParams::default());
+            rig.run_until(3.0);
+            let mut ekf = rig.est.ekf.take().unwrap();
+            let fix = Stamped::ideal(
+                Micros(3_000_000),
+                GpsSample {
+                    h_acc_m: 0.6,
+                    s_acc_mps: 0.2,
+                    fix_3d: true,
+                    ..GpsSample::default()
+                },
+            );
+            rig.est
+                .correct_heading(&mut ekf, &fix, 1.0, sigma, 0.6, 0.3);
+            ekf.p.get(ekf::ITH + 2, ekf::ITH + 2)
+        };
+        // A fit sigma below 0.1 rad: the reset's sigma is 0.1.
+        assert!((var_after(0.02) - 0.01).abs() < 1e-4);
+        assert!((var_after(0.099) - 0.01).abs() < 1e-4);
+        // Above it, the fit's own.
+        assert!((var_after(0.3) - 0.09).abs() < 1e-3);
+        assert!((var_after(0.15) - 0.0225).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_correction_gives_the_tilt_variances_back_their_initial_value() {
+        let init = EkfParams::default().init_tilt_sigma_rad;
+        let rig = wrong_rig(1.0, 3.0);
+        // Just before: the filter has learnt its tilt, variance below the
+        // initial one.
+        let mut rig = rig;
+        let mut before = f32::NAN;
+        let mut corrected = None;
+        while rig.now().as_secs_f64() < 14.0 && corrected.is_none() {
+            before = rig.est.ekf().unwrap().p.get(ekf::ITH, ekf::ITH);
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            corrected = rig.est.take_heading_corrected();
+        }
+        corrected.expect("a correction");
+        assert!(
+            before < 0.5 * init * init,
+            "variance before {before}, init {}",
+            init * init
+        );
+        for i in [ekf::ITH, ekf::ITH + 1] {
+            let after = rig.est.ekf().unwrap().p.get(i, i);
+            assert!(
+                (after - init * init).abs() < 0.1 * init * init,
+                "tilt variance {i}: {after}, init {}",
+                init * init
+            );
+        }
+    }
+
+    #[test]
+    fn the_declination_shift_keeps_the_magnetometer_innovation_near_zero() {
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, dpsi, _) = until_first_correction(rig, 14.0);
+        let innovation = |rig: &Rig| {
+            let e = rig.est.ekf().unwrap();
+            wrap_pi(e.mag_heading(rig.mag_field).unwrap() - e.x.q.yaw())
+        };
+        assert!(
+            innovation(&rig).abs() < 0.1,
+            "innovation {}",
+            innovation(&rig)
+        );
+        assert!((rig.est.declination_shift() - dpsi).abs() < 1e-6);
+        assert!((rig.est.ekf().unwrap().declination() - (1.0 + dpsi)).abs() < 1e-5);
+        assert_eq!(
+            rig.est.status().heading_shift_rad,
+            rig.est.declination_shift()
+        );
+        // And it stays there: the magnetometer holds the corrected heading
+        // instead of dragging it back or being rejected.
+        let rejected = rig.est.status().rejected;
+        let until = rig.now().as_secs_f64() + 6.0;
+        fly_path(&mut rig, 3.0, until);
+        assert!(innovation(&rig).abs() < 0.1);
+        assert_eq!(rig.est.status().rejected, rejected, "nothing rejected");
+        assert_eq!(rig.est.heading_corrections(), 1);
+    }
+
+    #[test]
+    fn the_fit_restarts_at_a_correction_and_one_verdict_is_one_correction() {
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, _, _) = until_first_correction(rig, 14.0);
+        // The record is the correcting fix's; the next fix is the first of a
+        // new fit: nothing of the old one is left.
+        let seq = rig.est.heading_fit().seq;
+        let verdicts = rig.est.heading_verdicts();
+        while rig.est.heading_fit().seq == seq {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+        }
+        let f = rig.est.heading_fit();
+        assert!(!f.used && f.sa == 0.0 && f.streak == 0, "{f:?}");
+        let until = rig.now().as_secs_f64() + 8.0;
+        fly_path(&mut rig, 3.0, until);
+        let f = rig.est.heading_fit();
+        assert!(f.seq > seq + 20, "fixes were judged after it");
+        // The fit rebuilt from nothing reads the right heading.
+        assert!(f.eps.abs() < 0.3, "eps after the correction {}", f.eps);
+        assert_eq!(rig.est.heading_verdicts(), verdicts, "no more verdicts");
+        assert_eq!(rig.est.heading_corrections(), 1);
+    }
+
+    #[test]
+    fn the_budget_two_corrections_then_the_third_verdict_is_containment() {
+        // The true heading steps by 0.9 rad at 10 s and by another 0.9 at
+        // 25 s with no gyro to show it (the magnetometer disagrees and is
+        // rejected): each is a wrong heading the check finds, after the
+        // declination fault's own correction at 4 s.
+        let psi = |t: f32| {
+            if t >= 22.0 {
+                1.8
+            } else if t >= 7.0 {
+                0.9
+            } else {
+                0.0
+            }
+        };
+        let mut rig = wrong_rig(1.0, 3.0);
+        let mut seen = Vec::new();
+        let mut contained_at = None;
+        while rig.now().as_secs_f64() < 40.0 {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path_heading(&mut rig, 3.0, next, psi);
+            if let Some(d) = rig.est.take_heading_corrected() {
+                seen.push((rig.now().as_secs_f64(), d));
+                assert!(!rig.est.heading_contained());
+                assert!(rig.est.validity().heading);
+            }
+            if rig.est.take_heading_contained() {
+                contained_at = Some(rig.now().as_secs_f64());
+            }
+        }
+        // The declination fault (1 rad), then the two heading steps: the
+        // budget allows two corrections; the third verdict is containment.
+        assert_eq!(seen.len(), 2, "corrections {seen:?}");
+        assert_eq!(rig.est.heading_corrections(), 2);
+        assert!(contained_at.is_some_and(|t| t > seen[1].0));
+        assert!(rig.est.heading_contained());
+        assert!(rig.est.status().heading_contained);
+        // The second correction is right: it undoes the first step (+0.9 rad
+        // of true heading), as seen from the heading the first correction
+        // had made right (to within the fit's bias, a few tenths).
+        assert!(
+            seen[1].1 > 0.4 && seen[1].1 < 1.3,
+            "second correction {:?}",
+            seen[1]
+        );
+    }
+
+    #[test]
+    fn with_a_budget_of_zero_the_first_verdict_is_containment() {
+        let params = EkfParams {
             mag_declination_rad: 1.0,
+            hdg_max_corrections: 0,
             ..EkfParams::default()
         };
-        let mut a = Rig::new(&wrong);
-        let mut b = Rig::new(&wrong);
-        a.run_until(3.0);
-        b.run_until(3.0);
-        a.est.set_airborne(true);
-        fly_path(&mut a, 3.0, 12.0);
-        fly_path(&mut b, 3.0, 12.0);
-        assert!(a.est.heading_verdicts() > 0);
-        assert_eq!(b.est.heading_verdicts(), 0);
-        let (ea, eb) = (a.est.state().unwrap(), b.est.state().unwrap());
-        assert_eq!(ea.position, eb.position);
-        assert_eq!(ea.velocity, eb.velocity);
-        assert_eq!(ea.attitude, eb.attitude);
-        assert_eq!(a.est.validity(), b.est.validity());
-        assert_eq!(a.est.status(), b.est.status());
+        let mut rig = wrong_rig_with(&params, 3.0);
+        let mut when = None;
+        while rig.now().as_secs_f64() < 14.0 && when.is_none() {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            if rig.est.take_heading_contained() {
+                when = Some(rig.now());
+            }
+        }
+        assert!(when.is_some(), "contained");
+        assert_eq!(rig.est.heading_corrections(), 0);
+        assert!(rig.est.take_heading_corrected().is_none());
+        assert_eq!(rig.est.declination_shift(), 0.0);
+    }
+
+    #[test]
+    fn contained_the_heading_velocity_and_position_are_invalid_and_gps_is_not_fused() {
+        let params = EkfParams {
+            mag_declination_rad: 1.0,
+            hdg_max_corrections: 0,
+            ..EkfParams::default()
+        };
+        let mut rig = wrong_rig_with(&params, 3.0);
+        while rig.now().as_secs_f64() < 14.0 && !rig.est.heading_contained() {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+        }
+        assert!(rig.est.heading_contained());
+        assert!(rig.est.take_heading_contained(), "the event, once");
+        let v = rig.est.validity();
+        assert!(!v.heading && !v.velocity && !v.position, "{v:?}");
+        assert!(v.attitude && v.altitude, "{v:?}");
+        // The latch is not `heading_ok`: that stays true, or the next
+        // magnetometer sample would reset the yaw to the (wrong)
+        // magnetometer heading and declare it good.
+        assert!(rig.est.heading_ok);
+        let resets = rig.est.status().resets;
+        let t_accept = rig.est.gps.last_accept;
+        let pos_accept = rig.est.gps.pos_accept;
+        let until = rig.now().as_secs_f64() + 6.0;
+        fly_path(&mut rig, 3.0, until);
+        assert!(rig.est.heading_ok);
+        assert_eq!(rig.est.status().resets, resets, "no reset of any kind");
+        // GPS is not fused: nothing accepted since the latch, so its
+        // timeout runs out.
+        assert_eq!(rig.est.gps.last_accept, t_accept);
+        assert_eq!(rig.est.gps.pos_accept, pos_accept);
+        assert!(!rig.est.status().gps_aiding);
+        // Still judged, for the log.
+        assert!(rig.est.heading_fit().seq > 0);
+        // And no second event, however many verdict fixes follow.
+        assert!(!rig.est.take_heading_contained());
+    }
+
+    #[test]
+    fn a_magnetometer_sample_does_not_reset_the_yaw_of_a_contained_filter() {
+        let params = EkfParams {
+            mag_declination_rad: 1.0,
+            hdg_max_corrections: 0,
+            ..EkfParams::default()
+        };
+        let mut rig = wrong_rig_with(&params, 3.0);
+        while rig.now().as_secs_f64() < 14.0 && !rig.est.heading_contained() {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+        }
+        let resets = rig.est.status().resets;
+        // The magnetometer now says a heading 2 rad away from the yaw: a
+        // filter whose `heading_ok` was cleared would take it as the
+        // heading at the next sample.
+        rig.mag_field = Quat::from_euler(0.0, 0.0, 2.0).inverse_rotate(MAG);
+        let until = rig.now().as_secs_f64() + 1.0;
+        fly_path(&mut rig, 3.0, until);
+        assert!(rig.est.heading_ok);
+        assert_eq!(rig.est.status().resets, resets);
+        // The magnetometer disagrees by 2 rad: gated, not taken as the
+        // heading.
+        assert!(rig.est.ekf().unwrap().x.q.yaw().abs() < 1.5);
+        assert!(!rig.est.validity().heading);
+    }
+
+    #[test]
+    fn the_shift_survives_a_new_filter_and_is_applied_again() {
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, dpsi, _) = until_first_correction(rig, 14.0);
+        // An IMU stall in flight: the filter is dropped, the vehicle then
+        // sits still and the estimator aligns afresh.
+        rig.imu_on = false;
+        let t = rig.now().as_secs_f64();
+        fly_path(&mut rig, 3.0, t + 0.3);
+        assert!(rig.est.ekf().is_none());
+        assert!(
+            (rig.est.declination_shift() - dpsi).abs() < 1e-6,
+            "kept outside the filter"
+        );
+        rig.imu_on = true;
+        rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
+        rig.mag_field = MAG;
+        rig.gps_vel = Vec3::zero();
+        rig.run_until(t + 4.0);
+        assert_eq!(rig.est.heading_corrections(), 1, "not cleared by the drop");
+        let e = rig.est.ekf().expect("aligned again");
+        assert!(
+            (e.declination() - (1.0 + dpsi)).abs() < 1e-5,
+            "declination {}",
+            e.declination()
+        );
+        // The heading is the corrected one (declination 1 rad plus the
+        // correction), not the wrong declination's 1 rad.
+        assert!(
+            wrap_pi(e.x.q.yaw() - (1.0 + dpsi)).abs() < 0.05,
+            "yaw {}",
+            e.x.q.yaw()
+        );
+        assert_eq!(rig.est.validity(), Validity::ALL);
+    }
+
+    #[test]
+    fn disarm_clears_the_count_the_latch_and_the_shift_and_the_filter_aligns_again() {
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, _, _) = until_first_correction(rig, 14.0);
+        assert_eq!(rig.est.heading_corrections(), 1);
+        assert!(rig.est.declination_shift() != 0.0);
+        // The vehicle lands and is disarmed, at rest.
+        rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
+        rig.gps_vel = Vec3::zero();
+        rig.mag_field = MAG;
+        rig.est.set_airborne(false);
+        rig.est.set_armed(false);
+        let t_disarm = rig.now().as_secs_f64();
+        assert_eq!(rig.est.heading_corrections(), 0);
+        assert!(!rig.est.heading_contained());
+        assert_eq!(rig.est.declination_shift(), 0.0);
+        let s = rig.est.status();
+        assert!(s.heading_corrections == 0 && !s.heading_contained && s.heading_shift_rad == 0.0);
+        assert!(rig.est.take_heading_corrected().is_none());
+        // The filter's heading (the truth) and the magnetometer (with the
+        // parameter's declination) now disagree: the filter is dropped, and
+        // it aligns again from the magnetometer: it does not carry the
+        // disagreement and it is not left rejecting the magnetometer.
+        assert!(rig.est.ekf().is_none());
+        assert_eq!(rig.est.validity(), Validity::NONE);
+        let mut valid_after = None;
+        while rig.now().as_secs_f64() < t_disarm + 8.0 {
+            rig.tick();
+            if valid_after.is_none() && rig.est.validity() == Validity::ALL {
+                valid_after = Some(rig.now().as_secs_f64() - t_disarm);
+            }
+        }
+        let valid_after = valid_after.expect("valid again");
+        assert!(valid_after < 5.0, "valid again after {valid_after} s");
+        assert!(
+            rig.est.estimate().is_some(),
+            "an estimate: the vehicle can be armed again"
+        );
+        let e = rig.est.ekf().unwrap();
+        assert_eq!(e.declination(), 1.0, "the parameter again");
+        // Consistent with the magnetometer: no disagreement left.
+        let nu = wrap_pi(e.mag_heading(MAG).unwrap() - e.x.q.yaw());
+        assert!(nu.abs() < 0.05, "innovation {nu}");
+        // A flight that was not touched is not disturbed by a disarm.
+        let mut quiet = Rig::new(&EkfParams::default());
+        quiet.run_until(4.0);
+        quiet.est.set_armed(true);
+        quiet.run_until(5.0);
+        quiet.est.set_armed(false);
+        quiet.run_until(5.5);
+        assert!(quiet.est.ekf().is_some());
+        assert_eq!(quiet.est.validity(), Validity::ALL);
+    }
+
+    #[test]
+    fn disarm_clears_a_latch_and_a_new_flight_can_correct_again() {
+        let params = EkfParams {
+            mag_declination_rad: 1.0,
+            hdg_max_corrections: 0,
+            ..EkfParams::default()
+        };
+        let mut rig = wrong_rig_with(&params, 3.0);
+        while rig.now().as_secs_f64() < 14.0 && !rig.est.heading_contained() {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+        }
+        assert!(rig.est.heading_contained());
+        rig.est.set_airborne(false);
+        rig.est.set_armed(false);
+        assert!(!rig.est.heading_contained());
+        assert!(!rig.est.status().heading_contained);
+        rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
+        rig.gps_vel = Vec3::zero();
+        rig.gps_pos = Vec3::zero();
+        rig.mag_field = MAG;
+        let t = rig.now().as_secs_f64();
+        rig.run_until(t + 6.0);
+        assert!(rig.est.validity().heading, "{:?}", rig.est.validity());
+    }
+
+    #[test]
+    fn nothing_is_corrected_or_contained_on_the_ground() {
+        let mut rig = Rig::new(&EkfParams {
+            mag_declination_rad: 1.0,
+            ..EkfParams::default()
+        });
+        rig.run_until(3.0);
+        rig.est.set_armed(true);
+        // Armed, on the ground (not airborne): the vehicle moves as in the
+        // flights above, and nothing acts.
+        fly_path(&mut rig, 3.0, 14.0);
+        assert_eq!(rig.est.heading_corrections(), 0);
+        assert!(!rig.est.heading_contained());
+        assert_eq!(rig.est.heading_verdicts(), 0);
+        assert_eq!(rig.est.declination_shift(), 0.0);
     }
 
     #[test]

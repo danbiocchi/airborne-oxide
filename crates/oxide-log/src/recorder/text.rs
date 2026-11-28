@@ -282,6 +282,19 @@ pub fn event_text(kind: &EventKind, b: &mut TextBuf) {
         EventKind::ParamFaultAcked => {
             b.push("Parameter fault acknowledged");
         }
+        EventKind::HeadingCorrected { angle_mrad, count } => {
+            b.push("Heading corrected by ");
+            if *angle_mrad < 0 {
+                b.push("-");
+            }
+            b.push_num(u64::from(angle_mrad.unsigned_abs()));
+            b.push(" mrad (correction ");
+            b.push_num(u64::from(*count));
+            b.push(")");
+        }
+        EventKind::HeadingContained => {
+            b.push("Heading untrustworthy: contained until disarm");
+        }
     }
 }
 
@@ -302,6 +315,7 @@ pub fn event_level(kind: &EventKind) -> u8 {
         } => level::EMERGENCY,
         EventKind::ReasonRaised(r) if r.contains(Reasons::LOSS_OF_CONTROL) => level::EMERGENCY,
         EventKind::ReasonRaised(_)
+        | EventKind::HeadingContained
         | EventKind::ArmRefused(_)
         | EventKind::ParamRefused { .. }
         | EventKind::ParamLoadFault(_) => level::WARNING,
@@ -316,6 +330,7 @@ pub fn event_level(kind: &EventKind) -> u8 {
         | EventKind::HomeSet
         | EventKind::ParamChanged(_)
         | EventKind::ParamLoadRecovered(_)
+        | EventKind::HeadingCorrected { .. }
         | EventKind::ParamFaultAcked => level::INFO,
     }
 }

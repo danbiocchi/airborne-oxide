@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The heading check (stage 1, piece P1 of the heading guard) in a whole
 //! flight: the supervisor's airborne state reaches it, a wrong declination
-//! gets a verdict, a right heading never does, and **no verdict changes a
-//! flight**: the same flight with the check's parameters set so that it can
-//! never say anything is the same flight, bit for bit.
+//! gets a verdict, a right heading never does, and the verdict acts only
+//! when it is given (the heading guard's second part): until its first
+//! correction a flight is the flight with the check silenced by its
+//! parameters, bit for bit.
 
 use std::path::Path;
 
@@ -20,6 +21,11 @@ struct Outcome {
     verdicts: u32,
     /// `t_sample` of the first fix with the verdict, s.
     first_verdict_s: Option<f64>,
+    /// Index in `trace` of the first tick with a correction made.
+    first_correction_tick: Option<usize>,
+    /// Corrections made and the latch, at the end.
+    corrections: u8,
+    contained: bool,
     /// Truth and estimate of every tick, as bits.
     trace: Vec<[u64; 8]>,
 }
@@ -38,6 +44,9 @@ fn fly(scenario: &str, profile: Profile, index: u64, params: &[(&str, f64)]) -> 
         judged: 0,
         verdicts: 0,
         first_verdict_s: None,
+        first_correction_tick: None,
+        corrections: 0,
+        contained: false,
         trace: Vec::new(),
     };
     let mut armed_once = false;
@@ -66,8 +75,13 @@ fn fly(scenario: &str, profile: Profile, index: u64, params: &[(&str, f64)]) -> 
             est.map_or(0, |e| u64::from(e.attitude.z.to_bits())),
         ]);
         out.judged = fit.seq;
+        if out.first_correction_tick.is_none() && sim.core().estimator().heading_corrections() > 0 {
+            out.first_correction_tick = Some(out.trace.len() - 1);
+        }
     }
     out.verdicts = sim.core().estimator().heading_verdicts();
+    out.corrections = sim.core().estimator().heading_corrections();
+    out.contained = sim.core().estimator().heading_contained();
     out
 }
 
@@ -92,7 +106,7 @@ fn the_airborne_state_reaches_the_check_and_a_right_heading_gets_no_verdict() {
 }
 
 #[test]
-fn a_wrong_declination_gets_a_verdict_and_the_verdict_changes_nothing() {
+fn a_wrong_declination_is_corrected_and_until_then_the_flight_is_the_silenced_one() {
     for (profile, index) in [(F405_LEAN, 500), (H743_FULL, 501)] {
         let mut wrong = vec![("EKF_MAG_DECL", 1.0)];
         let loud = fly("gust-hold", profile, index, &wrong);
@@ -105,14 +119,26 @@ fn a_wrong_declination_gets_a_verdict_and_the_verdict_changes_nothing() {
             "{}: verdict at {t} s",
             profile.name
         );
-        // The same flight with the check silenced: bit for bit the same.
+        // One verdict, one correction, no containment.
+        assert_eq!(loud.corrections, 1, "{}", profile.name);
+        assert!(!loud.contained, "{}", profile.name);
+        // The same flight with the check silenced never corrects, and is the
+        // same flight bit for bit until the correction (the plumbing adds
+        // nothing before it).
         wrong.extend(SILENT);
         let quiet = fly("gust-hold", profile, index, &wrong);
         assert_eq!(quiet.verdicts, 0, "{}", profile.name);
+        assert_eq!(quiet.corrections, 0, "{}", profile.name);
         assert_eq!(loud.trace.len(), quiet.trace.len());
+        let first = loud.first_correction_tick.expect("a correction tick");
         assert!(
-            loud.trace == quiet.trace,
-            "{}: a verdict changed the flight",
+            loud.trace[..first] == quiet.trace[..first],
+            "{}: the flights differ before the correction (tick {first})",
+            profile.name
+        );
+        assert!(
+            loud.trace[first..] != quiet.trace[first..],
+            "{}: the correction changed nothing",
             profile.name
         );
     }

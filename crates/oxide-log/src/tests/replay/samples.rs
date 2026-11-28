@@ -255,6 +255,8 @@ pub fn busy_status() -> Status {
             gps_aiding: true,
             rejected: u32::MAX - 1,
             resets: 0x8000_0001,
+            // Not in the replay record.
+            ..oxide_core::io::EstimatorStatus::default()
         },
         nav: NavState::LandNow,
         valid: Validity::ALL,

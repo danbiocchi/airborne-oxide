@@ -417,6 +417,19 @@ pub enum EventKind {
     /// An operator acknowledged the parameter fault; the store must now be
     /// rewritten from the values in use (`Status::params_unsaved`).
     ParamFaultAcked,
+    /// The heading check found the filter's heading wrong and the estimator
+    /// corrected it. `angle_mrad` is the yaw change applied (rad x 1000,
+    /// rounded; the heading was wrong by the opposite angle), `count` the
+    /// corrections made in this flight so far, this one included.
+    HeadingCorrected {
+        angle_mrad: i16,
+        count: u8,
+    },
+    /// The heading check found the heading wrong again with the correction
+    /// budget used up (`EKF_HDG_NMAX`, or zero): the estimator declared the
+    /// heading untrustworthy until disarm, so velocity and position are not
+    /// valid and `ESTIMATOR_UNHEALTHY` follows.
+    HeadingContained,
 }
 
 /// An event with the tick time it happened at.
@@ -464,7 +477,7 @@ impl EventList {
 }
 
 /// Estimator health (ADR-0002).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EstimatorStatus {
     /// Tilt and heading have been initialised.
     pub aligned: bool,
@@ -474,10 +487,19 @@ pub struct EstimatorStatus {
     pub rejected: u32,
     /// State resets since boot (position or velocity snapped to GPS).
     pub resets: u32,
+    /// Heading corrections made in this flight (cleared at disarm).
+    pub heading_corrections: u8,
+    /// The heading was declared untrustworthy after the correction budget
+    /// was used up (until disarm): the heading, velocity and position are
+    /// not valid.
+    pub heading_contained: bool,
+    /// The run-time shift of the magnetometer declination made by the
+    /// corrections of this flight, rad.
+    pub heading_shift_rad: f32,
 }
 
 /// Health and status flags reported with every output.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Status {
     pub armed: bool,
     /// The kill switch fired; latched until the arm switch is released.

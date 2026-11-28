@@ -285,6 +285,10 @@ fn describe(kind: EventKind) -> String {
             r.torn
         ),
         EventKind::ParamFaultAcked => "Parameter fault acknowledged".to_string(),
+        EventKind::HeadingCorrected { angle_mrad, count } => {
+            format!("Heading corrected by {angle_mrad} mrad (correction {count})")
+        }
+        EventKind::HeadingContained => "Heading untrustworthy: contained until disarm".to_string(),
     }
 }
 

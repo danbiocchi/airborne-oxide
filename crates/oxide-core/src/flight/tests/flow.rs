@@ -46,8 +46,28 @@ struct Rig {
     mass_kg: f32,
     max_thrust_n: f32,
     nominal_v: f32,
+    /// EKF rig: the vehicle moves horizontally on a made-up path from this
+    /// time on, s (the accelerometer and the GPS follow it; the vehicle's
+    /// true heading is 0 against the rig's field).
+    path_from_s: Option<f64>,
     events: Vec<Event>,
     out: Outputs<4>,
+}
+
+/// The made-up horizontal path of `Rig::path_from_s`: north and east
+/// velocity (m/s) `a sin(w t)`, position its integral and the acceleration
+/// its derivative, at `t` s after the start.
+fn path_at(t: f64) -> ([f32; 2], [f32; 2], [f32; 2]) {
+    let t = t.max(0.0) as f32;
+    let (w1, w2, a1, a2) = (1.1_f32, 0.7_f32, 2.4_f32, 2.0_f32);
+    (
+        [
+            a1 * (1.0 - Real::cos(w1 * t)) / w1,
+            a2 * (1.0 - Real::cos(w2 * t)) / w2,
+        ],
+        [a1 * Real::sin(w1 * t), a2 * Real::sin(w2 * t)],
+        [a1 * w1 * Real::cos(w1 * t), a2 * w2 * Real::cos(w2 * t)],
+    )
 }
 
 fn at_height(h: f32) -> StateSample {
@@ -96,6 +116,7 @@ impl Rig {
             mass_kg: cfg.mass_kg,
             max_thrust_n: cfg.rotors[0].max_thrust_n,
             nominal_v: cfg.nominal_voltage_v,
+            path_from_s: None,
             events: Vec::new(),
             out: Outputs::off(Micros::ZERO),
         }
@@ -156,6 +177,23 @@ impl Rig {
         i.battery = self.battery.map(|b| Stamped::ideal(t, b));
         if let Some(g) = i.gps.as_mut() {
             g.value.position.y = self.gps_east;
+        }
+        if self.ekf
+            && let Some(t0) = self.path_from_s
+        {
+            let now_s = self.k as f64 * 1.0e-3;
+            if let Some(imu) = i.imu.as_mut() {
+                let (_, _, a) = path_at(now_s - t0);
+                imu.value.accel.x = a[0];
+                imu.value.accel.y = a[1];
+            }
+            if let Some(g) = i.gps.as_mut() {
+                let (p, v, _) = path_at(g.t_sample.as_secs_f64() - t0);
+                g.value.position.x = p[0];
+                g.value.position.y = p[1];
+                g.value.velocity.x = v[0];
+                g.value.velocity.y = v[1];
+            }
         }
         if !self.gps_on {
             i.gps = None;
@@ -1946,6 +1984,263 @@ fn an_estimator_reset_re_bases_the_setpoints_even_if_the_flags_never_dropped() {
         );
         assert!((g.position_sp.y - 6.0).abs() < 1e-6, "{nav:?}");
     }
+}
+
+// ---- the heading guard through the whole core ----
+
+/// An EKF rig whose filter has a declination the site does not have
+/// (`decl` rad: its heading is wrong by `decl`), armed in the mode of
+/// `mode_switch` and moving on the made-up path from the moment it is
+/// armed. `nmax` is `EKF_HDG_NMAX`; a hold after RC loss lasts long enough
+/// not to become a return within the test.
+fn wrong_heading_rig(mode_switch: u8, decl: f32, nmax: u32) -> Rig {
+    let mut c = ekf_cfg();
+    c.estimator.ekf.mag_declination_rad = decl;
+    c.estimator.ekf.hdg_max_corrections = nmax;
+    c.failsafe.rc_loss_hold_s = 120.0;
+    let mut rig = Rig::ekf(mode_switch).with_cfg(c);
+    rig.arm();
+    rig.rc.throttle = 0.5;
+    rig.path_from_s = Some(rig.k as f64 * 1.0e-3);
+    rig
+}
+
+/// Runs until the core reports a heading correction, then a few more ticks
+/// so that guidance has seen the estimate that carries it. False if none by
+/// `max_s`.
+fn run_to_correction(rig: &mut Rig, max_s: f64) -> bool {
+    let n = rig.count(|k| matches!(k, EventKind::HeadingCorrected { .. }));
+    if !rig.run_until(max_s, |r| {
+        r.count(|k| matches!(k, EventKind::HeadingCorrected { .. })) > n
+    }) {
+        return false;
+    }
+    rig.run(0.05);
+    true
+}
+
+fn estimate_of(rig: &Rig) -> StateSample {
+    rig.core.estimate.visible.state.expect("an estimate")
+}
+
+#[test]
+fn a_correction_in_hold_re_bases_the_held_point_and_the_yaw_set_point() {
+    let mut rig = wrong_heading_rig(2, 3.0, 2);
+    rig.path_from_s = None;
+    // The brain's setpoints stop: Hold (the held point is where the
+    // vehicle was when the hold began).
+    rig.setpoint = None;
+    assert!(rig.run_until(3.0, |r| r.nav() == NavState::Hold));
+    assert!(rig.out.status.reasons.contains(Reasons::SETPOINT_STALE));
+    let held = rig.core.guide_state.position_sp;
+    rig.path_from_s = Some(rig.k as f64 * 1.0e-3);
+    assert!(run_to_correction(&mut rig, 40.0));
+    // The correction snapped the estimate to the GPS fix, metres away from
+    // where the wrong heading had carried it: the held point follows, it is
+    // not the point the vehicle held before (which the vehicle would fly
+    // back to, in the wrong place).
+    assert_eq!(rig.nav(), NavState::Hold);
+    let e = estimate_of(&rig);
+    let g = rig.core.guide_state;
+    let off = Vec3::new(
+        g.position_sp.x - e.position.x,
+        g.position_sp.y - e.position.y,
+        0.0,
+    )
+    .norm();
+    assert!(
+        off < 0.3,
+        "held point {:?} against estimate {:?}",
+        g.position_sp,
+        e.position
+    );
+    let moved = Vec3::new(g.position_sp.x - held.x, g.position_sp.y - held.y, 0.0).norm();
+    assert!(moved > 0.5, "the point moved only {moved} m");
+    assert!(
+        wrap_pi_test(g.yaw_sp - e.attitude.yaw()).abs() < 0.1,
+        "yaw set-point {} against yaw {}",
+        g.yaw_sp,
+        e.attitude.yaw()
+    );
+    // And the heading stayed valid through it: no failsafe on its account.
+    assert!(rig.out.status.valid.heading);
+    assert!(
+        !rig.out
+            .status
+            .reasons
+            .contains(Reasons::ESTIMATOR_UNHEALTHY)
+    );
+    assert_eq!(rig.out.status.estimator.heading_corrections, 1);
+}
+
+fn wrap_pi_test(a: f32) -> f32 {
+    crate::math::wrap_pi(a)
+}
+
+#[test]
+fn a_correction_in_offboard_goes_on_following_the_setpoint_and_keeps_the_mode() {
+    let mut rig = wrong_heading_rig(2, 3.0, 2);
+    let sp = rig.setpoint.expect("a setpoint");
+    assert!(run_to_correction(&mut rig, 40.0));
+    // Offboard keeps its mode; the held point is the brain's set-point (it
+    // is not replaced by the re-based estimate: the vehicle flies back to
+    // where it was told to be), and the yaw set-point the brain's too.
+    assert_eq!(rig.nav(), NavState::Offboard);
+    let g = rig.core.guide_state;
+    assert_eq!(g.position_sp, sp.position);
+    assert!((g.yaw_sp - sp.yaw).abs() < 1e-6);
+    assert!(rig.out.status.valid.full());
+    assert!(
+        !rig.out
+            .status
+            .reasons
+            .contains(Reasons::ESTIMATOR_UNHEALTHY)
+    );
+    assert_eq!(rig.out.status.estimator.heading_corrections, 1);
+    // The correction is in the estimator's status and in the events, with
+    // its angle.
+    let dpsi = rig
+        .events
+        .iter()
+        .find_map(|e| match e.kind {
+            EventKind::HeadingCorrected { angle_mrad, count } => Some((angle_mrad, count)),
+            _ => None,
+        })
+        .expect("the event");
+    assert_eq!(dpsi.1, 1);
+    assert!(dpsi.0.abs() > 1000, "the filter was 3 rad wrong: {dpsi:?}");
+}
+
+#[test]
+fn every_mode_that_holds_a_point_re_bases_it_when_the_estimator_corrects_the_heading() {
+    // The estimator's reset count moves with the correction (the position
+    // and velocity snap and the yaw turn): guidance takes the estimate as
+    // the point to hold and its yaw as the yaw set-point, whatever the mode
+    // and with every flag valid throughout.
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    let rc = RcSample {
+        throttle: 0.5,
+        arm_switch: true,
+        ..RcSample::default()
+    };
+    // Offboard with no fresh setpoint (the supervisor holds within a moment
+    // of that; in that moment the held point is the one to re-base).
+    for nav in [
+        NavState::Hold,
+        NavState::Position,
+        NavState::Offboard,
+        NavState::Altitude,
+        NavState::Stabilized,
+        NavState::Land,
+        NavState::LandNow,
+    ] {
+        let mut core = guidance_core();
+        core.rc = Some(Stamped::ideal(Micros(0), rc));
+        core.setpoint = None;
+        let p = Vec3::new(0.0, 0.0, -5.0);
+        guide(&mut core, 0, nav, Validity::ALL, p, 0.0, home);
+        guide(&mut core, 1, nav, Validity::ALL, p, 0.0, home);
+        // A correction: the estimate snaps 4 m and its yaw turns by 1.2 rad
+        // (the output predictor turned with it), the reset count moves.
+        let jumped = Vec3::new(4.0, 2.0, -5.0);
+        core.estimate.visible.resets += 1;
+        guide(&mut core, 2, nav, Validity::ALL, jumped, 1.2, home);
+        let g = core.guide_state;
+        assert!(
+            (g.yaw_sp - 1.2).abs() < 1e-6,
+            "{nav:?}: yaw set-point {}",
+            g.yaw_sp
+        );
+        if nav != NavState::Stabilized && nav != NavState::Altitude {
+            assert!(
+                (g.position_sp.x - 4.0).abs() < 1e-6 && (g.position_sp.y - 2.0).abs() < 1e-6,
+                "{nav:?}: held point {:?}",
+                g.position_sp
+            );
+        }
+    }
+}
+
+#[test]
+fn a_correction_on_the_way_home_continues_from_the_corrected_position() {
+    // Rtl on its way home (the return phase): the moving set-point is
+    // re-based on the estimate, so the vehicle goes home from where the
+    // correction says it is, not back to where it was.
+    let mut core = guidance_core();
+    let home = Some(Vec3::new(0.0, 0.0, 0.0));
+    let at = Vec3::new(30.0, 0.0, -11.0);
+    for k in 0..3 {
+        guide(&mut core, k, NavState::Rtl, Validity::ALL, at, 0.0, home);
+    }
+    assert_eq!(core.guide_state.rtl, RtlPhase::Return);
+    assert!((core.guide_state.position_sp.x - 30.0).abs() < 0.5);
+    let jumped = Vec3::new(36.0, 5.0, -11.0);
+    core.estimate.visible.resets += 1;
+    guide(
+        &mut core,
+        3,
+        NavState::Rtl,
+        Validity::ALL,
+        jumped,
+        0.9,
+        home,
+    );
+    let g = core.guide_state;
+    assert_eq!(g.rtl, RtlPhase::Return);
+    // One step of the return (3 m/s at 4 ms is 12 mm) from the estimate.
+    assert!(
+        (g.position_sp.x - 36.0).abs() < 0.1 && (g.position_sp.y - 5.0).abs() < 0.1,
+        "{:?}",
+        g.position_sp
+    );
+    assert!((g.yaw_sp - 0.9).abs() < 1e-6);
+}
+
+#[test]
+fn a_contained_heading_raises_estimator_unhealthy_and_lands_now_and_the_pilot_gets_only_stabilized_or_altitude()
+ {
+    // A budget of zero: the first disagreement is containment.
+    let mut rig = wrong_heading_rig(1, 3.0, 0);
+    assert!(rig.run_until(40.0, |r| r.saw(EventKind::HeadingContained)));
+    assert!(rig.run_until(2.0, |r| r.nav() == NavState::LandNow));
+    assert!(rig.saw(EventKind::ReasonRaised(Reasons::ESTIMATOR_UNHEALTHY)));
+    assert!(
+        rig.out
+            .status
+            .reasons
+            .contains(Reasons::ESTIMATOR_UNHEALTHY)
+    );
+    assert_eq!(rig.out.status.action, Action::LandNow);
+    assert!(rig.saw(EventKind::ActionChanged {
+        from: Action::None,
+        to: Action::LandNow
+    }));
+    let v = rig.out.status.valid;
+    assert!(!v.heading && !v.velocity && !v.position, "{v:?}");
+    assert!(rig.out.status.estimator.heading_contained);
+    assert_eq!(rig.out.status.estimator.heading_corrections, 0);
+    assert!(!rig.out.status.estimator.gps_aiding || rig.core.estimator.heading_contained());
+    // The pilot takes the vehicle with the mode switch (the link is good
+    // and settled): Stabilized is flown as asked.
+    rig.rc.mode_switch = 0;
+    assert!(rig.run_until(4.0, |r| r.nav() == NavState::Stabilized));
+    // (GPS_LOST is true as well: GPS fusion stopped with the latch.)
+    assert!(rig.events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::PilotOverride(r) if r.contains(Reasons::ESTIMATOR_UNHEALTHY)
+    )));
+    // Position (and Offboard) are not given back: Altitude is, with the
+    // reason named.
+    rig.rc.mode_switch = 1;
+    assert!(rig.run_until(4.0, |r| r.nav() == NavState::Altitude));
+    assert!(rig.saw(EventKind::ModeDegraded {
+        requested: FlightMode::Position,
+        flown: NavState::Altitude
+    }));
+    rig.run(2.0);
+    assert_eq!(rig.nav(), NavState::Altitude);
+    // The per-flight state stays until disarm.
+    assert!(rig.out.status.estimator.heading_contained);
 }
 
 // ---- read-only telemetry (M1c part three, K1) ----

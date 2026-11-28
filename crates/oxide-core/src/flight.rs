@@ -516,7 +516,22 @@ impl<const N: usize> Core<N> {
             // vehicle is armed and not landed.
             self.estimator
                 .set_airborne(self.supervision.visible.armed && !self.sup_state.land.landed());
+            // A fall of `armed` ends the flight: the estimator clears its
+            // per-flight heading state.
+            self.estimator.set_armed(self.supervision.visible.armed);
             self.estimator.update(now);
+            if let Some(dpsi) = self.estimator.take_heading_corrected() {
+                self.emit(
+                    now,
+                    EventKind::HeadingCorrected {
+                        angle_mrad: mrad(dpsi),
+                        count: self.estimator.heading_corrections(),
+                    },
+                );
+            }
+            if self.estimator.take_heading_contained() {
+                self.emit(now, EventKind::HeadingContained);
+            }
             let state = self.estimator.state();
             let valid = if state.is_some() {
                 self.estimator.validity()
@@ -685,6 +700,15 @@ impl<const N: usize> Core<N> {
         }
         out
     }
+}
+
+/// An angle in rad as whole milliradians for an event (rounded, within
+/// `i16`: the angle is in (-pi, pi]).
+#[allow(clippy::cast_possible_truncation)]
+fn mrad(angle_rad: f32) -> i16 {
+    let m = angle_rad.finite_or(0.0) * 1000.0;
+    // `as` rounds toward zero and saturates: add half away from zero first.
+    (if m >= 0.0 { m + 0.5 } else { m - 0.5 }) as i16
 }
 
 /// A stick position with the deadband `db` (`Limits::stick_deadband`) cut

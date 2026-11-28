@@ -999,6 +999,10 @@ fn oxide_estimator(t: u64, k: &Tick, _: &Vehicle, e: &mut Exp<'_>) {
     e.v("fit_t", f.t_us);
     e.v("fit_streak", f.streak);
     e.flag("fit_used", f.used);
+    // The heading guard's state.
+    e.v("hdg_corrections", est.heading_corrections);
+    e.flag("hdg_contained", est.heading_contained);
+    e.v("hdg_shift", est.heading_shift_rad);
 }
 
 /// `oxide_event`: every event of every tick, in order, with the fixed codes
@@ -1084,6 +1088,12 @@ fn check_events(fl: &Flight, file: &UlogFile, cov: &mut Coverage) -> usize {
                 rep = x;
             }
             EventKind::ParamFaultAcked => kind = 15,
+            EventKind::HeadingCorrected { angle_mrad, count } => {
+                kind = 16;
+                mask = u16::from_ne_bytes(angle_mrad.to_ne_bytes());
+                a = count;
+            }
+            EventKind::HeadingContained => kind = 17,
         }
         let mut e = Exp {
             topic: "oxide_event",

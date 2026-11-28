@@ -253,6 +253,27 @@ fn pins() -> Vec<(EventKind, String, u8)> {
             "Parameter fault acknowledged",
             INFO,
         ),
+        p(
+            EventKind::HeadingCorrected {
+                angle_mrad: -1003,
+                count: 1,
+            },
+            "Heading corrected by -1003 mrad (correction 1)",
+            INFO,
+        ),
+        p(
+            EventKind::HeadingCorrected {
+                angle_mrad: 3142,
+                count: 2,
+            },
+            "Heading corrected by 3142 mrad (correction 2)",
+            INFO,
+        ),
+        p(
+            EventKind::HeadingContained,
+            "Heading untrustworthy: contained until disarm",
+            WARNING,
+        ),
     ]
 }
 
@@ -275,7 +296,9 @@ fn variant_code(k: &EventKind) -> u8 {
         | EventKind::ParamRefused { .. }
         | EventKind::ParamLoadFault(_)
         | EventKind::ParamLoadRecovered(_)
-        | EventKind::ParamFaultAcked => k.code(),
+        | EventKind::ParamFaultAcked
+        | EventKind::HeadingCorrected { .. }
+        | EventKind::HeadingContained => k.code(),
     }
 }
 

@@ -58,6 +58,9 @@ pub(super) fn all_samples() -> Vec<Vec<u8>> {
                 gps_aiding: true,
                 rejected: 3,
                 resets: 1,
+                heading_corrections: 1,
+                heading_contained: true,
+                heading_shift_rad: -0.75,
             },
             true,
             Vec3::new(0.1, 0.2, 0.3),
@@ -306,6 +309,9 @@ fn oxide_estimator_table() {
         gps_aiding: false,
         rejected: 70_000,
         resets: 4_000_000_000,
+        heading_corrections: 2,
+        heading_contained: true,
+        heading_shift_rad: -1.5,
     };
     let fit = HeadingFit {
         seq: 7,
@@ -339,6 +345,8 @@ fn oxide_estimator_table() {
             ("fit_t", 5_000_000_001),
             ("fit_streak", 3),
             ("fit_used", 1),
+            ("hdg_corrections", 2),
+            ("hdg_contained", 1),
         ],
     );
     floats(
@@ -354,10 +362,11 @@ fn oxide_estimator_table() {
             ("fit_rho", 0.125),
             ("fit_stat", 4.75),
             ("fit_vel_ratio", 0.5),
+            ("hdg_shift", -1.5),
         ],
     );
-    // 31 bytes before the heading fit was added.
-    assert_eq!(r.raw().len(), 74);
+    // 31 bytes before the heading fit was added, 74 before the guard's state.
+    assert_eq!(r.raw().len(), 80);
 }
 
 #[test]
@@ -418,9 +427,11 @@ fn variant_index(k: &EventKind) -> usize {
         EventKind::ParamLoadFault(_) => 13,
         EventKind::ParamLoadRecovered(_) => 14,
         EventKind::ParamFaultAcked => 15,
+        EventKind::HeadingCorrected { .. } => 16,
+        EventKind::HeadingContained => 17,
     }
 }
-const VARIANTS: usize = 16;
+const VARIANTS: usize = 18;
 
 const NAVS: [NavState; 10] = [
     NavState::Disarmed,
@@ -590,6 +601,13 @@ fn events() -> Vec<Event> {
         kinds.push(EventKind::ParamLoadFault(rep));
         kinds.push(EventKind::ParamLoadRecovered(rep));
     }
+    for angle_mrad in [i16::MIN, -3142, -1, 0, 1, 1000, 3142, i16::MAX] {
+        for count in [0_u8, 1, 2, 5, u8::MAX] {
+            kinds.push(EventKind::HeadingCorrected { angle_mrad, count });
+        }
+    }
+    kinds.push(EventKind::HeadingContained);
+    kinds.push(EventKind::HeadingContained);
     let times = [0_u64, 1, 123_456_789, 4_294_967_296, u64::MAX];
     kinds
         .into_iter()
@@ -707,7 +725,7 @@ fn base(kind: EventKind) -> EventFields {
 #[test]
 fn every_other_code_is_refused_by_the_decoder() {
     // Event kinds.
-    for k in 16..=255_u8 {
+    for k in 18..=255_u8 {
         let fields = EventFields {
             kind: k,
             ..base(EventKind::Armed)

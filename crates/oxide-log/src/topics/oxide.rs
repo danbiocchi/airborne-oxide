@@ -34,15 +34,18 @@ pub const OXIDE_STATUS: Topic = Topic {
 /// after the latest GPS fix it judged while airborne (`fit_*`; all zero on
 /// the ground: `fit_seq` counts the fixes, `fit_t` is the fix's sample time,
 /// `fit_vel_ratio` is the GPS velocity test ratio of the filter's fusion of
-/// that fix, -1 when it was not fused).
+/// that fix, -1 when it was not fused), and the heading guard's state:
+/// `hdg_corrections` made in this flight, `hdg_contained` (the latch) and
+/// `hdg_shift`, the run-time shift of the declination, rad.
 pub const OXIDE_ESTIMATOR: Topic = Topic {
     name: "oxide_estimator",
     format: "uint64_t timestamp;uint32_t rejected;uint32_t resets;float[3] gyro_filtered;\
              bool aligned;bool gps_aiding;bool has_estimate;uint8_t fit_verdict;\
              uint32_t fit_seq;float fit_eps;float fit_sigma;float fit_sa;float fit_kappa;\
              float fit_rho;float fit_stat;float fit_vel_ratio;uint64_t fit_t;\
-             uint8_t fit_streak;bool fit_used;uint8_t[6] _padding0;",
-    record_len: 74,
+             uint8_t fit_streak;bool fit_used;uint8_t hdg_corrections;bool hdg_contained;\
+             float hdg_shift;",
+    record_len: 80,
 };
 
 /// `oxide_event`: one event, exactly. The fields are numbers; which of them
@@ -176,6 +179,9 @@ pub fn oxide_estimator<S: Sink + ?Sized>(
         .f32(fit.vel_ratio);
     w.u64(fit.t_us);
     w.u8(fit.streak).bool(fit.used);
+    w.u8(e.heading_corrections)
+        .bool(e.heading_contained)
+        .f32(e.heading_shift_rad);
 }
 
 /// `oxide_logger` from the logger's statistics. `high_water` is the ring's
@@ -207,6 +213,8 @@ pub fn oxide_logger<S: Sink + ?Sized>(w: &mut RecordWriter<'_, S>, now: Micros, 
 /// | `ParamChanged` | `param_key`, `param_index` |
 /// | `ParamRefused` | `param_key`, `param_index`, `why` the [`ParamError`] code, `why_detail` its detail code |
 /// | `ParamLoadFault`, `ParamLoadRecovered` | `applied`, `unknown`, `dropped`, `torn`, `invalid`, `unreadable` |
+/// | `HeadingCorrected` | `mask` the yaw change in milliradians (two's complement), `code_a` the corrections made in this flight |
+/// | `HeadingContained` | none |
 ///
 /// A parameter is identified by its stable key (`params::key_of`);
 /// `param_index` is where the table had it when the log was written, a note
@@ -288,7 +296,12 @@ impl EventFields {
             EventKind::Armed
             | EventKind::Touchdown
             | EventKind::HomeSet
-            | EventKind::ParamFaultAcked => {}
+            | EventKind::ParamFaultAcked
+            | EventKind::HeadingContained => {}
+            EventKind::HeadingCorrected { angle_mrad, count } => {
+                f.mask = u16::from_ne_bytes(angle_mrad.to_ne_bytes());
+                f.code_a = count;
+            }
             EventKind::Disarmed(r) => f.code_a = r.code(),
             EventKind::ArmRefused(p) => f.mask = p.0,
             EventKind::NavChanged { from, to } => {
@@ -378,6 +391,11 @@ impl EventFields {
             13 => EventKind::ParamLoadFault(report()),
             14 => EventKind::ParamLoadRecovered(report()),
             15 => EventKind::ParamFaultAcked,
+            16 => EventKind::HeadingCorrected {
+                angle_mrad: i16::from_ne_bytes(self.mask.to_ne_bytes()),
+                count: a,
+            },
+            17 => EventKind::HeadingContained,
             k => return Err(EventError::BadKind(k)),
         };
         let event = Event {
