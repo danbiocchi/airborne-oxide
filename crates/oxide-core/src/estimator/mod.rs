@@ -2490,6 +2490,8 @@ mod tests {
     #[test]
     fn the_tilt_reference_is_born_with_the_filter_from_its_roll_pitch_and_gyro_bias() {
         let mut rig = tilt_rig(1);
+        // A vehicle at rest on a slope: the filter aligns tilted.
+        rig.accel = tilt_ref::TiltRef::new(0.2, -0.1, Vec3::zero()).down() * (-GRAVITY);
         assert!(rig.est.tilt.is_none());
         until_aligned(&mut rig);
         let ekf = rig.est.ekf().unwrap();
@@ -2498,6 +2500,7 @@ mod tests {
             let e = ekf.x.q.to_euler();
             (e.x, e.y, e.z)
         };
+        assert!((roll - 0.2).abs() < 1e-3 && (pitch + 0.1).abs() < 1e-3);
         assert!((t.roll() - roll).abs() < 1e-5, "{} {roll}", t.roll());
         assert!((t.pitch() - pitch).abs() < 1e-5);
         // The filter's own gyro-bias estimate at that moment, not zero.
@@ -2615,6 +2618,9 @@ mod tests {
         rig.est.tilt = Some(ref_tilt);
         let d = rest_delta();
         let mut ekf = rig.est.ekf.take().unwrap();
+        // The filter has an accelerometer bias estimate, which the fit's
+        // input takes off as the filter does.
+        ekf.x.ba = Vec3::new(0.3, -0.2, 0.1);
         let filter_own = ekf.last_dvw_ne();
         let got = rig.est.heading_input(&mut ekf, &d);
         // What it must be: the delta velocity less the filter's accelerometer
