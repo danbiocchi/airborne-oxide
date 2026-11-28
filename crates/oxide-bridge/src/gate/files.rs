@@ -193,6 +193,10 @@ pub const SCENARIO_FILES: &[(&str, &str)] = &[
         "setpoint-gap",
         include_str!("../../../../scenarios/setpoint-gap.toml"),
     ),
+    (
+        "yaw-step-large",
+        include_str!("../../../../scenarios/yaw-step-large.toml"),
+    ),
 ];
 
 /// The text of the scenario file `name`, as built.
@@ -363,7 +367,9 @@ pub fn plan_fact_differences(plan: &Plan) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::plan::{GUST, MOTORS_OFF_NAMES, NOT_SCORED_NAMES, OUTCOME_NAMES, PAIR_NAMES};
+    use crate::gate::plan::{
+        GUST, MOTORS_OFF_NAMES, NOT_FOR_THE_GATE, NOT_SCORED_NAMES, OUTCOME_NAMES, PAIR_NAMES,
+    };
     use std::path::PathBuf;
 
     fn dir() -> PathBuf {
@@ -405,6 +411,7 @@ mod tests {
             &MOTORS_OFF_NAMES[..],
             &NOT_SCORED_NAMES[..],
             &PAIR_NAMES[..],
+            &NOT_FOR_THE_GATE[..],
         ] {
             record.extend(list.iter().map(|s| (*s).to_string()));
         }

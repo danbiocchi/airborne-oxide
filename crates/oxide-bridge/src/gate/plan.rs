@@ -86,6 +86,12 @@ pub const MOTORS_OFF_NAMES: [&str; 2] = ["motor-loss", "imu-loss"];
 /// Flown and not scored.
 pub const NOT_SCORED_NAMES: [&str; 2] = ["kill-in-rtl", "hover-step"];
 
+/// Files of `scenarios/` the gate does not fly: they test our core alone
+/// (a heading step must not switch the motors off; ArduCopter is not
+/// compared on it), so the record of ADR-0007 lists them nowhere and the plan
+/// leaves them out instead of refusing them.
+pub const NOT_FOR_THE_GATE: [&str; 1] = ["yaw-step-large"];
+
 /// Flown twice, with ArduCopter only: the scenario and how many indices
 /// from 0 (ADR-0007 section 7: ten flights).
 pub const TWICE: [(&str, u64); 6] = [
@@ -307,6 +313,9 @@ impl Plan {
                     "the file {} holds the scenario {name:?}: a file is named for its scenario",
                     path.display()
                 ));
+            }
+            if NOT_FOR_THE_GATE.contains(&name.as_str()) {
+                continue;
             }
             let seeds = src.file.run.seeds;
             let scoring = if let Some(s) = named_scoring(&name) {
