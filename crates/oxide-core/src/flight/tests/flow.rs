@@ -2673,19 +2673,6 @@ fn a_vehicle_that_has_landed_and_sits_armed_is_not_judged_when_it_is_moved() {
     );
 }
 
-/// Runs until the core reports a fine step of the heading, then a few more
-/// ticks so that guidance has seen the estimate that carries it.
-fn run_to_refinement(rig: &mut Rig, max_s: f64) -> bool {
-    let n = rig.count(|k| matches!(k, EventKind::HeadingRefined { .. }));
-    if !rig.run_until(max_s, |r| {
-        r.count(|k| matches!(k, EventKind::HeadingRefined { .. })) > n
-    }) {
-        return false;
-    }
-    rig.run(0.05);
-    true
-}
-
 /// The rig's path is gentle (its fit's sigma stays above the default limit
 /// of 0.2 rad), so the fine step's limit is opened to 0.5 and the declination
 /// is the one for which this path leaves a residual above its sigma.
