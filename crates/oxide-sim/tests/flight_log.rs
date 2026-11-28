@@ -343,7 +343,7 @@ fn the_replay_level_starts_and_its_header_says_so() {
     assert_eq!(file.info_str("oxide_profile"), Some("f405-lean"));
     // The start records of ADR-0005 §5 are in the data section already.
     assert_eq!(file.records("oxide_boot").count(), 1);
-    assert_eq!(file.records("oxide_param_us").count(), 10);
+    assert_eq!(file.records("oxide_param_us").count(), 11);
     assert!(file.records("oxide_vehicle").count() > 20);
     assert_eq!(file.records("oxide_in_tick").count(), 0);
 }

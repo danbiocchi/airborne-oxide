@@ -985,6 +985,20 @@ fn oxide_estimator(t: u64, k: &Tick, _: &Vehicle, e: &mut Exp<'_>) {
     e.flag("aligned", est.aligned);
     e.flag("gps_aiding", est.gps_aiding);
     e.flag("has_estimate", k.tel.estimate.is_some());
+    // The heading check's record for the latest fix it judged.
+    let f = &k.tel.heading_fit;
+    e.v("fit_verdict", f.verdict);
+    e.v("fit_seq", f.seq);
+    e.v("fit_eps", f.eps);
+    e.v("fit_sigma", f.sigma);
+    e.v("fit_sa", f.sa);
+    e.v("fit_kappa", f.kappa);
+    e.v("fit_rho", f.rho);
+    e.v("fit_stat", f.stat);
+    e.v("fit_vel_ratio", f.vel_ratio);
+    e.v("fit_t", f.t_us);
+    e.v("fit_streak", f.streak);
+    e.flag("fit_used", f.used);
 }
 
 /// `oxide_event`: every event of every tick, in order, with the fixed codes

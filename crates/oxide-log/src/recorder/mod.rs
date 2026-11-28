@@ -756,11 +756,19 @@ impl<const CAP: usize> Recorder<CAP> {
             });
         }
         // Due on its clock, or at once for a GPS fix the heading check has
-        // judged since the last record (one record per fix, as the clock
-        // alone would drop or double some): writing it moves the clock on.
+        // judged since the last record: one record per fix. A record written
+        // for a fix starts the clock again from that moment, so the topic
+        // stays at its rate (5 Hz, one record per fix at the fix rate) and
+        // the clock does not write a second record beside it.
         let fit_fresh = tel.heading_fit.seq != self.fit_seq;
-        if fit_fresh || self.clocks.estimator.due(t) {
+        let due = if fit_fresh {
+            self.clocks.estimator = Clock::new(period::HZ_5);
             self.clocks.estimator.advance(t);
+            true
+        } else {
+            take(&mut self.clocks.estimator, t)
+        };
+        if due {
             self.fit_seq = tel.heading_fit.seq;
             self.stream(t, id::OXIDE_ESTIMATOR, &topics::OXIDE_ESTIMATOR, |w| {
                 topics::oxide_estimator(
