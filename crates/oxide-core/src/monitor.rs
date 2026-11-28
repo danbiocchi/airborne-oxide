@@ -208,9 +208,15 @@ impl LandDetector {
 }
 
 /// Loss-of-control detection (ADR-0003 §3, LOSS_OF_CONTROL).
+///
+/// A multirotor has lost control when it cannot point its thrust where it is
+/// commanded, so the error judged here is the *tilt error*: the angle between
+/// the estimated and the commanded thrust axis. The heading is not judged: a
+/// vehicle turning to a new heading has not lost anything, and switching the
+/// motors off in the air guarantees a crash (ADR-0003, amendment).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ControlMonitor {
-    /// Since when the attitude error has exceeded its limit.
+    /// Since when the tilt error has exceeded its limit.
     error_since: Option<Micros>,
     /// Since when the tilt has exceeded its limit.
     tilt_since: Option<Micros>,
@@ -225,12 +231,13 @@ impl ControlMonitor {
     }
 
     /// `attitude`: estimated; `target`: commanded. True when the angle between
-    /// them has exceeded `loc_error_rad` for `loc_error_s`, or the tilt has
+    /// their thrust axes (the tilt error, heading ignored) has exceeded
+    /// `loc_error_rad` for `loc_error_s`, or the tilt has
     /// exceeded `loc_tilt_rad` for `loc_tilt_s`. `active = false` (disarmed or
     /// landed) resets both timers and returns false.
     ///
-    /// A non-finite attitude counts as over both limits, so a corrupt estimate
-    /// trips the check instead of hiding in it.
+    /// A non-finite attitude or target counts as over both limits, so a
+    /// corrupt estimate trips the check instead of hiding in it.
     pub fn update(
         &mut self,
         now: Micros,
@@ -244,7 +251,7 @@ impl ControlMonitor {
             self.tilt_since = None;
             return false;
         }
-        let err = attitude_error_angle(attitude, target);
+        let err = tilt_error_angle(attitude, target);
         let tilt = tilt_angle(attitude);
         let err_bad = !err.is_finite() || err > p.loc_error_rad;
         let tilt_bad = !tilt.is_finite() || tilt > p.loc_tilt_rad;
@@ -254,10 +261,17 @@ impl ControlMonitor {
     }
 }
 
-/// Attitude error angle, rad: |Log(target ⊗ conj(attitude))|, in `[0, π]`.
-/// NaN if either quaternion is non-finite.
-pub fn attitude_error_angle(attitude: Quat<f32>, target: Quat<f32>) -> f32 {
-    target.hamilton(attitude.conj()).to_rotation_vector().norm()
+/// Tilt error, rad: the angle between the thrust axes (body z, the down axis
+/// in the body frame, rotated into the world) of `attitude` and `target`, in
+/// `[0, π]`. A rotation about the thrust axis, the heading, does not change
+/// it. NaN if either quaternion is non-finite.
+pub fn tilt_error_angle(attitude: Quat<f32>, target: Quat<f32>) -> f32 {
+    let down = Vec3::new(0.0, 0.0, 1.0);
+    let a = attitude.rotate(down);
+    let b = target.rotate(down);
+    // atan2 of the cross and dot products stays accurate near 0 and π,
+    // where an arccosine of the dot product loses all its digits.
+    <f32 as Real>::atan2(a.cross(b).norm(), a.dot(b))
 }
 
 /// Tilt, rad: angle between body z and world z (NED down), in `[0, π]`.
@@ -740,23 +754,69 @@ mod tests {
     // ---- Geometry -------------------------------------------------------
 
     #[test]
-    fn attitude_error_angle_matches_hand_values() {
+    fn tilt_error_angle_matches_hand_values() {
         let id = Quat::<f32>::identity();
-        let yaw30 = Quat::<f32>::from_euler(0.0, 0.0, 30.0 * DEG);
-        assert!((attitude_error_angle(id, yaw30) - 30.0 * DEG).abs() < 1e-5);
-        assert!((attitude_error_angle(yaw30, id) - 30.0 * DEG).abs() < 1e-5);
         let roll10 = Quat::<f32>::from_euler(10.0 * DEG, 0.0, 0.0);
-        assert!((attitude_error_angle(id, roll10) - 10.0 * DEG).abs() < 1e-5);
-        // Both rotated: only the difference matters.
-        let yaw10 = Quat::<f32>::from_euler(0.0, 0.0, 10.0 * DEG);
-        assert!((attitude_error_angle(yaw10, yaw30) - 20.0 * DEG).abs() < 1e-5);
-        assert!(attitude_error_angle(roll10, roll10) < 1e-6);
+        assert!((tilt_error_angle(id, roll10) - 10.0 * DEG).abs() < 1e-5);
+        assert!((tilt_error_angle(roll10, id) - 10.0 * DEG).abs() < 1e-5);
+        // Both tilted: only the angle between the thrust axes matters.
+        let roll30 = Quat::<f32>::from_euler(30.0 * DEG, 0.0, 0.0);
+        assert!((tilt_error_angle(roll10, roll30) - 20.0 * DEG).abs() < 1e-5);
+        let pitch30 = Quat::<f32>::from_euler(0.0, 30.0 * DEG, 0.0);
+        // Roll 30 against pitch 30: cos = cos 30 * cos 30 + sin-sin cross terms.
+        let want = f64::acos(f64::from(
+            roll30
+                .rotate(Vec3::new(0.0, 0.0, 1.0))
+                .dot(pitch30.rotate(Vec3::new(0.0, 0.0, 1.0))),
+        ));
+        assert!((f64::from(tilt_error_angle(roll30, pitch30)) - want).abs() < 1e-4);
+        assert!(tilt_error_angle(roll10, roll10) < 1e-6);
     }
 
     #[test]
-    fn attitude_error_angle_non_finite_is_not_zero() {
+    fn tilt_error_angle_ignores_the_heading() {
+        let id = Quat::<f32>::identity();
+        for deg in [10.0_f32, 90.0, 179.0, 180.0, -135.0] {
+            let yaw = Quat::<f32>::from_euler(0.0, 0.0, deg * DEG);
+            assert!(tilt_error_angle(id, yaw) < 1e-5, "{deg}");
+            assert!(tilt_error_angle(yaw, id) < 1e-5, "{deg}");
+        }
+        // A turn about the body's own thrust axis keeps the thrust axis.
+        let a = Quat::<f32>::from_euler(0.0, 20.0 * DEG, 0.0);
+        let yaw_about_thrust = a.hamilton(Quat::<f32>::from_euler(0.0, 0.0, 150.0 * DEG));
+        assert!(tilt_error_angle(a, yaw_about_thrust) < 1e-5);
+        // Leaning toward another compass direction is a tilt error.
+        let b = Quat::<f32>::from_euler(0.0, 20.0 * DEG, 150.0 * DEG);
+        assert!(tilt_error_angle(a, b) > 0.1);
+    }
+
+    #[test]
+    fn tilt_error_angle_corners() {
+        let id = Quat::<f32>::identity();
+        // Inverted (roll 180) against level: the axes are opposite.
+        let inverted = Quat::<f32>::from_euler(180.0 * DEG, 0.0, 0.0);
+        assert!((tilt_error_angle(id, inverted) - core::f32::consts::PI).abs() < 1e-5);
+        // 90 degrees of tilt.
+        let roll90 = Quat::<f32>::from_euler(90.0 * DEG, 0.0, 0.0);
+        assert!((tilt_error_angle(id, roll90) - 90.0 * DEG).abs() < 1e-5);
+        assert!((tilt_error_angle(roll90, inverted) - 90.0 * DEG).abs() < 1e-5);
+        // A target equal to the attitude, and a tiny error near zero.
+        assert!(tilt_error_angle(roll90, roll90) < 1e-6);
+        let tiny = Quat::<f32>::from_euler(1e-4, 0.0, 0.0);
+        assert!((tilt_error_angle(id, tiny) - 1e-4).abs() < 1e-6);
+        // Near pi, too.
+        let almost = Quat::<f32>::from_euler(179.99 * DEG, 0.0, 0.0);
+        assert!((tilt_error_angle(id, almost) - 179.99 * DEG).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tilt_error_angle_non_finite_is_not_zero() {
         let nan = Quat::new(f32::NAN, 0.0, 0.0, 0.0);
-        assert!(!attitude_error_angle(nan, Quat::identity()).is_finite());
+        assert!(!tilt_error_angle(nan, Quat::identity()).is_finite());
+        assert!(!tilt_error_angle(Quat::identity(), nan).is_finite());
+        let inf = Quat::new(f32::INFINITY, 0.0, 0.0, 0.0);
+        assert!(!tilt_error_angle(inf, Quat::identity()).is_finite());
+        assert!(!tilt_error_angle(Quat::identity(), inf).is_finite());
     }
 
     #[test]

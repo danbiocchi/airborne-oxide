@@ -351,7 +351,8 @@ pub struct FailsafeParams {
     pub fence_radius_m: f32,
     /// Geofence height above home, m. Zero disables it.
     pub fence_altitude_m: f32,
-    /// Loss of control: attitude error above this for
+    /// Loss of control: tilt error (the angle between the estimated and the
+    /// commanded thrust axis; the heading is not counted) above this for
     /// `loc_error_s`, rad.
     pub loc_error_rad: f32,
     pub loc_error_s: f32,

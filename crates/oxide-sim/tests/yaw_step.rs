@@ -15,7 +15,7 @@ use oxide_sim::scenario_file;
 /// (time of the step, s; heading setpoint, rad), from the file.
 const STEPS: [(f64, f64); 4] = [(10.0, 2.5), (17.0, 0.0), (24.0, 3.14), (31.0, 0.0)];
 /// The heading must be within `TOL_RAD` of the setpoint this long after a step.
-const SETTLE_S: f64 = 4.0;
+const SETTLE_S: f64 = 2.5;
 const TOL_RAD: f64 = 0.1;
 
 fn wrap(a: f64) -> f64 {

@@ -201,6 +201,7 @@ All actions are configurable, and the pilot can override under the rules in §4.
 | Geofence breached | RTL |
 | IMU failure | **H743:** switch IMU lane. **F405 (one IMU):** <br>• try to recover the sensor (bus reset and re-initialisation within a bounded time, holding the last outputs); <br>• partial faults (clipping, a stuck axis, missed data-ready) degrade filtering rather than ending the flight; <br>• if the IMU stays invalid, the vehicle cannot be stabilised, so apply the configured terminal action (default: motors off) and log it. <br>This is a documented limit of single-IMU boards. F405 scenarios test that the behaviour is defined, not that the vehicle survives. |
 | Motor failure | Hex/octo: land on the remaining motors. Quad: a defined, logged outcome now; a controlled spinning descent later (ETH Zurich research). |
+| Loss of control | The thrust axis is more than 45° from where it is commanded for 0.5 s (the heading is not counted: a turn is not a loss of control), or the tilt is above 75° for 0.25 s: stop motors. This is how a quad's motor failure is detected. ([ADR-0003](adr/0003-failsafes.md) §3 and its amendment.) |
 | Excessive vibration | Warn, then Land |
 | Core reset while armed | In-flight restart (§4.16) |
 

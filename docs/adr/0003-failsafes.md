@@ -78,7 +78,7 @@ A *reason* is a condition that is currently true. Each maps to an action, someti
 | `ESTIMATOR_UNHEALTHY` | `attitude` valid, but `altitude` or `heading` invalid, or the filter reported a numerical fault | Armed | `LandNow` |
 | `IMU_FAILURE` | `attitude` invalid | Armed | `Terminated` |
 | `GEOFENCE` | Further than `fence_radius_m` from home, or higher than `fence_altitude_m` above it. Zero disables that limit; both default to zero. | Armed, `position` valid | `Rtl` |
-| `LOSS_OF_CONTROL` | Attitude error above 45° for 0.5 s, or tilt above 75° for 0.25 s | Armed, not landed | `Terminated` |
+| `LOSS_OF_CONTROL` | Tilt error (the angle between the estimated and the commanded thrust axis; the heading is not counted, see the amendment) above 45° for 0.5 s, or tilt above 75° for 0.25 s | Armed, not landed | `Terminated` |
 
 **Interpretations of DESIGN §4.10.**
 - **RC loss and ground-station loss.** The table's rows overlap. Read together: in a pilot mode, losing RC alone starts Hold then Rtl, whatever the ground station does. In Offboard, losing RC alone changes nothing; losing every human link starts the `no_link_rtl_s` countdown. A ground station that never connected counts as absent, and losing it alone is never a failsafe.
@@ -161,3 +161,50 @@ The core reports discrete events through its outputs: armed, disarmed and why, a
 - The energy-to-home check for Rtl.
 - IMU and estimator lanes on the H743.
 - Switch confirmation on every link frame. The supervisor samples the newest frame at 50 Hz, so on a faster link the frames between two runs are not examined. Counting in the input path would examine all of them.
+
+## Amendment: loss of control is judged on the thrust axis, not on the heading
+
+**Date:** 2026-11-28 · **Changes:** §3 (the `LOSS_OF_CONTROL` row), `crates/oxide-core/src/monitor.rs`, the descriptions of `FS_LOC_ERR` and `FS_LOC_ERR_T`, DESIGN §4.10.
+
+### The fault
+
+The rule of §3 measured the whole rotation between the estimated and the commanded attitude, heading included. A heading setpoint that jumps far enough keeps the heading error above 45° for longer than 0.5 s, because the vehicle turns at its yaw rate limit. A healthy vehicle was then terminated in flight by an ordinary command. Hover at 5 m in Offboard with realistic sensors, then one heading setpoint of 2.5 rad: `ReasonRaised(LOSS_OF_CONTROL)`, `Terminate` and `Disarmed(Terminated)` 0.52 s after the step, and the vehicle fell and met the ground at 9.2 to 9.5 m/s (the same at 3.0 rad; at 2.0 rad it flew on). It was found by a check of the auto-tune experiments, which flew 6 of 6 flights into it on any gains. No scenario file commanded a heading step this large, so no test saw it. The new `yaw-step-large` flies it (2.5 rad and 3.14 rad, and back): before this change all 40 flights of runs 500 to 519 on both profiles were terminated 0.52 s after the first step; after it none is, and their largest tilt is 14.5°.
+
+### The decision
+
+**Loss of control is judged on the direction of the thrust axis.** The error of the rule is the angle between the estimated and the commanded thrust axis (the body's down axis in each attitude): the *tilt error*, `tilt_error_angle` in `monitor.rs`, computed as the arctangent of the norm of the cross product over the dot product of the two axes, so it is exact near 0 and near π. A heading error alone no longer raises `LOSS_OF_CONTROL`. The figures stay: 45° for 0.5 s on the tilt error, 75° for 0.25 s on the tilt, the parameters `FS_LOC_ERR`, `FS_LOC_ERR_T`, `FS_LOC_TILT`, `FS_LOC_TILT_T` with their ranges and cross-field rules, and the action `Terminated`. A non-finite attitude or target still counts as over both limits. The old function `attitude_error_angle` is gone: it returned the whole rotation, and nothing else used it.
+
+### The grounds
+
+- **A multirotor that cannot point its thrust where it is commanded has lost control; one that is turning to a new heading has not.** Its thrust axis, and with it the height and the position, stay under control through a heading step. Switching the motors off in flight guarantees a crash, so the rule must not fire on a healthy vehicle. After the change the 40 heading-step flights of runs 500 to 519 pass the scenario's own limits (horizontal error below 0.8 m, tilt below 30°); the largest tilt is 14.5°.
+- **PX4** (BSD-3, checked out at commit `935addf1d6bec6e955b155494a52e7eb4b750eb3`; read, not copied). Its failure detector, `src/modules/commander/failure_detector/FailureDetector.cpp`, `updateAttitudeStatus` (lines 100 to 146), takes the Euler angles of the estimated attitude (`const matrix::Eulerf euler(matrix::Quatf(attitude.q));`, line 106) and judges only roll and pitch: `const bool roll_status = (max_roll > FLT_EPSILON) && (fabsf(roll) > max_roll);` (line 131) and the same for pitch (line 132). Yaw is never read, and neither is the attitude setpoint: PX4 compares the absolute roll and pitch with fixed limits. The limits are `FD_FAIL_R` and `FD_FAIL_P`, 60° by default, with `FD_FAIL_R_TTRI` and `FD_FAIL_P_TTRI`, 0.3 s by default (`failure_detector_params.yaml`, lines 5 to 20 and 37 to 47: "Maximum roll angle before FailureDetector triggers the attitude_failure flag. The flag triggers flight termination (if @CBRK_FLIGHTTERM = 0), which sets outputs to their failsafe values."; "Seconds (decimal) that roll has to exceed FD_FAIL_R before being considered as a failure."). So PX4 judges the direction of the thrust axis (through roll and pitch) and ignores the heading. It does not look at the error to the command; our tilt rule (75° for 0.25 s) is its counterpart, and the error rule is the part PX4 does not have.
+- **ArduPilot** (behaviour reference only; no source read). Its crash check, as recorded in [ADR-0009](0009-arducopter-tuning.md), disarms "in cases where the vehicle is likely out of control and has hit the ground", when the lean angle is more than 30° from the wanted one and the vehicle accelerates by less than 3 m/s², for 2 s. A lean angle is the direction of the thrust axis, so this too is a tilt error against the command and says nothing of the heading.
+
+Both references judge the thrust axis and neither counts the heading; ours now judges the thrust axis against the command, as ArduPilot's does and PX4's does not.
+
+### Not chosen
+
+- **Limiting how fast the heading target may move**, so that the error never grows large. It would change every heading step the controller flies and every pinned flight with one, and it treats the symptom: the rule would still count heading. It may be worth doing later for its own sake.
+- **A longer time or a larger angle.** It only moves the size of the step that kills the vehicle.
+- **A softer reaction to a heading error that persists** (for example a landing). Possibly right, but a new rule: deferred.
+
+### Deferred
+
+- A reaction to a heading error that persists, if one is wanted (a vehicle that cannot turn, for example on a lost yaw authority). Today a vehicle that does not follow its heading command raises nothing.
+- A limit on the speed of the heading target (see above).
+
+### Measurements
+
+All on runs 500 to 519 of every scenario file, both profiles, before and after, comparing the class, the verdict, the event timeline and the trace hash of each of the 1760 flights.
+
+- **Only loss-of-control flights changed.** 78 flights differ: the 38 of `motor-loss` that were terminated before and are terminated after (2 of the 40 are bit for bit the same), and the 40 flights of the new `yaw-step-large`, terminated before and flown clean after. The other 42 files, 1680 flights, are unchanged to the trace hash. (`imu-loss` fails its verdict on these runs before and after, identically: a finding outside this change.)
+- **Motor loss is still terminated, a little later.** Time from the fault (at 15 s) to the last motor command above zero, runs 500 to 519 (the criterion B3 measure of gate 1):
+
+  | profile | median before | median after | latest before | latest after |
+  |---|---|---|---|---|
+  | f405-lean | 0.999 s | 1.239 s | 0.999 s | 1.239 s |
+  | h743-full | 1.000 s | 1.240 s | 1.000 s | 1.240 s |
+
+  The scenario's own limit (terminated by 17 s, a fault at 15 s) holds on every run; the latest is 1.24 s after the fault. The reason is raised 0.98 s after the fault before, and 0.98 s to 1.22 s after (38 of the 40 flights are later): the heading part of the error no longer counts toward the limit. The median moves by 0.24 s.
+- **Gate 1.** Its reports in `docs/gates/` are records and stand as flown: the motors-off figures of our core there (0.999 s on F405, 1.0 s on H743 in `motor-loss`) were flown on the old rule. On the new rule the medians are 1.239 s and 1.240 s. ArduCopter's figure and the verdict of B3 are not touched: our core's median is still far below ArduCopter's 14.9995 s.
+- **Pins.** The trace hashes of the three pinned `motor-loss` flights (and nothing else) moved, and the three of `yaw-step-large` are new. The ten `oxide-sim hash` lines: the two `motor-loss` lines moved, the other eight did not.

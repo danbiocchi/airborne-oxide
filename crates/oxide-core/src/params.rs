@@ -601,9 +601,9 @@ declare_params! {
         f32 FS_FENCE_ALT = fence_altitude_m: 0.0, 0.0, 1000000.0, "m", Failsafe, live,
             "Geofence height above home. Zero disables it.";
         f32 FS_LOC_ERR = loc_error_rad: 45.0_f32.to_radians(), 0.35, PI, "rad", Failsafe, live,
-            "Loss of control: attitude error above this for FS_LOC_ERR_T. At least 0.35 rad (20 degrees): below it normal flight switches the motors off.";
+            "Loss of control: tilt error above this for FS_LOC_ERR_T. The tilt error is the angle between the estimated and the commanded thrust axis; the heading is not counted. At least 0.35 rad (20 degrees): below it normal flight switches the motors off.";
         f32 FS_LOC_ERR_T = loc_error_s: 0.5, 0.1, DUR, "s", Failsafe, live,
-            "Loss of control: how long the attitude error must stay above FS_LOC_ERR. At least 0.1 s.";
+            "Loss of control: how long the tilt error must stay above FS_LOC_ERR. At least 0.1 s.";
         f32 FS_LOC_TILT = loc_tilt_rad: 75.0_f32.to_radians(), 0.185, PI, "rad", Failsafe, live,
             "Loss of control: tilt above this for FS_LOC_TILT_T. Must be at least 0.175 rad (10 degrees) above both LIM_TILT and LIM_TILT_STAB, or the tilt the controller commands switches the motors off.";
         f32 FS_LOC_TILT_T = loc_tilt_s: 0.25, 0.05, DUR, "s", Failsafe, live,

@@ -43,9 +43,9 @@ kill-in-rtl h743-full 0 bfc6e35f2d34cbf4
 mag-loss f405-lean 0 0b55257b485d7f70
 mag-loss f405-lean 1 677a2c8ef3d624b7
 mag-loss h743-full 0 64564a7ea1038efb
-motor-loss f405-lean 0 aea1fc271efee43d
-motor-loss f405-lean 1 02b39e1856c1684f
-motor-loss h743-full 0 6d5b21b4f7e9fe8a
+motor-loss f405-lean 0 e67c37bedf10caa3
+motor-loss f405-lean 1 f108a957b6dfbfcd
+motor-loss h743-full 0 787b297d6eb3b929
 no-human-link f405-lean 0 e81b830d74cd2812
 no-human-link f405-lean 1 c0b581cd78ce0160
 no-human-link h743-full 0 dd6f45494c72afc9
@@ -127,3 +127,6 @@ rc-loss-position h743-full 0 d7fe692090e72b1c
 setpoint-gap f405-lean 0 bf42ee617786d5cb
 setpoint-gap f405-lean 1 66bdf57f51d363cd
 setpoint-gap h743-full 0 9bfbc3f45650a5c2
+yaw-step-large f405-lean 0 fb3e470d66a2ade0
+yaw-step-large f405-lean 1 cec99df3807d792d
+yaw-step-large h743-full 0 30341d1c1dc17dda
