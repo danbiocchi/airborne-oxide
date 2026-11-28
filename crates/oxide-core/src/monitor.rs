@@ -606,10 +606,11 @@ mod tests {
     // ---- ControlMonitor -------------------------------------------------
 
     #[test]
-    fn control_error_trips_at_exact_time() {
+    fn control_tilt_error_trips_at_exact_time() {
         let p = params(); // 45° for 0.5 s
         let mut m = ControlMonitor::new();
-        let target = Quat::<f32>::from_euler(0.0, 0.0, 50.0 * DEG);
+        // The commanded thrust axis is 50° away from the estimated one.
+        let target = Quat::<f32>::from_euler(50.0 * DEG, 0.0, 0.0);
         for ms in (0..=400).step_by(100) {
             assert!(!m.update(t(ms), true, Quat::identity(), target, &p));
         }
@@ -617,11 +618,11 @@ mod tests {
     }
 
     #[test]
-    fn control_tilt_trips_before_error_timer() {
+    fn control_tilt_trips_before_tilt_error_timer() {
         let p = params(); // 75° for 0.25 s; error check would take 0.5 s
         let mut m = ControlMonitor::new();
         let a = Quat::<f32>::from_euler(80.0 * DEG, 0.0, 0.0);
-        // Target equal to the attitude: no attitude error, only tilt.
+        // Target equal to the attitude: no tilt error, only tilt.
         assert!(!m.update(t(0), true, a, a, &p));
         assert!(!m.update(t(249), true, a, a, &p));
         assert!(m.update(t(250), true, a, a, &p));
@@ -638,10 +639,10 @@ mod tests {
     }
 
     #[test]
-    fn control_recovery_restarts_the_error_timer() {
+    fn control_recovery_restarts_the_tilt_error_timer() {
         let p = params();
         let mut m = ControlMonitor::new();
-        let bad = Quat::<f32>::from_euler(0.0, 0.0, 50.0 * DEG);
+        let bad = Quat::<f32>::from_euler(50.0 * DEG, 0.0, 0.0);
         for ms in (0..=400).step_by(100) {
             m.update(t(ms), true, Quat::identity(), bad, &p);
         }
@@ -660,7 +661,7 @@ mod tests {
     fn control_inactive_resets_timers() {
         let p = params();
         let mut m = ControlMonitor::new();
-        let bad = Quat::<f32>::from_euler(0.0, 0.0, 50.0 * DEG);
+        let bad = Quat::<f32>::from_euler(50.0 * DEG, 0.0, 0.0);
         for ms in (0..=400).step_by(100) {
             m.update(t(ms), true, Quat::identity(), bad, &p);
         }
@@ -677,6 +678,63 @@ mod tests {
         let nan = Quat::new(f32::NAN, 0.0, 0.0, 0.0);
         assert!(!m.update(t(0), true, nan, Quat::identity(), &p));
         assert!(m.update(t(500), true, nan, Quat::identity(), &p));
+    }
+
+    #[test]
+    fn control_pure_heading_error_never_trips() {
+        // A heading error of any size, held for any time, is not a loss of
+        // control: the thrust axis points where it is commanded.
+        let p = params();
+        for deg in [50.0_f32, 90.0, 120.0, 170.0, 179.0, 180.0, -150.0] {
+            let mut m = ControlMonitor::new();
+            let target = Quat::<f32>::from_euler(0.0, 0.0, deg * DEG);
+            for ms in (0..=60_000).step_by(100) {
+                assert!(
+                    !m.update(t(ms), true, Quat::identity(), target, &p),
+                    "yaw error {deg} deg tripped at {ms} ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn control_heading_error_on_a_tilted_vehicle_never_trips() {
+        // The estimate leans 20 deg; the command leans the same way and
+        // turns the heading by 150 deg: the thrust axes agree.
+        let p = params();
+        let mut m = ControlMonitor::new();
+        let a = Quat::<f32>::from_euler(0.0, 20.0 * DEG, 0.0);
+        let target = Quat::<f32>::from_euler(0.0, 20.0 * DEG, 150.0 * DEG);
+        for ms in (0..=10_000).step_by(100) {
+            assert!(!m.update(t(ms), true, a, target, &p), "at {ms} ms");
+        }
+    }
+
+    #[test]
+    fn control_mixed_rotation_is_judged_by_its_tilt_part() {
+        let p = params();
+        // 30 deg of tilt error with 170 deg of heading: below the limit.
+        let mut m = ControlMonitor::new();
+        let small = Quat::<f32>::from_euler(30.0 * DEG, 0.0, 170.0 * DEG);
+        for ms in (0..=10_000).step_by(100) {
+            assert!(!m.update(t(ms), true, Quat::identity(), small, &p));
+        }
+        // 50 deg of tilt error with 170 deg of heading: trips at 0.5 s.
+        let mut m = ControlMonitor::new();
+        let big = Quat::<f32>::from_euler(50.0 * DEG, 0.0, 170.0 * DEG);
+        for ms in (0..=400).step_by(100) {
+            assert!(!m.update(t(ms), true, Quat::identity(), big, &p));
+        }
+        assert!(m.update(t(500), true, Quat::identity(), big, &p));
+    }
+
+    #[test]
+    fn control_non_finite_target_trips() {
+        let p = params();
+        let mut m = ControlMonitor::new();
+        let nan = Quat::new(f32::NAN, 0.0, 0.0, 0.0);
+        assert!(!m.update(t(0), true, Quat::identity(), nan, &p));
+        assert!(m.update(t(500), true, Quat::identity(), nan, &p));
     }
 
     // ---- Geometry -------------------------------------------------------

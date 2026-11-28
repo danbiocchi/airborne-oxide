@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name = "yaw-step-large"
+about = "Hover at 5 m, then heading setpoints that step by 2.5 rad and by 3.14 rad and back: a turn is not a loss of control, no failsafe is raised, and the position holds."
+airframe = "quad-x-5in"
+duration_s = 38.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "calm"
+
+[pilot]
+arm_at_s = 3.0
+
+[[pilot.mode]]
+t = 0.0
+switch = "offboard"
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, 0.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 4.0
+position = [0.0, 0.0, 5.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 10.0
+position = [0.0, 0.0, 5.0]
+yaw = 2.5
+
+[[pilot.setpoint]]
+t = 17.0
+position = [0.0, 0.0, 5.0]
+yaw = 0.0
+
+[[pilot.setpoint]]
+t = 24.0
+position = [0.0, 0.0, 5.0]
+yaw = 3.14
+
+[[pilot.setpoint]]
+t = 31.0
+position = [0.0, 0.0, 5.0]
+yaw = 0.0
+
+# No failsafe reason of any kind, the vehicle still flying at the point
+# at the end, tilt and height held. The heading itself is judged by the test
+# `yaw_step` in crates/oxide-sim/tests/yaw_step.rs (the file format has no
+# yaw expectation).
+[expect]
+reasons_never = [
+  "RC_LOST", "NO_HUMAN_LINK", "BRAIN_LOST", "SETPOINT_STALE", "BATTERY_LOW",
+  "BATTERY_CRITICAL", "GPS_LOST", "ESTIMATOR_UNHEALTHY", "IMU_FAILURE",
+  "GEOFENCE", "LOSS_OF_CONTROL",
+]
+by_s = 38.0
+max_tilt_deg = 30.0
+min_height_m = 4.5
+max_height_m = 5.6
+max_distance_from_home_m = 0.8
+
+[expect.ending]
+kind = "flying"
+point = [0.0, 0.0, 5.0]
+tolerance_m = 0.4
+
+[expect.hold]
+window_start_s = 9.0
+armed_from_s = 5.0
+max_h_error_m = 0.8
+rms_h_error_m = 0.3
+max_v_error_m = 0.6
+max_tilt_deg = 30.0
+est_max_h_error_m = 1.0
+est_max_v_error_m = 1.0
+est_max_vel_error_mps = 0.5
+est_max_att_error_deg = 3.0
+
+[run]
+seeds = 10
+profiles = ["f405", "h743"]

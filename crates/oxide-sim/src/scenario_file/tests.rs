@@ -110,7 +110,7 @@ fn every_file_in_scenarios_loads_and_is_named_after_its_file() {
         );
         n += 1;
     }
-    assert_eq!(n, 43);
+    assert_eq!(n, 44);
 }
 
 #[test]
