@@ -256,6 +256,7 @@ impl EventKind {
             EventKind::HeadingCorrected { .. } => 16,
             EventKind::HeadingContained => 17,
             EventKind::GpsSnapRepeated => 18,
+            EventKind::HeadingRefined { .. } => 19,
         }
     }
 }
@@ -452,6 +453,7 @@ mod tests {
             ),
             (EventKind::HeadingContained, 17),
             (EventKind::GpsSnapRepeated, 18),
+            (EventKind::HeadingRefined { angle_mrad: 150 }, 19),
         ];
         for (k, c) in table {
             assert_eq!(k.code(), *c, "{k:?}");

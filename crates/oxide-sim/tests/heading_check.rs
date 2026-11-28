@@ -299,3 +299,51 @@ fn an_uncorrected_flight_with_a_declination_is_the_flight_before_the_guard() {
         );
     }
 }
+
+/// A flight with a fine step replays bit for bit on both profiles: the step
+/// is in the outputs the replay compares (the attitude, the reset count, the
+/// set-points), and the log carries its count and its event.
+#[test]
+fn flights_with_a_fine_step_replay_bit_for_bit_and_log_the_step() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/gust-hold.toml");
+    let file = scenario_file::load_path(&path).expect("the file loads");
+    for (profile, index) in [(F405_LEAN, 502), (H743_FULL, 501)] {
+        let params = vec![("EKF_MAG_DECL".to_string(), 1.0)];
+        let mut sim = file
+            .build_with_params(profile, index, &params)
+            .expect("builds");
+        let buf = SharedBuffer::new();
+        sim.start_log(
+            Level::Replay,
+            &LogBuild::sim("heading-guard"),
+            Box::new(buf.clone()),
+        )
+        .expect("the replay level starts");
+        let mut flown = 0_u64;
+        let (mut fine, mut seen_in_log) = (0_u8, 0_u8);
+        loop {
+            let r = sim.step();
+            flown += 1;
+            if r.t >= file.end() {
+                break;
+            }
+            fine = fine.max(sim.core().estimator().heading_fine_steps());
+            seen_in_log = seen_in_log.max(sim.core().telemetry().heading_guard.fine_steps);
+        }
+        sim.finish_log().expect("finishes");
+        assert_eq!(fine, 1, "{}: one fine step", profile.name);
+        assert_eq!(
+            seen_in_log, 1,
+            "{}: in the telemetry the log writes",
+            profile.name
+        );
+        let r = replay(&buf.bytes(), &ReplayOptions::default()).expect("replays");
+        assert_eq!(r.ticks, flown, "{}", profile.name);
+        assert!(
+            r.identical() && r.stop == Stop::End,
+            "{}: {}",
+            profile.name,
+            r.lines().join("; ")
+        );
+    }
+}

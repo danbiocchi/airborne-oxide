@@ -270,6 +270,16 @@ fn pins() -> Vec<(EventKind, String, u8)> {
             INFO,
         ),
         p(
+            EventKind::HeadingRefined { angle_mrad: -150 },
+            "Heading refined by -150 mrad",
+            INFO,
+        ),
+        p(
+            EventKind::HeadingRefined { angle_mrad: 87 },
+            "Heading refined by 87 mrad",
+            INFO,
+        ),
+        p(
             EventKind::HeadingContained,
             "Heading untrustworthy: contained until disarm",
             WARNING,
@@ -303,6 +313,7 @@ fn variant_code(k: &EventKind) -> u8 {
         | EventKind::ParamLoadRecovered(_)
         | EventKind::ParamFaultAcked
         | EventKind::HeadingCorrected { .. }
+        | EventKind::HeadingRefined { .. }
         | EventKind::HeadingContained
         | EventKind::GpsSnapRepeated => k.code(),
     }

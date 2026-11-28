@@ -529,6 +529,14 @@ impl<const N: usize> Core<N> {
                     },
                 );
             }
+            if let Some(dpsi) = self.estimator.take_heading_refined() {
+                self.emit(
+                    now,
+                    EventKind::HeadingRefined {
+                        angle_mrad: mrad(dpsi),
+                    },
+                );
+            }
             if self.estimator.take_heading_contained() {
                 self.emit(now, EventKind::HeadingContained);
             }

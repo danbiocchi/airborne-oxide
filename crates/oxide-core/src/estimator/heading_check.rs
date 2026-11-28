@@ -63,6 +63,12 @@ pub const DT_MIN_US: u64 = 100_000;
 /// accelerometer integral then covers a different span than the fix pair
 /// assumes.
 pub const DT_MAX_US: u64 = 300_000;
+/// How long after a correction the fine step may act, µs. A reading that
+/// passes the fine step's rule came within 10 s of the correction in 198 of
+/// the 208 flights of the measurement (report-HM part B, what-if with a
+/// sigma limit of 0.30 rad), the median 0.8 s after it; a longer window would
+/// only cover flights in which the restarted fit stays blind.
+pub const FINE_WINDOW_US: u64 = 10_000_000;
 /// Smallest `E` the sigma formula divides by.
 const E_MIN: f32 = 1.0e-9;
 /// `√2`: the standard deviation of a difference of two GPS velocities is
@@ -83,6 +89,9 @@ pub struct HeadingConfig {
     pub tau_s: f32,
     /// Floor of the GPS velocity noise, m/s (`EKF_GPS_VEL_N`).
     pub vel_noise_mps: f32,
+    /// The fine step acts on a reading whose one-sigma is at most this, rad
+    /// (`EKF_HDG_FINE`); 0 switches it off.
+    pub fine_rad: f32,
 }
 
 impl Default for HeadingConfig {
@@ -94,6 +103,7 @@ impl Default for HeadingConfig {
             persist_us: 1_000_000,
             tau_s: 3.0,
             vel_noise_mps: 0.3,
+            fine_rad: 0.2,
         }
     }
 }
@@ -107,6 +117,13 @@ pub enum Verdict {
     /// rad, any angle) with one-sigma `sigma`, and has for the persistence
     /// time. The estimator acts on it and restarts the fit.
     Correct { eps: f32, sigma: f32 },
+    /// The fine step: a first reading after a correction that is sharp
+    /// enough (`sigma` at most `EKF_HDG_FINE`, every gate open, `|eps|`
+    /// above `sigma`) says the heading is still `eps` off. The estimator
+    /// steps the heading by `-eps` through the correction's own five steps,
+    /// without counting it against the budget; the check restarts, and no
+    /// window of its own opens.
+    Refine { eps: f32, sigma: f32 },
 }
 
 /// One record per GPS fix judged while airborne: the quantities of the fit
@@ -134,7 +151,8 @@ pub struct HeadingFit {
     pub stat: f32,
     /// Consecutive fixes with every gate open and `stat >= K`.
     pub streak: u8,
-    /// 1 when the verdict at this fix is `Correct`, else 0.
+    /// 1 when the verdict at this fix is `Correct`, 2 when it is `Refine`
+    /// (the fine step), else 0.
     pub verdict: u8,
     /// The filter's GPS velocity test ratio at this fix (squared normalised
     /// innovation over the squared gate; above 1 means rejected), or -1
@@ -154,6 +172,9 @@ pub struct HeadingGuard {
     /// corrections of this flight, rad (the parameter `EKF_MAG_DECL` is
     /// never written).
     pub shift_rad: f32,
+    /// Fine steps of the heading made in this flight (second, smaller steps
+    /// after a correction, not counted in `corrections`).
+    pub fine_steps: u8,
     /// The tilt reference's roll, rad (zero when there is none: the switch
     /// `EKF_HDG_TILT` is 0 or the filter does not exist).
     pub tilt_roll_rad: f32,
@@ -182,6 +203,10 @@ pub struct HeadingCheck {
     streak_from: Micros,
     /// Fixes at which the verdict was `Correct`, since boot.
     verdicts: u32,
+    /// The fine step's window: until this time (a fix's `t_sample`) the first
+    /// sharp reading refines the heading. Opened by a correction, closed by
+    /// the fine step, by a disarm and by a new filter; `None` when closed.
+    fine_until: Option<Micros>,
     fit: HeadingFit,
 }
 
@@ -200,6 +225,7 @@ impl HeadingCheck {
             streak: 0,
             streak_from: Micros::ZERO,
             verdicts: 0,
+            fine_until: None,
             fit: HeadingFit {
                 seq: 0,
                 t_us: 0,
@@ -225,6 +251,24 @@ impl HeadingCheck {
     /// How many fixes since boot had the verdict `Correct`.
     pub const fn verdicts(&self) -> u32 {
         self.verdicts
+    }
+
+    /// Opens the fine step's window: for [`FINE_WINDOW_US`] after the
+    /// correcting fix at `t` the first sharp reading refines the heading,
+    /// once. Called by the estimator at a correction (not at a fine step).
+    pub fn open_fine_window(&mut self, t: Micros) {
+        self.fine_until = Some(t.add_us(FINE_WINDOW_US));
+    }
+
+    /// Closes the window (the flight ended, the filter was dropped; the check
+    /// itself closes it when it says `Refine`, once per correction).
+    pub fn close_fine_window(&mut self) {
+        self.fine_until = None;
+    }
+
+    /// Whether the fine step's window is open.
+    pub const fn fine_window_open(&self) -> bool {
+        self.fine_until.is_some()
     }
 
     /// Whether the check believes the vehicle is airborne.
@@ -397,7 +441,16 @@ impl HeadingCheck {
             self.streak = 0;
         }
         let verdict = if self.streak > 0 && t.since(self.streak_from) >= self.cfg.persist_us {
+            // The main rule goes on as before; if its own streak completes
+            // first, that is a correction.
             Verdict::Correct {
+                eps: self.fit.eps,
+                sigma: self.fit.sigma,
+            }
+        } else if good && self.fine_ready(t) {
+            // Once per correction: the window closes with the step.
+            self.fine_until = None;
+            Verdict::Refine {
                 eps: self.fit.eps,
                 sigma: self.fit.sigma,
             }
@@ -405,6 +458,17 @@ impl HeadingCheck {
             Verdict::None
         };
         self.record(t, used, stat, verdict)
+    }
+
+    /// The fine step's rule at this fix (`good`, the gates of the main rule
+    /// and a used interval, is checked by the caller): its window is open,
+    /// the reading's one-sigma is at most `EKF_HDG_FINE` and its angle is
+    /// larger than that sigma.
+    fn fine_ready(&self, t: Micros) -> bool {
+        self.cfg.fine_rad > 0.0
+            && self.fine_until.is_some_and(|until| t <= until)
+            && self.fit.sigma <= self.cfg.fine_rad
+            && self.fit.eps.abs() > self.fit.sigma
     }
 
     /// Fills the per-fix record (the fit quantities are already in it) and
@@ -422,8 +486,12 @@ impl HeadingCheck {
         self.fit.used = used;
         self.fit.stat = stat;
         self.fit.streak = self.streak;
-        self.fit.verdict = u8::from(matches!(verdict, Verdict::Correct { .. }));
-        if self.fit.verdict != 0 {
+        self.fit.verdict = match verdict {
+            Verdict::None => 0,
+            Verdict::Correct { .. } => 1,
+            Verdict::Refine { .. } => 2,
+        };
+        if self.fit.verdict == 1 {
             self.verdicts = self.verdicts.saturating_add(1);
         }
         self.fit.vel_ratio = -1.0;
@@ -1261,5 +1329,239 @@ mod tests {
             follow(1.0),
             follow(6.0)
         );
+    }
+
+    // ---- the fine step ----
+
+    /// A drive that has just made a correction: a 1 rad disagreement until
+    /// the verdict, then what the estimator does (the fit restarts, the
+    /// window opens at the correcting fix). From here the filter's heading
+    /// is `res` rad off (`fix_with(.., res, ..)`).
+    fn corrected(cfg: HeadingConfig) -> Drive {
+        let mut d = Drive::new();
+        d.chk = HeadingCheck::new(cfg);
+        d.chk.set_airborne(true);
+        d.noise = 0.05;
+        // Start late, so that a window can be set to end at a given fix.
+        d.t_us += 20_000_000;
+        for _ in 0..60 {
+            if matches!(d.fix(1.0), Verdict::Correct { .. }) {
+                break;
+            }
+        }
+        assert!(d.first_verdict_fix.is_some(), "the correction");
+        d.chk.restart();
+        d.chk.open_fine_window(Micros(d.t_us));
+        d
+    }
+
+    /// Fixes with the residual `res` until the check says `Refine` (at most
+    /// `max`); the fix's time and the record at it.
+    fn until_refine(d: &mut Drive, res: f32, max: u32) -> Option<(u64, HeadingFit)> {
+        for _ in 0..max {
+            let v = d.fix(res);
+            assert!(
+                !matches!(v, Verdict::Correct { .. }),
+                "a correction, not a fine step"
+            );
+            if matches!(v, Verdict::Refine { .. }) {
+                return Some((d.t_us, d.chk.fit()));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_fine_step_refines_a_residual_once_after_a_correction() {
+        let mut d = corrected(HeadingConfig::default());
+        let t_corr = d.t_us;
+        let (t, fit) = until_refine(&mut d, 0.25, 40).expect("a fine step");
+        let Verdict::Refine { eps, sigma } = d.last else {
+            panic!("{:?}", d.last)
+        };
+        assert!((eps - 0.25).abs() < sigma + 0.05, "eps {eps} sigma {sigma}");
+        assert!(sigma <= 0.2 && eps.abs() > sigma);
+        assert_eq!((fit.eps, fit.sigma), (eps, sigma));
+        assert_eq!(fit.verdict, 2, "the record says a fine step");
+        assert!(
+            t > t_corr + 2 * FIX_US,
+            "not at the first fixes: {}",
+            t - t_corr
+        );
+        assert_eq!(d.chk.verdicts(), 1, "only the correction is a verdict");
+        // Once per correction: the same residual for 60 more fixes says nothing.
+        assert!(!d.chk.fine_window_open());
+        assert!(until_refine(&mut d, 0.25, 60).is_none());
+    }
+
+    #[test]
+    fn the_fine_step_acts_only_inside_its_window() {
+        let cfg = HeadingConfig::default();
+        let mut probe = corrected(cfg);
+        let (t_first, _) = until_refine(&mut probe, 0.25, 40).expect("a fine step");
+        // The window ends exactly at the fix: it acts there.
+        let mut d = corrected(cfg);
+        d.chk.open_fine_window(Micros(t_first - FINE_WINDOW_US));
+        let (t, _) = until_refine(&mut d, 0.25, 40).expect("at the end of the window");
+        assert_eq!(t, t_first);
+        // A microsecond less: the first sharp reading is after it, and so is
+        // every later one (the window 10.2 s after the correction).
+        let mut d = corrected(cfg);
+        d.chk.open_fine_window(Micros(t_first - FINE_WINDOW_US - 1));
+        assert!(until_refine(&mut d, 0.25, 60).is_none());
+        // The window is 10 s.
+        assert_eq!(FINE_WINDOW_US, 10_000_000);
+        // Closed (never opened, or closed at a disarm): nothing, with a
+        // residual under the main rule's threshold.
+        let mut d = corrected(cfg);
+        d.chk.close_fine_window();
+        assert!(until_refine(&mut d, 0.25, 60).is_none());
+        let mut d = Drive::new();
+        d.noise = 0.05;
+        assert!(
+            until_refine(&mut d, 0.25, 60).is_none(),
+            "no correction, no window"
+        );
+    }
+
+    #[test]
+    fn the_fine_step_needs_a_sigma_at_most_its_limit() {
+        let cfg = HeadingConfig::default();
+        let mut probe = corrected(cfg);
+        let (t_first, fit) = until_refine(&mut probe, 0.25, 40).expect("a fine step");
+        let s = fit.sigma;
+        // A limit just above the sigma of that reading: the same fix. Just
+        // below: a later one (a sharper reading), not that one.
+        let mut d = corrected(HeadingConfig {
+            fine_rad: s + 1.0e-4,
+            ..cfg
+        });
+        assert_eq!(until_refine(&mut d, 0.25, 40).map(|r| r.0), Some(t_first));
+        let mut d = corrected(HeadingConfig {
+            fine_rad: s - 1.0e-4,
+            ..cfg
+        });
+        let later = until_refine(&mut d, 0.25, 40).map(|r| r.0);
+        assert!(
+            later.is_none_or(|t| t > t_first),
+            "{later:?} against {t_first}"
+        );
+        // A limit below any sigma this drive reaches: never.
+        let mut d = corrected(HeadingConfig {
+            fine_rad: 0.01,
+            ..cfg
+        });
+        assert!(until_refine(&mut d, 0.25, 60).is_none());
+    }
+
+    #[test]
+    fn the_fine_step_is_off_at_zero() {
+        let mut d = corrected(HeadingConfig {
+            fine_rad: 0.0,
+            ..HeadingConfig::default()
+        });
+        assert!(until_refine(&mut d, 0.25, 80).is_none());
+        assert_eq!(d.chk.fit().verdict, 0);
+    }
+
+    #[test]
+    fn the_fine_step_needs_the_angle_to_exceed_its_sigma() {
+        // A residual smaller than the reading's own sigma (about 0.1 here)
+        // is noise: nothing, however long it lasts.
+        let mut d = corrected(HeadingConfig::default());
+        assert!(until_refine(&mut d, 0.02, 80).is_none());
+        let f = d.chk.fit();
+        assert!(f.sigma <= 0.2 && f.eps.abs() <= f.sigma, "{f:?}");
+        let mut d = corrected(HeadingConfig::default());
+        assert!(until_refine(&mut d, -0.02, 80).is_none());
+        // And a residual larger than it, of either sign, is stepped.
+        for res in [0.2_f32, -0.2, 0.45, -0.45] {
+            let mut d = corrected(HeadingConfig::default());
+            let (_, fit) = until_refine(&mut d, res, 40).unwrap_or_else(|| panic!("{res}"));
+            assert!((fit.eps - res).abs() < fit.sigma + 0.05, "{res}: {fit:?}");
+        }
+    }
+
+    #[test]
+    fn whenever_the_fine_step_acts_every_gate_of_the_main_rule_is_open() {
+        // Over a grid of amplitudes, size mismatches, noise and receiver
+        // accuracy, with the sigma limit wide open (0.5): each fine step the
+        // check says has the interval used, `Sa`, `kappa` and `rho` inside
+        // their gates, and a sigma under the limit.
+        let cfg = HeadingConfig {
+            fine_rad: 0.5,
+            ..HeadingConfig::default()
+        };
+        let mut steps = 0;
+        let mut amps = vec![0.04_f32, 0.1, 0.3, 1.0, 3.0];
+        let mut a = 0.04_f32;
+        while a < 0.4 {
+            amps.push(a);
+            a *= 1.06;
+        }
+        for amp in amps {
+            for scale in [0.3_f32, 0.55, 0.8, 1.0, 1.5, 3.0] {
+                for (noise, s_acc) in [(0.0_f32, 0.2_f32), (0.05, 0.2), (1.5, 0.2), (0.05, 0.6)] {
+                    for res in [0.15_f32, 0.5, 1.0] {
+                        let mut d = corrected(cfg);
+                        d.amp = amp;
+                        d.noise = noise;
+                        d.s_acc = s_acc;
+                        for _ in 0..30 {
+                            let v = d.fix_with(FIX_US, res, scale, [0.0; 2]);
+                            let f = d.chk.fit();
+                            if matches!(v, Verdict::Refine { .. }) {
+                                steps += 1;
+                                assert!(f.used, "amp {amp} scale {scale}: {f:?}");
+                                assert!(f.sa >= SA_MIN, "amp {amp} scale {scale}: {f:?}");
+                                assert!((KAPPA_MIN..=KAPPA_MAX).contains(&f.kappa), "{f:?}");
+                                assert!(f.rho <= RES_MAX, "amp {amp} scale {scale}: {f:?}");
+                                assert!(f.sigma <= 0.5 && f.eps.abs() > f.sigma, "{f:?}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(steps > 100, "the grid has fine steps in it: {steps}");
+    }
+
+    #[test]
+    fn the_main_rule_goes_on_as_before_and_wins_at_a_fix_where_both_speak() {
+        // A new 1 rad disagreement after a correction with the sigma limit
+        // too tight to refine: the streak completes, a correction.
+        let mut d = corrected(HeadingConfig {
+            fine_rad: 0.05,
+            ..HeadingConfig::default()
+        });
+        for _ in 0..40 {
+            d.fix(1.0);
+        }
+        assert!(d.chk.verdicts() > 1, "the correction, then another verdict");
+        assert_eq!(d.chk.fit().verdict, 1);
+        // The fix at which the streak completes is also a sharp one with the
+        // window open: the verdict is the correction.
+        let mut a = Drive::new();
+        a.noise = 0.05;
+        a.chk.restart();
+        let mut at = None;
+        for k in 1..60 {
+            if matches!(a.fix(1.0), Verdict::Correct { .. }) {
+                at = Some(k);
+                break;
+            }
+        }
+        let at = at.expect("a correction");
+        let mut b = Drive::new();
+        b.noise = 0.05;
+        b.chk.restart();
+        for _ in 1..at {
+            b.fix(1.0);
+        }
+        b.chk.open_fine_window(Micros(b.t_us));
+        let v = b.fix(1.0);
+        assert!(matches!(v, Verdict::Correct { .. }), "{v:?}");
+        assert_eq!(b.chk.fit().verdict, 1);
     }
 }

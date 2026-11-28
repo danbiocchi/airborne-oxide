@@ -292,6 +292,14 @@ pub fn event_text(kind: &EventKind, b: &mut TextBuf) {
             b.push_num(u64::from(*count));
             b.push(")");
         }
+        EventKind::HeadingRefined { angle_mrad } => {
+            b.push("Heading refined by ");
+            if *angle_mrad < 0 {
+                b.push("-");
+            }
+            b.push_num(u64::from(angle_mrad.unsigned_abs()));
+            b.push(" mrad");
+        }
         EventKind::HeadingContained => {
             b.push("Heading untrustworthy: contained until disarm");
         }
@@ -334,6 +342,7 @@ pub fn event_level(kind: &EventKind) -> u8 {
         | EventKind::ParamChanged(_)
         | EventKind::ParamLoadRecovered(_)
         | EventKind::HeadingCorrected { .. }
+        | EventKind::HeadingRefined { .. }
         | EventKind::GpsSnapRepeated
         | EventKind::ParamFaultAcked => level::INFO,
     }

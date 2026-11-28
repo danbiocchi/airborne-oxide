@@ -288,6 +288,9 @@ fn describe(kind: EventKind) -> String {
         EventKind::HeadingCorrected { angle_mrad, count } => {
             format!("Heading corrected by {angle_mrad} mrad (correction {count})")
         }
+        EventKind::HeadingRefined { angle_mrad } => {
+            format!("Heading refined by {angle_mrad} mrad")
+        }
         EventKind::HeadingContained => "Heading untrustworthy: contained until disarm".to_string(),
         EventKind::GpsSnapRepeated => "GPS rejected again soon after a reset to it".to_string(),
     }

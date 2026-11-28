@@ -425,6 +425,13 @@ pub enum EventKind {
         angle_mrad: i16,
         count: u8,
     },
+    /// The fine step: after a correction the restarted heading check read the
+    /// heading still wrong by more than its own sharp one-sigma, and the
+    /// estimator stepped it again (not counted against the budget).
+    /// `angle_mrad` is the yaw change applied (rad x 1000, rounded).
+    HeadingRefined {
+        angle_mrad: i16,
+    },
     /// The heading check found the heading wrong again with the correction
     /// budget used up (`EKF_HDG_NMAX`, or zero): the estimator declared the
     /// heading untrustworthy until disarm, so velocity and position are not

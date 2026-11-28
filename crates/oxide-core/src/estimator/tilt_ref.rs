@@ -424,6 +424,43 @@ mod tests {
         (3000, [-0.291846764, -0.575206267, 0.76417486], [0.00947865183, -0.0052723243, -0.00340631402], [12.4413572, 19.9401122]),
     ];
 
+    /// The cost of the reference per filter step (the step and the
+    /// horizontal change, as the estimator calls them) and its state in bytes
+    /// (a measurement, not a pass condition): `cargo test --release -p
+    /// oxide-core --lib tilt_ref::tests::cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing measurement: run it by hand, in release"]
+    fn cost_of_the_reference_per_filter_step() {
+        use std::time::Instant;
+        let mut r = TiltRef::new(0.1, -0.05, Vec3::new(0.005, -0.004, 0.0));
+        let seq: Vec<(Vec3<f32>, Vec3<f32>, f32)> = (0..3000).map(made_up).collect();
+        let reps = 20_000_u32;
+        let t0 = Instant::now();
+        let mut x = 0.0_f32;
+        for k in 0..reps * 3000 {
+            let (gyro, accel, yaw) = seq[(k % 3000) as usize];
+            let d = delta(gyro, accel);
+            r.step(&d);
+            let [n, e] = r.horizontal(d.dvel, [Real::cos(yaw), Real::sin(yaw)]);
+            x += n + e;
+        }
+        let per_step = t0.elapsed().as_secs_f64() / f64::from(reps * 3000) * 1e9;
+        // The test's own cos and sin of the yaw are in that figure; the
+        // estimator takes them from the filter's quaternion with a square
+        // root and two divisions.
+        let t0 = Instant::now();
+        let mut y = 0.0_f32;
+        for k in 0..reps * 3000 {
+            let (_, _, yaw) = seq[(k % 3000) as usize];
+            y += Real::cos(yaw) + Real::sin(yaw);
+        }
+        let own = t0.elapsed().as_secs_f64() / f64::from(reps * 3000) * 1e9;
+        println!(
+            "tilt reference: {per_step:.1} ns per filter step with the yaw's cos and sin ({own:.1} ns of it the test's own), state {} bytes, checksum {x} {y}",
+            core::mem::size_of::<TiltRef>()
+        );
+    }
+
     #[test]
     fn the_port_gives_what_the_measured_code_gives_on_3000_steps() {
         let mut r = TiltRef::new(0.10, -0.05, Vec3::new(0.005, -0.004, 0.0));

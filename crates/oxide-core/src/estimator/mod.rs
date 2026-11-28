@@ -172,8 +172,14 @@ pub struct Estimator {
     tilt: Option<TiltRef>,
     /// The supervisor's `armed` (a fall clears the per-flight state).
     armed: bool,
+    /// Fine steps made in this flight (cleared at disarm): second, smaller
+    /// steps of the heading after a correction, not counted against the
+    /// budget.
+    hdg_fine_steps: u8,
     /// The last correction not yet reported (rad), for the core's event.
     pending_corrected: Option<f32>,
+    /// The last fine step not yet reported (rad), for the core's event.
+    pending_refined: Option<f32>,
     /// The containment latch was set and not yet reported.
     pending_contained: bool,
     /// `t_sample` of the fix at which the filter last snapped to GPS after
@@ -232,7 +238,9 @@ impl Estimator {
             decl_shift: 0.0,
             tilt: None,
             armed: false,
+            hdg_fine_steps: 0,
             pending_corrected: None,
+            pending_refined: None,
             pending_contained: false,
             snap_at: None,
             pending_snap_repeat: false,
@@ -262,7 +270,10 @@ impl Estimator {
         self.hdg_corrections = 0;
         self.hdg_latched = false;
         self.decl_shift = 0.0;
+        self.hdg_fine_steps = 0;
+        self.hdg.close_fine_window();
         self.pending_corrected = None;
+        self.pending_refined = None;
         self.pending_contained = false;
         self.snap_at = None;
         self.pending_snap_repeat = false;
@@ -292,6 +303,17 @@ impl Estimator {
     /// any: the core reports it as an event.
     pub fn take_heading_corrected(&mut self) -> Option<f32> {
         self.pending_corrected.take()
+    }
+
+    /// Fine steps of the heading made in this flight.
+    pub fn heading_fine_steps(&self) -> u8 {
+        self.hdg_fine_steps
+    }
+
+    /// The last fine step (rad) made since the previous call, if any: the
+    /// core reports it as an event.
+    pub fn take_heading_refined(&mut self) -> Option<f32> {
+        self.pending_refined.take()
     }
 
     /// True once after a rejection followed, within 3 s, a snap to GPS that
@@ -493,6 +515,7 @@ impl Estimator {
             corrections: self.hdg_corrections,
             contained: self.hdg_latched,
             shift_rad: self.decl_shift,
+            fine_steps: self.hdg_fine_steps,
             tilt_roll_rad: self.tilt.map_or(0.0, |t| t.roll()),
             tilt_pitch_rad: self.tilt.map_or(0.0, |t| t.pitch()),
         }
@@ -534,6 +557,7 @@ impl Estimator {
         self.mag_accept = None;
         self.last_imu_arrival = None;
         self.hdg.restart();
+        self.hdg.close_fine_window();
         self.resets = self.resets.saturating_add(1);
     }
 
@@ -817,9 +841,14 @@ impl Estimator {
         if self.hdg_latched {
             return;
         }
+        if let Verdict::Refine { eps, sigma } = verdict {
+            // The fine step: the correction's own five steps, not counted.
+            self.correct_heading(ekf, s, eps, sigma, sigma_p, sigma_v, true);
+            return;
+        }
         if let Verdict::Correct { eps, sigma } = verdict {
             if self.hdg_corrections < self.hdg_max {
-                self.correct_heading(ekf, s, eps, sigma, sigma_p, sigma_v);
+                self.correct_heading(ekf, s, eps, sigma, sigma_p, sigma_v, false);
             } else {
                 // The budget is used up (or is zero): the next
                 // disagreement is containment, through the existing
@@ -908,8 +937,9 @@ impl Estimator {
     }
 
     /// The heading check says the filter's heading is wrong by `eps` (filter
-    /// minus truth, one-sigma `sigma`) and the budget allows a correction
-    /// (D2 2.3), at the delayed horizon, in this order:
+    /// minus truth, one-sigma `sigma`): a correction, while the budget allows
+    /// it (D2 2.3), or the fine step (`fine`), the smaller second step after a
+    /// correction. One code path, at the delayed horizon, in this order:
     ///
     /// 1. the yaw is reset by the fitted angle with sigma `max(sigma, 0.1)`
     ///    and the output predictor is turned by the same angle, as the
@@ -918,11 +948,14 @@ impl Estimator {
     ///    also counts the reset that guidance re-bases its held point and yaw
     ///    set-point on) so that GPS fusion resumes at once;
     /// 3. the tilt variances go back to their initial value;
-    /// 4. the declination of the heading model is shifted by the correction
-    ///    (and the shift kept here), so that the magnetometer goes on holding
-    ///    the corrected heading;
-    /// 5. the fit restarts, the corrections are counted and the event is
-    ///    queued.
+    /// 4. the declination of the heading model is shifted by the step (and
+    ///    the shift kept here), so that the magnetometer goes on holding the
+    ///    corrected heading;
+    /// 5. the fit restarts and the step is counted and queued as an event: a
+    ///    correction counts against `EKF_HDG_NMAX` and opens the fine step's
+    ///    window; a fine step counts apart (the check closed the window when
+    ///    it said so: one per correction, and no window of its own).
+    #[allow(clippy::too_many_arguments)] // the fix and its noise, as the fusion passes them
     fn correct_heading(
         &mut self,
         ekf: &mut Ekf<f32>,
@@ -931,6 +964,7 @@ impl Estimator {
         sigma: f32,
         sigma_p: f32,
         sigma_v: f32,
+        fine: bool,
     ) {
         let yaw = ekf.x.q.yaw();
         let dpsi = ekf.reset_yaw(yaw - eps, sigma.max(HDG_RESET_SIGMA_MIN_RAD));
@@ -940,8 +974,14 @@ impl Estimator {
         ekf.shift_declination(dpsi);
         self.decl_shift = wrap_pi(self.decl_shift + dpsi);
         self.hdg.restart();
-        self.hdg_corrections = self.hdg_corrections.saturating_add(1);
-        self.pending_corrected = Some(dpsi);
+        if fine {
+            self.hdg_fine_steps = self.hdg_fine_steps.saturating_add(1);
+            self.pending_refined = Some(dpsi);
+        } else {
+            self.hdg.open_fine_window(s.t_sample);
+            self.hdg_corrections = self.hdg_corrections.saturating_add(1);
+            self.pending_corrected = Some(dpsi);
+        }
     }
 
     /// Snaps position (N/E) and velocity to a GPS fix.
@@ -975,6 +1015,7 @@ fn heading_config(p: &EkfParams) -> HeadingConfig {
         persist_us: u64::from(p.hdg_persist_us),
         tau_s: p.hdg_tau_s,
         vel_noise_mps: p.gps_vel_noise_mps,
+        fine_rad: p.hdg_fine_rad,
     }
 }
 
@@ -1005,6 +1046,7 @@ mod tests {
     const MAG: Vec3<f32> = Vec3::new(25.0, 0.0, 43.3);
 
     /// Drives an estimator with synthetic stationary sensors at 1 kHz.
+    #[derive(Clone)]
     struct Rig {
         est: Estimator,
         k: u64,
@@ -2023,7 +2065,7 @@ mod tests {
                 },
             );
             rig.est
-                .correct_heading(&mut ekf, &fix, 1.0, sigma, 0.6, 0.3);
+                .correct_heading(&mut ekf, &fix, 1.0, sigma, 0.6, 0.3, false);
             ekf.p.get(ekf::ITH + 2, ekf::ITH + 2)
         };
         // A fit sigma below 0.1 rad: the reset's sigma is 0.1.
@@ -2133,7 +2175,17 @@ mod tests {
                 0.0
             }
         };
-        let mut rig = wrong_rig(1.0, 3.0);
+        // (The fine step is off here: this is the budget of corrections on
+        // its own; the fine step's own test follows the budget through a
+        // fine step.)
+        let mut rig = wrong_rig_with(
+            &EkfParams {
+                mag_declination_rad: 1.0,
+                hdg_fine_rad: 0.0,
+                ..EkfParams::default()
+            },
+            3.0,
+        );
         let mut seen = Vec::new();
         let mut contained_at = None;
         while rig.now().as_secs_f64() < 40.0 {
@@ -2577,7 +2629,7 @@ mod tests {
         assert_eq!(rig.est.tilt, Some(before), "a GPS reset");
         // A heading correction (yaw reset, snap, tilt variances, shift).
         with_filter(&mut rig, |e, ekf| {
-            e.correct_heading(ekf, &fix, 1.2, 0.2, 0.6, 0.3)
+            e.correct_heading(ekf, &fix, 1.2, 0.2, 0.6, 0.3, false)
         });
         assert_eq!(rig.est.tilt, Some(before), "a heading correction");
         assert_eq!(rig.est.heading_corrections(), 1);
@@ -2672,5 +2724,195 @@ mod tests {
         assert!(f.seq > 30 && f.used, "{f:?}");
         assert!(f.eps.abs() < 0.2, "eps {}", f.eps);
         assert_eq!(rig.est.heading_verdicts(), 0);
+    }
+
+    // ---- the fine step in the estimator ----
+
+    /// Flies the path in 1 ms pieces until the first fine step (or `limit`
+    /// s); the rig and the step's angle. A correction on the way is taken
+    /// and counted in the returned count.
+    fn until_first_fine_step(mut rig: Rig, limit: f64) -> (Rig, f32, u32) {
+        let mut corrections = 0;
+        while rig.now().as_secs_f64() < limit {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            if rig.est.take_heading_corrected().is_some() {
+                corrections += 1;
+            }
+            if let Some(d) = rig.est.take_heading_refined() {
+                return (rig, d, corrections);
+            }
+        }
+        panic!("no fine step by {limit} s");
+    }
+
+    #[test]
+    fn a_fine_step_follows_a_correction_through_the_same_five_steps() {
+        let mut rig = wrong_rig(1.0, 3.0);
+        let mut resets = rig.est.status().resets;
+        let mut before_yaw = 0.0;
+        let mut stepped = None;
+        let mut corrected_at = None;
+        while rig.now().as_secs_f64() < 16.0 && stepped.is_none() {
+            resets = rig.est.status().resets;
+            before_yaw = rig.est.state().map_or(0.0, |s| s.attitude.yaw());
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            assert!(rig.est.validity().heading, "heading valid through it");
+            if rig.est.take_heading_corrected().is_some() {
+                corrected_at = Some(rig.now().as_secs_f64());
+            }
+            stepped = rig.est.take_heading_refined();
+        }
+        let dpsi = stepped.expect("a fine step");
+        let t_corr = corrected_at.expect("after a correction");
+        // Within 10 s of the correction, once, and not a correction.
+        assert!(rig.now().as_secs_f64() - t_corr < 10.2);
+        assert_eq!(rig.est.heading_corrections(), 1);
+        assert_eq!(rig.est.heading_fine_steps(), 1);
+        assert_eq!(rig.est.heading_guard().fine_steps, 1);
+        // Step 1: the published attitude turned in the same step.
+        let turned = wrap_pi(rig.est.state().unwrap().attitude.yaw() - before_yaw);
+        assert!((turned - dpsi).abs() < 0.02, "turned {turned}, dpsi {dpsi}");
+        assert!(
+            dpsi.abs() > 0.02 && dpsi.abs() < 0.45,
+            "a small step {dpsi}"
+        );
+        // Step 2: counted as one reset, the snap to the fix (guidance
+        // re-bases on the count).
+        assert_eq!(rig.est.status().resets, resets + 1);
+        // Step 4: the declination shift took it (the correction's and this).
+        let shift = rig.est.declination_shift();
+        assert!(shift.abs() > 0.3, "the shift {shift}");
+        // Step 5: the fit restarted: the next fix is the first of a new fit.
+        let seq = rig.est.heading_fit().seq;
+        while rig.est.heading_fit().seq == seq {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+        }
+        let f = rig.est.heading_fit();
+        assert!(!f.used && f.sa == 0.0 && f.streak == 0, "{f:?}");
+        // And no second one for this correction, however long it flies.
+        let until = rig.now().as_secs_f64() + 12.0;
+        while rig.now().as_secs_f64() < until {
+            let next = rig.now().as_secs_f64() + 0.05;
+            fly_path(&mut rig, 3.0, next);
+            assert!(
+                rig.est.take_heading_refined().is_none(),
+                "once per correction"
+            );
+        }
+        assert_eq!(rig.est.heading_fine_steps(), 1);
+        assert_eq!(rig.est.heading_corrections(), 1);
+        assert!(!rig.est.heading_contained());
+    }
+
+    #[test]
+    fn the_fine_step_is_off_when_its_limit_is_zero() {
+        let mut rig = wrong_rig_with(
+            &EkfParams {
+                mag_declination_rad: 1.0,
+                hdg_fine_rad: 0.0,
+                ..EkfParams::default()
+            },
+            3.0,
+        );
+        fly_path(&mut rig, 3.0, 30.0);
+        assert_eq!(rig.est.heading_corrections(), 1);
+        assert_eq!(rig.est.heading_fine_steps(), 0);
+        assert!(rig.est.take_heading_refined().is_none());
+    }
+
+    #[test]
+    fn nothing_is_stepped_once_the_containment_latch_is_set() {
+        // The same flight twice; in the second the latch is set right after
+        // the correction (the fine step's reading would come seconds later).
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, _, _) = until_first_correction(rig, 14.0);
+        let mut twin = rig.clone();
+        fly_path(&mut rig, 3.0, 20.0);
+        assert_eq!(rig.est.heading_fine_steps(), 1, "the free flight refines");
+        twin.est.hdg_latched = true;
+        fly_path(&mut twin, 3.0, 20.0);
+        assert_eq!(twin.est.heading_fine_steps(), 0, "latched: no fine step");
+        assert!(twin.est.take_heading_refined().is_none());
+        assert_eq!(twin.est.heading_corrections(), 1);
+    }
+
+    #[test]
+    fn a_fine_step_is_not_counted_against_the_budget() {
+        // The declination fault (1 rad) is corrected, its residual refined,
+        // a true heading step of 0.9 rad at 7 s is corrected (a second
+        // correction), its residual refined: two corrections and two fine
+        // steps and no containment with a budget of two. Then the filter's
+        // heading is knocked 1.5 rad off with the magnetometer gone: the
+        // third verdict is containment.
+        let psi = |t: f32| if t >= 7.0 { 0.9 } else { 0.0 };
+        let mut rig = wrong_rig(1.0, 3.0);
+        let mut seen: Vec<(char, f64)> = Vec::new();
+        while rig.now().as_secs_f64() < 20.0 {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path_heading(&mut rig, 3.0, next, psi);
+            let now = rig.now().as_secs_f64();
+            if rig.est.take_heading_corrected().is_some() {
+                seen.push(('C', now));
+            }
+            if rig.est.take_heading_refined().is_some() {
+                seen.push(('F', now));
+            }
+            assert!(!rig.est.heading_contained(), "contained at {now}: {seen:?}");
+            assert!(rig.est.validity().heading);
+        }
+        let kinds: String = seen.iter().map(|s| s.0).collect();
+        assert!(
+            kinds.starts_with("CFC"),
+            "a correction, a fine step, a second correction: {seen:?}"
+        );
+        // Two corrections made, the fine steps counted apart.
+        assert_eq!(rig.est.heading_corrections(), 2, "{seen:?}");
+        assert!(rig.est.heading_fine_steps() >= 2, "{seen:?}");
+        // A third verdict is containment.
+        rig.mag_on = false;
+        let ekf = rig.est.ekf.as_mut().unwrap();
+        let yaw = ekf.x.q.yaw();
+        ekf.reset_yaw(yaw + 1.5, 0.1);
+        rig.est.hdg.restart();
+        let mut contained = false;
+        while rig.now().as_secs_f64() < 32.0 {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path_heading(&mut rig, 3.0, next, psi);
+            assert!(
+                rig.est.take_heading_corrected().is_none(),
+                "no third correction"
+            );
+            contained |= rig.est.take_heading_contained();
+        }
+        assert!(contained && rig.est.heading_contained());
+        assert_eq!(rig.est.heading_corrections(), 2);
+        assert!(!rig.est.validity().heading);
+    }
+
+    #[test]
+    fn the_fine_steps_state_is_cleared_at_disarm_and_with_a_new_filter() {
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, _, _) = until_first_correction(rig, 14.0);
+        // A correction opens the window.
+        assert!(rig.est.hdg.fine_window_open());
+        let mut other = rig.clone();
+        // A disarm with the window open closes it.
+        rig.est.set_armed(false);
+        assert!(!rig.est.hdg.fine_window_open());
+        assert_eq!(rig.est.heading_fine_steps(), 0);
+        // A new filter closes it too.
+        other.est.drop_to_unaligned();
+        assert!(!other.est.hdg.fine_window_open());
+        // After a fine step the count is cleared at disarm.
+        let rig = wrong_rig(1.0, 3.0);
+        let (mut rig, _, _) = until_first_fine_step(rig, 16.0);
+        assert_eq!(rig.est.heading_fine_steps(), 1);
+        rig.est.set_armed(false);
+        assert_eq!(rig.est.heading_fine_steps(), 0);
+        assert_eq!(rig.est.heading_guard().fine_steps, 0);
+        assert!(rig.est.take_heading_refined().is_none());
     }
 }
