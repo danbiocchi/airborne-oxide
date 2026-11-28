@@ -1481,6 +1481,52 @@ mod fault_tests {
     }
 
     #[test]
+    fn the_rotation_is_about_world_down_for_a_tilted_vehicle_too() {
+        // The vehicle is tilted, so a turn about the BODY z axis is not a
+        // turn about world Down: the magnetometer must read the body-frame
+        // image of the world field turned about Down, never the body-frame
+        // field turned about the body z axis.
+        let cfg = SensorConfig::ideal();
+        let deg = core::f64::consts::PI / 180.0;
+        let down = Vec3::new(0.0, 0.0, 1.0);
+        for (roll, pitch, yaw) in [(30.0, 0.0, 0.0), (30.0, -20.0, 70.0), (-25.0, 15.0, -140.0)] {
+            let attitude = Quat::from_euler(roll * deg, pitch * deg, yaw * deg);
+            let body = BodyState::<4> {
+                attitude,
+                ..level_body()
+            };
+            for angle in [0.6, -1.3] {
+                let mut s = SensorSuite::<4>::new(cfg, 7, BASE)
+                    .unwrap()
+                    .with_faults(&[rotate(angle, 0.0, 0.0, None)]);
+                let f = s
+                    .sample(Micros(0), &truth(&body))
+                    .mag
+                    .unwrap()
+                    .value
+                    .field_ut;
+                let world = Quat::from_axis_angle(down, angle).rotate(cfg.mag.field_ned_ut);
+                let want = attitude.inverse_rotate(world);
+                let wrong = Quat::from_axis_angle(down, angle)
+                    .rotate(attitude.inverse_rotate(cfg.mag.field_ned_ut));
+                // The two differ clearly for this attitude (else the test
+                // could not tell them apart) and the sensor gives the first.
+                let apart = (want.x - wrong.x).abs() + (want.y - wrong.y).abs();
+                assert!(apart > 1.0, "{roll} {pitch} {yaw}: {apart}");
+                let err = |w: Vec3<f64>| {
+                    (f64::from(f.x) - w.x).abs()
+                        + (f64::from(f.y) - w.y).abs()
+                        + (f64::from(f.z) - w.z).abs()
+                };
+                assert!(
+                    err(want) < 1e-4,
+                    "{roll} {pitch} {yaw} {angle}: {f:?} {want:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_window_is_start_inclusive_and_end_exclusive_at_the_tick() {
         let cfg = SensorConfig::ideal();
         let got = mag(cfg, &[rotate(0.8, 0.0, 1.0, Some(2.0))], 3);
