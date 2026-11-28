@@ -70,7 +70,7 @@ fn prove(f: &ScenarioFile, profile: Profile) -> Proved {
 fn every_scenario_file_replays_identically_on_both_profiles() {
     let started = Instant::now();
     let files = files();
-    assert_eq!(files.len(), 43);
+    assert_eq!(files.len(), 44);
     let jobs: Vec<(usize, Profile)> = (0..files.len())
         .flat_map(|i| [(i, F405_LEAN), (i, H743_FULL)])
         .collect();
