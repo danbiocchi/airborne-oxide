@@ -757,6 +757,56 @@ mod tests {
     }
 
     #[test]
+    fn sigma_is_the_larger_of_the_claimed_noise_and_the_fits_own_residual() {
+        // Each interval scatters by 0.6 m/s perpendicular to the
+        // acceleration: rho (0.6) is above the claimed sqrt(2) 0.3 (0.42)
+        // and below the residual gate (0.85). The sigma follows rho.
+        let mut chk = HeadingCheck::new(HeadingConfig::default());
+        chk.set_airborne(true);
+        let mut t = 1_000_000u64;
+        let mut prev = [0.0f32; 2];
+        for k in 0..60u32 {
+            t += FIX_US;
+            let p = path(k);
+            let cur = [2.0 * p[0], 2.0 * p[1]];
+            let g = [cur[0] - prev[0], cur[1] - prev[1]];
+            prev = cur;
+            let gn = Real::sqrt(g[0] * g[0] + g[1] * g[1]).max(1e-6);
+            let side = if k % 2 == 0 { 0.6 } else { -0.6 };
+            chk.on_step(rot([g[0] - side * g[1] / gn, g[1] + side * g[0] / gn], 1.5));
+            let _ = chk.on_fix(Micros(t), Some((cur, 0.2)));
+        }
+        let f = chk.fit();
+        assert!(f.rho > 0.5 && f.rho < RES_MAX, "rho {}", f.rho);
+        // sigma = max(0.424, rho) sqrt(Sa) / E with E = kappa Sa.
+        let want = f.rho.max(SQRT_2 * 0.3) / (f.kappa * Real::sqrt(f.sa));
+        assert!(
+            (f.sigma - want).abs() < 1e-4 * want,
+            "sigma {} want {}",
+            f.sigma,
+            want
+        );
+        // And with the noise floor above rho it is the claimed noise.
+        let cfg = HeadingConfig {
+            vel_noise_mps: 1.0,
+            ..HeadingConfig::default()
+        };
+        let mut d = Drive::new();
+        d.chk = HeadingCheck::new(cfg);
+        d.chk.set_airborne(true);
+        d.s_acc = 0.2;
+        d.run(40, 1.5);
+        let f = d.chk.fit();
+        let want = SQRT_2 * 1.0 / (f.kappa * Real::sqrt(f.sa));
+        assert!(
+            (f.sigma - want).abs() < 1e-4 * want,
+            "sigma {} want {}",
+            f.sigma,
+            want
+        );
+    }
+
+    #[test]
     fn the_receivers_own_speed_accuracy_gates_the_interval() {
         let mut d = Drive::new();
         d.s_acc = 0.8;
