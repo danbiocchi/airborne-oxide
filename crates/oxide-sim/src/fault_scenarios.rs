@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use crate::scenario_file::{self, ScenarioFile};
 
 /// Every scenario file in `scenarios/` as `(name, text)`, sorted by name.
-pub const EMBEDDED: [(&str, &str); 43] = [
+pub const EMBEDDED: [(&str, &str); 44] = [
     (
         "baro-loss",
         include_str!("../../../scenarios/baro-loss.toml"),
@@ -176,6 +176,10 @@ pub const EMBEDDED: [(&str, &str); 43] = [
         "setpoint-gap",
         include_str!("../../../scenarios/setpoint-gap.toml"),
     ),
+    (
+        "yaw-step-large",
+        include_str!("../../../scenarios/yaw-step-large.toml"),
+    ),
 ];
 
 /// Every embedded scenario, loaded once.
@@ -200,12 +204,16 @@ fn is_pair(s: &ScenarioFile) -> bool {
     s.name.starts_with("pair-")
 }
 
+/// Embedded files that state `[expect]` and are neither pairings nor
+/// injected failures: flights that must stay failsafe-free.
+const NOT_A_FAULT: [&str; 1] = ["yaw-step-large"];
+
 /// The 20 named fault scenarios: embedded files that state `[expect]` and
-/// are not pairings.
+/// are not pairings (nor in [`NOT_A_FAULT`]).
 pub fn all() -> Vec<ScenarioFile> {
     embedded()
         .iter()
-        .filter(|s| s.expect.is_some() && !is_pair(s))
+        .filter(|s| s.expect.is_some() && !is_pair(s) && !NOT_A_FAULT.contains(&s.name.as_str()))
         .cloned()
         .collect()
 }
@@ -216,7 +224,7 @@ pub fn pairs() -> Vec<ScenarioFile> {
 }
 
 /// The embedded scenario called `name` (fault scenarios, pairings,
-/// `hover-step`, `gust-hold`).
+/// `hover-step`, `gust-hold`, `yaw-step-large`).
 pub fn by_name(name: &str) -> Option<ScenarioFile> {
     embedded().iter().find(|s| s.name == name).cloned()
 }
@@ -279,7 +287,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate scenario name");
-        assert_eq!(embedded().len(), 20 + 21 + 2);
+        assert_eq!(embedded().len(), 20 + 21 + 2 + 1);
     }
 
     #[test]

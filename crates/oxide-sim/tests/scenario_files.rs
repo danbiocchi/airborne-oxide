@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The scenario files in `scenarios/` are the only definition of the 43
+//! The scenario files in `scenarios/` are the only definition of the 44
 //! scenarios (ADR-0004 §7). Task S1 proved that each file flies the same
 //! flight as the Rust definition it was exported from; the definitions are
 //! gone, so the trace hashes of those flights are pinned in
@@ -68,7 +68,7 @@ fn pinned() -> Vec<(String, String, u64, u64)> {
 /// Flies `pinned` entries selected by `keep` and compares.
 fn check(keep: impl Fn(&str, u64) -> bool + Sync) {
     let files = files();
-    assert_eq!(files.len(), 43);
+    assert_eq!(files.len(), 44);
     let jobs: Vec<_> = pinned()
         .into_iter()
         .filter(|(_, p, i, _)| keep(p, *i))

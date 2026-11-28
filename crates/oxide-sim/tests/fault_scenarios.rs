@@ -112,7 +112,7 @@ fn fault_pairs_quick() {
 #[ignore = "every file's [run] seeds x profiles; run with --release"]
 fn fault_scenarios_full() {
     let scenarios = files();
-    assert_eq!(scenarios.len(), 41);
+    assert_eq!(scenarios.len(), 42);
     let mut failed = 0_usize;
     let mut failed_scenarios = Vec::new();
     for s in &scenarios {
