@@ -64,6 +64,14 @@ pub enum FaultKind {
         sigma_mps: f64,
         s_acc_mps: Option<f64>,
     },
+    /// The measurement time the receiver stamps on a fix (the `t_sample` the
+    /// core is handed) is the true one plus `offset_s` for every fix
+    /// measured in the window: positive = the stamp is later than the truth,
+    /// negative = earlier. Nothing else of the fix changes and it arrives
+    /// when it would have. Offsets that overlap add.
+    GpsTimeOffset {
+        offset_s: f64,
+    },
 }
 
 /// A fault active from `start_s` until `end_s`.
@@ -84,6 +92,9 @@ fn secs_to_us(s: f64) -> u64 {
         0
     }
 }
+
+/// The largest stamp error a `gps-time-offset` may set, either sign, s.
+pub const MAX_GPS_TIME_OFFSET_S: f64 = 1.0;
 
 impl Fault {
     /// Start time, µs.
@@ -178,7 +189,8 @@ impl ActiveFaults {
                 // autopilot behind a bridge does not see.
                 FaultKind::MagRotate { .. }
                 | FaultKind::GpsVelOffset { .. }
-                | FaultKind::GpsVelNoise { .. } => {}
+                | FaultKind::GpsVelNoise { .. }
+                | FaultKind::GpsTimeOffset { .. } => {}
             }
         }
         a
@@ -299,6 +311,13 @@ pub fn validate_faults(
                 {
                     return refuse(format!(
                         "gps-vel-noise s_acc_mps {a} is not a finite figure of at least 0"
+                    ));
+                }
+            }
+            FaultKind::GpsTimeOffset { offset_s } => {
+                if !(offset_s.is_finite() && offset_s.abs() <= MAX_GPS_TIME_OFFSET_S) {
+                    return refuse(format!(
+                        "gps-time-offset offset_s {offset_s} is not a finite time between -{MAX_GPS_TIME_OFFSET_S} s and {MAX_GPS_TIME_OFFSET_S} s"
                     ));
                 }
             }
@@ -451,12 +470,26 @@ mod tests {
         ok(off(-5.0, 2.0), Some(2.0));
         ok(noise(0.0, Some(0.0)), Some(2.0));
         ok(noise(2.0, None), None);
+        // The stamp offset: finite, at most a second either way.
+        let stamp = |offset_s| FaultKind::GpsTimeOffset { offset_s };
+        bad(stamp(f64::NAN), None, "offset_s");
+        bad(stamp(f64::INFINITY), None, "offset_s");
+        bad(stamp(1.0001), None, "offset_s");
+        bad(stamp(-1.5), Some(2.0), "offset_s");
+        ok(stamp(1.0), None);
+        ok(stamp(-1.0), Some(2.0));
+        ok(stamp(0.0), Some(2.0));
     }
 
     #[test]
     fn the_new_faults_set_no_flag_the_bridge_reads() {
         let faults = [
             mag(1.0, 0.0, 0.0, None),
+            Fault {
+                kind: FaultKind::GpsTimeOffset { offset_s: 0.1 },
+                start_s: 0.0,
+                end_s: None,
+            },
             Fault {
                 kind: FaultKind::GpsVelOffset {
                     north_mps: 1.0,

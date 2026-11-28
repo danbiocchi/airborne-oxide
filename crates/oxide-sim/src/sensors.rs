@@ -593,6 +593,7 @@ impl<const N: usize> SensorSuite<N> {
                     FaultKind::MagRotate { .. }
                         | FaultKind::GpsVelOffset { .. }
                         | FaultKind::GpsVelNoise { .. }
+                        | FaultKind::GpsTimeOffset { .. }
                 )
             })
             .copied()
@@ -765,8 +766,9 @@ impl<const N: usize> SensorSuite<N> {
                 let mut velocity = add_vec(truth.body.velocity, vel_noise);
                 let mut s_acc_mps = m.reported_s_acc_mps;
                 self.apply_gps_velocity_faults(t, &mut velocity, &mut s_acc_mps);
+                let t_stamp = self.gps_stamp(t);
                 self.gps_queue.push_back(Stamped {
-                    t_sample: t,
+                    t_sample: t_stamp,
                     t_arrival: t.add_us(m.latency_us),
                     value: GpsSample {
                         position: add_vec(truth.body.position, pos_noise).cast(),
@@ -784,6 +786,26 @@ impl<const N: usize> SensorSuite<N> {
         } else {
             None
         }
+    }
+
+    /// The measurement time the receiver stamps on a fix measured at `t`:
+    /// `t` plus the sum of the `gps-time-offset` faults active at `t` (the
+    /// window is read by the true measurement time), not below 0. The fix's
+    /// arrival does not depend on it.
+    fn gps_stamp(&self, t: Micros) -> Micros {
+        let mut offset_us: i64 = 0;
+        for f in self.faults.iter().filter(|f| f.active(t)) {
+            if let FaultKind::GpsTimeOffset { offset_s } = f.kind {
+                offset_us += (offset_s * 1e6).round() as i64;
+            }
+        }
+        if offset_us == 0 {
+            return t;
+        }
+        let us = i64::try_from(t.0)
+            .unwrap_or(i64::MAX)
+            .saturating_add(offset_us);
+        Micros(u64::try_from(us).unwrap_or(0))
     }
 
     /// The GPS velocity faults active at the measurement time `t`: offsets add
@@ -1814,6 +1836,105 @@ mod fault_tests {
             .iter()
             .all(|s| s.id() != id)
         );
+    }
+
+    fn stamp_fault(offset_s: f64, start_s: f64, end_s: Option<f64>) -> Fault {
+        fault(FaultKind::GpsTimeOffset { offset_s }, start_s, end_s)
+    }
+
+    /// Whole fixes (t_sample, t_arrival, sample) of `seconds`.
+    fn stamped(cfg: SensorConfig, faults: &[Fault], seconds: u64) -> Vec<(u64, u64, GpsSample)> {
+        let body = level_body();
+        let mut s = SensorSuite::<4>::new(cfg, 11, BASE)
+            .unwrap()
+            .with_faults(faults);
+        let mut out = Vec::new();
+        for k in 0..seconds * 1000 {
+            if let Some(g) = s.sample(Micros(k * BASE), &truth(&body)).gps {
+                out.push((g.t_sample.0, g.t_arrival.0, g.value));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_time_offset_moves_the_stamp_of_the_fixes_measured_in_its_window_only() {
+        let cfg = SensorConfig::realistic();
+        let base = stamped(cfg, &[], 14);
+        // Fixes every 0.2 s measured at 10.0, 10.2, ...; the window 10.1 to
+        // 10.5 holds the fixes measured at 10.2 and 10.4 (by measurement
+        // time, not by arrival 0.15 s later).
+        for (offset_s, off_us) in [(0.10, 100_000_i64), (-0.14, -140_000)] {
+            let hit = stamped(cfg, &[stamp_fault(offset_s, 10.1, Some(10.5))], 14);
+            assert_eq!(base.len(), hit.len());
+            let mut moved = Vec::new();
+            for ((ts, ta, a), (ts2, ta2, b)) in base.iter().zip(&hit) {
+                // Arrival and the whole fix other than the stamp: unchanged.
+                assert_eq!(ta, ta2);
+                assert_eq!(a, b, "t {ts}");
+                if ts != ts2 {
+                    assert_eq!(*ts2 as i64 - *ts as i64, off_us);
+                    moved.push(*ts);
+                }
+            }
+            assert_eq!(moved, vec![10_200_000, 10_400_000], "{offset_s}");
+        }
+        // Edges by measurement time: the first fix of the window is moved,
+        // the one at its end (exclusive) is not.
+        let hit = stamped(cfg, &[stamp_fault(0.1, 10.2, Some(10.6))], 14);
+        let at = |v: &[(u64, u64, GpsSample)], ts: u64| v.iter().position(|x| x.0 == ts);
+        assert!(at(&hit, 10_300_000).is_some());
+        assert!(at(&hit, 10_500_000).is_some());
+        assert!(at(&hit, 10_200_000).is_none() && at(&hit, 10_400_000).is_none());
+        assert!(at(&hit, 10_600_000).is_some());
+    }
+
+    #[test]
+    fn two_time_offsets_add_and_a_stamp_never_goes_below_zero() {
+        let cfg = SensorConfig::ideal();
+        let hit = stamped(
+            cfg,
+            &[
+                stamp_fault(0.30, 1.0, None),
+                stamp_fault(-0.10, 2.0, Some(3.0)),
+            ],
+            4,
+        );
+        let base = stamped(cfg, &[], 4);
+        for ((ts, ta, _), (ts2, ta2, _)) in base.iter().zip(&hit) {
+            assert_eq!(ta, ta2);
+            let want = if (1_000_000..2_000_000).contains(ts) || *ts >= 3_000_000 {
+                300_000
+            } else if (2_000_000..3_000_000).contains(ts) {
+                200_000
+            } else {
+                0
+            };
+            assert_eq!(*ts2 as i64 - *ts as i64, want, "t {ts}");
+        }
+        // A stamp before the epoch is held at 0.
+        let early = stamped(cfg, &[stamp_fault(-1.0, 0.0, Some(0.5))], 1);
+        assert!(early.iter().all(|(ts, _, _)| *ts < 1_000_000));
+        assert_eq!(early[0].0, 0);
+    }
+
+    #[test]
+    fn a_time_offset_outside_its_window_leaves_every_sample_as_it_was() {
+        let cfg = SensorConfig::realistic();
+        let body = level_body();
+        let faults = [stamp_fault(0.5, 100.0, Some(110.0))];
+        let mut plain = SensorSuite::<4>::new(cfg, 3, BASE).unwrap();
+        let mut faulty = SensorSuite::<4>::new(cfg, 3, BASE)
+            .unwrap()
+            .with_faults(&faults);
+        for k in 0..20_000_u64 {
+            let t = Micros(k * BASE);
+            assert_eq!(
+                plain.sample(t, &truth(&body)),
+                faulty.sample(t, &truth(&body)),
+                "tick {k}"
+            );
+        }
     }
 
     #[test]

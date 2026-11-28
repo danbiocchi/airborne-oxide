@@ -60,6 +60,16 @@ fn noise_2() -> Fault {
     )
 }
 
+/// The stamp fault of the fifth check flight: +0.10 s for the whole flight.
+fn stamp_plus_0_10() -> Fault {
+    fault(FaultKind::GpsTimeOffset { offset_s: 0.10 }, 0.0, None)
+}
+
+/// A stamp fault that begins at 10 s (the window test).
+fn stamp_late() -> Fault {
+    fault(FaultKind::GpsTimeOffset { offset_s: 0.10 }, 10.0, None)
+}
+
 /// What a flight leaves.
 struct Flight {
     hash: u64,
@@ -162,6 +172,11 @@ fn faults_that_have_not_begun_leave_the_flight_bit_for_bit_as_it_was() {
             100.0,
             Some(105.0),
         ),
+        fault(
+            FaultKind::GpsTimeOffset { offset_s: 0.1 },
+            100.0,
+            Some(110.0),
+        ),
     ];
     late.gps_latency_us = Some(150_000);
     for (profile, index) in [(F405_LEAN, 500), (H743_FULL, 501)] {
@@ -180,7 +195,7 @@ fn a_window_that_has_ended_leaves_what_came_before_it_as_it_was() {
     base.duration_s = 9.0;
     base.pilot.duration_s = 9.0;
     let mut hit = base.clone();
-    hit.faults = vec![rotate_1_5(), jump_5_north(), noise_2()];
+    hit.faults = vec![rotate_1_5(), jump_5_north(), noise_2(), stamp_late()];
     let a = fly(&base, F405_LEAN, 500);
     let b = fly(&hit, F405_LEAN, 500);
     assert_eq!(a.hash, b.hash);
@@ -195,6 +210,7 @@ fn each_fault_changes_the_flight_and_the_same_flight_twice_is_the_same_flight() 
         ("mag-rotate", Some(rotate_1_5())),
         ("gps-vel-offset", Some(jump_5_north())),
         ("gps-vel-noise", Some(noise_2())),
+        ("gps-time-offset", Some(stamp_plus_0_10())),
         ("gps latency", None),
     ] {
         let mut file = base.clone();
@@ -219,6 +235,8 @@ fn flights_with_each_fault_replay_bit_for_bit() {
         ("gps-vel-offset", F405_LEAN, 500, Some(jump_5_north())),
         ("gps-vel-noise", F405_LEAN, 500, Some(noise_2())),
         ("gps-vel-noise", H743_FULL, 502, Some(noise_2())),
+        ("gps-time-offset", F405_LEAN, 500, Some(stamp_plus_0_10())),
+        ("gps-time-offset", H743_FULL, 501, Some(stamp_plus_0_10())),
         ("gps latency", F405_LEAN, 500, None),
         ("gps latency", H743_FULL, 500, None),
     ] {
@@ -276,6 +294,10 @@ fn the_four_check_flights() {
             Some(jump_5_north()),
         ),
         ("gps-vel-noise 2 m/s 10 s to 15 s", Some(noise_2())),
+        (
+            "gps-time-offset +0.10 s whole flight",
+            Some(stamp_plus_0_10()),
+        ),
         ("gps latency 0.25 s", None),
     ] {
         let mut file = base.clone();

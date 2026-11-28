@@ -18,7 +18,11 @@
 //! [sim]                       # default: ideal sensors, external estimator, brain link only
 //! sensors = "realistic"       # "ideal" | "realistic"
 //! gps_latency_us = 250000     # the GPS receiver's delay from measurement to arrival, µs; default: the
-//!                             # preset's (150000 realistic, 0 ideal); a whole number of ms, at most 5 s
+//!                             # preset's (150000 realistic, 0 ideal); a whole number of ms, at most 5 s.
+//!                             # It models a delay the filter KNOWS (every fix still carries its true
+//!                             # measurement time): up to the filter's horizon it changes nothing in the
+//!                             # flight, beyond it the fixes are too late and there is no GPS at all. A
+//!                             # wrong latency is the fault gps-time-offset below.
 //! estimator = "ekf"           # "external" (truth) | "ekf"
 //! [sim.links]
 //! gcs = false                 # a ground station sends heartbeats (1 Hz)
@@ -46,7 +50,7 @@
 //!
 //! [[fault]]                   # kind: motor-loss (rotor, scale), gps-loss, imu-loss, baro-loss,
 //! kind = "gps-loss"           #       mag-loss, rc-loss, rc-silent, gcs-loss, brain-crash, brain-hang,
-//! start_s = 15.0              #       mag-rotate, gps-vel-offset, gps-vel-noise (below)
+//! start_s = 15.0              #       mag-rotate, gps-vel-offset, gps-vel-noise, gps-time-offset (below)
 //! # end_s = 19.0              # absent = to the end of the run
 //! # Three faults change what a sensor reports, from start_s to end_s (a window is start <= t < end):
 //! #   kind = "mag-rotate"     # the field the magnetometer sees is rotated about Down by angle_rad
@@ -61,6 +65,12 @@
 //! #   sigma_mps = 2.0         #   horizontal axis on the reported velocity, from a stream of its own;
 //! #   s_acc_mps = 1.0         #   s_acc_mps (optional, not negative): the speed accuracy reported in the
 //! #                           #   window; absent = the receiver goes on reporting its normal figure
+//! #   kind = "gps-time-offset" # offset_s (required, finite, -1 to 1 s): a stamp that is wrong. Every fix
+//! #   offset_s = 0.10         #   MEASURED in the window is handed to the core with the measurement time
+//! #                           #   t_sample + offset_s (positive: stamped later than the truth; negative:
+//! #                           #   earlier); nothing else of the fix changes and it arrives when it would
+//! #                           #   have; two add. A stamp the core drops as too old, or one later than the
+//! #                           #   fix's arrival, is the scenario author's business.
 //!
 //! [pilot]                     # default: never arms, Stabilized, no setpoints
 //! arm_at_s = 3.0              # absent = never; disarm_at_s and kill_at_s likewise
@@ -112,7 +122,7 @@ use serde::Deserialize;
 
 use crate::SimError;
 use crate::airframe::{Airframe, BatterySpec, ordered_params};
-use crate::faults::{Fault, FaultKind, LinkConfig, validate_faults};
+use crate::faults::{Fault, FaultKind, LinkConfig, MAX_GPS_TIME_OFFSET_S, validate_faults};
 use crate::metrics::{HoldCriteria, HoldMetrics};
 use crate::outcome::{Ending, EventTag, Expect, FlightOutcome, NotJudged, REASON_NAMES};
 use crate::rng::{Rng, Stream, run_seed};
@@ -768,6 +778,7 @@ struct RawFault {
     east_mps: Option<f64>,
     sigma_mps: Option<f64>,
     s_acc_mps: Option<f64>,
+    offset_s: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1342,7 +1353,7 @@ fn check_params(params: &[(String, f64)]) -> Result<()> {
 }
 
 /// Fault kinds by file name.
-pub const FAULT_KIND_NAMES: [&str; 13] = [
+pub const FAULT_KIND_NAMES: [&str; 14] = [
     "motor-loss",
     "gps-loss",
     "imu-loss",
@@ -1356,6 +1367,7 @@ pub const FAULT_KIND_NAMES: [&str; 13] = [
     "mag-rotate",
     "gps-vel-offset",
     "gps-vel-noise",
+    "gps-time-offset",
 ];
 
 fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
@@ -1375,6 +1387,7 @@ fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
             other => {
                 let own: &[&str] = match other {
                     "mag-rotate" => &["angle_rad", "ramp_s"],
+                    "gps-time-offset" => &["offset_s"],
                     "gps-vel-offset" => &["north_mps", "east_mps"],
                     "gps-vel-noise" => &["sigma_mps", "s_acc_mps"],
                     _ => &[],
@@ -1388,12 +1401,13 @@ fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
                     ("east_mps", f.east_mps.is_some(), "a gps-vel-offset"),
                     ("sigma_mps", f.sigma_mps.is_some(), "a gps-vel-noise"),
                     ("s_acc_mps", f.s_acc_mps.is_some(), "a gps-vel-noise"),
+                    ("offset_s", f.offset_s.is_some(), "a gps-time-offset"),
                 ];
                 for (name, set, whose) in given {
                     if set && !own.contains(&name) {
                         return Err(ScenarioError::new(
                             format!("{key}.{name}"),
-                            format!("only {whose} has a {name}"),
+                            format!("only {whose} has the field {name}"),
                         ));
                     }
                 }
@@ -1401,7 +1415,7 @@ fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
                     let v = v.ok_or_else(|| {
                         ScenarioError::new(
                             format!("{key}.{name}"),
-                            format!("a {other} needs a {name}"),
+                            format!("a {other} needs the field {name}"),
                         )
                     })?;
                     finite(&format!("{key}.{name}"), v)
@@ -1440,6 +1454,18 @@ fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
                             None => None,
                         },
                     },
+                    "gps-time-offset" => {
+                        let offset_s = need("offset_s", f.offset_s)?;
+                        if offset_s.abs() > MAX_GPS_TIME_OFFSET_S {
+                            return Err(ScenarioError::new(
+                                format!("{key}.offset_s"),
+                                format!(
+                                    "{offset_s} s is more than {MAX_GPS_TIME_OFFSET_S} s from the true time"
+                                ),
+                            ));
+                        }
+                        FaultKind::GpsTimeOffset { offset_s }
+                    }
                     "gps-loss" => FaultKind::GpsLoss,
                     "imu-loss" => FaultKind::ImuLoss,
                     "baro-loss" => FaultKind::BaroLoss,

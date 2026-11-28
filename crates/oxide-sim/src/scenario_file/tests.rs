@@ -840,3 +840,45 @@ fn the_gps_delay_is_validated() {
     assert_eq!(key("5001000"), "sim.gps_latency_us");
     assert!(load_str(&format!("{MINIMAL}[sim]\ngps_latency_us = 5000000\n")).is_ok());
 }
+
+#[test]
+fn the_gps_time_offset_loads_and_is_refused_naming_the_field() {
+    let s = load_str(&format!(
+        "{MINIMAL}[[fault]]\nkind = \"gps-time-offset\"\nstart_s = 5.0\nend_s = 9.0\noffset_s = -0.14\n\
+         [[fault]]\nkind = \"gps-time-offset\"\nstart_s = 0.0\noffset_s = 1.0\n"
+    ))
+    .expect("loads");
+    assert_eq!(
+        s.faults.iter().map(|f| f.kind).collect::<Vec<_>>(),
+        vec![
+            FaultKind::GpsTimeOffset { offset_s: -0.14 },
+            FaultKind::GpsTimeOffset { offset_s: 1.0 }
+        ]
+    );
+    let fault = |body: &str| format!("[[fault]]\nstart_s = 1.0\nend_s = 9.0\n{body}");
+    let key = |body: &str| refused(&fault(body)).key;
+    assert_eq!(key("kind = \"gps-time-offset\"\n"), "fault[0].offset_s");
+    for bad in ["nan", "inf", "-inf", "1.01", "-1.01", "30.0"] {
+        assert_eq!(
+            key(&format!("kind = \"gps-time-offset\"\noffset_s = {bad}\n")),
+            "fault[0].offset_s",
+            "{bad}"
+        );
+    }
+    // A field of another kind, either way.
+    assert_eq!(
+        key("kind = \"gps-loss\"\noffset_s = 0.1\n"),
+        "fault[0].offset_s"
+    );
+    assert_eq!(
+        key("kind = \"gps-time-offset\"\noffset_s = 0.1\nsigma_mps = 1.0\n"),
+        "fault[0].sigma_mps"
+    );
+    // The error texts read right: an article for no field name.
+    let e = refused(&fault("kind = \"mag-rotate\"\n"));
+    assert!(e.reason.contains("needs the field angle_rad"), "{e}");
+    let e = refused(&fault("kind = \"gps-loss\"\nangle_rad = 1.0\n"));
+    assert!(e.reason.contains("has the field angle_rad"), "{e}");
+    assert!(FAULT_KIND_NAMES.contains(&"gps-time-offset"));
+    assert_eq!(FAULT_KIND_NAMES.len(), 14);
+}
