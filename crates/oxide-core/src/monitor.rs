@@ -728,6 +728,23 @@ mod tests {
     }
 
     #[test]
+    fn control_tilt_exactly_at_the_limit_does_not_trip() {
+        // The tilt rule too is strict: above the limit trips, equal does not.
+        // The target equals the attitude, so the error rule stays silent.
+        let mut p = params();
+        let attitude = Quat::<f32>::from_euler(80.0 * DEG, 0.0, 0.0);
+        p.loc_tilt_rad = tilt_angle(attitude);
+        let mut m = ControlMonitor::new();
+        for ms in (0..=2_000).step_by(50) {
+            assert!(!m.update(t(ms), true, attitude, attitude, &p), "at {ms} ms");
+        }
+        p.loc_tilt_rad = tilt_angle(attitude) * 0.999;
+        let mut m = ControlMonitor::new();
+        assert!(!m.update(t(0), true, attitude, attitude, &p));
+        assert!(m.update(t(250), true, attitude, attitude, &p));
+    }
+
+    #[test]
     fn control_pure_heading_error_never_trips() {
         // A heading error of any size, held for any time, is not a loss of
         // control: the thrust axis points where it is commanded.

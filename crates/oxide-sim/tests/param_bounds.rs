@@ -307,7 +307,7 @@ const KNOWN: &[(&str, &str, &str, &str)] = &[
         "gust-hold",
         "as the minimum: +pi against a site with declination 0, the same flight with the \
          same history (terminated on the ground at arming by the old heading term, which was \
-         not a guard; flies away now)",
+         not a guard; now it flies away and is terminated only after it, as the minimum is)",
     ),
 ];
 
