@@ -10,6 +10,7 @@
 
 use super::{Core, guidance::LAND_CONTACT_S};
 use crate::control::{HorizontalForm, VerticalForm, YawForm};
+use crate::estimator::heading_check::HeadingFit;
 use crate::io::{StateSample, Validity};
 use crate::math::{Quat, Vec3};
 
@@ -107,6 +108,9 @@ pub struct Telemetry {
     pub battery_current_a: Option<f32>,
     /// Events dropped because the queue overflowed.
     pub events_dropped: u32,
+    /// The heading check's record for the latest GPS fix it judged while
+    /// airborne (estimator task; all zero for the external source).
+    pub heading_fit: HeadingFit,
 }
 
 impl<const N: usize> Core<N> {
@@ -133,6 +137,7 @@ impl<const N: usize> Core<N> {
             battery_voltage_v: self.battery.map(|b| b.value.voltage_v),
             battery_current_a: self.battery.map(|b| b.value.current_a),
             events_dropped: self.events_dropped,
+            heading_fit: self.heading_fit(),
         }
     }
 }

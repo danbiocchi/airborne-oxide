@@ -332,6 +332,10 @@ pub struct Recorder<const CAP: usize> {
     /// A sample of each input has arrived since its topic's last record.
     fresh: Fresh,
     clocks: Clocks,
+    /// `seq` of the heading check's record last written to `oxide_estimator`:
+    /// a newer one is written at once (every fix judged is logged), and the
+    /// topic's clock moves on as for any record.
+    fit_seq: u32,
     vehicle_status: OnChange<(u8, u8, u8, bool, bool)>,
     failsafe_flags: OnChange<u16>,
     oxide_status: OnChange<OxideStatusKey>,
@@ -430,6 +434,7 @@ impl<const CAP: usize> Recorder<CAP> {
             battery: None,
             fresh: Fresh::new(),
             clocks: Clocks::new(),
+            fit_seq: 0,
             vehicle_status: OnChange::new(),
             failsafe_flags: OnChange::new(),
             oxide_status: OnChange::new(),
@@ -750,7 +755,13 @@ impl<const CAP: usize> Recorder<CAP> {
                 )
             });
         }
-        if take(&mut self.clocks.estimator, t) {
+        // Due on its clock, or at once for a GPS fix the heading check has
+        // judged since the last record (one record per fix, as the clock
+        // alone would drop or double some): writing it moves the clock on.
+        let fit_fresh = tel.heading_fit.seq != self.fit_seq;
+        if fit_fresh || self.clocks.estimator.due(t) {
+            self.clocks.estimator.advance(t);
+            self.fit_seq = tel.heading_fit.seq;
             self.stream(t, id::OXIDE_ESTIMATOR, &topics::OXIDE_ESTIMATOR, |w| {
                 topics::oxide_estimator(
                     w,
@@ -758,6 +769,7 @@ impl<const CAP: usize> Recorder<CAP> {
                     &status.estimator,
                     tel.estimate.is_some(),
                     tel.gyro_filtered,
+                    &tel.heading_fit,
                 )
             });
         }

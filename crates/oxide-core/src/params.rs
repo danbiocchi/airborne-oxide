@@ -254,6 +254,9 @@ macro_rules! p_kind {
     (source) => {
         ParamKind::I32
     };
+    (count) => {
+        ParamKind::I32
+    };
 }
 
 macro_rules! p_is_micros {
@@ -266,6 +269,9 @@ macro_rules! p_is_micros {
     (source) => {
         false
     };
+    (count) => {
+        false
+    };
 }
 
 macro_rules! p_val {
@@ -276,6 +282,9 @@ macro_rules! p_val {
         ParamValue::F32($x)
     };
     (source, $x:expr) => {
+        ParamValue::I32($x)
+    };
+    (count, $x:expr) => {
         ParamValue::I32($x)
     };
 }
@@ -292,6 +301,9 @@ macro_rules! p_load {
             EstimatorSource::External => 0,
             EstimatorSource::Ekf => 1,
         })
+    };
+    (count, $s:ident, $($p:ident).+) => {
+        Stored::I(i32::try_from($s.$($p).+).unwrap_or(i32::MAX))
     };
 }
 
@@ -331,13 +343,26 @@ macro_rules! p_store {
             ParamValue::F32(_) => Err(ParamError::WrongType),
         }
     };
+    (count, $s:ident, $v:ident, $($p:ident).+) => {
+        match $v {
+            ParamValue::I32(x) => match u32::try_from(x) {
+                Ok(n) => {
+                    $s.$($p).+ = n;
+                    Ok(true)
+                }
+                Err(_) => Err(ParamError::OutOfRange),
+            },
+            ParamValue::F32(_) => Err(ParamError::WrongType),
+        }
+    };
 }
 
 /// Declares the table. Each entry is `kind NAME = field.path : default, min,
 /// max, "unit", Group, live | disarmed, "description";` inside the block of
 /// the configuration struct that holds the field. Kinds: `f32` (an `f32`
 /// field), `secs` (a `u32` field of whole microseconds, a parameter in
-/// seconds), `source` (the estimator source as `i32`).
+/// seconds), `source` (the estimator source as `i32`), `count` (a `u32`
+/// field, a non-negative whole number, as `i32`).
 macro_rules! declare_params {
     ($(
         $sec:ty {
@@ -562,6 +587,16 @@ declare_params! {
             "Heading stays valid this long after the last accepted magnetometer reading.";
         f32 EKF_OUT_TAU = output_tau_s: 0.25, 0.15, 10.0, "s", Estimator, disarmed,
             "Time constant with which the output predictor follows the filter. At least 0.15 s and at least EKF_HORIZON: flown on gust-hold, the estimate oscillates and the flight is lost below about 0.7 of the horizon (0.14 s at the default horizon).";
+        count EKF_HDG_NMAX = hdg_max_corrections: 2, 0, 5, "", Estimator, disarmed,
+            "Heading corrections allowed per flight when the heading disagrees with the vehicle's own motion; the next disagreement lands the vehicle (heading invalid). 0 detects and contains only. Two: one correction for the fault, one for the residual or a second effect; a third means the error is not constant. In this version the check only watches and nothing acts on it.";
+        f32 EKF_HDG_THR = hdg_threshold_rad: 0.3, 0.1, 1.0, "rad", Estimator, disarmed,
+            "Heading error worth acting on: about half the smallest error at which the position loop turns unstable (0.65 rad in Position mode), so what is left uncorrected keeps a factor of 2 of margin. PX4 uses 25 degrees (0.44 rad).";
+        f32 EKF_HDG_K = hdg_k_sigma: 2.0, 1.0, 5.0, "sigma", Estimator, disarmed,
+            "Confidence with which the heading error must exceed EKF_HDG_THR before the check says so: the lower bound at this many standard deviations (2 is 97.7 percent, one sided). 3 is the conservative choice.";
+        secs EKF_HDG_T = hdg_persist_us: 1.0, 0.4, 5.0, "s", Estimator, disarmed,
+            "How long the disagreement of the heading with the vehicle's own motion must hold before the check says so. PX4's yaw-estimator reset delay is 1 s.";
+        f32 EKF_HDG_TAU = hdg_tau_s: 3.0, 1.0, 10.0, "s", Estimator, disarmed,
+            "Memory of the heading fit (a fading window): long enough to collect a few seconds of manoeuvre, short enough that a change of heading is seen within seconds. PX4's yaw estimator converges after about 3 s of acceleration.";
     }
     EstimatorConfig {
         source EKF_SOURCE = source: 0, 0, 1, "", Estimator, disarmed,
@@ -1748,18 +1783,22 @@ mod tests {
             if !matches!(d.default, ParamValue::F32(_)) || d.unit != "s" {
                 continue;
             }
-            let mut c = cfg();
-            // 0.1 s and 0.4 us: no whole microsecond is this f32.
-            let off = 0.100_000_4_f32;
-            if set(&mut c, &F405_LEAN, id, ParamValue::F32(off)).is_ok()
-                && get(&c, id) != Some(ParamValue::F32(off))
-            {
-                probed.push(id);
+            // 0.1 s and 0.4 us: no whole microsecond is this f32. A
+            // parameter whose range starts above 0.1 s takes 0.4 s and
+            // 0.4 us instead.
+            for off in [0.100_000_4_f32, 0.400_000_4_f32] {
+                let mut c = cfg();
+                if set(&mut c, &F405_LEAN, id, ParamValue::F32(off)).is_ok() {
+                    if get(&c, id) != Some(ParamValue::F32(off)) {
+                        probed.push(id);
+                    }
+                    break;
+                }
             }
         }
         let reported: Vec<ParamId> = micro_ids().collect();
         assert_eq!(reported, probed);
-        assert_eq!(reported.len(), 10);
+        assert_eq!(reported.len(), 11);
         for (id, _) in ids() {
             assert_eq!(is_micros(id), reported.contains(&id));
             assert_eq!(micros(&cfg(), id).is_some(), is_micros(id));
@@ -1772,7 +1811,10 @@ mod tests {
     fn micros_is_the_field_the_parameter_writes() {
         let mut c = cfg();
         for (k, id) in micro_ids().enumerate() {
-            let us = 100_000 + 1000 * k as u32;
+            // 0.1 s and a little more, or the start of the range if that
+            // is above it.
+            let lo = range_us(&PARAMS[id.index()]).map_or(0, |r| r.0);
+            let us = lo.max(100_000) + 1000 * k as u32;
             set(&mut c, &F405_LEAN, id, ParamValue::F32(us as f32 / 1e6)).unwrap();
             assert_eq!(micros(&c, id), Some(us), "{}", PARAMS[id.index()].name);
         }
@@ -1784,6 +1826,7 @@ mod tests {
             e.pos_timeout_us,
             e.baro_timeout_us,
             e.mag_timeout_us,
+            e.hdg_persist_us,
             f.rc_timeout_us,
             f.gcs_timeout_us,
             f.brain_timeout_us,

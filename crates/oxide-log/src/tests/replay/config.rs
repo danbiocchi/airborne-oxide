@@ -417,13 +417,19 @@ fn the_microsecond_records_follow_the_cores_list_in_table_order_and_carry_its_va
     // `micro_ids`, in order, with `params::micros` as the value.
     let mut c = quad();
     for (k, id) in params::micro_ids().enumerate() {
-        let us = 100_000 + 1000 * k as u32;
+        // 0.1 s and a little more, or the start of the range if that is
+        // above it (EKF_HDG_T starts at 0.4 s).
+        let lo = match params::PARAMS[id.index()].min {
+            params::ParamValue::F32(x) => (x * 1e6).round() as u32,
+            params::ParamValue::I32(_) => 0,
+        };
+        let us = lo.max(100_000) + 1000 * k as u32;
         params::set(&mut c, &F405_LEAN, id, ParamValue::F32(us as f32 / 1e6)).unwrap();
     }
     let want: Vec<(u32, u32)> = params::micro_ids()
         .map(|id| (params::key_of(id).unwrap(), params::micros(&c, id).unwrap()))
         .collect();
-    assert_eq!(want.len(), 10);
+    assert_eq!(want.len(), 11);
     assert_eq!(micros_list(&c), want);
     // `write_micros` writes them in that order: after the 3-byte message
     // header and the 2-byte subscription id, timestamp, key, microseconds.
@@ -644,10 +650,10 @@ fn every_way_a_configuration_cannot_be_rebuilt_is_a_sentence_without_debug_outpu
         ),
         (
             RebuildError::UnknownParam {
-                position: 93,
+                position: 98,
                 key: 0x1234_5678,
             },
-            "the file has a parameter this build does not have, at position 93 (key 0x12345678)",
+            "the file has a parameter this build does not have, at position 98 (key 0x12345678)",
         ),
         (
             RebuildError::DuplicateParam(roll),

@@ -160,6 +160,10 @@ pub struct Ekf<T> {
     pub p: Cov<T>,
     prm: Prm<T>,
     faults: u32,
+    /// Horizontal part (north, east) of the world-frame velocity change the
+    /// last `predict` integrated, m/s: `R(q) (dvel - ba dt)`. Zero when the
+    /// last delta was unusable. Read-only for the heading check.
+    dvw_ne: [T; 2],
 }
 
 /// True for a finite, strictly positive value (false for NaN).
@@ -239,6 +243,7 @@ impl<T: Real> Ekf<T> {
             p: prm.initial_cov(),
             prm,
             faults: 0,
+            dvw_ne: [T::ZERO; 2],
         }
     }
 
@@ -249,7 +254,7 @@ impl<T: Real> Ekf<T> {
 
     /// Propagates the nominal state over one IMU delta and returns it with
     /// the error-state transition matrix. `None` if the delta is unusable.
-    fn transition(&self, d: &ImuDelta<T>) -> Option<(NominalState<T>, Cov<T>)> {
+    fn transition(&self, d: &ImuDelta<T>) -> Option<(NominalState<T>, Cov<T>, Vec3<T>)> {
         let dt = d.dt;
         if !pos(dt) || !d.dang.is_finite() || !d.dvel.is_finite() {
             return None;
@@ -287,15 +292,23 @@ impl<T: Real> Ekf<T> {
             bg: self.x.bg,
             ba: self.x.ba,
         };
-        Some((next, f))
+        Some((next, f, dvw))
+    }
+
+    /// The horizontal (north, east) world-frame velocity change the last
+    /// [`Ekf::predict`] integrated, m/s (zero if that delta was unusable).
+    pub fn last_dvw_ne(&self) -> [T; 2] {
+        self.dvw_ne
     }
 
     /// Time update with one IMU delta. Ignored when `dt <= 0` or anything is
     /// not finite.
     pub fn predict(&mut self, d: &ImuDelta<T>) {
-        let Some((next, f)) = self.transition(d) else {
+        let Some((next, f, dvw)) = self.transition(d) else {
+            self.dvw_ne = [T::ZERO; 2];
             return;
         };
+        self.dvw_ne = [dvw.x, dvw.y];
         let dt = d.dt;
         let mut p = f.mul(&self.p).mul(&f.transpose());
         let sq = |x: T| x * x;
@@ -718,7 +731,7 @@ mod tests {
             ekf.x.ba = rng.vec(0.2);
             // Rates up to 5 rad/s per axis, specific force up to ~30 m/s².
             let d = delta::<f64>(0.004, rng.vec(5.0) * 0.004, rng.vec(17.0) * 0.004);
-            let (_, f) = ekf.transition(&d).unwrap();
+            let (_, f, _) = ekf.transition(&d).unwrap();
             for j in 0..N_ERR {
                 let mut dx = [0.0; N_ERR];
                 dx[j] = eps;
@@ -731,8 +744,8 @@ mod tests {
                     x: injected(&ekf.x, &dx),
                     ..ekf
                 };
-                let (np, _) = xp.transition(&d).unwrap();
-                let (nm, _) = xm.transition(&d).unwrap();
+                let (np, _, _) = xp.transition(&d).unwrap();
+                let (nm, _, _) = xm.transition(&d).unwrap();
                 let col = err_vec(&np, &nm, 2.0 * eps);
                 for (i, c) in col.iter().enumerate() {
                     let fij = f.get(i, j);

@@ -12,6 +12,7 @@ use crate::topics::{
     OXIDE_STATUS, bits, decode_event, event_fields,
 };
 use oxide_core::config::EstimatorSource;
+use oxide_core::estimator::heading_check::HeadingFit;
 use oxide_core::io::{
     Action, DisarmReason, EstimatorStatus, Event, EventKind, FlightMode, NavState, PrearmFlags,
     Reasons, Status, Validity,
@@ -60,6 +61,7 @@ pub(super) fn all_samples() -> Vec<Vec<u8>> {
             },
             true,
             Vec3::new(0.1, 0.2, 0.3),
+            &HeadingFit::default(),
         )
     });
     let e = Event {
@@ -305,8 +307,22 @@ fn oxide_estimator_table() {
         rejected: 70_000,
         resets: 4_000_000_000,
     };
+    let fit = HeadingFit {
+        seq: 7,
+        t_us: 5_000_000_001,
+        used: true,
+        eps: 1.5,
+        sigma: 0.25,
+        sa: 4.0,
+        kappa: 1.25,
+        rho: 0.125,
+        stat: 4.75,
+        streak: 3,
+        verdict: 1,
+        vel_ratio: 0.5,
+    };
     let f = one_record(&OXIDE_ESTIMATOR, |w| {
-        topics::oxide_estimator(w, Micros(55), &e, true, Vec3::new(0.5, -1.5, 2.0))
+        topics::oxide_estimator(w, Micros(55), &e, true, Vec3::new(0.5, -1.5, 2.0), &fit)
     });
     let r = f.records("oxide_estimator").next().unwrap();
     ints(
@@ -318,6 +334,11 @@ fn oxide_estimator_table() {
             ("aligned", 1),
             ("gps_aiding", 0),
             ("has_estimate", 1),
+            ("fit_verdict", 1),
+            ("fit_seq", 7),
+            ("fit_t", 5_000_000_001),
+            ("fit_streak", 3),
+            ("fit_used", 1),
         ],
     );
     floats(
@@ -326,9 +347,17 @@ fn oxide_estimator_table() {
             ("gyro_filtered[0]", 0.5),
             ("gyro_filtered[1]", -1.5),
             ("gyro_filtered[2]", 2.0),
+            ("fit_eps", 1.5),
+            ("fit_sigma", 0.25),
+            ("fit_sa", 4.0),
+            ("fit_kappa", 1.25),
+            ("fit_rho", 0.125),
+            ("fit_stat", 4.75),
+            ("fit_vel_ratio", 0.5),
         ],
     );
-    assert_eq!(r.raw().len(), 31);
+    // 31 bytes before the heading fit was added.
+    assert_eq!(r.raw().len(), 74);
 }
 
 #[test]

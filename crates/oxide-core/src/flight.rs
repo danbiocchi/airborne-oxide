@@ -15,6 +15,7 @@ use crate::config::{ConfigError, EstimatorSource, VehicleConfig};
 use crate::control::{
     AttitudeTarget, PositionController, RateController, RateTarget, attitude_rate_setpoint,
 };
+use crate::estimator::heading_check::HeadingFit;
 use crate::estimator::ring::Ring;
 use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
@@ -511,6 +512,10 @@ impl<const N: usize> Core<N> {
 
     fn run_estimator(&mut self, now: Micros) {
         if self.cfg.estimator.source == EstimatorSource::Ekf {
+            // The heading check judges only while the supervisor says the
+            // vehicle is armed and not landed.
+            self.estimator
+                .set_airborne(self.supervision.visible.armed && !self.sup_state.land.landed());
             self.estimator.update(now);
             let state = self.estimator.state();
             let valid = if state.is_some() {
@@ -551,6 +556,15 @@ impl<const N: usize> Core<N> {
                 aligned: self.estimate.visible.valid.attitude,
                 ..EstimatorStatus::default()
             },
+        }
+    }
+
+    /// The heading check's latest per-fix record (zero for the external
+    /// source).
+    fn heading_fit(&self) -> HeadingFit {
+        match self.cfg.estimator.source {
+            EstimatorSource::Ekf => self.estimator.heading_fit(),
+            EstimatorSource::External => HeadingFit::default(),
         }
     }
 

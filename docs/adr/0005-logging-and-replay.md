@@ -32,7 +32,7 @@ The firmware will reuse the first two layers unchanged. What stays for hardware 
 - **`timestamp`** is the first field of every topic, `uint64_t`, microseconds: the time of the tick that produced the record. Where PX4's topic has `timestamp_sample`, it carries the sample's own time.
 - **Field order and padding** follow PX4's generator (fields sorted by size, padding fields named `_padding`), and trailing padding is in the format but never in a data record. That is what `pyulog` requires.
 - **Information keys:** `sys_name` is `Oxide`; `ver_sw` is the git hash; `ver_hw` names the board, or `SIM` in the simulator. Three keys are our own: `oxide_profile` (the chip profile), `oxide_config_hash` (§6) and `oxide_log_level`. The crate is given the build information by its caller and reads nothing from the environment; an empty string is written as `unknown`.
-- **Parameters:** all 93 are written at the start, and again in the data section when one changes.
+- **Parameters:** all 98 are written at the start, and again in the data section when one changes.
 - **A synchronisation message** every 500 ms, as PX4 does, so that a reader can recover after damage. The interval is counted from the first message written.
 
 ### 3. The normal level: a flight any ULog tool can show
@@ -84,10 +84,10 @@ A replay log is a normal log plus an exact record of the core's boundary.
 
 - **At the start:**
   - the vehicle description (mass, inertia, rotors, thrust curve, battery), one record per number with its name;
-  - the exact microseconds of the ten duration parameters (`oxide_param_us`). A parameter message holds a duration as `f32` seconds, which names the microsecond only up to 16 s;
+  - the exact microseconds of the eleven duration parameters (`oxide_param_us`). A parameter message holds a duration as `f32` seconds, which names the microsecond only up to 16 s;
   - the profile's name and rates, and the report of the stored-parameter load.
 
-  These are data records, written right after the subscriptions. With the 93 parameters that is the whole configuration. A file whose values do not rebuild exactly one configuration is refused, with the parameter named: a replay never runs against a configuration that is nearly the one flown. The same check runs when a replay-level log is started, so a configuration that could not be replayed is refused before the flight, not after it. A record carries at most eight motors.
+  These are data records, written right after the subscriptions. With the 98 parameters that is the whole configuration. A file whose values do not rebuild exactly one configuration is refused, with the parameter named: a replay never runs against a configuration that is nearly the one flown. The same check runs when a replay-level log is started, so a configuration that could not be replayed is refused before the flight, not after it. A record carries at most eight motors.
 - **Every tick, in this order:** a tick record (`oxide_in_tick`) with the time, a sequence number and which inputs are present; one record per input present, with both of its time stamps and its values as the exact bits; the outputs record (`oxide_out`: motor commands, every status field, the number of events); then the tick's events and the normal level's records. The replay topics take the message ids after the normal level's twenty.
 - **Events:** the `oxide_event` records of the normal level already carry each event exactly, so the replay level has no second event topic. The outputs record says how many belong to its tick.
 - **Between ticks:** the store's "saved" call is a marker on the next tick record. The logger does not intercept the call. It sees that the core's unsaved flag was set after one tick and is clear before the next, and nothing else clears it. A call that changes nothing (the flag already clear, or the vehicle armed) leaves no marker and needs none.

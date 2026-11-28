@@ -10,6 +10,7 @@ use crate::Sink;
 use crate::logger::Stats;
 use crate::record::{RecordWriter, Topic};
 use oxide_core::config::EstimatorSource;
+use oxide_core::estimator::heading_check::HeadingFit;
 use oxide_core::io::{
     Action, DisarmReason, EstimatorStatus, Event, EventKind, FlightMode, NavState, PrearmFlags,
     Reasons, Status, Validity,
@@ -29,12 +30,19 @@ pub const OXIDE_STATUS: Topic = Topic {
     record_len: 33,
 };
 
-/// `oxide_estimator`: the estimator's health.
+/// `oxide_estimator`: the estimator's health, and the heading check's fit
+/// after the latest GPS fix it judged while airborne (`fit_*`; all zero on
+/// the ground: `fit_seq` counts the fixes, `fit_t` is the fix's sample time,
+/// `fit_vel_ratio` is the GPS velocity test ratio of the filter's fusion of
+/// that fix, -1 when it was not fused).
 pub const OXIDE_ESTIMATOR: Topic = Topic {
     name: "oxide_estimator",
     format: "uint64_t timestamp;uint32_t rejected;uint32_t resets;float[3] gyro_filtered;\
-             bool aligned;bool gps_aiding;bool has_estimate;uint8_t[1] _padding0;",
-    record_len: 31,
+             bool aligned;bool gps_aiding;bool has_estimate;uint8_t fit_verdict;\
+             uint32_t fit_seq;float fit_eps;float fit_sigma;float fit_sa;float fit_kappa;\
+             float fit_rho;float fit_stat;float fit_vel_ratio;uint64_t fit_t;\
+             uint8_t fit_streak;bool fit_used;uint8_t[6] _padding0;",
+    record_len: 74,
 };
 
 /// `oxide_event`: one event, exactly. The fields are numbers; which of them
@@ -143,19 +151,31 @@ pub fn oxide_status<S: Sink + ?Sized>(
 
 /// `oxide_estimator`: the rejected-measurement and reset counters, the
 /// rate loop's filtered gyro (rad/s, body), the alignment and GPS-aiding
-/// flags, and whether the core had published an estimate at all.
+/// flags, whether the core had published an estimate at all, and the
+/// heading check's fit after the latest GPS fix it judged while airborne.
 pub fn oxide_estimator<S: Sink + ?Sized>(
     w: &mut RecordWriter<'_, S>,
     now: Micros,
     e: &EstimatorStatus,
     has_estimate: bool,
     gyro_filtered: Vec3<f32>,
+    fit: &HeadingFit,
 ) {
     w.u64(now.0).u32(e.rejected).u32(e.resets);
     w.f32(gyro_filtered.x)
         .f32(gyro_filtered.y)
         .f32(gyro_filtered.z);
     w.bool(e.aligned).bool(e.gps_aiding).bool(has_estimate);
+    w.u8(fit.verdict).u32(fit.seq);
+    w.f32(fit.eps)
+        .f32(fit.sigma)
+        .f32(fit.sa)
+        .f32(fit.kappa)
+        .f32(fit.rho)
+        .f32(fit.stat)
+        .f32(fit.vel_ratio);
+    w.u64(fit.t_us);
+    w.u8(fit.streak).bool(fit.used);
 }
 
 /// `oxide_logger` from the logger's statistics. `high_water` is the ring's

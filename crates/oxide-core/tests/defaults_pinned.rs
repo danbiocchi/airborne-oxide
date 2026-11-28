@@ -107,6 +107,11 @@ fn defaults_are_pinned() {
     assert_eq!(e.baro_timeout_us, 5000000, "e.baro_timeout_us");
     assert_eq!(e.mag_timeout_us, 30000000, "e.mag_timeout_us");
     f("e.output_tau_s", e.output_tau_s, 0x3e800000);
+    assert_eq!(e.hdg_max_corrections, 2, "e.hdg_max_corrections");
+    f("e.hdg_threshold_rad", e.hdg_threshold_rad, 0x3e99999a);
+    f("e.hdg_k_sigma", e.hdg_k_sigma, 0x40000000);
+    assert_eq!(e.hdg_persist_us, 1000000, "e.hdg_persist_us");
+    f("e.hdg_tau_s", e.hdg_tau_s, 0x40400000);
     assert_eq!(fs.rc_timeout_us, 500000, "fs.rc_timeout_us");
     f("fs.rc_valid_min_s", fs.rc_valid_min_s, 0x3f800000);
     f("fs.rc_loss_hold_s", fs.rc_loss_hold_s, 0x40400000);

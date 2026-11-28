@@ -7,6 +7,7 @@ use crate::reader::UlogFile;
 use crate::recorder::{Boot, Recorder};
 use crate::topics::NORMAL;
 use oxide_core::config::VehicleConfig;
+use oxide_core::estimator::heading_check::HeadingFit;
 use oxide_core::flight::{RateCommand, Telemetry};
 use oxide_core::io::{
     BaroSample, BatterySample, ImuSample, Inputs, MagSample, Outputs, RcSample, Stamped,
@@ -47,6 +48,7 @@ pub(crate) fn telemetry() -> Telemetry {
         battery_voltage_v: Some(23.4),
         battery_current_a: Some(10.0),
         events_dropped: 0,
+        heading_fit: HeadingFit::default(),
     }
 }
 
@@ -116,7 +118,7 @@ fn start_writes_the_header_for_the_normal_topics() {
         f.info("oxide_config_hash").unwrap().as_u64(),
         Some(cfg.config_hash())
     );
-    assert_eq!(f.initial_params.len(), 93);
+    assert_eq!(f.initial_params.len(), 98);
     assert!(f.items.is_empty());
 }
 

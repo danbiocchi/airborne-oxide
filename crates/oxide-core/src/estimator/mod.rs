@@ -16,6 +16,7 @@
 //! at any filter rate (see [`ekf::Ekf::predict`]).
 
 pub mod ekf;
+pub mod heading_check;
 pub mod imu;
 pub mod output;
 pub mod ring;
@@ -29,6 +30,7 @@ use crate::math::{Quat, Real, Vec3};
 use crate::schedule::Profile;
 use crate::time::Micros;
 use ekf::{Ekf, Fusion, GYRO_BIAS_LIMIT, heading_from_mag, tilt_from_accel};
+use heading_check::{HeadingCheck, HeadingConfig, HeadingFit};
 use imu::{ImuAccumulator, ImuDelta};
 use output::OutputPredictor;
 use ring::Ring;
@@ -132,6 +134,10 @@ pub struct Estimator {
     raw_gyro: Vec3<f32>,
     rejected: u32,
     resets: u32,
+    /// The check of the heading against the vehicle's own motion. In this
+    /// version it only watches: its verdict is counted and logged, and
+    /// nothing reads it to act.
+    hdg: HeadingCheck,
 }
 
 impl Estimator {
@@ -174,7 +180,26 @@ impl Estimator {
             raw_gyro: Vec3::zero(),
             rejected: 0,
             resets: 0,
+            hdg: HeadingCheck::new(heading_config(p)),
         })
+    }
+
+    /// The supervisor's `armed && !landed`: the heading check judges and
+    /// accumulates only while airborne.
+    pub fn set_airborne(&mut self, airborne: bool) {
+        self.hdg.set_airborne(airborne);
+    }
+
+    /// The heading check's record for the latest GPS fix it judged while
+    /// airborne (all zero before the first).
+    pub fn heading_fit(&self) -> HeadingFit {
+        self.hdg.fit()
+    }
+
+    /// How many fixes since boot had the heading check's verdict
+    /// `Correct` (nothing acts on it).
+    pub fn heading_verdicts(&self) -> u32 {
+        self.hdg.verdicts()
     }
 
     /// Adds an IMU sample. Once aligned it also advances the output
@@ -375,6 +400,7 @@ impl Estimator {
         self.baro_accept = None;
         self.mag_accept = None;
         self.last_imu_arrival = None;
+        self.hdg.restart();
         self.resets = self.resets.saturating_add(1);
     }
 
@@ -486,6 +512,7 @@ impl Estimator {
             }
             self.imu_ring.pop_front();
             ekf.predict(&d);
+            self.hdg.on_step(ekf.last_dvw_ne());
             self.t_ekf = d.t_end;
             self.fuse_due(&mut ekf, d.t_end);
             self.output.correct(d.t_end, &ekf.x, self.filter_dt);
@@ -563,6 +590,8 @@ impl Estimator {
             if let Some(psi) = ekf.mag_heading(s.value.field_ut) {
                 let dpsi = ekf.reset_yaw(psi, self.params.init_yaw_sigma_rad);
                 self.output.rotate_yaw(dpsi);
+                // The heading the check judged is gone.
+                self.hdg.restart();
                 self.heading_ok = true;
                 self.mag_accept = Some(s.t_sample);
                 self.resets = self.resets.saturating_add(1);
@@ -591,13 +620,22 @@ impl Estimator {
     fn fuse_gps(&mut self, ekf: &mut Ekf<f32>, s: &Stamped<GpsSample>) {
         let g = s.value;
         if !g.fix_3d || !g.position.is_finite() || !g.velocity.is_finite() {
+            let _ = self.hdg.on_fix(s.t_sample, None);
             return;
         }
         // Without a heading, GPS velocity would be attributed to the wrong
         // body axes and corrupt the tilt. Wait for the magnetometer.
         if !self.heading_ok {
+            let _ = self.hdg.on_fix(s.t_sample, None);
             return;
         }
+        // The heading check judges the fix (with the velocity change the
+        // filter integrated since the previous one) before the fusion
+        // changes anything. Its verdict is counted and logged, not acted on.
+        let _ = self.hdg.on_fix(
+            s.t_sample,
+            Some(([g.velocity.x, g.velocity.y], g.s_acc_mps)),
+        );
         let sigma_p = g.h_acc_m.finite_or(0.0).max(self.params.gps_pos_noise_m);
         let sigma_v = g
             .s_acc_mps
@@ -612,6 +650,10 @@ impl Estimator {
         }
         let pos = self.note(ekf.fuse_gps_position_ne([g.position.x, g.position.y], sigma_p));
         let vel = self.note(ekf.fuse_gps_velocity(g.velocity, sigma_v));
+        self.hdg.set_vel_ratio(match vel {
+            Fusion::Accepted { test_ratio } | Fusion::Rejected { test_ratio } => Some(test_ratio),
+            Fusion::Skipped => None,
+        });
         let accepted = |f: Fusion<f32>| matches!(f, Fusion::Accepted { .. });
         let rejected = |f: Fusion<f32>| matches!(f, Fusion::Rejected { .. });
         // Position and velocity validity are tracked apart: a fix whose
@@ -683,6 +725,17 @@ impl Estimator {
         self.gps.reject_since = None;
         self.gps.pos_reject_since = None;
         self.gps.vel_reject_since = None;
+    }
+}
+
+/// The heading check's settings from the filter's parameters.
+fn heading_config(p: &EkfParams) -> HeadingConfig {
+    HeadingConfig {
+        threshold_rad: p.hdg_threshold_rad,
+        k_sigma: p.hdg_k_sigma,
+        persist_us: u64::from(p.hdg_persist_us),
+        tau_s: p.hdg_tau_s,
+        vel_noise_mps: p.gps_vel_noise_mps,
     }
 }
 
@@ -1431,5 +1484,172 @@ mod tests {
         assert!(e.velocity.x > 3.5, "v = {:?}", e.velocity);
         rig.run_until(4.0 + 9.0);
         assert_eq!(rig.est.status().resets, resets + 1, "one reset only");
+    }
+
+    // ---- the heading check, wired into the filter -------------------------
+
+    /// Moves the rig along a horizontal velocity path from `t0` (s): north
+    /// `6 sin(1.1 t)`, east `5 sin(0.7 t)` m/s, the body frame being the
+    /// world frame (true heading 0 against the rig's magnetic field), until
+    /// `until` (s). The accelerometer and the GPS both follow the path.
+    fn fly_path(rig: &mut Rig, t0: f64, until: f64) {
+        let (w1, w2) = (1.1f32, 0.7f32);
+        while rig.now().as_secs_f64() < until {
+            let t = (rig.now().as_secs_f64() - t0).max(0.0) as f32;
+            rig.accel = Vec3::new(
+                6.0 * w1 * Real::cos(w1 * t),
+                5.0 * w2 * Real::cos(w2 * t),
+                -GRAVITY,
+            );
+            rig.gps_vel = Vec3::new(6.0 * Real::sin(w1 * t), 5.0 * Real::sin(w2 * t), 0.0);
+            rig.gps_pos = Vec3::new(
+                6.0 * (1.0 - Real::cos(w1 * t)) / w1,
+                5.0 * (1.0 - Real::cos(w2 * t)) / w2,
+                0.0,
+            );
+            rig.tick();
+        }
+    }
+
+    #[test]
+    fn the_heading_check_judges_nothing_on_the_ground() {
+        let mut rig = Rig::new(&EkfParams::default());
+        // Moving but not airborne (the supervisor has not said so).
+        fly_path(&mut rig, 3.0, 12.0);
+        assert_eq!(rig.est.heading_fit().seq, 0);
+        assert_eq!(rig.est.heading_fit().sa, 0.0);
+        assert_eq!(rig.est.heading_verdicts(), 0);
+    }
+
+    #[test]
+    fn the_heading_check_agrees_with_a_right_heading_and_flags_a_wrong_one() {
+        // Right heading (declination 0 and the rig's field north).
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(3.0);
+        rig.est.set_airborne(true);
+        fly_path(&mut rig, 3.0, 14.0);
+        let f = rig.est.heading_fit();
+        assert!(f.seq > 30, "fixes judged: {}", f.seq);
+        assert!(f.used && f.sa > 1.0, "{f:?}");
+        assert!(f.eps.abs() < 0.2, "eps {}", f.eps);
+        assert_eq!(rig.est.heading_verdicts(), 0);
+        assert_eq!(rig.est.validity(), Validity::ALL);
+        // The fix's own record: its time is a GPS sample time, and the
+        // filter's velocity test ratio is there (the fix was fused).
+        assert_eq!(f.t_us % 200_000, 0);
+        assert!((0.0..=1.0).contains(&f.vel_ratio), "ratio {}", f.vel_ratio);
+
+        // The same flight with a declination of 1 rad the site does not
+        // have: the filter's heading is wrong by +1 rad.
+        let wrong = EkfParams {
+            mag_declination_rad: 1.0,
+            ..EkfParams::default()
+        };
+        let mut rig = Rig::new(&wrong);
+        rig.run_until(3.0);
+        rig.est.set_airborne(true);
+        fly_path(&mut rig, 3.0, 14.0);
+        assert!(
+            rig.est.heading_verdicts() > 0,
+            "{:?}",
+            rig.est.heading_fit()
+        );
+        let f = rig.est.heading_fit();
+        assert!((f.eps - 1.0).abs() < 0.5, "eps {} (true +1.0)", f.eps);
+        assert_eq!(f.verdict, 1);
+        // Nothing acts on it: the heading is still valid and the flight is
+        // exactly what it was without the check.
+        assert!(rig.est.validity().heading);
+    }
+
+    #[test]
+    fn the_verdict_changes_nothing_in_the_filter() {
+        // Two rigs with a wrong heading, one told it is airborne and one
+        // not: the filter's state is bit for bit the same.
+        let wrong = EkfParams {
+            mag_declination_rad: 1.0,
+            ..EkfParams::default()
+        };
+        let mut a = Rig::new(&wrong);
+        let mut b = Rig::new(&wrong);
+        a.run_until(3.0);
+        b.run_until(3.0);
+        a.est.set_airborne(true);
+        fly_path(&mut a, 3.0, 12.0);
+        fly_path(&mut b, 3.0, 12.0);
+        assert!(a.est.heading_verdicts() > 0);
+        assert_eq!(b.est.heading_verdicts(), 0);
+        let (ea, eb) = (a.est.state().unwrap(), b.est.state().unwrap());
+        assert_eq!(ea.position, eb.position);
+        assert_eq!(ea.velocity, eb.velocity);
+        assert_eq!(ea.attitude, eb.attitude);
+        assert_eq!(a.est.validity(), b.est.validity());
+        assert_eq!(a.est.status(), b.est.status());
+    }
+
+    #[test]
+    fn the_heading_check_restarts_where_the_yaw_is_reset() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(3.0);
+        rig.est.set_airborne(true);
+        fly_path(&mut rig, 3.0, 8.0);
+        assert!(rig.est.heading_fit().sa > 1.0);
+        // The magnetometer is silent for longer than its timeout, then
+        // returns: the filter resets its yaw to it (`fuse_mag`).
+        rig.mag_on = false;
+        fly_path(&mut rig, 3.0, 8.0 + 31.0);
+        assert!(rig.est.heading_fit().sa > 1.0, "the fit goes on without it");
+        let resets = rig.est.status().resets;
+        rig.mag_on = true;
+        // The magnetometer sample is fused 0.2 s after it was taken (the
+        // filter runs on a delayed horizon); wait for the reset.
+        let sa_before = rig.est.heading_fit().sa;
+        let mut reset_tick = None;
+        let mut first_after = None;
+        let mut prev_seq = rig.est.heading_fit().seq;
+        while rig.now().as_secs_f64() < 8.0 + 36.0 {
+            let next = rig.now().as_secs_f64() + 0.001;
+            fly_path(&mut rig, 3.0, next);
+            let f = rig.est.heading_fit();
+            if reset_tick.is_none() && rig.est.status().resets > resets {
+                reset_tick = Some(f.seq);
+            }
+            // The first fix judged at or after the reset: the reset and the
+            // fix can fall in the same tick (the reset is first).
+            if reset_tick.is_some() && first_after.is_none() && f.seq != prev_seq {
+                first_after = Some(f);
+            }
+            prev_seq = f.seq;
+        }
+        assert!(reset_tick.is_some(), "the yaw was reset");
+        // That fix is the first of a new fit: no interval, nothing carried
+        // over.
+        let f = first_after.expect("a fix after the reset");
+        assert!(sa_before > 2.0);
+        assert!(!f.used && f.sa == 0.0, "{f:?}");
+        // And it builds up again afterwards.
+        assert!(rig.est.heading_fit().sa > 1.0);
+    }
+
+    #[test]
+    fn the_heading_check_restarts_when_the_filter_is_dropped() {
+        let mut rig = Rig::new(&EkfParams::default());
+        rig.run_until(3.0);
+        rig.est.set_airborne(true);
+        fly_path(&mut rig, 3.0, 8.0);
+        assert!(rig.est.heading_fit().sa > 1.0);
+        // An IMU stall: the filter is dropped, and everything restarts.
+        rig.imu_on = false;
+        let t = rig.now().as_secs_f64();
+        fly_path(&mut rig, 3.0, t + 0.3);
+        assert!(rig.est.ekf().is_none());
+        rig.imu_on = true;
+        rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
+        rig.gps_vel = Vec3::zero();
+        // (The unaligned filter takes no fixes; the fit is cleared when it
+        // does come back and the vehicle is still airborne.)
+        rig.run_until(t + 4.0);
+        let f = rig.est.heading_fit();
+        assert!(f.sa < 0.5, "{f:?}");
     }
 }
