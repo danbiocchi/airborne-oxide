@@ -2751,10 +2751,12 @@ mod tests {
         let mut rig = wrong_rig(1.0, 3.0);
         let mut resets = rig.est.status().resets;
         let mut before_yaw = 0.0;
+        let mut shift_before = 0.0;
         let mut stepped = None;
         let mut corrected_at = None;
         while rig.now().as_secs_f64() < 16.0 && stepped.is_none() {
             resets = rig.est.status().resets;
+            shift_before = rig.est.declination_shift();
             before_yaw = rig.est.state().map_or(0.0, |s| s.attitude.yaw());
             let next = rig.now().as_secs_f64() + 0.001;
             fly_path(&mut rig, 3.0, next);
@@ -2783,7 +2785,13 @@ mod tests {
         assert_eq!(rig.est.status().resets, resets + 1);
         // Step 4: the declination shift took it (the correction's and this).
         let shift = rig.est.declination_shift();
-        assert!(shift.abs() > 0.3, "the shift {shift}");
+        assert!(
+            wrap_pi(shift - shift_before - dpsi).abs() < 1e-5,
+            "the shift {shift} was {shift_before} before a step of {dpsi}"
+        );
+        // ... and it is the declination the filter's heading model uses.
+        let model = rig.est.ekf().unwrap().declination();
+        assert!(wrap_pi(model - (1.0 + shift)).abs() < 1e-5, "model {model}");
         // Step 5: the fit restarted: the next fix is the first of a new fit.
         let seq = rig.est.heading_fit().seq;
         while rig.est.heading_fit().seq == seq {
@@ -2906,6 +2914,11 @@ mod tests {
         // A new filter closes it too.
         other.est.drop_to_unaligned();
         assert!(!other.est.hdg.fine_window_open());
+        // An event not yet taken is cleared at disarm too.
+        let mut late = wrong_rig(1.0, 3.0);
+        late.est.pending_refined = Some(0.1);
+        late.est.set_armed(false);
+        assert!(late.est.take_heading_refined().is_none());
         // After a fine step the count is cleared at disarm.
         let rig = wrong_rig(1.0, 3.0);
         let (mut rig, _, _) = until_first_fine_step(rig, 16.0);
