@@ -690,6 +690,38 @@ mod tests {
         }
     }
 
+    /// The check's cost on this machine and the size of its state (a
+    /// measurement, not a pass condition): `cargo test --release -p oxide-core
+    /// --lib heading_check::tests::cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing measurement: run it by hand, in release"]
+    fn cost_of_the_check_per_step_and_per_fix() {
+        use std::time::Instant;
+        let mut d = Drive::new();
+        d.noise = 0.1;
+        d.run(200, 1.0);
+        let steps = 20_000_000_u32;
+        let t0 = Instant::now();
+        let mut x = 0.0_f32;
+        for k in 0..steps {
+            let v = 0.001 * (k % 7) as f32;
+            d.chk.on_step([v, 0.5 * v]);
+            x += v;
+        }
+        let per_step = t0.elapsed().as_secs_f64() / f64::from(steps) * 1e9;
+        let fixes = 2_000_000_u32;
+        let t0 = Instant::now();
+        for _ in 0..fixes {
+            d.fix(1.0);
+        }
+        let per_fix = t0.elapsed().as_secs_f64() / f64::from(fixes) * 1e9;
+        println!(
+            "heading check: {per_step:.2} ns per filter step, {per_fix:.0} ns per fix (the fix includes the test's own path and noise), state {} bytes ({} with the record), checksum {x}",
+            core::mem::size_of::<HeadingCheck>() - core::mem::size_of::<HeadingFit>(),
+            core::mem::size_of::<HeadingCheck>(),
+        );
+    }
+
     #[test]
     fn a_jump_does_not_produce_a_verdict_on_a_rotated_flight() {
         // 5 fixes of a real 1.5 rad error would fire; a jump in the fifth
