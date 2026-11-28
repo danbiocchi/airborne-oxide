@@ -1316,6 +1316,46 @@ mod tests {
         }
     }
 
+    /// The heading guard's declination shift: a filter built with
+    /// declination 0 and then shifted by `d` has the heading model of a filter
+    /// built with `d` (the innovation and the whole of `H`, whose entries
+    /// carry the cosine and sine of the declination), and the shift adds up
+    /// and wraps.
+    #[test]
+    fn a_shifted_declination_is_the_declination_built_in() {
+        let mut rng = Lcg(11);
+        for d in [0.4_f64, -1.2, 2.9, -3.0] {
+            let at = |decl: f64| EkfParams {
+                mag_declination_rad: decl as f32,
+                ..EkfParams::default()
+            };
+            let q = Quat::from_euler(0.2, -0.3, 0.9);
+            let mut shifted = Ekf::<f64>::new(&at(0.0), q);
+            shifted.shift_declination(d);
+            let built = Ekf::<f64>::new(&at(d), q);
+            // The f32 parameter rounds `d`: compare against that value.
+            let d = f64::from(at(d).mag_declination_rad);
+            assert!((shifted.declination() - wrap_pi(d)).abs() < 1e-6, "{d}");
+            for _ in 0..10 {
+                let m = Vec3::new(rng.range(20.0, 30.0), rng.range(-10.0, 10.0), 20.0);
+                let (n1, h1) = shifted.heading_model(m).unwrap();
+                let (n2, h2) = built.heading_model(m).unwrap();
+                assert!(wrap_pi(n1 - n2).abs() < 1e-6, "decl {d}: {n1} against {n2}");
+                for k in 0..3 {
+                    assert!((h1[k].1 - h2[k].1).abs() < 1e-6, "decl {d}: H[{k}]");
+                }
+            }
+        }
+        // Shifts add up and wrap into (-pi, pi].
+        let mut e = Ekf::<f64>::new(&EkfParams::default(), Quat::identity());
+        e.shift_declination(2.0);
+        e.shift_declination(2.0);
+        assert!((e.declination() - (4.0 - 2.0 * core::f64::consts::PI)).abs() < 1e-9);
+        // A shift that is not finite changes nothing.
+        e.shift_declination(f64::NAN);
+        assert!((e.declination() - (4.0 - 2.0 * core::f64::consts::PI)).abs() < 1e-9);
+    }
+
     /// At a consistent field (ν = 0) H equals the exact first-order
     /// expression `−m_x·m_z/h²`, `−m_y·m_z/h²` evaluated at the world
     /// field, also for a non-zero declination (the finite-difference test
