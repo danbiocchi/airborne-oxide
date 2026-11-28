@@ -66,9 +66,6 @@ pub(super) fn all_samples() -> Vec<Vec<u8>> {
                 corrections: 1,
                 contained: true,
                 shift_rad: -0.75,
-                tilt_roll_rad: 0.0,
-                tilt_pitch_rad: 0.0,
-                fine_steps: 0,
             },
         )
     });
@@ -319,9 +316,6 @@ fn oxide_estimator_table() {
         corrections: 2,
         contained: true,
         shift_rad: -1.5,
-        tilt_roll_rad: 0.5,
-        tilt_pitch_rad: -0.25,
-        fine_steps: 3,
     };
     let fit = HeadingFit {
         seq: 7,
@@ -365,7 +359,6 @@ fn oxide_estimator_table() {
             ("fit_used", 1),
             ("hdg_corrections", 2),
             ("hdg_contained", 1),
-            ("hdg_fine", 3),
         ],
     );
     floats(
@@ -382,14 +375,10 @@ fn oxide_estimator_table() {
             ("fit_stat", 4.75),
             ("fit_vel_ratio", 0.5),
             ("hdg_shift", -1.5),
-            ("tilt_roll", 0.5),
-            ("tilt_pitch", -0.25),
         ],
     );
-    // 31 bytes before the heading fit was added, 74 before the guard's
-    // state, 80 before the tilt reference's roll and pitch, 88 before the
-    // fine steps' count.
-    assert_eq!(r.raw().len(), 89);
+    // 31 bytes before the heading fit was added, 74 before the guard's state.
+    assert_eq!(r.raw().len(), 80);
 }
 
 #[test]
@@ -453,10 +442,9 @@ fn variant_index(k: &EventKind) -> usize {
         EventKind::HeadingCorrected { .. } => 16,
         EventKind::HeadingContained => 17,
         EventKind::GpsSnapRepeated => 18,
-        EventKind::HeadingRefined { .. } => 19,
     }
 }
-const VARIANTS: usize = 20;
+const VARIANTS: usize = 19;
 
 const NAVS: [NavState; 10] = [
     NavState::Disarmed,
@@ -631,9 +619,6 @@ fn events() -> Vec<Event> {
             kinds.push(EventKind::HeadingCorrected { angle_mrad, count });
         }
     }
-    for angle_mrad in [i16::MIN, -150, 0, 150, i16::MAX] {
-        kinds.push(EventKind::HeadingRefined { angle_mrad });
-    }
     kinds.push(EventKind::HeadingContained);
     kinds.push(EventKind::HeadingContained);
     kinds.push(EventKind::GpsSnapRepeated);
@@ -755,7 +740,7 @@ fn base(kind: EventKind) -> EventFields {
 #[test]
 fn every_other_code_is_refused_by_the_decoder() {
     // Event kinds.
-    for k in 20..=255_u8 {
+    for k in 19..=255_u8 {
         let fields = EventFields {
             kind: k,
             ..base(EventKind::Armed)

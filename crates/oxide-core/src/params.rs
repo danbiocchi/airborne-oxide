@@ -597,10 +597,6 @@ declare_params! {
             "How long the disagreement of the heading with the vehicle's own motion must hold before the check says so. PX4's yaw-estimator reset delay is 1 s.";
         f32 EKF_HDG_TAU = hdg_tau_s: 3.0, 1.0, 10.0, "s", Estimator, disarmed,
             "Memory of the heading fit (a fading window): long enough to collect a few seconds of manoeuvre, short enough that a change of heading is seen within seconds. PX4's yaw estimator converges after about 3 s of acceleration.";
-        count EKF_HDG_TILT = hdg_tilt: 1, 0, 1, "", Estimator, disarmed,
-            "An experiment's switch. 1: the heading check's fit takes the roll and pitch of a separate tilt reference (the gyro, pulled toward the accelerometer's direction, that GPS never touches) in place of the filter's own, which a wrong heading itself pulls wrong by several degrees and which makes the fit read the angle too high. 0: the filter's own. One of the two mechanisms is removed after the experiment that compares them.";
-        f32 EKF_HDG_FINE = hdg_fine_rad: 0.2, 0.0, 0.5, "rad", Estimator, disarmed,
-            "An experiment's setting. The largest one-sigma, in radians, of the first reading after a heading correction that is used for a second, smaller step on the heading (within 10 s of the correction, once per correction, not counted against EKF_HDG_NMAX). 0 switches the fine step off. One of the two mechanisms is removed after the experiment that compares them.";
     }
     EstimatorConfig {
         source EKF_SOURCE = source: 0, 0, 1, "", Estimator, disarmed,

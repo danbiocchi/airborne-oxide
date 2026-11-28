@@ -301,17 +301,6 @@ impl<T: Real> Ekf<T> {
         self.dvw_ne
     }
 
-    /// Cosine and sine of the filter's yaw, from its rotation matrix: the
-    /// normalised first column's horizontal part, no trigonometric call.
-    /// `None` when the body x axis points straight up or down (no yaw).
-    pub fn yaw_cos_sin(&self) -> Option<[T; 2]> {
-        let q = self.x.q;
-        let c = T::ONE - T::TWO * (q.y * q.y + q.z * q.z);
-        let s = T::TWO * (q.x * q.y + q.w * q.z);
-        let h = (c * c + s * s).sqrt();
-        (h > T::from_f64(1.0e-6)).then(|| [c / h, s / h])
-    }
-
     /// Time update with one IMU delta. Ignored when `dt <= 0` or anything is
     /// not finite.
     pub fn predict(&mut self, d: &ImuDelta<T>) {

@@ -1004,9 +1004,6 @@ fn oxide_estimator(t: u64, k: &Tick, _: &Vehicle, e: &mut Exp<'_>) {
     e.v("hdg_corrections", h.corrections);
     e.flag("hdg_contained", h.contained);
     e.v("hdg_shift", h.shift_rad);
-    e.v("tilt_roll", h.tilt_roll_rad);
-    e.v("tilt_pitch", h.tilt_pitch_rad);
-    e.v("hdg_fine", h.fine_steps);
 }
 
 /// `oxide_event`: every event of every tick, in order, with the fixed codes
@@ -1099,10 +1096,6 @@ fn check_events(fl: &Flight, file: &UlogFile, cov: &mut Coverage) -> usize {
             }
             EventKind::HeadingContained => kind = 17,
             EventKind::GpsSnapRepeated => kind = 18,
-            EventKind::HeadingRefined { angle_mrad } => {
-                kind = 19;
-                mask = u16::from_ne_bytes(angle_mrad.to_ne_bytes());
-            }
         }
         let mut e = Exp {
             topic: "oxide_event",
@@ -1483,11 +1476,10 @@ fn the_reader_gives_the_values_the_simulator_had_at_the_same_ticks() {
     assert_eq!(seen("manual_control_setpoint.mode switch"), set(&[0, 1, 2]));
     assert_eq!(
         seen("oxide_event.kind"),
-        (0..=17).chain([19]).collect(),
-        "every kind of event is in some flight (the heading guard's in the wrong-heading \
-         flights, the fine step's kind 19 among them; kind 18, the snap-and-reject cycle, is in \
-         none: no healthy flight has one, and its encoding is covered by the log crate's own \
-         tests)"
+        (0..=17).collect(),
+        "every kind of event is in some flight (the heading guard's two in the wrong-heading \
+         flights; kind 18, the snap-and-reject cycle, is in none: no healthy flight has one, \
+         and its encoding is covered by the log crate's own tests)"
     );
     // Every PX4 navigation state the core can show.
     assert_eq!(

@@ -119,7 +119,7 @@ fn start_writes_the_header_for_the_normal_topics() {
         f.info("oxide_config_hash").unwrap().as_u64(),
         Some(cfg.config_hash())
     );
-    assert_eq!(f.initial_params.len(), 100);
+    assert_eq!(f.initial_params.len(), 98);
     assert!(f.items.is_empty());
 }
 

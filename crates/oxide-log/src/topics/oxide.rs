@@ -36,10 +36,7 @@ pub const OXIDE_STATUS: Topic = Topic {
 /// `fit_vel_ratio` is the GPS velocity test ratio of the filter's fusion of
 /// that fix, -1 when it was not fused), and the heading guard's state:
 /// `hdg_corrections` made in this flight, `hdg_contained` (the latch) and
-/// `hdg_shift`, the run-time shift of the declination, rad, and the tilt
-/// reference's roll and pitch, rad (`tilt_roll`, `tilt_pitch`; zero when
-/// `EKF_HDG_TILT` is 0) and `hdg_fine`, the fine steps of the heading made in
-/// this flight.
+/// `hdg_shift`, the run-time shift of the declination, rad.
 pub const OXIDE_ESTIMATOR: Topic = Topic {
     name: "oxide_estimator",
     format: "uint64_t timestamp;uint32_t rejected;uint32_t resets;float[3] gyro_filtered;\
@@ -47,9 +44,8 @@ pub const OXIDE_ESTIMATOR: Topic = Topic {
              uint32_t fit_seq;float fit_eps;float fit_sigma;float fit_sa;float fit_kappa;\
              float fit_rho;float fit_stat;float fit_vel_ratio;uint64_t fit_t;\
              uint8_t fit_streak;bool fit_used;uint8_t hdg_corrections;bool hdg_contained;\
-             float hdg_shift;float tilt_roll;float tilt_pitch;uint8_t hdg_fine;\
-             uint8_t[7] _padding0;",
-    record_len: 89,
+             float hdg_shift;",
+    record_len: 80,
 };
 
 /// `oxide_event`: one event, exactly. The fields are numbers; which of them
@@ -187,10 +183,7 @@ pub fn oxide_estimator<S: Sink + ?Sized>(
     w.u8(fit.streak).bool(fit.used);
     w.u8(guard.corrections)
         .bool(guard.contained)
-        .f32(guard.shift_rad)
-        .f32(guard.tilt_roll_rad)
-        .f32(guard.tilt_pitch_rad)
-        .u8(guard.fine_steps);
+        .f32(guard.shift_rad);
 }
 
 /// `oxide_logger` from the logger's statistics. `high_water` is the ring's
@@ -223,7 +216,6 @@ pub fn oxide_logger<S: Sink + ?Sized>(w: &mut RecordWriter<'_, S>, now: Micros, 
 /// | `ParamRefused` | `param_key`, `param_index`, `why` the [`ParamError`] code, `why_detail` its detail code |
 /// | `ParamLoadFault`, `ParamLoadRecovered` | `applied`, `unknown`, `dropped`, `torn`, `invalid`, `unreadable` |
 /// | `HeadingCorrected` | `mask` the yaw change in milliradians (two's complement), `code_a` the corrections made in this flight |
-/// | `HeadingRefined` | `mask` the yaw change in milliradians (two's complement) |
 /// | `HeadingContained`, `GpsSnapRepeated` | none |
 ///
 /// A parameter is identified by its stable key (`params::key_of`);
@@ -312,9 +304,6 @@ impl EventFields {
             EventKind::HeadingCorrected { angle_mrad, count } => {
                 f.mask = u16::from_ne_bytes(angle_mrad.to_ne_bytes());
                 f.code_a = count;
-            }
-            EventKind::HeadingRefined { angle_mrad } => {
-                f.mask = u16::from_ne_bytes(angle_mrad.to_ne_bytes());
             }
             EventKind::Disarmed(r) => f.code_a = r.code(),
             EventKind::ArmRefused(p) => f.mask = p.0,
@@ -411,9 +400,6 @@ impl EventFields {
             },
             17 => EventKind::HeadingContained,
             18 => EventKind::GpsSnapRepeated,
-            19 => EventKind::HeadingRefined {
-                angle_mrad: i16::from_ne_bytes(self.mask.to_ne_bytes()),
-            },
             k => return Err(EventError::BadKind(k)),
         };
         let event = Event {

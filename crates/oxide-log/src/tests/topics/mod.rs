@@ -173,7 +173,7 @@ fn record_lengths_are_pinned() {
             ("vehicle_status", 78),
             ("failsafe_flags", 101),
             ("oxide_status", 33),
-            ("oxide_estimator", 89),
+            ("oxide_estimator", 80),
             ("oxide_event", 39),
             ("oxide_logger", 40),
         ]

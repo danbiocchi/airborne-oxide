@@ -1995,15 +1995,9 @@ fn an_estimator_reset_re_bases_the_setpoints_even_if_the_flags_never_dropped() {
 /// armed. `nmax` is `EKF_HDG_NMAX`; a hold after RC loss lasts long enough
 /// not to become a return within the test.
 fn wrong_heading_rig(mode_switch: u8, decl: f32, nmax: u32) -> Rig {
-    wrong_heading_rig_with(mode_switch, decl, nmax, 0.2)
-}
-
-/// `wrong_heading_rig` with the fine step's sigma limit (`EKF_HDG_FINE`).
-fn wrong_heading_rig_with(mode_switch: u8, decl: f32, nmax: u32, fine: f32) -> Rig {
     let mut c = ekf_cfg();
     c.estimator.ekf.mag_declination_rad = decl;
     c.estimator.ekf.hdg_max_corrections = nmax;
-    c.estimator.ekf.hdg_fine_rad = fine;
     c.failsafe.rc_loss_hold_s = 120.0;
     let mut rig = Rig::ekf(mode_switch).with_cfg(c);
     rig.arm();
@@ -2671,79 +2665,4 @@ fn a_vehicle_that_has_landed_and_sits_armed_is_not_judged_when_it_is_moved() {
         carried_ms > 1_500,
         "carried while landed for only {carried_ms} ms"
     );
-}
-
-/// The rig's path is gentle (its fit's sigma stays above the default limit
-/// of 0.2 rad), so the fine step's limit is opened to 0.5 and the declination
-/// is the one for which this path leaves a residual above its sigma.
-const FINE_DECL: f32 = -1.0;
-
-#[test]
-fn a_fine_step_in_hold_re_bases_the_held_point_and_the_yaw_set_point_as_a_correction_does() {
-    let mut rig = wrong_heading_rig_with(2, FINE_DECL, 2, 0.5);
-    rig.path_from_s = None;
-    rig.setpoint = None;
-    assert!(rig.run_until(3.0, |r| r.nav() == NavState::Hold));
-    rig.path_from_s = Some(rig.k as f64 * 1.0e-3);
-    assert!(run_to_correction(&mut rig, 40.0));
-    assert_eq!(rig.core.estimator.heading_fine_steps(), 0);
-    // The fine step comes seconds later, when the restarted fit has a sharp
-    // reading. The reset count is what guidance re-bases on: one more at
-    // the step, and the held point and the yaw set-point follow the
-    // estimate (position snapped to the fix, yaw turned).
-    let mut resets = rig.core.estimate.visible.resets;
-    let n = rig.count(|k| matches!(k, EventKind::HeadingRefined { .. }));
-    let mut before = None;
-    for _ in 0..40_000 {
-        rig.step();
-        if rig.count(|k| matches!(k, EventKind::HeadingRefined { .. })) > n {
-            before = Some(resets);
-            break;
-        }
-        resets = rig.core.estimate.visible.resets;
-    }
-    let before = before.expect("a fine step after the correction");
-    rig.run(0.05);
-    let after = rig.core.estimate.visible.resets;
-    assert_eq!(rig.core.estimator.heading_fine_steps(), 1);
-    assert_eq!(rig.core.estimator.heading_corrections(), 1);
-    assert_eq!(
-        after,
-        before + 1,
-        "the reset count moves by one at the step: {before} {after}"
-    );
-    assert_eq!(rig.nav(), NavState::Hold);
-    let e = estimate_of(&rig);
-    let g = rig.core.guide_state;
-    let off = Vec3::new(
-        g.position_sp.x - e.position.x,
-        g.position_sp.y - e.position.y,
-        0.0,
-    )
-    .norm();
-    assert!(
-        off < 0.3,
-        "held point {:?} against {:?}",
-        g.position_sp,
-        e.position
-    );
-    assert!(wrap_pi_test(g.yaw_sp - e.attitude.yaw()).abs() < 0.1);
-    // The heading stayed valid through it, no failsafe on its account, and
-    // the event carries the angle the estimator applied.
-    assert!(rig.out.status.valid.heading);
-    assert!(
-        !rig.out
-            .status
-            .reasons
-            .contains(Reasons::ESTIMATOR_UNHEALTHY)
-    );
-    let ev = rig
-        .events
-        .iter()
-        .find_map(|e| match e.kind {
-            EventKind::HeadingRefined { angle_mrad } => Some(angle_mrad),
-            _ => None,
-        })
-        .expect("the event");
-    assert!(ev != 0 && ev.abs() < 450, "a small step: {ev} mrad");
 }

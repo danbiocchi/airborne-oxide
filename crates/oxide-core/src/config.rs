@@ -240,13 +240,6 @@ pub struct EkfParams {
     pub hdg_persist_us: u32,
     /// Memory of the heading fit, s.
     pub hdg_tau_s: f32,
-    /// An experiment's switch: 1 feeds the heading fit with the roll and
-    /// pitch of the separate tilt reference (`estimator::tilt_ref`), 0 with
-    /// the filter's own.
-    pub hdg_tilt: u32,
-    /// An experiment's setting: the fine step after a correction acts on a
-    /// reading whose sigma is at most this, rad; 0 switches it off.
-    pub hdg_fine_rad: f32,
 }
 
 impl Default for EkfParams {
@@ -283,8 +276,6 @@ impl Default for EkfParams {
             hdg_k_sigma: 0.0,
             hdg_persist_us: 0,
             hdg_tau_s: 0.0,
-            hdg_tilt: 0,
-            hdg_fine_rad: 0.0,
         };
         crate::params::fill_defaults(&mut e);
         e
@@ -826,7 +817,7 @@ impl<const N: usize> VehicleConfig<N> {
     /// (the cell count is an integer below 256). At most
     /// [`MAX_NUMBERED_ROTORS`] rotors: more does not compile.
     ///
-    /// The 100 parameters are not here; they are `params::get` over the
+    /// The 98 parameters are not here; they are `params::get` over the
     /// table. Together they are the whole configuration.
     pub fn vehicle_numbers(&self, mut f: impl FnMut(&'static str, f32)) {
         const { assert!(N <= MAX_NUMBERED_ROTORS) };
@@ -855,7 +846,7 @@ impl<const N: usize> VehicleConfig<N> {
     /// description from named values (any order). Every name must appear
     /// once; one that is not this vehicle's is [`NumbersError::Unknown`].
     ///
-    /// The gains, limits, estimator and failsafe settings, which the 100
+    /// The gains, limits, estimator and failsafe settings, which the 98
     /// parameters hold, come out at the table defaults: apply the
     /// parameters on top (`params::set_all`). The result is not validated.
     pub fn from_vehicle_numbers<'a>(
