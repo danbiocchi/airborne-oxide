@@ -1683,30 +1683,39 @@ mod tests {
         assert_eq!(rig.est.status().resets, resets + 1, "one reset only");
     }
 
-    /// The filter snaps its velocity to a GPS that disagreed for the timeout,
-    /// airborne; the GPS then disagrees again `gap_s` later. Returns whether
-    /// the repeat was reported.
-    fn snap_then_reject(airborne: bool, gap_s: f64) -> bool {
+    /// The filter snaps to a GPS that disagreed for the timeout, airborne
+    /// (its velocity alone, or its position: the two kinds of snap after
+    /// continuous rejection); the GPS then disagrees again `gap_s` later.
+    /// Returns whether the repeat was reported.
+    fn snap_then_reject(airborne: bool, gap_s: f64, position_snap: bool) -> bool {
         let mut rig = Rig::new(&EkfParams::default());
         rig.run_until(4.0);
         rig.est.set_airborne(airborne);
-        rig.gps_vel = Vec3::new(5.0, 0.0, 0.0);
+        if position_snap {
+            rig.gps_pos = Vec3::new(40.0, 0.0, 0.0);
+        } else {
+            rig.gps_vel = Vec3::new(5.0, 0.0, 0.0);
+        }
         let resets = rig.est.status().resets;
-        // Until the snap (the velocity-only rejection timer, 5 s).
+        // Until the snap (the rejection timers, 5 s).
         while rig.est.status().resets == resets && rig.now().as_secs_f64() < 20.0 {
             rig.tick();
         }
         assert_eq!(rig.est.status().resets, resets + 1, "the snap");
         assert!(!rig.est.take_gps_snap_repeated(), "not yet");
-        // The fixes after it agree (the receiver's position now moves with
-        // its velocity): no event.
+        // The fixes after it agree (a velocity snap: the receiver's position
+        // now moves with its velocity): no event.
         let until = rig.now().as_secs_f64() + gap_s;
         while rig.now().as_secs_f64() < until {
             rig.gps_pos.x += rig.gps_vel.x * 0.001;
             rig.tick();
         }
         assert!(!rig.est.take_gps_snap_repeated(), "agreeing fixes");
-        rig.gps_vel = Vec3::new(-6.0, 0.0, 0.0);
+        if position_snap {
+            rig.gps_pos = Vec3::new(-40.0, 0.0, 0.0);
+        } else {
+            rig.gps_vel = Vec3::new(-6.0, 0.0, 0.0);
+        }
         let until = rig.now().as_secs_f64() + 0.8;
         rig.run_until(until);
         rig.est.take_gps_snap_repeated()
@@ -1714,13 +1723,32 @@ mod tests {
 
     #[test]
     fn a_rejection_soon_after_a_snap_to_gps_is_reported_once_in_the_air() {
-        assert!(snap_then_reject(true, 1.0), "1 s after the snap, airborne");
-        assert!(snap_then_reject(true, 2.0), "2 s after the snap, airborne");
-        // On the ground (after a kill the receiver simply does not agree
-        // with a vehicle that is not there): nothing is reported.
-        assert!(!snap_then_reject(false, 1.0));
-        // Not after the window.
-        assert!(!snap_then_reject(true, 3.5));
+        for position_snap in [false, true] {
+            let what = if position_snap {
+                "position"
+            } else {
+                "velocity"
+            };
+            assert!(
+                snap_then_reject(true, 1.0, position_snap),
+                "{what}: 1 s after the snap, airborne"
+            );
+            assert!(
+                snap_then_reject(true, 2.0, position_snap),
+                "{what}: 2 s after the snap, airborne"
+            );
+            // On the ground (after a kill the receiver simply does not agree
+            // with a vehicle that is not there): nothing is reported.
+            assert!(
+                !snap_then_reject(false, 1.0, position_snap),
+                "{what}: on the ground"
+            );
+            // Not after the window.
+            assert!(
+                !snap_then_reject(true, 3.5, position_snap),
+                "{what}: 3.5 s after"
+            );
+        }
     }
 
     // ---- the heading check, wired into the filter -------------------------
