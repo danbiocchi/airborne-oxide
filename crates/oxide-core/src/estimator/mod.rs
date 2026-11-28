@@ -2123,6 +2123,19 @@ mod tests {
         rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
         rig.mag_field = MAG;
         rig.gps_vel = Vec3::zero();
+        // The alignment itself uses the shifted declination: the yaw is
+        // right at the very tick the filter exists, before any magnetometer
+        // fusion could pull it there.
+        while rig.est.ekf().is_none() {
+            rig.tick();
+            assert!(rig.now().as_secs_f64() < t + 4.0);
+        }
+        let at_alignment = rig.est.ekf().unwrap().x.q.yaw();
+        assert!(
+            wrap_pi(at_alignment - (1.0 + dpsi)).abs() < 0.02,
+            "yaw at alignment {at_alignment}, want {}",
+            1.0 + dpsi
+        );
         rig.run_until(t + 4.0);
         assert_eq!(rig.est.heading_corrections(), 1, "not cleared by the drop");
         let e = rig.est.ekf().expect("aligned again");

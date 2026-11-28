@@ -242,7 +242,13 @@ fn corrected_and_contained_flights_replay_bit_for_bit() {
             contained |= sim.core().estimator().heading_contained();
         }
         sim.finish_log().expect("finishes");
-        // (Both are cleared at the disarm after the landing.)
+        // Both are cleared at the disarm after the landing (the core tells
+        // the estimator the supervisor's `armed`): the flights end landed.
+        if nmax <= 0.0 {
+            let est = sim.core().estimator();
+            assert!(!est.heading_contained() && est.heading_corrections() == 0);
+            assert_eq!(est.declination_shift(), 0.0);
+        }
         if nmax > 0.0 {
             assert!(corrected && !contained, "{}: corrected", profile.name);
         } else {

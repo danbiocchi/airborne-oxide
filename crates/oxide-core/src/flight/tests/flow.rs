@@ -3,6 +3,7 @@
 //! (ADR-0003).
 
 use super::*;
+use crate::estimator::heading_check::HeadingGuard;
 use crate::flight::guidance::RtlPhase;
 use crate::io::DisarmReason;
 use crate::math::Quat;
@@ -2242,6 +2243,13 @@ fn a_contained_heading_raises_estimator_unhealthy_and_lands_now_and_the_pilot_ge
     // The per-flight state stays until disarm.
     assert!(rig.core.estimator.heading_contained());
     assert!(rig.core.telemetry().heading_guard.contained);
+    // The pilot disarms (the vehicle is on the ground as far as the rig can
+    // tell): the latch and the correction state go with the flight.
+    rig.rc.arm_switch = false;
+    assert!(rig.run_until(5.0, |r| !r.out.status.armed));
+    rig.run(0.1);
+    assert!(!rig.core.estimator.heading_contained());
+    assert_eq!(rig.core.telemetry().heading_guard, HeadingGuard::default());
 }
 
 // ---- read-only telemetry (M1c part three, K1) ----
