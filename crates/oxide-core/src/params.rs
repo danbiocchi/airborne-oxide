@@ -588,7 +588,7 @@ declare_params! {
         f32 EKF_OUT_TAU = output_tau_s: 0.25, 0.15, 10.0, "s", Estimator, disarmed,
             "Time constant with which the output predictor follows the filter. At least 0.15 s and at least EKF_HORIZON: flown on gust-hold, the estimate oscillates and the flight is lost below about 0.7 of the horizon (0.14 s at the default horizon).";
         count EKF_HDG_NMAX = hdg_max_corrections: 2, 0, 5, "", Estimator, disarmed,
-            "Heading corrections allowed per flight when the heading disagrees with the vehicle's own motion; the next disagreement lands the vehicle (heading invalid). 0 detects and contains only. Two: one correction for the fault, one for the residual or a second effect; a third means the error is not constant. In this version the check only watches and nothing acts on it.";
+            "Heading corrections allowed per flight when the heading disagrees with the vehicle's own motion; the next disagreement lands the vehicle (the heading is declared invalid until disarm: ESTIMATOR_UNHEALTHY, LandNow). 0 detects and contains only: the first disagreement lands. Two: one correction for the fault, one for the residual or a second effect; a third means the error is not constant.";
         f32 EKF_HDG_THR = hdg_threshold_rad: 0.3, 0.1, 1.0, "rad", Estimator, disarmed,
             "Heading error worth acting on: about half the smallest error at which the position loop turns unstable (0.65 rad in Position mode), so what is left uncorrected keeps a factor of 2 of margin. PX4 uses 25 degrees (0.44 rad).";
         f32 EKF_HDG_K = hdg_k_sigma: 2.0, 1.0, 5.0, "sigma", Estimator, disarmed,

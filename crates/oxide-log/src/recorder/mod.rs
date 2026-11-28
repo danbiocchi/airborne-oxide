@@ -778,6 +778,7 @@ impl<const CAP: usize> Recorder<CAP> {
                     tel.estimate.is_some(),
                     tel.gyro_filtered,
                     &tel.heading_fit,
+                    &tel.heading_guard,
                 )
             });
         }

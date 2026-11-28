@@ -15,7 +15,7 @@ use crate::config::{ConfigError, EstimatorSource, VehicleConfig};
 use crate::control::{
     AttitudeTarget, PositionController, RateController, RateTarget, attitude_rate_setpoint,
 };
-use crate::estimator::heading_check::HeadingFit;
+use crate::estimator::heading_check::{HeadingFit, HeadingGuard};
 use crate::estimator::ring::Ring;
 use crate::estimator::{Estimator, IMU_TIMEOUT_US};
 use crate::filters::LowPass2;
@@ -580,6 +580,14 @@ impl<const N: usize> Core<N> {
         match self.cfg.estimator.source {
             EstimatorSource::Ekf => self.estimator.heading_fit(),
             EstimatorSource::External => HeadingFit::default(),
+        }
+    }
+
+    /// The heading guard's state (zero for the external source).
+    fn heading_guard(&self) -> HeadingGuard {
+        match self.cfg.estimator.source {
+            EstimatorSource::Ekf => self.estimator.heading_guard(),
+            EstimatorSource::External => HeadingGuard::default(),
         }
     }
 

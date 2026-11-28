@@ -12,7 +12,7 @@ use crate::topics::{
     OXIDE_STATUS, bits, decode_event, event_fields,
 };
 use oxide_core::config::EstimatorSource;
-use oxide_core::estimator::heading_check::HeadingFit;
+use oxide_core::estimator::heading_check::{HeadingFit, HeadingGuard};
 use oxide_core::io::{
     Action, DisarmReason, EstimatorStatus, Event, EventKind, FlightMode, NavState, PrearmFlags,
     Reasons, Status, Validity,
@@ -58,13 +58,15 @@ pub(super) fn all_samples() -> Vec<Vec<u8>> {
                 gps_aiding: true,
                 rejected: 3,
                 resets: 1,
-                heading_corrections: 1,
-                heading_contained: true,
-                heading_shift_rad: -0.75,
             },
             true,
             Vec3::new(0.1, 0.2, 0.3),
             &HeadingFit::default(),
+            &HeadingGuard {
+                corrections: 1,
+                contained: true,
+                shift_rad: -0.75,
+            },
         )
     });
     let e = Event {
@@ -309,9 +311,11 @@ fn oxide_estimator_table() {
         gps_aiding: false,
         rejected: 70_000,
         resets: 4_000_000_000,
-        heading_corrections: 2,
-        heading_contained: true,
-        heading_shift_rad: -1.5,
+    };
+    let guard = HeadingGuard {
+        corrections: 2,
+        contained: true,
+        shift_rad: -1.5,
     };
     let fit = HeadingFit {
         seq: 7,
@@ -328,7 +332,15 @@ fn oxide_estimator_table() {
         vel_ratio: 0.5,
     };
     let f = one_record(&OXIDE_ESTIMATOR, |w| {
-        topics::oxide_estimator(w, Micros(55), &e, true, Vec3::new(0.5, -1.5, 2.0), &fit)
+        topics::oxide_estimator(
+            w,
+            Micros(55),
+            &e,
+            true,
+            Vec3::new(0.5, -1.5, 2.0),
+            &fit,
+            &guard,
+        )
     });
     let r = f.records("oxide_estimator").next().unwrap();
     ints(

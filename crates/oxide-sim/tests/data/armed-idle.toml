@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Not a scenario of the set: a vehicle that arms and idles on the ground for
+# the rest of the flight (Stabilized, the throttle stick down), used by
+# `tests/heading_check.rs` with a wrong declination to show that the heading
+# guard never acts between arming and lift-off.
+name = "armed-idle"
+about = "Armed on the ground at idle, never lifting off."
+airframe = "quad-x-5in"
+duration_s = 25.0
+
+[sim]
+sensors = "realistic"
+estimator = "ekf"
+
+[sim.links]
+gcs = false
+brain = true
+rc_failsafe_delay_us = 1000000
+
+[wind]
+kind = "random"
+steady_speed_mps = [0.0, 2.0]
+sigma_h_mps = [0.1, 0.4]
+sigma_v_ratio = 0.5
+tau_s = 2.0
+
+[pilot]
+arm_at_s = 3.0
+
+[[pilot.mode]]
+t = 0.0
+switch = "stabilized"
+
+[[pilot.setpoint]]
+t = 0.0
+position = [0.0, 0.0, 0.0]
+yaw = 0.0
+
+[expect]
+max_height_m = 0.2
+
+[expect.ending]
+kind = "landed"
+within_m_of_home = 0.5
+
+[run]
+seeds = 1
+profiles = ["f405"]

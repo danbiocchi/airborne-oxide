@@ -9,10 +9,16 @@
 //! fit of that one angle over a fading window is closed form:
 //! `eps = atan2(Σ cross(G, A), Σ G·A)`, and it reads any angle, ±π included.
 //!
-//! **In this piece the verdict changes nothing in flight.** The check is
-//! computed, counted and logged ([`HeadingFit`]) only; nothing reads
-//! [`Verdict`] to act. `EKF_HDG_NMAX` exists as a parameter and nothing uses
-//! it yet.
+//! The verdict is acted on by the estimator (`Estimator::fuse_gps`): a
+//! correction of the heading while fewer than `EKF_HDG_NMAX` have been made
+//! in the flight, containment (a latch read by the validity and by the GPS
+//! fusion) after that. The check itself only judges, counts and logs
+//! ([`HeadingFit`]); it restarts at every correction, so one disagreement is
+//! one verdict and one correction, not one per fix.
+//!
+//! **A fix without a valid speed accuracy** (`s_acc` not finite) is judged
+//! with the filter's noise floor, as the fusion treats it (see `on_fix`);
+//! the board bring-up must say that the receiver in use reports `s_acc`.
 //!
 //! All state is a handful of `f32` sums: no allocation, no history, no
 //! division by a value that can be zero (guarded), transcendentals only
@@ -99,7 +105,7 @@ pub enum Verdict {
     None,
     /// The heading disagrees with the motion by `eps` (filter minus truth,
     /// rad, any angle) with one-sigma `sigma`, and has for the persistence
-    /// time. In this piece nothing acts on it.
+    /// time. The estimator acts on it and restarts the fit.
     Correct { eps: f32, sigma: f32 },
 }
 
@@ -134,6 +140,20 @@ pub struct HeadingFit {
     /// innovation over the squared gate; above 1 means rejected), or -1
     /// when the fix was not fused (a reset to GPS, or skipped).
     pub vel_ratio: f32,
+}
+
+/// The heading guard's per-flight state, for the log (cleared at disarm).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeadingGuard {
+    /// Corrections made in this flight.
+    pub corrections: u8,
+    /// The containment latch: the heading is declared untrustworthy until
+    /// disarm.
+    pub contained: bool,
+    /// The run-time shift of the magnetometer declination made by the
+    /// corrections of this flight, rad (the parameter `EKF_MAG_DECL` is
+    /// never written).
+    pub shift_rad: f32,
 }
 
 /// The heading check: the sums, the previous fix and the streak.
@@ -279,8 +299,15 @@ impl HeadingCheck {
         if !(v[0].is_finite() && v[1].is_finite()) {
             return Verdict::None;
         }
-        // A receiver that reports no accuracy is taken as the filter takes
-        // it (zero: the noise floor applies).
+        // A receiver that reports no accuracy (`s_acc` not finite) is taken
+        // as the filter's fusion takes it: zero, so the noise floor applies
+        // and the fix is judged. This is a decision (planner's ruling R3):
+        // a receiver that reports no accuracy must not switch the guard off,
+        // an unseen wrong heading being the worse failure. The price is that
+        // the receiver's own refusal of its velocity (`s_acc` above
+        // `SACC_MAX`) is not heard from a receiver that never says it. The
+        // board bring-up must therefore confirm that the receiver in use
+        // reports its speed accuracy.
         let s_acc = s_acc.finite_or(0.0).max(0.0);
         let a = self.acc;
         self.acc = [0.0; 2];
@@ -588,6 +615,79 @@ mod tests {
         d.fix_with(FIX_US, 1.5, 1.0, [0.0, 8.0]);
         assert!(!d.chk.fit().used);
         assert_eq!(d.chk.fit().streak, 0);
+    }
+
+    /// Two fixes 0.2 s apart with GPS velocity change `|G| = g` and an IMU
+    /// integral of size `a` (the same direction); whether the second
+    /// interval was used and whether the fit was restarted.
+    fn gate_case(g: f32, a: f32, s_acc: f32) -> (bool, f32) {
+        let mut chk = HeadingCheck::new(HeadingConfig::default());
+        chk.set_airborne(true);
+        // A first interval with agreeing sizes, so that there is something
+        // to restart.
+        let mut t = 1_000_000;
+        let mut v = 0.0;
+        chk.on_fix(Micros(t), Some(([v, 0.0], s_acc)));
+        for _ in 0..3 {
+            t += FIX_US;
+            v += 1.0;
+            chk.on_step([1.0, 0.0]);
+            chk.on_fix(Micros(t), Some(([v, 0.0], s_acc)));
+        }
+        assert!(chk.fit().used && chk.fit().sa > 2.0);
+        t += FIX_US;
+        chk.on_step([a, 0.0]);
+        chk.on_fix(Micros(t), Some(([v + g, 0.0], s_acc)));
+        (chk.fit().used, chk.fit().sa)
+    }
+
+    #[test]
+    fn the_magnitude_gate_is_the_difference_of_the_sizes_at_five_root_two_sigma() {
+        // sv = max(s_acc 0.2, noise floor 0.3) = 0.3: the gate is
+        // 5 sqrt(2) 0.3 = 2.1213 m/s on | |G| - |A| |.
+        let gate = MAG_GATE * SQRT_2 * 0.3;
+        assert!((gate - 2.1213).abs() < 1e-3);
+        // A moderate acceleration, the IMU feeling less than the GPS: just
+        // below the gate the interval is used, just above it is not and the
+        // fit restarts. (A gate on the squares, `|G|^2 - |A|^2`, refuses the
+        // first of these.)
+        let (used, sa) = gate_case(3.0, 3.0 - (gate - 0.02), 0.2);
+        assert!(used, "just below the gate");
+        assert!(sa > 2.0);
+        let (used, sa) = gate_case(3.0, 3.0 - (gate + 0.02), 0.2);
+        assert!(!used, "just above the gate");
+        assert_eq!(sa, 0.0, "the fit restarts");
+        // The IMU feeling more than the GPS, at a small GPS change (a gate
+        // on a ratio, or on the squares, gets this one wrong).
+        let (used, _) = gate_case(1.0, 1.0 + gate - 0.02, 0.2);
+        assert!(used, "just below the gate, A larger");
+        let (used, sa) = gate_case(1.0, 1.0 + gate + 0.02, 0.2);
+        assert!(!used && sa == 0.0, "just above the gate, A larger");
+        // The gate widens with the receiver's own accuracy (sv = s_acc when
+        // above the floor): 5 sqrt(2) 0.4 = 2.83.
+        let wide = MAG_GATE * SQRT_2 * 0.4;
+        let (used, _) = gate_case(3.0, 3.0 - (wide - 0.02), 0.4);
+        assert!(used);
+        let (used, _) = gate_case(3.0, 3.0 - (wide + 0.02), 0.4);
+        assert!(!used);
+    }
+
+    #[test]
+    fn a_fix_with_no_valid_speed_accuracy_is_judged_with_the_noise_floor() {
+        // The fusion takes a missing `s_acc` as zero (the noise floor); so
+        // does the check, so a receiver that reports none does not switch
+        // the guard off.
+        let run = |s_acc: f32| {
+            let mut d = Drive::new();
+            d.s_acc = s_acc;
+            d.run(60, 1.5);
+            (d.first_verdict_fix, d.chk.fit().used, d.chk.fit().sigma)
+        };
+        let floor = run(0.0);
+        assert!(floor.0.is_some());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            assert_eq!(run(bad), floor, "s_acc {bad}");
+        }
     }
 
     #[test]

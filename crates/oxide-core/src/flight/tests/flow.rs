@@ -2070,7 +2070,7 @@ fn a_correction_in_hold_re_bases_the_held_point_and_the_yaw_set_point() {
             .reasons
             .contains(Reasons::ESTIMATOR_UNHEALTHY)
     );
-    assert_eq!(rig.out.status.estimator.heading_corrections, 1);
+    assert_eq!(rig.core.estimator.heading_corrections(), 1);
 }
 
 fn wrap_pi_test(a: f32) -> f32 {
@@ -2096,7 +2096,7 @@ fn a_correction_in_offboard_goes_on_following_the_setpoint_and_keeps_the_mode() 
             .reasons
             .contains(Reasons::ESTIMATOR_UNHEALTHY)
     );
-    assert_eq!(rig.out.status.estimator.heading_corrections, 1);
+    assert_eq!(rig.core.estimator.heading_corrections(), 1);
     // The correction is in the estimator's status and in the events, with
     // its angle.
     let dpsi = rig
@@ -2217,9 +2217,9 @@ fn a_contained_heading_raises_estimator_unhealthy_and_lands_now_and_the_pilot_ge
     }));
     let v = rig.out.status.valid;
     assert!(!v.heading && !v.velocity && !v.position, "{v:?}");
-    assert!(rig.out.status.estimator.heading_contained);
-    assert_eq!(rig.out.status.estimator.heading_corrections, 0);
-    assert!(!rig.out.status.estimator.gps_aiding || rig.core.estimator.heading_contained());
+    assert!(rig.core.estimator.heading_contained());
+    assert!(rig.core.telemetry().heading_guard.contained);
+    assert_eq!(rig.core.estimator.heading_corrections(), 0);
     // The pilot takes the vehicle with the mode switch (the link is good
     // and settled): Stabilized is flown as asked.
     rig.rc.mode_switch = 0;
@@ -2240,7 +2240,8 @@ fn a_contained_heading_raises_estimator_unhealthy_and_lands_now_and_the_pilot_ge
     rig.run(2.0);
     assert_eq!(rig.nav(), NavState::Altitude);
     // The per-flight state stays until disarm.
-    assert!(rig.out.status.estimator.heading_contained);
+    assert!(rig.core.estimator.heading_contained());
+    assert!(rig.core.telemetry().heading_guard.contained);
 }
 
 // ---- read-only telemetry (M1c part three, K1) ----

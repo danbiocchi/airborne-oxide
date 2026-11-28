@@ -477,7 +477,7 @@ impl EventList {
 }
 
 /// Estimator health (ADR-0002).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EstimatorStatus {
     /// Tilt and heading have been initialised.
     pub aligned: bool,
@@ -487,19 +487,10 @@ pub struct EstimatorStatus {
     pub rejected: u32,
     /// State resets since boot (position or velocity snapped to GPS).
     pub resets: u32,
-    /// Heading corrections made in this flight (cleared at disarm).
-    pub heading_corrections: u8,
-    /// The heading was declared untrustworthy after the correction budget
-    /// was used up (until disarm): the heading, velocity and position are
-    /// not valid.
-    pub heading_contained: bool,
-    /// The run-time shift of the magnetometer declination made by the
-    /// corrections of this flight, rad.
-    pub heading_shift_rad: f32,
 }
 
 /// Health and status flags reported with every output.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Status {
     pub armed: bool,
     /// The kill switch fired; latched until the arm switch is released.

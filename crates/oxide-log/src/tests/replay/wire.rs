@@ -471,10 +471,6 @@ impl Flat for decode::OutRecord<4> {
             gps_aiding,
             rejected,
             resets,
-            // Not in the replay record (the outputs cover them).
-            heading_corrections: _,
-            heading_contained: _,
-            heading_shift_rad: _,
         } = estimator;
         let Validity {
             attitude,
@@ -567,7 +563,6 @@ impl Flat for decode::OutRecord<4> {
                     gps_aiding,
                     rejected,
                     resets,
-                    ..EstimatorStatus::default()
                 },
                 nav,
                 valid,

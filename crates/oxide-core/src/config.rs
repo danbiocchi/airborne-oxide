@@ -230,7 +230,7 @@ pub struct EkfParams {
     pub output_tau_s: f32,
     /// Heading check against the vehicle's own motion (stage 1 of the
     /// heading guard; `estimator::heading_check`). Corrections allowed per
-    /// flight. In piece P1 nothing acts on a verdict, so nothing reads it.
+    /// flight; the next disagreement is containment.
     pub hdg_max_corrections: u32,
     /// Heading error worth acting on, rad.
     pub hdg_threshold_rad: f32,

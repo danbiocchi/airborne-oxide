@@ -30,7 +30,7 @@ use crate::math::{Quat, Real, Vec3, wrap_pi};
 use crate::schedule::Profile;
 use crate::time::Micros;
 use ekf::{Ekf, Fusion, GYRO_BIAS_LIMIT, heading_from_mag, tilt_from_accel};
-use heading_check::{HeadingCheck, HeadingConfig, HeadingFit, Verdict};
+use heading_check::{HeadingCheck, HeadingConfig, HeadingFit, HeadingGuard, Verdict};
 use imu::{ImuAccumulator, ImuDelta};
 use output::OutputPredictor;
 use ring::Ring;
@@ -139,9 +139,9 @@ pub struct Estimator {
     raw_gyro: Vec3<f32>,
     rejected: u32,
     resets: u32,
-    /// The check of the heading against the vehicle's own motion. In this
-    /// version it only watches: its verdict is counted and logged, and
-    /// nothing reads it to act.
+    /// The check of the heading against the vehicle's own motion. Its
+    /// verdict is acted on in `fuse_gps`: a correction, or containment when
+    /// the budget is used up.
     hdg: HeadingCheck,
     /// Corrections made in this flight (cleared at disarm).
     hdg_corrections: u8,
@@ -282,7 +282,7 @@ impl Estimator {
     }
 
     /// How many fixes since boot had the heading check's verdict
-    /// `Correct` (nothing acts on it).
+    /// `Correct`.
     pub fn heading_verdicts(&self) -> u32 {
         self.hdg.verdicts()
     }
@@ -449,9 +449,19 @@ impl Estimator {
             gps_aiding: aiding,
             rejected: self.rejected,
             resets: self.resets,
-            heading_corrections: self.hdg_corrections,
-            heading_contained: self.hdg_latched,
-            heading_shift_rad: self.decl_shift,
+        }
+    }
+
+    /// The heading guard's per-flight state: the corrections made, the
+    /// containment latch and the run-time shift of the declination. Not part
+    /// of [`EstimatorStatus`] (which is an output the replay compares bit for
+    /// bit: the guard's effect is in the outputs it changes, validity, resets
+    /// and the estimate); logged with the heading check's fit.
+    pub fn heading_guard(&self) -> HeadingGuard {
+        HeadingGuard {
+            corrections: self.hdg_corrections,
+            contained: self.hdg_latched,
+            shift_rad: self.decl_shift,
         }
     }
 
@@ -1923,7 +1933,7 @@ mod tests {
         assert!((rig.est.declination_shift() - dpsi).abs() < 1e-6);
         assert!((rig.est.ekf().unwrap().declination() - (1.0 + dpsi)).abs() < 1e-5);
         assert_eq!(
-            rig.est.status().heading_shift_rad,
+            rig.est.heading_guard().shift_rad,
             rig.est.declination_shift()
         );
         // And it stays there: the magnetometer holds the corrected heading
@@ -1996,7 +2006,7 @@ mod tests {
         assert_eq!(rig.est.heading_corrections(), 2);
         assert!(contained_at.is_some_and(|t| t > seen[1].0));
         assert!(rig.est.heading_contained());
-        assert!(rig.est.status().heading_contained);
+        assert!(rig.est.heading_guard().contained);
         // The second correction is right: it undoes the first step (+0.9 rad
         // of true heading), as seen from the heading the first correction
         // had made right (to within the fit's bias, a few tenths).
@@ -2147,8 +2157,7 @@ mod tests {
         assert_eq!(rig.est.heading_corrections(), 0);
         assert!(!rig.est.heading_contained());
         assert_eq!(rig.est.declination_shift(), 0.0);
-        let s = rig.est.status();
-        assert!(s.heading_corrections == 0 && !s.heading_contained && s.heading_shift_rad == 0.0);
+        assert_eq!(rig.est.heading_guard(), HeadingGuard::default());
         assert!(rig.est.take_heading_corrected().is_none());
         // The filter's heading (the truth) and the magnetometer (with the
         // parameter's declination) now disagree: the filter is dropped, and
@@ -2201,7 +2210,7 @@ mod tests {
         rig.est.set_airborne(false);
         rig.est.set_armed(false);
         assert!(!rig.est.heading_contained());
-        assert!(!rig.est.status().heading_contained);
+        assert!(!rig.est.heading_guard().contained);
         rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
         rig.gps_vel = Vec3::zero();
         rig.gps_pos = Vec3::zero();

@@ -586,9 +586,6 @@ pub fn decode_out<const N: usize>(r: &RecordView<'_>) -> Res<OutRecord<N>> {
             gps_aiding: d.flag("gps_aiding")?,
             rejected: d.u32("rejected")?,
             resets: d.u32("resets")?,
-            // Not part of the replay record: the replay checks the outputs,
-            // which cover what the heading state does.
-            ..EstimatorStatus::default()
         },
         nav: d.code("nav", NavState::from_code)?,
         valid: Validity {

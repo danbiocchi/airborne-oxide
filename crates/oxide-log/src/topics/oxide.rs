@@ -10,7 +10,7 @@ use crate::Sink;
 use crate::logger::Stats;
 use crate::record::{RecordWriter, Topic};
 use oxide_core::config::EstimatorSource;
-use oxide_core::estimator::heading_check::HeadingFit;
+use oxide_core::estimator::heading_check::{HeadingFit, HeadingGuard};
 use oxide_core::io::{
     Action, DisarmReason, EstimatorStatus, Event, EventKind, FlightMode, NavState, PrearmFlags,
     Reasons, Status, Validity,
@@ -155,7 +155,8 @@ pub fn oxide_status<S: Sink + ?Sized>(
 /// `oxide_estimator`: the rejected-measurement and reset counters, the
 /// rate loop's filtered gyro (rad/s, body), the alignment and GPS-aiding
 /// flags, whether the core had published an estimate at all, and the
-/// heading check's fit after the latest GPS fix it judged while airborne.
+/// heading check's fit after the latest GPS fix it judged while airborne,
+/// and the heading guard's state (corrections, latch, declination shift).
 pub fn oxide_estimator<S: Sink + ?Sized>(
     w: &mut RecordWriter<'_, S>,
     now: Micros,
@@ -163,6 +164,7 @@ pub fn oxide_estimator<S: Sink + ?Sized>(
     has_estimate: bool,
     gyro_filtered: Vec3<f32>,
     fit: &HeadingFit,
+    guard: &HeadingGuard,
 ) {
     w.u64(now.0).u32(e.rejected).u32(e.resets);
     w.f32(gyro_filtered.x)
@@ -179,9 +181,9 @@ pub fn oxide_estimator<S: Sink + ?Sized>(
         .f32(fit.vel_ratio);
     w.u64(fit.t_us);
     w.u8(fit.streak).bool(fit.used);
-    w.u8(e.heading_corrections)
-        .bool(e.heading_contained)
-        .f32(e.heading_shift_rad);
+    w.u8(guard.corrections)
+        .bool(guard.contained)
+        .f32(guard.shift_rad);
 }
 
 /// `oxide_logger` from the logger's statistics. `high_water` is the ring's

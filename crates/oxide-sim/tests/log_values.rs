@@ -1000,9 +1000,10 @@ fn oxide_estimator(t: u64, k: &Tick, _: &Vehicle, e: &mut Exp<'_>) {
     e.v("fit_streak", f.streak);
     e.flag("fit_used", f.used);
     // The heading guard's state.
-    e.v("hdg_corrections", est.heading_corrections);
-    e.flag("hdg_contained", est.heading_contained);
-    e.v("hdg_shift", est.heading_shift_rad);
+    let h = &k.tel.heading_guard;
+    e.v("hdg_corrections", h.corrections);
+    e.flag("hdg_contained", h.contained);
+    e.v("hdg_shift", h.shift_rad);
 }
 
 /// `oxide_event`: every event of every tick, in order, with the fixed codes
