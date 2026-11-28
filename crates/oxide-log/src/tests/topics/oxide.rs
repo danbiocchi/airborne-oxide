@@ -66,6 +66,8 @@ pub(super) fn all_samples() -> Vec<Vec<u8>> {
                 corrections: 1,
                 contained: true,
                 shift_rad: -0.75,
+                tilt_roll_rad: 0.0,
+                tilt_pitch_rad: 0.0,
             },
         )
     });
@@ -316,6 +318,8 @@ fn oxide_estimator_table() {
         corrections: 2,
         contained: true,
         shift_rad: -1.5,
+        tilt_roll_rad: 0.5,
+        tilt_pitch_rad: -0.25,
     };
     let fit = HeadingFit {
         seq: 7,
@@ -375,10 +379,13 @@ fn oxide_estimator_table() {
             ("fit_stat", 4.75),
             ("fit_vel_ratio", 0.5),
             ("hdg_shift", -1.5),
+            ("tilt_roll", 0.5),
+            ("tilt_pitch", -0.25),
         ],
     );
-    // 31 bytes before the heading fit was added, 74 before the guard's state.
-    assert_eq!(r.raw().len(), 80);
+    // 31 bytes before the heading fit was added, 74 before the guard's
+    // state, 80 before the tilt reference's roll and pitch.
+    assert_eq!(r.raw().len(), 88);
 }
 
 #[test]

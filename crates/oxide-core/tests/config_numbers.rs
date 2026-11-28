@@ -269,7 +269,7 @@ fn changing_any_single_value_changes_the_hash() {
 
 #[test]
 fn the_hash_of_the_reference_quad_is_pinned() {
-    // 28 vehicle numbers and 98 parameters, each as four little-endian bytes
+    // 28 vehicle numbers and 100 parameters, each as four little-endian bytes
     // of its bits, then the exact microseconds of the eleven durations as four
     // little-endian bytes each, through 64-bit FNV-1a: also computed by an
     // independent Python script from the same list of bits. The first part
@@ -278,7 +278,11 @@ fn the_hash_of_the_reference_quad_is_pinned() {
     // heading-check parameters were added (EKF_HDG_NMAX, EKF_HDG_THR, EKF_HDG_K,
     // EKF_HDG_T, EKF_HDG_TAU): the hash covers every parameter and every
     // duration, so it is the old list plus those five (one of them a duration).
-    assert_eq!(quad().config_hash(), 0xaad3_ec4e_ea2e_465d);
+    // It changed again for the two parameters of the fourth part (EKF_HDG_TILT,
+    // default 1, and EKF_HDG_FINE, default 0.2, listed after EKF_HDG_TAU): the
+    // value was recomputed by `hp/config_hash_check.py` from the old list of
+    // bits with those two inserted, and equals the one the code gives.
+    assert_eq!(quad().config_hash(), 0x1b7b_96c6_0f8c_fa33);
 }
 
 #[test]

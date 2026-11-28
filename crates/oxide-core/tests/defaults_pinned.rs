@@ -112,6 +112,8 @@ fn defaults_are_pinned() {
     f("e.hdg_k_sigma", e.hdg_k_sigma, 0x40000000);
     assert_eq!(e.hdg_persist_us, 1000000, "e.hdg_persist_us");
     f("e.hdg_tau_s", e.hdg_tau_s, 0x40400000);
+    assert_eq!(e.hdg_tilt, 1, "e.hdg_tilt");
+    f("e.hdg_fine_rad", e.hdg_fine_rad, 0x3e4ccccd);
     assert_eq!(fs.rc_timeout_us, 500000, "fs.rc_timeout_us");
     f("fs.rc_valid_min_s", fs.rc_valid_min_s, 0x3f800000);
     f("fs.rc_loss_hold_s", fs.rc_loss_hold_s, 0x40400000);

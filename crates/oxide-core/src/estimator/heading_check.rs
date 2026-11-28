@@ -154,6 +154,11 @@ pub struct HeadingGuard {
     /// corrections of this flight, rad (the parameter `EKF_MAG_DECL` is
     /// never written).
     pub shift_rad: f32,
+    /// The tilt reference's roll, rad (zero when there is none: the switch
+    /// `EKF_HDG_TILT` is 0 or the filter does not exist).
+    pub tilt_roll_rad: f32,
+    /// The tilt reference's pitch, rad (zero when there is none).
+    pub tilt_pitch_rad: f32,
 }
 
 /// The heading check: the sums, the previous fix and the streak.

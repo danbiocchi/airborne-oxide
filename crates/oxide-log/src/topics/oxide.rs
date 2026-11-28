@@ -36,7 +36,9 @@ pub const OXIDE_STATUS: Topic = Topic {
 /// `fit_vel_ratio` is the GPS velocity test ratio of the filter's fusion of
 /// that fix, -1 when it was not fused), and the heading guard's state:
 /// `hdg_corrections` made in this flight, `hdg_contained` (the latch) and
-/// `hdg_shift`, the run-time shift of the declination, rad.
+/// `hdg_shift`, the run-time shift of the declination, rad, and the tilt
+/// reference's roll and pitch, rad (`tilt_roll`, `tilt_pitch`; zero when
+/// `EKF_HDG_TILT` is 0).
 pub const OXIDE_ESTIMATOR: Topic = Topic {
     name: "oxide_estimator",
     format: "uint64_t timestamp;uint32_t rejected;uint32_t resets;float[3] gyro_filtered;\
@@ -44,8 +46,8 @@ pub const OXIDE_ESTIMATOR: Topic = Topic {
              uint32_t fit_seq;float fit_eps;float fit_sigma;float fit_sa;float fit_kappa;\
              float fit_rho;float fit_stat;float fit_vel_ratio;uint64_t fit_t;\
              uint8_t fit_streak;bool fit_used;uint8_t hdg_corrections;bool hdg_contained;\
-             float hdg_shift;",
-    record_len: 80,
+             float hdg_shift;float tilt_roll;float tilt_pitch;",
+    record_len: 88,
 };
 
 /// `oxide_event`: one event, exactly. The fields are numbers; which of them
@@ -183,7 +185,9 @@ pub fn oxide_estimator<S: Sink + ?Sized>(
     w.u8(fit.streak).bool(fit.used);
     w.u8(guard.corrections)
         .bool(guard.contained)
-        .f32(guard.shift_rad);
+        .f32(guard.shift_rad)
+        .f32(guard.tilt_roll_rad)
+        .f32(guard.tilt_pitch_rad);
 }
 
 /// `oxide_logger` from the logger's statistics. `high_water` is the ring's

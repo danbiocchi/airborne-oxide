@@ -100,8 +100,8 @@ fn all_the_parameters_are_there_with_their_exact_values() {
         params::set(&mut cfg, &F405_LEAN, id, v).unwrap();
     }
     let f = UlogFile::parse(&normal(&cfg)).unwrap();
-    assert_eq!(params::COUNT, 98);
-    assert_eq!(f.initial_params.len(), 98);
+    assert_eq!(params::COUNT, 100);
+    assert_eq!(f.initial_params.len(), 100);
     for (i, (p, def)) in f.initial_params.iter().zip(params::PARAMS).enumerate() {
         assert_eq!(p.name, def.name, "table order");
         let want = params::get(&cfg, ParamId(i as u16)).unwrap();
@@ -357,7 +357,7 @@ fn pyulog_reads_a_header_and_one_record_of_each_topic_without_corruption() {
     assert!(lines.contains(&"info oxide_log_level normal"));
     assert!(lines.contains(&format!("info oxide_config_hash {}", cfg.config_hash()).as_str()));
     let params_seen = lines.iter().filter(|l| l.starts_with("param ")).count();
-    assert_eq!(params_seen, 98);
+    assert_eq!(params_seen, 100);
     for (i, def) in params::PARAMS.iter().enumerate() {
         let text = match params::get(&cfg, ParamId(i as u16)).unwrap() {
             params::ParamValue::F32(x) => format!("0x{:08x}", x.to_bits()),

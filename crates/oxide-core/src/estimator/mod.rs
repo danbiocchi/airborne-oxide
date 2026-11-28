@@ -20,6 +20,7 @@ pub mod heading_check;
 pub mod imu;
 pub mod output;
 pub mod ring;
+pub mod tilt_ref;
 
 use crate::GRAVITY;
 use crate::config::{ConfigError, EkfParams};
@@ -34,6 +35,7 @@ use heading_check::{HeadingCheck, HeadingConfig, HeadingFit, HeadingGuard, Verdi
 use imu::{ImuAccumulator, ImuDelta};
 use output::OutputPredictor;
 use ring::Ring;
+use tilt_ref::TiltRef;
 
 /// The least sigma given to the yaw reset of a heading correction, rad: not
 /// smaller than this, so that the magnetometer and the GPS can still refine
@@ -163,6 +165,11 @@ pub struct Estimator {
     /// a new filter (`drop_to_unaligned`) reads the declination from the
     /// parameters again. `EKF_MAG_DECL` itself is never written.
     decl_shift: f32,
+    /// The tilt reference behind the heading fit's input (`EKF_HDG_TILT`):
+    /// born with the filter, with the filter's own roll, pitch and gyro
+    /// bias, and from then on takes nothing from it but its yaw. `None`
+    /// while there is no filter, and always when the switch is 0.
+    tilt: Option<TiltRef>,
     /// The supervisor's `armed` (a fall clears the per-flight state).
     armed: bool,
     /// The last correction not yet reported (rad), for the core's event.
@@ -223,6 +230,7 @@ impl Estimator {
             hdg_max: u8::try_from(p.hdg_max_corrections).unwrap_or(u8::MAX),
             hdg_latched: false,
             decl_shift: 0.0,
+            tilt: None,
             armed: false,
             pending_corrected: None,
             pending_contained: false,
@@ -485,6 +493,8 @@ impl Estimator {
             corrections: self.hdg_corrections,
             contained: self.hdg_latched,
             shift_rad: self.decl_shift,
+            tilt_roll_rad: self.tilt.map_or(0.0, |t| t.roll()),
+            tilt_pitch_rad: self.tilt.map_or(0.0, |t| t.pitch()),
         }
     }
 
@@ -510,6 +520,7 @@ impl Estimator {
             self.dropped_faults = self.dropped_faults.saturating_add(e.faults());
         }
         self.ekf = None;
+        self.tilt = None;
         self.acc = ImuAccumulator::new(self.base_dt);
         self.imu_ring.clear();
         self.gps_ring.clear();
@@ -606,6 +617,9 @@ impl Estimator {
         // negligible).
         let limit = <f32 as Real>::from_f64(GYRO_BIAS_LIMIT);
         ekf.x.bg = (w.dang * (1.0 / w.dt)).clamp_abs(Vec3::splat(limit));
+        // The tilt reference starts from the filter's own roll, pitch and
+        // gyro bias, and is its own from then on.
+        self.tilt = (self.params.hdg_tilt != 0).then(|| TiltRef::new(roll, pitch, ekf.x.bg));
         self.ekf = Some(ekf);
         self.baro_ref = (w.baro_n > 0).then_some(w.baro_mean);
         self.output.reset(now, q0, Vec3::zero(), Vec3::zero());
@@ -648,12 +662,30 @@ impl Estimator {
             }
             self.imu_ring.pop_front();
             ekf.predict(&d);
-            self.hdg.on_step(ekf.last_dvw_ne());
+            let dvw = self.heading_input(&mut ekf, &d);
+            self.hdg.on_step(dvw);
             self.t_ekf = d.t_end;
             self.fuse_due(&mut ekf, d.t_end);
             self.output.correct(d.t_end, &ekf.x, self.filter_dt);
         }
         self.ekf = Some(ekf);
+    }
+
+    /// The horizontal velocity change handed to the heading check for this
+    /// step. With the tilt reference (`EKF_HDG_TILT` 1) it is the delta
+    /// velocity (less the filter's accelerometer bias, as the filter forms
+    /// it) turned with the reference's roll and pitch and the filter's yaw;
+    /// otherwise, or when the filter has no yaw to give (its x axis points
+    /// straight up or down), the filter's own.
+    fn heading_input(&mut self, ekf: &mut Ekf<f32>, d: &ImuDelta<f32>) -> [f32; 2] {
+        let Some(tilt) = self.tilt.as_mut() else {
+            return ekf.last_dvw_ne();
+        };
+        tilt.step(d);
+        match ekf.yaw_cos_sin() {
+            Some(cs) => tilt.horizontal(d.dvel - ekf.x.ba * d.dt, cs),
+            None => ekf.last_dvw_ne(),
+        }
     }
 
     /// Fuses every buffered observation measured at or before `t`.
@@ -2430,5 +2462,209 @@ mod tests {
         rig.run_until(t + 4.0);
         let f = rig.est.heading_fit();
         assert!(f.sa < 0.5, "{f:?}");
+    }
+
+    // ---- the tilt reference behind the heading fit ------------------------
+
+    /// A rig whose gyro reads a constant bias, so that the filter's bias
+    /// estimate at the alignment (the mean rate at rest) is not zero, with
+    /// the tilt switch as given.
+    fn tilt_rig(switch: u32) -> Rig {
+        let mut rig = Rig::new(&EkfParams {
+            hdg_tilt: switch,
+            ..EkfParams::default()
+        });
+        rig.gyro = Vec3::new(0.012, -0.007, 0.004);
+        rig
+    }
+
+    /// Runs the rig a tick at a time until the filter exists.
+    fn until_aligned(rig: &mut Rig) {
+        let from = rig.now().as_secs_f64();
+        while rig.est.ekf().is_none() {
+            assert!(rig.now().as_secs_f64() < from + 5.0, "never aligned");
+            rig.tick();
+        }
+    }
+
+    #[test]
+    fn the_tilt_reference_is_born_with_the_filter_from_its_roll_pitch_and_gyro_bias() {
+        let mut rig = tilt_rig(1);
+        assert!(rig.est.tilt.is_none());
+        until_aligned(&mut rig);
+        let ekf = rig.est.ekf().unwrap();
+        let t = rig.est.tilt.expect("a reference with the filter");
+        let (roll, pitch, _) = {
+            let e = ekf.x.q.to_euler();
+            (e.x, e.y, e.z)
+        };
+        assert!((t.roll() - roll).abs() < 1e-5, "{} {roll}", t.roll());
+        assert!((t.pitch() - pitch).abs() < 1e-5);
+        // The filter's own gyro-bias estimate at that moment, not zero.
+        assert!(ekf.x.bg.norm() > 0.01, "the rig has a gyro bias");
+        assert!((t.bias() - ekf.x.bg).norm() < 1e-7);
+        // It is in the guard's state for the log.
+        let g = rig.est.heading_guard();
+        assert_eq!((g.tilt_roll_rad, g.tilt_pitch_rad), (t.roll(), t.pitch()));
+    }
+
+    #[test]
+    fn with_the_switch_at_zero_there_is_no_reference_and_the_log_says_zero() {
+        let mut rig = tilt_rig(0);
+        rig.run_until(4.0);
+        assert!(rig.est.ekf().is_some());
+        assert!(rig.est.tilt.is_none());
+        let g = rig.est.heading_guard();
+        assert_eq!((g.tilt_roll_rad, g.tilt_pitch_rad), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_new_filter_gets_a_new_reference_from_the_new_filter() {
+        let mut rig = tilt_rig(1);
+        rig.run_until(4.0);
+        let first = rig.est.tilt.unwrap();
+        // Let the reference learn something of its own, then drop the filter.
+        fly_path(&mut rig, 4.0, 8.0);
+        assert_ne!(rig.est.tilt.unwrap().bias(), first.bias());
+        rig.est.drop_to_unaligned();
+        assert!(rig.est.ekf().is_none());
+        assert!(rig.est.tilt.is_none(), "no filter, no reference");
+        // A different gyro bias at the new alignment.
+        rig.accel = Vec3::new(0.0, 0.0, -GRAVITY);
+        rig.gps_vel = Vec3::zero();
+        rig.gyro = Vec3::new(-0.009, 0.011, 0.002);
+        until_aligned(&mut rig);
+        let ekf = rig.est.ekf().unwrap();
+        let t = rig.est.tilt.expect("a reference with the new filter");
+        assert!((t.bias() - ekf.x.bg).norm() < 1e-7, "bias {:?}", t.bias());
+        assert!((t.bias() - Vec3::new(-0.009, 0.011, 0.002)).norm() < 1e-3);
+    }
+
+    /// Runs `f` on the estimator with its filter taken out.
+    fn with_filter(rig: &mut Rig, f: impl FnOnce(&mut Estimator, &mut Ekf<f32>)) {
+        let mut ekf = rig.est.ekf.take().expect("a filter");
+        f(&mut rig.est, &mut ekf);
+        rig.est.ekf = Some(ekf);
+    }
+
+    fn a_fix(rig: &Rig, north: f32) -> Stamped<GpsSample> {
+        Stamped::ideal(
+            rig.now(),
+            GpsSample {
+                position: Vec3::new(north, 3.0, 0.0),
+                velocity: Vec3::new(2.0, 1.0, 0.0),
+                h_acc_m: 0.6,
+                v_acc_m: 1.0,
+                s_acc_mps: 0.2,
+                fix_3d: true,
+            },
+        )
+    }
+
+    #[test]
+    fn nothing_the_filter_does_to_itself_touches_the_tilt_reference() {
+        let mut rig = tilt_rig(1);
+        rig.run_until(3.0);
+        rig.est.set_airborne(true);
+        fly_path(&mut rig, 3.0, 6.0);
+        let before = rig.est.tilt.expect("a reference");
+        // A GPS reset (position and velocity snapped to a fix).
+        let fix = a_fix(&rig, 40.0);
+        with_filter(&mut rig, |e, ekf| e.reset_to_gps(ekf, &fix, 0.6, 0.3));
+        assert_eq!(rig.est.tilt, Some(before), "a GPS reset");
+        // A heading correction (yaw reset, snap, tilt variances, shift).
+        with_filter(&mut rig, |e, ekf| {
+            e.correct_heading(ekf, &fix, 1.2, 0.2, 0.6, 0.3)
+        });
+        assert_eq!(rig.est.tilt, Some(before), "a heading correction");
+        assert_eq!(rig.est.heading_corrections(), 1);
+        // The magnetometer's own yaw reset (the heading was lost).
+        rig.est.heading_ok = false;
+        let mag = Stamped::ideal(
+            rig.now(),
+            MagSample {
+                field_ut: Vec3::new(-MAG.x, -MAG.y, MAG.z),
+            },
+        );
+        let yaw = rig.est.ekf().unwrap().x.q.yaw();
+        with_filter(&mut rig, |e, ekf| e.fuse_mag(ekf, &mag));
+        assert!(
+            (rig.est.ekf().unwrap().x.q.yaw() - yaw).abs() > 1.0,
+            "the magnetometer turned the yaw"
+        );
+        assert_eq!(rig.est.tilt, Some(before), "a magnetometer reset");
+    }
+
+    /// A rest delta: no turning, the accelerometer reads gravity.
+    fn rest_delta() -> ImuDelta<f32> {
+        ImuDelta {
+            t_end: Micros(1_000),
+            dt: 0.004,
+            dang: Vec3::zero(),
+            dvel: Vec3::new(0.0, 0.0, -GRAVITY * 0.004),
+        }
+    }
+
+    #[test]
+    fn the_fit_input_is_the_references_tilt_with_the_filters_yaw() {
+        let mut rig = tilt_rig(1);
+        rig.run_until(4.0);
+        // A tilt the filter does not have, and a velocity change in the
+        // body frame (the step itself is a rest delta).
+        let ref_tilt = tilt_ref::TiltRef::new(0.3, -0.2, Vec3::zero());
+        rig.est.tilt = Some(ref_tilt);
+        let d = rest_delta();
+        let mut ekf = rig.est.ekf.take().unwrap();
+        let filter_own = ekf.last_dvw_ne();
+        let got = rig.est.heading_input(&mut ekf, &d);
+        // What it must be: the delta velocity less the filter's accelerometer
+        // bias, turned with the reference's roll and pitch (after its own
+        // step) and the filter's yaw.
+        let mut stepped = ref_tilt;
+        stepped.step(&d);
+        let cs = ekf.yaw_cos_sin().unwrap();
+        let want = stepped.horizontal(d.dvel - ekf.x.ba * d.dt, cs);
+        assert_eq!(got, want);
+        assert_eq!(rig.est.tilt, Some(stepped));
+        // Not the filter's own, which is for a level vehicle.
+        assert!((got[0] - filter_own[0]).abs() > 1e-4 || (got[1] - filter_own[1]).abs() > 1e-4);
+        // A yaw reset of the filter turns the answer and not the reference.
+        let a1 = rig.est.heading_input(&mut ekf, &d);
+        let mut next = rig.est.tilt.unwrap();
+        next.step(&d);
+        ekf.reset_yaw(ekf.x.q.yaw() + 1.0, 0.1);
+        let a2 = rig.est.heading_input(&mut ekf, &d);
+        let (c, s) = (Real::cos(1.0_f32), Real::sin(1.0_f32));
+        assert!(
+            (a2[0] - (c * a1[0] - s * a1[1])).abs() < 1e-5,
+            "{a1:?} {a2:?}"
+        );
+        assert!(
+            (a2[1] - (s * a1[0] + c * a1[1])).abs() < 1e-5,
+            "{a1:?} {a2:?}"
+        );
+        assert_eq!(rig.est.tilt, Some(next), "the reference only stepped");
+        // With no reference (switch 0) it is the filter's own.
+        rig.est.tilt = None;
+        assert_eq!(rig.est.heading_input(&mut ekf, &d), ekf.last_dvw_ne());
+    }
+
+    #[test]
+    fn on_a_consistent_flight_the_reference_follows_the_filters_tilt() {
+        // The rig's accelerometer carries the path's horizontal accelerations
+        // on a body that stays level, so the reference (pulled toward the
+        // accelerometer's direction) leans with them; it is not the filter's
+        // tilt, but it stays within a few degrees and the fit agrees with
+        // the right heading.
+        let mut rig = tilt_rig(1);
+        rig.run_until(3.0);
+        rig.est.set_airborne(true);
+        fly_path(&mut rig, 3.0, 14.0);
+        let t = rig.est.tilt.unwrap();
+        assert!(t.roll().abs() < 0.5 && t.pitch().abs() < 0.5);
+        let f = rig.est.heading_fit();
+        assert!(f.seq > 30 && f.used, "{f:?}");
+        assert!(f.eps.abs() < 0.2, "eps {}", f.eps);
+        assert_eq!(rig.est.heading_verdicts(), 0);
     }
 }
