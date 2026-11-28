@@ -19,6 +19,7 @@ use oxide_core::math::{Real, Vec3};
 use oxide_core::time::Micros;
 
 use crate::SimError;
+use crate::faults::{Fault, FaultKind};
 use crate::rng::{Rng, Stream};
 use crate::vehicle::BodyState;
 
@@ -501,6 +502,11 @@ pub struct SensorSuite<const N: usize> {
     baro_drift: f64,
     gps_queue: VecDeque<Stamped<GpsSample>>,
     base_us: u64,
+    /// The faults that act on the values the sensors report (`mag-rotate`,
+    /// `gps-vel-offset`, `gps-vel-noise`); see [`SensorSuite::with_faults`].
+    faults: Vec<Fault>,
+    /// The extra GPS velocity noise's own stream: no other draw moves.
+    gps_vel_noise_rng: Rng,
 }
 
 impl<const N: usize> SensorSuite<N> {
@@ -567,7 +573,31 @@ impl<const N: usize> SensorSuite<N> {
             baro_drift: 0.0,
             gps_queue: VecDeque::new(),
             base_us,
+            faults: Vec::new(),
+            gps_vel_noise_rng: Rng::stream(run_seed, Stream::GpsVelNoise),
         })
+    }
+
+    /// The suite with the sensor-value faults among `faults` applied to what
+    /// it reports (the others are the simulation's to apply). A fault acts
+    /// on a measurement by the time it was taken, so a GPS fix is changed
+    /// when it is sampled, not when it arrives. With none of these faults
+    /// the suite is bit for bit what it was without them.
+    #[must_use]
+    pub fn with_faults(mut self, faults: &[Fault]) -> Self {
+        self.faults = faults
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.kind,
+                    FaultKind::MagRotate { .. }
+                        | FaultKind::GpsVelOffset { .. }
+                        | FaultKind::GpsVelNoise { .. }
+                )
+            })
+            .copied()
+            .collect();
+        self
     }
 
     /// Samples every sensor due at `t`. Call once per tick, `t` increasing
@@ -732,15 +762,18 @@ impl<const N: usize> SensorSuite<N> {
             let vel_noise = self.gps_rng.gaussian_vec(Vec3::splat(m.vel_sigma_mps));
             let lost = self.gps_rng.chance(m.dropout_probability);
             if !lost {
+                let mut velocity = add_vec(truth.body.velocity, vel_noise);
+                let mut s_acc_mps = m.reported_s_acc_mps;
+                self.apply_gps_velocity_faults(t, &mut velocity, &mut s_acc_mps);
                 self.gps_queue.push_back(Stamped {
                     t_sample: t,
                     t_arrival: t.add_us(m.latency_us),
                     value: GpsSample {
                         position: add_vec(truth.body.position, pos_noise).cast(),
-                        velocity: add_vec(truth.body.velocity, vel_noise).cast(),
+                        velocity: velocity.cast(),
                         h_acc_m: m.reported_h_acc_m as f32,
                         v_acc_m: m.reported_v_acc_m as f32,
-                        s_acc_mps: m.reported_s_acc_mps as f32,
+                        s_acc_mps: s_acc_mps as f32,
                         fix_3d: true,
                     },
                 });
@@ -751,6 +784,69 @@ impl<const N: usize> SensorSuite<N> {
         } else {
             None
         }
+    }
+
+    /// The GPS velocity faults active at the measurement time `t`: offsets add
+    /// to the north and east velocity; noise (several at once add in
+    /// quadrature, one draw per axis) comes from the stream of its own and
+    /// only while a fault is active; the receiver reports the largest speed
+    /// accuracy any active noise fault names, else its normal figure.
+    fn apply_gps_velocity_faults(&mut self, t: Micros, velocity: &mut Vec3<f64>, s_acc: &mut f64) {
+        let mut var = 0.0;
+        let mut noisy = false;
+        let mut reported: Option<f64> = None;
+        for f in self.faults.iter().filter(|f| f.active(t)) {
+            match f.kind {
+                FaultKind::GpsVelOffset {
+                    north_mps,
+                    east_mps,
+                } => {
+                    velocity.x += north_mps;
+                    velocity.y += east_mps;
+                }
+                FaultKind::GpsVelNoise {
+                    sigma_mps,
+                    s_acc_mps,
+                } => {
+                    noisy = true;
+                    var += sigma_mps * sigma_mps;
+                    if let Some(a) = s_acc_mps {
+                        reported = Some(reported.map_or(a, |r| r.max(a)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if noisy {
+            let sigma = Real::sqrt(var);
+            velocity.x += self.gps_vel_noise_rng.gaussian(sigma);
+            velocity.y += self.gps_vel_noise_rng.gaussian(sigma);
+            if let Some(a) = reported {
+                *s_acc = a;
+            }
+        }
+    }
+
+    /// The Earth's field in NED as the magnetometer sees it at `t`: rotated
+    /// about Down by the sum of the active `mag-rotate` angles.
+    fn mag_field_ned(&self, t: Micros, field: Vec3<f64>) -> Vec3<f64> {
+        let mut angle = 0.0;
+        let mut rotated = false;
+        for f in self.faults.iter().filter(|f| f.active(t)) {
+            if let FaultKind::MagRotate { angle_rad, ramp_s } = f.kind {
+                angle += angle_rad * f.ramp_weight(t, ramp_s);
+                rotated = true;
+            }
+        }
+        if !rotated {
+            return field;
+        }
+        let (s, c) = (Real::sin(angle), Real::cos(angle));
+        Vec3::new(
+            c * field.x - s * field.y,
+            s * field.x + c * field.y,
+            field.z,
+        )
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -782,7 +878,10 @@ impl<const N: usize> SensorSuite<N> {
             return None;
         }
         let noise = unit_normals(&mut self.mag_rng) * m.noise_sigma_ut;
-        let field = truth.body.attitude.inverse_rotate(m.field_ned_ut);
+        let field = truth
+            .body
+            .attitude
+            .inverse_rotate(self.mag_field_ned(t, m.field_ned_ut));
         Some(Stamped::ideal(
             t,
             MagSample {

@@ -17,6 +17,8 @@
 //!
 //! [sim]                       # default: ideal sensors, external estimator, brain link only
 //! sensors = "realistic"       # "ideal" | "realistic"
+//! gps_latency_us = 250000     # the GPS receiver's delay from measurement to arrival, µs; default: the
+//!                             # preset's (150000 realistic, 0 ideal); a whole number of ms, at most 5 s
 //! estimator = "ekf"           # "external" (truth) | "ekf"
 //! [sim.links]
 //! gcs = false                 # a ground station sends heartbeats (1 Hz)
@@ -43,9 +45,22 @@
 //! FS_GPS_LAND = 10.0
 //!
 //! [[fault]]                   # kind: motor-loss (rotor, scale), gps-loss, imu-loss, baro-loss,
-//! kind = "gps-loss"           #       mag-loss, rc-loss, rc-silent, gcs-loss, brain-crash, brain-hang
-//! start_s = 15.0
+//! kind = "gps-loss"           #       mag-loss, rc-loss, rc-silent, gcs-loss, brain-crash, brain-hang,
+//! start_s = 15.0              #       mag-rotate, gps-vel-offset, gps-vel-noise (below)
 //! # end_s = 19.0              # absent = to the end of the run
+//! # Three faults change what a sensor reports, from start_s to end_s (a window is start <= t < end):
+//! #   kind = "mag-rotate"     # the field the magnetometer sees is rotated about Down by angle_rad
+//! #   angle_rad = 1.5         #   (required, finite, either sign; positive turns north towards east);
+//! #   ramp_s = 2.0            #   default 0 = a step; else the angle rises linearly over ramp_s from the
+//! #                           #   start and, if end_s is given, falls over the last ramp_s (2 * ramp_s must
+//! #                           #   fit in the window); absent end_s = a rotation that never ends; two add
+//! #   kind = "gps-vel-offset" # north_mps and east_mps (both required, finite) are added to the velocity
+//! #   north_mps = 5.0         #   the receiver reports for fixes measured in the window; the position is
+//! #   east_mps = 0.0          #   not changed; a short window is a jump, a long one a bias; two add
+//! #   kind = "gps-vel-noise"  # sigma_mps (required, not negative, finite): extra white noise per
+//! #   sigma_mps = 2.0         #   horizontal axis on the reported velocity, from a stream of its own;
+//! #   s_acc_mps = 1.0         #   s_acc_mps (optional, not negative): the speed accuracy reported in the
+//! #                           #   window; absent = the receiver goes on reporting its normal figure
 //!
 //! [pilot]                     # default: never arms, Stabilized, no setpoints
 //! arm_at_s = 3.0              # absent = never; disarm_at_s and kill_at_s likewise
@@ -440,6 +455,8 @@ pub struct ScenarioFile {
     pub airframe: String,
     pub duration_s: f64,
     pub sensors: SensorPreset,
+    /// `[sim] gps_latency_us`: replaces the preset's GPS delay, µs.
+    pub gps_latency_us: Option<u64>,
     pub estimator: EstimatorSource,
     pub links: LinkConfig,
     pub wind: WindSpec,
@@ -488,9 +505,13 @@ impl ScenarioFile {
         let seed = self.seed(index);
         let mut params = self.params.clone();
         params.extend_from_slice(extra);
+        let mut sensors = self.sensors.config();
+        if let Some(us) = self.gps_latency_us {
+            sensors.gps.latency_us = us;
+        }
         SimOptions {
             seed,
-            sensors: self.sensors.config(),
+            sensors,
             wind_period_us: None,
             wind: self.wind.config(seed),
             estimator: self.estimator,
@@ -675,6 +696,7 @@ struct RawFile {
 #[serde(deny_unknown_fields)]
 struct RawSim {
     sensors: Option<String>,
+    gps_latency_us: Option<u64>,
     estimator: Option<String>,
     links: Option<RawLinks>,
 }
@@ -740,6 +762,12 @@ struct RawFault {
     end_s: Option<f64>,
     rotor: Option<usize>,
     scale: Option<f64>,
+    angle_rad: Option<f64>,
+    ramp_s: Option<f64>,
+    north_mps: Option<f64>,
+    east_mps: Option<f64>,
+    sigma_mps: Option<f64>,
+    s_acc_mps: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1062,7 +1090,7 @@ fn convert(raw: RawFile) -> Result<ScenarioFile> {
         ));
     }
 
-    let (sensors, estimator, links) = convert_sim(raw.sim)?;
+    let (sensors, gps_latency_us, estimator, links) = convert_sim(raw.sim)?;
     let wind = raw.wind.map_or(Ok(WindSpec::Calm), convert_wind)?;
     let battery = raw
         .battery
@@ -1109,6 +1137,7 @@ fn convert(raw: RawFile) -> Result<ScenarioFile> {
         airframe,
         duration_s: raw.duration_s,
         sensors,
+        gps_latency_us,
         estimator,
         links,
         wind,
@@ -1122,7 +1151,20 @@ fn convert(raw: RawFile) -> Result<ScenarioFile> {
     })
 }
 
-fn convert_sim(raw: Option<RawSim>) -> Result<(SensorPreset, EstimatorSource, LinkConfig)> {
+/// The longest GPS delay a file may set, µs.
+pub const MAX_GPS_LATENCY_US: u64 = 5_000_000;
+
+/// The step a GPS delay must be a whole multiple of, µs: the base period of
+/// the slower profile, so that the file flies on both.
+fn gps_latency_step_us() -> u64 {
+    u64::from(F405_LEAN.base_period_us.max(H743_FULL.base_period_us))
+}
+
+#[allow(clippy::type_complexity)]
+fn convert_sim(
+    raw: Option<RawSim>,
+) -> Result<(SensorPreset, Option<u64>, EstimatorSource, LinkConfig)> {
+    let mut gps_latency_us = None;
     let mut sensors = SensorPreset::Ideal;
     let mut estimator = EstimatorSource::External;
     let mut links = LinkConfig::default();
@@ -1137,6 +1179,18 @@ fn convert_sim(raw: Option<RawSim>) -> Result<(SensorPreset, EstimatorSource, Li
                 "sim.sensors",
                 &n,
             )?;
+        }
+        if let Some(us) = s.gps_latency_us {
+            let step = gps_latency_step_us();
+            if us > MAX_GPS_LATENCY_US || us % step != 0 {
+                return Err(ScenarioError::new(
+                    "sim.gps_latency_us",
+                    format!(
+                        "{us} µs is not a whole number of {step} µs steps of at most {MAX_GPS_LATENCY_US} µs"
+                    ),
+                ));
+            }
+            gps_latency_us = Some(us);
         }
         if let Some(n) = s.estimator {
             estimator = lookup(
@@ -1156,7 +1210,7 @@ fn convert_sim(raw: Option<RawSim>) -> Result<(SensorPreset, EstimatorSource, Li
                 l.rc_failsafe_delay_us.unwrap_or(links.rc_failsafe_delay_us);
         }
     }
-    Ok((sensors, estimator, links))
+    Ok((sensors, gps_latency_us, estimator, links))
 }
 
 fn vec3(key: &str, v: [f64; 3]) -> Result<Vec3<f64>> {
@@ -1288,7 +1342,7 @@ fn check_params(params: &[(String, f64)]) -> Result<()> {
 }
 
 /// Fault kinds by file name.
-pub const FAULT_KIND_NAMES: [&str; 10] = [
+pub const FAULT_KIND_NAMES: [&str; 13] = [
     "motor-loss",
     "gps-loss",
     "imu-loss",
@@ -1299,6 +1353,9 @@ pub const FAULT_KIND_NAMES: [&str; 10] = [
     "gcs-loss",
     "brain-crash",
     "brain-hang",
+    "mag-rotate",
+    "gps-vel-offset",
+    "gps-vel-noise",
 ];
 
 fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
@@ -1316,19 +1373,73 @@ fn convert_faults(raw: &[RawFault], links: &LinkConfig) -> Result<Vec<Fault>> {
                 FaultKind::MotorLoss { rotor, scale }
             }
             other => {
-                if f.rotor.is_some() {
-                    return Err(ScenarioError::new(
-                        format!("{key}.rotor"),
-                        "only a motor-loss has a rotor",
-                    ));
+                let own: &[&str] = match other {
+                    "mag-rotate" => &["angle_rad", "ramp_s"],
+                    "gps-vel-offset" => &["north_mps", "east_mps"],
+                    "gps-vel-noise" => &["sigma_mps", "s_acc_mps"],
+                    _ => &[],
+                };
+                let given = [
+                    ("rotor", f.rotor.is_some(), "a motor-loss"),
+                    ("scale", f.scale.is_some(), "a motor-loss"),
+                    ("angle_rad", f.angle_rad.is_some(), "a mag-rotate"),
+                    ("ramp_s", f.ramp_s.is_some(), "a mag-rotate"),
+                    ("north_mps", f.north_mps.is_some(), "a gps-vel-offset"),
+                    ("east_mps", f.east_mps.is_some(), "a gps-vel-offset"),
+                    ("sigma_mps", f.sigma_mps.is_some(), "a gps-vel-noise"),
+                    ("s_acc_mps", f.s_acc_mps.is_some(), "a gps-vel-noise"),
+                ];
+                for (name, set, whose) in given {
+                    if set && !own.contains(&name) {
+                        return Err(ScenarioError::new(
+                            format!("{key}.{name}"),
+                            format!("only {whose} has a {name}"),
+                        ));
+                    }
                 }
-                if f.scale.is_some() {
-                    return Err(ScenarioError::new(
-                        format!("{key}.scale"),
-                        "only a motor-loss has a scale",
-                    ));
-                }
+                let need = |name: &str, v: Option<f64>| -> Result<f64> {
+                    let v = v.ok_or_else(|| {
+                        ScenarioError::new(
+                            format!("{key}.{name}"),
+                            format!("a {other} needs a {name}"),
+                        )
+                    })?;
+                    finite(&format!("{key}.{name}"), v)
+                };
+                let not_negative = |name: &str, v: f64| -> Result<f64> {
+                    if v >= 0.0 {
+                        Ok(v)
+                    } else {
+                        Err(ScenarioError::new(
+                            format!("{key}.{name}"),
+                            "must not be negative",
+                        ))
+                    }
+                };
                 match other {
+                    "mag-rotate" => {
+                        let ramp_s = match f.ramp_s {
+                            Some(r) => not_negative("ramp_s", need("ramp_s", Some(r))?)?,
+                            None => 0.0,
+                        };
+                        FaultKind::MagRotate {
+                            angle_rad: need("angle_rad", f.angle_rad)?,
+                            ramp_s,
+                        }
+                    }
+                    "gps-vel-offset" => FaultKind::GpsVelOffset {
+                        north_mps: need("north_mps", f.north_mps)?,
+                        east_mps: need("east_mps", f.east_mps)?,
+                    },
+                    "gps-vel-noise" => FaultKind::GpsVelNoise {
+                        sigma_mps: not_negative("sigma_mps", need("sigma_mps", f.sigma_mps)?)?,
+                        s_acc_mps: match f.s_acc_mps {
+                            Some(a) => {
+                                Some(not_negative("s_acc_mps", need("s_acc_mps", Some(a))?)?)
+                            }
+                            None => None,
+                        },
+                    },
                     "gps-loss" => FaultKind::GpsLoss,
                     "imu-loss" => FaultKind::ImuLoss,
                     "baro-loss" => FaultKind::BaroLoss,

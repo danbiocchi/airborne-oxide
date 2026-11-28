@@ -45,6 +45,10 @@ pub enum Stream {
     /// GPS (ADR-0006 §4). A stream of its own: our GPS model's draws
     /// ([`Stream::Gps`]) are not touched by it.
     GpsError,
+    /// The extra noise a `gps-vel-noise` fault puts on the reported GPS
+    /// velocity: a stream of its own, so that a flight without the fault
+    /// (and every draw of [`Stream::Gps`]) is as it was.
+    GpsVelNoise,
 }
 
 impl Stream {
@@ -59,6 +63,7 @@ impl Stream {
             Stream::Wind => 6,
             Stream::Scenario => 7,
             Stream::GpsError => 8,
+            Stream::GpsVelNoise => 9,
         }
     }
 }

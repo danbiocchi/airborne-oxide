@@ -221,6 +221,9 @@ fn kind_name(kind: &FaultKind) -> &'static str {
         FaultKind::GcsLoss => "gcs-loss",
         FaultKind::BrainCrash => "brain-crash",
         FaultKind::BrainHang => "brain-hang",
+        FaultKind::MagRotate { .. } => "mag-rotate",
+        FaultKind::GpsVelOffset { .. } => "gps-vel-offset",
+        FaultKind::GpsVelNoise { .. } => "gps-vel-noise",
     }
 }
 

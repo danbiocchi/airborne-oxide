@@ -39,6 +39,31 @@ pub enum FaultKind {
     /// Brain heartbeats continue with a frozen progress counter; setpoints
     /// stop.
     BrainHang,
+    /// The world magnetic field the magnetometer sees is rotated about Down
+    /// by `angle_rad` (positive turns the field's north towards east, a
+    /// right-handed turn about Down). The angle rises linearly over `ramp_s`
+    /// from the start of the window and, when the window has an end, falls
+    /// linearly to zero over the last `ramp_s` of it (0 = a step). Rotations
+    /// that overlap add.
+    MagRotate {
+        angle_rad: f64,
+        ramp_s: f64,
+    },
+    /// `north_mps` and `east_mps` are added to the velocity the GPS receiver
+    /// reports (measurements taken in the window); the position is not
+    /// changed. Offsets that overlap add.
+    GpsVelOffset {
+        north_mps: f64,
+        east_mps: f64,
+    },
+    /// Extra white noise of `sigma_mps` per horizontal axis on the reported
+    /// GPS velocity (measurements taken in the window), drawn from a stream
+    /// of its own. While it is active the receiver reports `s_acc_mps` as
+    /// its speed accuracy; `None` = it goes on reporting its normal figure.
+    GpsVelNoise {
+        sigma_mps: f64,
+        s_acc_mps: Option<f64>,
+    },
 }
 
 /// A fault active from `start_s` until `end_s`.
@@ -75,6 +100,29 @@ impl Fault {
             Some(e) if !e.is_nan() => t.0 < secs_to_us(e),
             _ => true,
         }
+    }
+}
+
+impl Fault {
+    /// The share of a [`FaultKind::MagRotate`]'s angle in force at `t`: 0
+    /// outside the window, 1 for a step, and for a ramp the smaller of the
+    /// rise since the start and (when the window has an end) the fall to it.
+    /// Times are whole microseconds, as `active` reads them.
+    pub fn ramp_weight(&self, t: Micros, ramp_s: f64) -> f64 {
+        if !self.active(t) {
+            return 0.0;
+        }
+        let ramp_us = secs_to_us(ramp_s);
+        if ramp_us == 0 {
+            return 1.0;
+        }
+        let ramp = ramp_us as f64;
+        let rise = (t.0 - self.start_us()) as f64 / ramp;
+        let fall = match self.end_s {
+            Some(e) if !e.is_nan() => (secs_to_us(e) - t.0) as f64 / ramp,
+            _ => f64::INFINITY,
+        };
+        rise.min(fall).min(1.0)
     }
 }
 
@@ -126,6 +174,11 @@ impl ActiveFaults {
                 FaultKind::GcsLoss => a.gcs_loss = true,
                 FaultKind::BrainCrash => a.brain_crash = true,
                 FaultKind::BrainHang => a.brain_hang = true,
+                // Sensor value faults act inside the sensor models, which the
+                // autopilot behind a bridge does not see.
+                FaultKind::MagRotate { .. }
+                | FaultKind::GpsVelOffset { .. }
+                | FaultKind::GpsVelNoise { .. } => {}
             }
         }
         a
@@ -205,6 +258,49 @@ pub fn validate_faults(
                 return refuse(format!(
                     "motor loss scale {scale} is not a fraction between 0 and 1"
                 ));
+            }
+            FaultKind::MagRotate { angle_rad, ramp_s } => {
+                if !angle_rad.is_finite() {
+                    return refuse(format!("mag-rotate angle_rad {angle_rad} is not finite"));
+                }
+                if !(ramp_s.is_finite() && ramp_s >= 0.0) {
+                    return refuse(format!(
+                        "mag-rotate ramp_s {ramp_s} is not a finite time of at least 0 s"
+                    ));
+                }
+                if let Some(end) = f.end_s
+                    && 2.0 * ramp_s > end - f.start_s
+                {
+                    return refuse(format!(
+                        "mag-rotate ramp_s {ramp_s} s is more than half of the window {} s to {end} s",
+                        f.start_s
+                    ));
+                }
+            }
+            FaultKind::GpsVelOffset {
+                north_mps,
+                east_mps,
+            } if !(north_mps.is_finite() && east_mps.is_finite()) => {
+                return refuse(format!(
+                    "gps-vel-offset north_mps {north_mps} and east_mps {east_mps} must be finite"
+                ));
+            }
+            FaultKind::GpsVelNoise {
+                sigma_mps,
+                s_acc_mps,
+            } => {
+                if !(sigma_mps.is_finite() && sigma_mps >= 0.0) {
+                    return refuse(format!(
+                        "gps-vel-noise sigma_mps {sigma_mps} is not a finite figure of at least 0"
+                    ));
+                }
+                if let Some(a) = s_acc_mps
+                    && !(a.is_finite() && a >= 0.0)
+                {
+                    return refuse(format!(
+                        "gps-vel-noise s_acc_mps {a} is not a finite figure of at least 0"
+                    ));
+                }
             }
             FaultKind::GcsLoss if !links.gcs => {
                 return refuse(

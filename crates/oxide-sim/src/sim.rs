@@ -592,7 +592,8 @@ impl<P: Pilot, const N: usize, A: Autopilot<N>> Simulation<P, N, A> {
         }
         options.links.validate(base_us)?;
         crate::faults::validate_faults(&options.faults, N, &options.links)?;
-        let sensors = SensorSuite::new(options.sensors, options.seed, base_us)?;
+        let sensors =
+            SensorSuite::new(options.sensors, options.seed, base_us)?.with_faults(&options.faults);
         let wind_period_us = options.wind_period_us.unwrap_or(base_us);
         if wind_period_us == 0 || !wind_period_us.is_multiple_of(base_us) {
             return Err(SimError::WindPeriod {
