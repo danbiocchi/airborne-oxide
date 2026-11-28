@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use oxide_bridge::gate::plan::{Plan, Scoring, pair_kinds, pair_scoring};
+use oxide_bridge::gate::plan::{NOT_FOR_THE_GATE, Plan, Scoring, pair_kinds, pair_scoring};
 use oxide_bridge::runner::Autopilot;
 use oxide_bridge::scenario::LoadedScenario;
 
@@ -187,8 +187,20 @@ fn every_file_of_the_directory_is_in_exactly_one_list() {
         .expect("dir")
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+        .filter(|e| {
+            let stem = e
+                .path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned());
+            !stem.is_some_and(|n| NOT_FOR_THE_GATE.contains(&n.as_str()))
+        })
         .count();
     assert_eq!(plan.entries.len(), in_dir);
+    // The files the gate does not fly are in the directory and not in the plan.
+    for name in NOT_FOR_THE_GATE {
+        assert!(scenarios_dir().join(format!("{name}.toml")).exists());
+        assert!(plan.entries.iter().all(|e| e.scenario != name), "{name}");
+    }
     let unique: BTreeSet<&str> = plan.entries.iter().map(|e| e.scenario.as_str()).collect();
     assert_eq!(unique.len(), in_dir, "no scenario twice");
     assert!(plan.deviations_from_the_record().is_empty());
