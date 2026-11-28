@@ -236,8 +236,10 @@ impl ControlMonitor {
     /// exceeded `loc_tilt_rad` for `loc_tilt_s`. `active = false` (disarmed or
     /// landed) resets both timers and returns false.
     ///
-    /// A non-finite attitude or target counts as over both limits, so a
-    /// corrupt estimate trips the check instead of hiding in it.
+    /// A non-finite attitude counts as over both limits (it trips after the
+    /// shorter time); a non-finite target counts as over the error limit
+    /// only, since the tilt is of the attitude. So a corrupt estimate trips
+    /// the check instead of hiding in it.
     pub fn update(
         &mut self,
         now: Micros,
@@ -692,6 +694,37 @@ mod tests {
         let nan = Quat::new(f32::NAN, 0.0, 0.0, 0.0);
         assert!(!m.update(t(0), true, nan, Quat::identity(), &p));
         assert!(m.update(t(500), true, nan, Quat::identity(), &p));
+    }
+
+    #[test]
+    fn control_non_finite_attitude_trips_after_the_tilt_time() {
+        // Both limits count a non-finite attitude, so the shorter time
+        // (0.25 s) decides, not the error time (0.5 s).
+        let p = params();
+        let mut m = ControlMonitor::new();
+        let nan = Quat::new(f32::NAN, 0.0, 0.0, 0.0);
+        assert!(!m.update(t(0), true, nan, Quat::identity(), &p));
+        assert!(!m.update(t(249), true, nan, Quat::identity(), &p));
+        assert!(m.update(t(250), true, nan, Quat::identity(), &p));
+    }
+
+    #[test]
+    fn control_tilt_error_exactly_at_the_limit_does_not_trip() {
+        // Strictly above the limit trips; equal to it does not.
+        let mut p = params();
+        let target = Quat::<f32>::from_euler(50.0 * DEG, 0.0, 0.0);
+        p.loc_error_rad = tilt_error_angle(Quat::identity(), target);
+        let mut m = ControlMonitor::new();
+        for ms in (0..=2_000).step_by(100) {
+            assert!(
+                !m.update(t(ms), true, Quat::identity(), target, &p),
+                "at {ms} ms"
+            );
+        }
+        p.loc_error_rad = tilt_error_angle(Quat::identity(), target) * 0.999;
+        let mut m = ControlMonitor::new();
+        assert!(!m.update(t(0), true, Quat::identity(), target, &p));
+        assert!(m.update(t(500), true, Quat::identity(), target, &p));
     }
 
     #[test]

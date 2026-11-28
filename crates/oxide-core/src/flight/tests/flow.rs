@@ -1083,6 +1083,19 @@ fn loss_of_control_terminates_in_the_air_but_not_on_the_ground() {
 }
 
 #[test]
+fn loss_of_control_by_the_error_to_the_command_goes_through_the_supervisor() {
+    // An estimate tilted 50 degrees while the command stays near level: the
+    // thrust axes are over 45 degrees apart (below the 75 degree tilt
+    // limit), so only the error rule can terminate, after its 0.5 s.
+    let mut rig = hovering(1, cfg());
+    rig.state = Some(tilted(50.0));
+    rig.run(0.3);
+    assert_ne!(rig.nav(), NavState::Terminated);
+    assert!(rig.run_until(1.5, |r| r.nav() == NavState::Terminated));
+    assert!(rig.out.status.reasons.contains(Reasons::LOSS_OF_CONTROL));
+}
+
+#[test]
 fn offboard_with_no_human_link_returns_after_the_countdown_unless_the_gcs_is_alive() {
     // RC lost alone changes nothing in Offboard, and the ground station
     // being alive keeps it that way.
