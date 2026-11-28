@@ -13,6 +13,7 @@
 use core::fmt;
 use std::path::{Path, PathBuf};
 
+use oxide_sim::faults::FaultKind;
 use oxide_sim::scenario::Script;
 use oxide_sim::scenario_file::{self, ScenarioFile};
 
@@ -111,6 +112,16 @@ pub enum Untranslatable {
     ParamValue { name: String, value: f64 },
     /// The file has faults and [`FAULTS_TRANSLATABLE`] is off.
     Faults(usize),
+    /// A fault that changes what a sensor reports (`mag-rotate`,
+    /// `gps-vel-offset`, `gps-vel-noise`, `gps-time-offset`): it is applied
+    /// inside our simulator's sensor models, which ArduCopter does not use
+    /// (it has its own sensor simulation), so ArduCopter would fly without
+    /// the fault and the comparison would be wrong.
+    SensorFault { index: usize, kind: &'static str },
+    /// The file sets the GPS receiver's delay (`[sim] gps_latency_us`):
+    /// ArduCopter's own GPS lag comes from its parameter files, so it would
+    /// fly with another delay than our core.
+    GpsLatency(u64),
 }
 
 impl fmt::Display for Untranslatable {
@@ -130,6 +141,18 @@ impl fmt::Display for Untranslatable {
                 "the parameter {name} is {value}: the fence radius must be a finite number, not negative"
             ),
             Self::Faults(n) => write!(f, "faults are not translatable (the file has {n})"),
+            Self::SensorFault { index, kind } => write!(
+                f,
+                "fault[{index}] is a {kind}, a sensor fault of our simulator that ArduCopter's own \
+                 sensor simulation does not have: ArduCopter would fly without it and the \
+                 comparison would be wrong"
+            ),
+            Self::GpsLatency(us) => write!(
+                f,
+                "the file sets sim.gps_latency_us to {us}, but ArduCopter's GPS delay comes from \
+                 its own parameter files: it would fly with another delay and the comparison \
+                 would be wrong"
+            ),
         }
     }
 }
@@ -182,6 +205,19 @@ pub fn translate(file: &ScenarioFile) -> Result<Translation, Untranslatable> {
             }
             ParamRoute::OursOnly => ours_only.push((name.clone(), *value)),
         }
+    }
+    if let Some(us) = file.gps_latency_us {
+        return Err(Untranslatable::GpsLatency(us));
+    }
+    for (index, f) in file.faults.iter().enumerate() {
+        let kind = match f.kind {
+            FaultKind::MagRotate { .. } => "mag-rotate",
+            FaultKind::GpsVelOffset { .. } => "gps-vel-offset",
+            FaultKind::GpsVelNoise { .. } => "gps-vel-noise",
+            FaultKind::GpsTimeOffset { .. } => "gps-time-offset",
+            _ => continue,
+        };
+        return Err(Untranslatable::SensorFault { index, kind });
     }
     if !FAULTS_TRANSLATABLE && !file.faults.is_empty() {
         return Err(Untranslatable::Faults(file.faults.len()));
@@ -500,6 +536,54 @@ mod tests {
         ));
         const { assert!(FAULTS_TRANSLATABLE) };
         assert!(translate(&faulted).is_ok());
+    }
+
+    #[test]
+    fn a_file_with_a_sensor_fault_or_the_gps_delay_is_refused_with_a_clear_error() {
+        let faults = [
+            (
+                "mag-rotate",
+                "kind = \"mag-rotate\"\nstart_s = 5.0\nangle_rad = 1.0\n",
+            ),
+            (
+                "gps-vel-offset",
+                "kind = \"gps-vel-offset\"\nstart_s = 5.0\nnorth_mps = 1.0\neast_mps = 0.0\n",
+            ),
+            (
+                "gps-vel-noise",
+                "kind = \"gps-vel-noise\"\nstart_s = 5.0\nsigma_mps = 1.0\n",
+            ),
+            (
+                "gps-time-offset",
+                "kind = \"gps-time-offset\"\nstart_s = 5.0\noffset_s = 0.1\n",
+            ),
+        ];
+        for (name, body) in faults {
+            // After a fault that is translatable, so that the index is read.
+            let f = load(&format!(
+                "{HEAD}{OFFBOARD}[[fault]]\nkind = \"gps-loss\"\nstart_s = 4.0\n[[fault]]\n{body}"
+            ));
+            let e = translate(&f).unwrap_err();
+            assert_eq!(
+                e,
+                Untranslatable::SensorFault {
+                    index: 1,
+                    kind: name
+                }
+            );
+            let text = e.to_string();
+            assert!(text.contains("fault[1]") && text.contains(name), "{text}");
+            assert!(text.contains("comparison would be wrong"), "{text}");
+        }
+        let f = load(&format!("{HEAD}[sim]\ngps_latency_us = 250000\n{OFFBOARD}"));
+        let e = translate(&f).unwrap_err();
+        assert_eq!(e, Untranslatable::GpsLatency(250_000));
+        assert!(e.to_string().contains("sim.gps_latency_us"), "{e}");
+        // The faults ArduCopter does get are still translated.
+        let ok = load(&format!(
+            "{HEAD}{OFFBOARD}[[fault]]\nkind = \"mag-loss\"\nstart_s = 5.0\n"
+        ));
+        assert!(translate(&ok).is_ok());
     }
 
     #[test]
