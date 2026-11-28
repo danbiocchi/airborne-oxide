@@ -273,42 +273,6 @@ const KNOWN: &[(&str, &str, &str, &str)] = &[
          draw of the IMU's noise (2 of runs 0 to 19 before the IMU model of ADR-0008, among \
          them not this one, and 5 with it); a floor above zero needs the loops' own tuning",
     ),
-    (
-        "EKF_MAG_DECL",
-        "min",
-        "rc-loss-position",
-        "the simulated site has declination 0, so -pi turns the heading estimate round and the \
-         position estimate disagrees with it: 1377 m out. Real declinations reach pi only at \
-         the geomagnetic poles, so the range is right and the value is wrong for this site",
-    ),
-    (
-        "EKF_MAG_DECL",
-        "max",
-        "rc-loss-position",
-        "as the minimum: +pi against a site with declination 0",
-    ),
-    (
-        "EKF_MAG_DECL",
-        "min",
-        "gust-hold",
-        "the same wrong declination as on rc-loss-position: -pi turns the heading estimate \
-         round, the position loop pushes the wrong way, and the vehicle takes off and flies \
-         away (886 m out on run 0, and terminated by the thrust-axis rule at 35.34 s, after the \
-         flight-away). Before the loss-of-control rule was judged on the thrust \
-         axis (ADR-0003, amendment of 28 November 2026) this flight was terminated on the \
-         ground 0.54 s after arming, by the heading term: in Offboard the commanded heading (0) \
-         and the wrongly estimated one were 180 degrees apart. That was an accident of the \
-         commanded heading and not a guard: where the command follows the estimate \
-         (rc-loss-position) the same declination flew away under the old rule too",
-    ),
-    (
-        "EKF_MAG_DECL",
-        "max",
-        "gust-hold",
-        "as the minimum: +pi against a site with declination 0, the same flight with the \
-         same history (terminated on the ground at arming by the old heading term, which was \
-         not a guard; now it flies away and is terminated only after it, as the minimum is)",
-    ),
 ];
 
 #[test]
